@@ -1,4 +1,3 @@
-import functools
 from typing import ClassVar
 
 import torch
@@ -188,7 +187,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
     @torch.compiler.disable
     def _build_attention_mask(
-        self, loss_mask: torch.Tensor, document_ids: torch.Tensor, device: torch.Tensor
+        self, loss_mask: torch.Tensor, document_ids: torch.Tensor, device: torch.device
     ):
         anchor_positions, anchor_valid = select_anchors(
             loss_mask, self.config.max_anchors, self.block_size

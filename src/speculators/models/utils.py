@@ -43,7 +43,7 @@ def conditional_torch_compile(func):
         def wrapper(*args, **kwargs):
             lengths = kwargs.get("lengths")
             if lengths is not None:
-                torch._dynamo.mark_dynamic(lengths, 0)
+                torch._dynamo.mark_dynamic(lengths, 0)  # noqa: SLF001
             return compiled(*args, **kwargs)
 
         return wrapper
