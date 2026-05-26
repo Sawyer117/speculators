@@ -1,5 +1,7 @@
+import functools
 import warnings
 
+import torch
 from transformers import AutoConfig, PretrainedConfig
 
 
@@ -31,3 +33,19 @@ def resolve_target_layer_ids(
         stacklevel=3,
     )
     return target_layer_ids
+
+
+def conditional_torch_compile(func):
+    if torch.cuda.is_available() and hasattr(torch, "compile"):
+        compiled = torch.compile(func)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            lengths = kwargs.get("lengths")
+            if lengths is not None:
+                torch._dynamo.mark_dynamic(lengths, 0)
+            return compiled(*args, **kwargs)
+
+        return wrapper
+    else:
+        return func

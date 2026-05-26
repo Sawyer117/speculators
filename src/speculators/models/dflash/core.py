@@ -1,3 +1,4 @@
+import functools
 from typing import ClassVar
 
 import torch
@@ -19,7 +20,7 @@ from speculators.models.dflash.utils import (
     select_anchors,
 )
 from speculators.models.metrics import kl_div_loss, resolve_loss_fn
-from speculators.models.utils import resolve_target_layer_ids
+from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
 
 
 @SpeculatorModel.register("dflash")
@@ -186,7 +187,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         return self.config.mask_token_id
 
     @torch.compiler.disable
-    def _build_attention_mask(self, loss_mask, lengths, device):
+    def _build_attention_mask(
+        self, loss_mask: torch.Tensor, lengths: torch.Tensor, device: torch.Tensor
+    ):
         anchor_positions, anchor_valid = select_anchors(
             loss_mask, self.config.max_anchors, self.block_size
         )
@@ -209,7 +212,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         return attention_mask, anchor_positions, anchor_valid
 
-    @torch.compile
+    @conditional_torch_compile
     def forward(
         self,
         hidden_states: torch.Tensor,  # shape: [1,total_seq_len,num_hidden*hidden_size]
@@ -253,7 +256,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # shape: [1, total_seq_len, hidden_size]
 
         mask_position_ids = get_base_indices_for_anchored_blocks(
-            position_ids[:, anchor_positions], self.block_size, input_ids.numel()
+            position_ids[0, anchor_positions], self.block_size, input_ids.numel()
         )
         position_ids = torch.cat([position_ids, mask_position_ids.unsqueeze(0)], dim=1)
         # shape: [1, total_seq_len + num_anchors*block_size]
