@@ -188,7 +188,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
     @torch.compiler.disable
     def _build_attention_mask(
-        self, loss_mask: torch.Tensor, lengths: torch.Tensor, device: torch.Tensor
+        self, loss_mask: torch.Tensor, document_ids: torch.Tensor, device: torch.Tensor
     ):
         anchor_positions, anchor_valid = select_anchors(
             loss_mask, self.config.max_anchors, self.block_size
@@ -196,7 +196,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # shape: [num_anchors], [num_anchors]
 
         mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
-            lengths=lengths.to(device),
+            document_ids=document_ids.squeeze(0).to(device),
             total_seq_len=loss_mask.shape[1],
             anchor_positions=anchor_positions,
             block_size=self.block_size,
@@ -219,7 +219,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         input_ids: torch.Tensor,  # shape: [1, total_seq_len]
         loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
         verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
-        lengths: torch.Tensor | None = None,  # shape: [batch_size]
+        document_ids: torch.Tensor,  # shape: [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
         loss_fn=kl_div_loss,
         **kwargs,
@@ -228,15 +228,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         total_seq_len = hidden_states.shape[1]
         num_anchors = self.config.max_anchors
 
-        if lengths is None:
-            lengths = torch.tensor([total_seq_len], dtype=torch.long, device=device)
         if position_ids is None:
             position_ids = 1 + torch.arange(
                 total_seq_len, dtype=torch.long, device=device
             ).unsqueeze(0)
 
         attention_mask, anchor_positions, anchor_valid = self._build_attention_mask(
-            loss_mask, lengths, device
+            loss_mask, document_ids, device
         )
 
         mask_tokens_size = num_anchors * self.block_size
