@@ -18,13 +18,16 @@ def hc_head_project(
     num_tokens, hc_mult, hidden_size = hidden_states.shape
 
     x = hidden_states.reshape(num_tokens, hc_mult * hidden_size).to(torch.float32)
+    hc_fn = hc_fn.to(torch.float32)
+    hc_scale = hc_scale.to(torch.float32).reshape(())
+    hc_base = hc_base.to(torch.float32)
 
     mixes = torch.matmul(x, hc_fn.t())
 
     sqrsum = x.square().sum(dim=-1, keepdim=True)
     rsqrt = torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_norm_eps)
 
-    pre_mix = torch.sigmoid(mixes * rsqrt * hc_scale[0] + hc_base) + hc_eps
+    pre_mix = torch.sigmoid(mixes * rsqrt * hc_scale + hc_base) + hc_eps
 
     result = torch.sum(pre_mix.unsqueeze(-1) * hidden_states.to(torch.float32), dim=1)
 

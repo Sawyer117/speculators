@@ -267,6 +267,27 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         return self.config.mask_token_id
 
     @torch.compile
+    def _compiled_layers(
+        self,
+        noise_embedding: torch.Tensor,
+        fc_output: torch.Tensor,
+        attention_mask,
+        position_ids: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        **kwargs,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            noise_embedding = layer(
+                hidden_states=noise_embedding,
+                target_hidden=fc_output,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+        return self.lm_head(self.norm(noise_embedding))
+
     def forward(
         self,
         hidden_states: torch.Tensor,  # shape: [1,total_seq_len,num_hidden*hidden_size]
@@ -356,18 +377,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             targets = verifier_logits[:, anchored_block_indices]
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
-        for layer in self.layers:
-            noise_embedding = layer(
-                hidden_states=noise_embedding,
-                target_hidden=fc_output,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-
-        logits = self.lm_head(self.norm(noise_embedding))
+        logits = self._compiled_layers(
+            noise_embedding,
+            fc_output,
+            attention_mask,
+            position_ids,
+            position_embeddings,
+            **kwargs,
+        )
         # shape: [1, num_anchors*block_size, vocab_size]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]

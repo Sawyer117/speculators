@@ -64,18 +64,9 @@ def split_files(datapath: str, ratio: float = 0.9, seed: int = 0):
 StandardizeFnSig = Callable[[dict[str, Any]], dict[str, Any]]
 
 
-def create_empty_sample(hidden_size: int):
-    # data structure: {
-    #     "hidden_states": [seq_len, 3 * hidden_size],
-    #     "input_ids": [seq_len],
-    #     "verifier_last_hidden_states": [seq_len, hidden_size],
-    #     "loss_mask": [seq_len],
-    #     "lengths": [1],
-    #     "position_ids": [seq_len],
-    # }
-
+def create_empty_sample(hidden_size: int, num_hidden_layers: int = 3):
     return {
-        "hidden_states": torch.empty(0, 3 * hidden_size),
+        "hidden_states": torch.empty(0, num_hidden_layers * hidden_size),
         "input_ids": torch.empty(0),
         "verifier_last_hidden_states": torch.empty(0, hidden_size),
         "loss_mask": torch.empty(0),
@@ -130,7 +121,7 @@ class BaseDataset(Dataset):
             return data
 
         # data structure: {
-        #  "hidden_states": [seq_len, 3 * hidden_size],
+        #  "hidden_states": [seq_len, num_layers * hidden_size],
         #  "input_ids": [seq_len],
         #  "verifier_last_hidden_states": [seq_len, hidden_size],
         #  "loss_mask": [seq_len],
@@ -151,7 +142,7 @@ class BaseDataset(Dataset):
         # shape: [seq_len]
 
         # data structure: {
-        #     "hidden_states": [seq_len, 3 * hidden_size],
+        #     "hidden_states": [seq_len, num_layers * hidden_size],
         #     "input_ids": [seq_len],
         #     "verifier_last_hidden_states": [seq_len, hidden_size],
         #     "loss_mask": [seq_len],
@@ -321,7 +312,7 @@ class ArrowDataset(BaseDataset):
         return {
             "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
                 1
-            ),  # [seq_len, 3 * hidden_size]
+            ),  # [seq_len, num_layers * hidden_size]
             "input_ids": loaded_hs["token_ids"],  # [seq_len]
             "verifier_last_hidden_states": loaded_hs["hidden_states"][
                 :, -1
@@ -431,15 +422,14 @@ def create_collate_fn(
     max_len: int,
     hidden_size: int,
     preprocess: Callable[[BatchType], BatchType] | None = None,
+    num_hidden_layers: int = 3,
 ):
     def collate_fn(batch: list[BatchType | None]) -> BatchType:
         # Apply per-sample preprocessing and filter failed samples
         batch = [preprocess(b) if preprocess else b for b in batch if b is not None]
 
         if not batch:
-            # Create empty sample which then gets padded to full
-            # batch size if no valid samples are found
-            batch = [create_empty_sample(hidden_size)]
+            batch = [create_empty_sample(hidden_size, num_hidden_layers)]
 
         collated_data = {}
         for key in batch[0]:  # type: ignore[union-attr]

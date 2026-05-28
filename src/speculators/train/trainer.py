@@ -206,6 +206,22 @@ class Trainer:
                 for k, v in batch.items()
             }
 
+            for key in ("hidden_states", "verifier_last_hidden_states"):
+                if key in gpu_batch and isinstance(gpu_batch[key], torch.Tensor):
+                    gpu_batch[key] = gpu_batch[key].to(
+                        dtype=self.config.hidden_states_dtype
+                    )
+
+            # has_data = gpu_batch["loss_mask"].any()
+            # if self.is_distributed:
+            #     has_data_t = torch.tensor(
+            #         [has_data], device=self.local_rank, dtype=torch.int32
+            #     )
+            #     dist.all_reduce(has_data_t, op=dist.ReduceOp.MIN)
+            #     has_data = has_data_t.item() > 0
+            # if not has_data:
+            #     continue
+
             _draft_tokens, loss, metrics = self.model(
                 **gpu_batch, **self.config.train_call_kwargs
             )
@@ -267,6 +283,12 @@ class Trainer:
                 else v
                 for k, v in batch.items()
             }
+
+            for key in ("hidden_states", "verifier_last_hidden_states"):
+                if key in gpu_batch and isinstance(gpu_batch[key], torch.Tensor):
+                    gpu_batch[key] = gpu_batch[key].to(
+                        dtype=self.config.hidden_states_dtype
+                    )
 
             _draft_tokens, _loss, metrics = self.model(
                 **gpu_batch, **self.config.val_call_kwargs

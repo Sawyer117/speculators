@@ -39,6 +39,7 @@ from speculators.train.vocab_mapping import (
     build_vocab_mappings_from_distribution,
     get_target_vocab_size,
 )
+from speculators.models.utils import resolve_target_layer_ids
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ def setup_dataloader(
     num_workers: int = 12,
     prefetch_factor: int = 4,
     preprocess=None,
+    num_hidden_layers: int = 3,
 ) -> DataLoader:
     """Setup dataloader for training.
     Args:
@@ -96,7 +98,9 @@ def setup_dataloader(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         pin_memory=True,
-        collate_fn=create_collate_fn(args.total_seq_len, hidden_size, preprocess),
+        collate_fn=create_collate_fn(
+            args.total_seq_len, hidden_size, preprocess, num_hidden_layers
+        ),
         persistent_workers=True,
     )
 
@@ -141,6 +145,10 @@ def create_transformer_layer_config(
 
     hc_mult = getattr(verifier_config, "hc_mult", 1)
 
+    head_dim = getattr(verifier_config, "head_dim", None)
+    if hc_mult > 1 and head_dim is not None:
+        head_dim = hc_mult * verifier_config.hidden_size // verifier_config.num_attention_heads
+
     return config_class(
         vocab_size=verifier_config.vocab_size,
         hidden_size=verifier_config.hidden_size,
@@ -152,7 +160,7 @@ def create_transformer_layer_config(
         max_position_embeddings=verifier_config.max_position_embeddings,
         initializer_range=verifier_config.initializer_range,
         rms_norm_eps=verifier_config.rms_norm_eps,
-        head_dim=getattr(verifier_config, "head_dim", None),
+        head_dim=head_dim,
         tie_word_embeddings=False,
         hc_mult=hc_mult,
     )
@@ -339,6 +347,10 @@ def main(args: argparse.Namespace):
 
     hc_mult = getattr(transformer_layer_config, "hc_mult", 1)
     effective_hidden_size = hc_mult * transformer_layer_config.hidden_size
+    target_layer_ids = resolve_target_layer_ids(
+        args.target_layer_ids, args.verifier_name_or_path
+    )
+    num_hidden_layers = len(target_layer_ids)
 
     train_loader = setup_dataloader(
         train_dataset,
@@ -348,6 +360,7 @@ def main(args: argparse.Namespace):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        num_hidden_layers=num_hidden_layers,
     )
     val_loader = setup_dataloader(
         val_dataset,
@@ -357,6 +370,7 @@ def main(args: argparse.Namespace):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        num_hidden_layers=num_hidden_layers,
     )
 
     # Get trainer kwargs from model class
