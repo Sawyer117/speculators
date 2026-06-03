@@ -26,6 +26,12 @@ Learn how to train a DFlash speculator model with block-based token generation.
 
 **Time required:** ~25 mins
 
+## [Train MTP Model Offline](train_mtp_offline.md)
+
+Learn how to finetune a model's native MTP head on domain-specific data using offline training.
+
+**Time required:** ~30 mins (varies by model size)
+
 ## [Response Regeneration](response_regeneration.md)
 
 Regenerate dataset responses using your target model for improved drafter alignment.
