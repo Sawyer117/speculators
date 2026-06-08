@@ -118,23 +118,63 @@ trap described next.
 > Do **not** install `torch` / `torch-npu` yourself — vllm-ascend pins them to
 > `2.10.0`. If you pre-install torch you'll fight its resolver.
 
-> ⚠️ **Do NOT use `pip install -e .` from source unless you're modifying
-> vllm-ascend.** A source build first installs `[build-system].requires` (which
-> includes `triton-ascend==3.2.1`) in an **isolated build env that ignores
-> command-line `--extra-index-url` and only reads your global pip config.** If the
-> `ascend/repos/pypi` index isn't in global config, that step fails with
-> `Could not find a version that satisfies triton-ascend==3.2.1` — even though a
-> plain `pip install triton-ascend==3.2.1 --extra-index-url .../ascend/repos/pypi`
-> works fine. The version is correct; the isolated env just can't see the index.
-> If you genuinely need the source build, put the index in **global** config first
-> so the isolated env inherits it:
->
-> ```bash
-> pip config set global.extra-index-url \
->   "https://mirrors.huaweicloud.com/repository/pypi/simple https://mirrors.huaweicloud.com/ascend/repos/pypi"
-> git clone --depth 1 --branch v0.20.2rc1 https://github.com/vllm-project/vllm-ascend.git
-> cd vllm-ascend && git submodule update --init --recursive && pip install -e . && cd ..
-> ```
+### 6c-alt. Editable source install of vllm-ascend (only if you'll modify it)
+
+Use this **only if you need to edit vllm-ascend code**. To just run speculators,
+stay with the wheel above. The source path needs CANN sourced (step 4) and the
+build toolchain (step 5), and it actually compiles the NPU C++ ops, so it's slow.
+
+**The trap:** `pip install -e .` first installs `[build-system].requires` (which
+includes `triton-ascend==3.2.1`) in an **isolated build env that ignores
+command-line `--extra-index-url` and only reads global pip config**. With only the
+tuna mirror in global config it fails with
+`Could not find a version that satisfies triton-ascend==3.2.1` — even though
+`pip install triton-ascend==3.2.1 --extra-index-url .../ascend/repos/pypi` works.
+The version is correct; the isolated env just can't see the ascend index.
+
+Pick **one** of these two reliable methods:
+
+**Method 1 — disable build isolation (most deterministic).** Pre-install every
+build dependency into the current env from both indexes, then build with
+`--no-build-isolation` so pip reuses them instead of spawning a blind isolated env:
+
+```bash
+# 1) install ALL build deps (from pyproject [build-system].requires) into THIS env
+pip install \
+  --extra-index-url https://mirrors.huaweicloud.com/repository/pypi/simple \
+  --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
+  attrs "cmake>=3.26" decorator einops googleapis-common-protos numpy packaging pip \
+  pybind11 pyyaml scipy pandas pandas-stubs psutil "setuptools>=64" "setuptools-scm>=8" \
+  transformers==5.5.3 torch==2.10.0 torch-npu==2.10.0 torchvision wheel msgpack quart \
+  numba "xgrammar>=0.1.30" "fastapi<0.124.0" "compressed_tensors>=0.11.0" \
+  arctic-inference==0.1.1 triton-ascend==3.2.1
+
+# 2) build editable WITHOUT isolation (reuses the deps above — won't re-resolve)
+git clone --depth 1 --branch v0.20.2rc1 https://github.com/vllm-project/vllm-ascend.git
+cd vllm-ascend
+git submodule update --init --recursive
+pip install -e . --no-build-isolation
+cd ..
+```
+
+**Method 2 — put the ascend index in global config** so the isolated build env
+inherits it (simpler command, but the isolated env re-downloads build deps each
+time):
+
+```bash
+pip config set global.extra-index-url \
+  "https://mirrors.huaweicloud.com/repository/pypi/simple https://mirrors.huaweicloud.com/ascend/repos/pypi"
+git clone --depth 1 --branch v0.20.2rc1 https://github.com/vllm-project/vllm-ascend.git
+cd vllm-ascend
+git submodule update --init --recursive
+pip install -e .
+cd ..
+```
+
+> If Method 2 still fails to find `triton-ascend==3.2.1` (some pip/build-backend
+> versions don't propagate global config into the isolated env), fall back to
+> Method 1 — `--no-build-isolation` removes the isolated env from the equation
+> entirely.
 
 ### 6d. Backfill CANN's Python dependencies (fresh conda env)
 
