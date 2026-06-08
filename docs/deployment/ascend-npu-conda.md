@@ -101,24 +101,40 @@ cd ..
 
 ### 6c. Install vllm-ascend (pulls torch==2.10.0 + torch-npu==2.10.0 automatically)
 
+**Recommended: install the prebuilt wheel.** Pass *both* Huawei Cloud indexes —
+vllm-ascend lives on `repository/pypi/simple`, but its dep `triton-ascend==3.2.1`
+lives on the separate `ascend/repos/pypi` index, so you need both or the resolve
+fails:
+
 ```bash
-pip install \
+pip install vllm-ascend==0.20.2rc1 \
   --extra-index-url https://mirrors.huaweicloud.com/repository/pypi/simple \
-  vllm-ascend==0.20.2rc1
+  --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
 ```
 
-Equivalently, from source (use the matching tag):
-
-```bash
-git clone --depth 1 --branch v0.20.2rc1 https://github.com/vllm-project/vllm-ascend.git
-cd vllm-ascend
-git submodule update --init --recursive
-pip install -e .
-cd ..
-```
+A binary wheel skips compilation entirely, so this also dodges the source-build
+trap described next.
 
 > Do **not** install `torch` / `torch-npu` yourself — vllm-ascend pins them to
 > `2.10.0`. If you pre-install torch you'll fight its resolver.
+
+> ⚠️ **Do NOT use `pip install -e .` from source unless you're modifying
+> vllm-ascend.** A source build first installs `[build-system].requires` (which
+> includes `triton-ascend==3.2.1`) in an **isolated build env that ignores
+> command-line `--extra-index-url` and only reads your global pip config.** If the
+> `ascend/repos/pypi` index isn't in global config, that step fails with
+> `Could not find a version that satisfies triton-ascend==3.2.1` — even though a
+> plain `pip install triton-ascend==3.2.1 --extra-index-url .../ascend/repos/pypi`
+> works fine. The version is correct; the isolated env just can't see the index.
+> If you genuinely need the source build, put the index in **global** config first
+> so the isolated env inherits it:
+>
+> ```bash
+> pip config set global.extra-index-url \
+>   "https://mirrors.huaweicloud.com/repository/pypi/simple https://mirrors.huaweicloud.com/ascend/repos/pypi"
+> git clone --depth 1 --branch v0.20.2rc1 https://github.com/vllm-project/vllm-ascend.git
+> cd vllm-ascend && git submodule update --init --recursive && pip install -e . && cd ..
+> ```
 
 ### 6d. Backfill CANN's Python dependencies (fresh conda env)
 
