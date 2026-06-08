@@ -229,23 +229,49 @@ print(llm.generate(['Hello from'], SamplingParams(max_tokens=16))[0].outputs[0].
 
 ## 8. Install Speculators — WITHOUT breaking the NPU stack ⚠️
 
-`pip install speculators` lists `torch` and `vllm` as plain dependencies. On a
-default index that **reinstalls the CUDA/CPU torch and stock vLLM, wiping out
-your torch-npu + vllm-ascend setup.** Install with `--no-deps`, then add only the
-safe dependencies (everything except torch/torchvision/torchaudio/vllm/transformers,
-which are already provided by vllm-ascend).
+Speculators lists `torch`, `torchaudio`, `torchvision`, `transformers` (and pulls
+`vllm` transitively) as plain dependencies. On a default index that **reinstalls
+the CUDA/CPU torch and stock vLLM, wiping out your torch-npu + vllm-ascend setup.**
+So install with `--no-deps`, then add only the safe dependencies — everything
+**except** `torch` / `torchaudio` / `torchvision` / `transformers` / `vllm`, which
+are already provided by vllm-ascend (torch 2.10.0, transformers 5.5.3, …).
+
+### 8a. From PyPI (release, not editable)
 
 ```bash
-# 1) speculators itself, no dependency resolution
 pip install --no-deps speculators==0.5.0
-
-# 2) its remaining deps, explicitly EXCLUDING torch*/vllm/transformers
-pip install \
-  "click" "datasets<=4.8.4,>=4.0.0" "huggingface-hub" \
-  "loguru<=0.7.3,>=0.7.2" "numpy<=2.4.2,>=2.0.0" "openai>=2.0.0" \
-  "protobuf" "psutil" "pydantic>=2.0.0" "pydantic-settings>=2.0.0" \
-  "rich" "safetensors" "setuptools" "tqdm<=4.67.3,>=4.66.3" "typer>=0.12.0"
 ```
+
+### 8b. Editable / from source (when you'll modify speculators code)
+
+```bash
+git clone https://github.com/<you>/speculators.git
+cd speculators
+git fetch --tags          # needed so setuptools-git-versioning resolves a version
+pip install -e . --no-deps
+cd ..
+```
+
+> `--no-deps` only skips runtime deps; the editable build isolation needs just
+> `setuptools` + `setuptools-git-versioning`, so it won't pull torch. Don't use
+> `--depth 1` for the clone — without tags the version resolves to `0.0.0`.
+
+### 8c. Add the safe dependencies (both install paths)
+
+```bash
+pip install \
+  "click" "datasets>=4.0.0,<=4.8.5" "huggingface-hub" "loguru>=0.7.2,<=0.7.3" \
+  "numpy>=2.0.0,<=2.4.2" "openai>=2.0.0" "protobuf" "psutil" \
+  "pydantic>=2.0.0" "pydantic-settings>=2.0.0" "rich" "safetensors" \
+  "tqdm>=4.66.3,<=4.67.3" "typer>=0.12.0"
+```
+
+> ⚠️ Watch the output of this command:
+> - **numpy** — speculators pins `<=2.4.2`, but the NPU stack may have installed a
+>   newer numpy. If pip downgrades it and `import torch_npu` then breaks, drop the
+>   `numpy` entry above and keep the stack's version.
+> - **If pip tries to touch `torch` / `transformers` / `vllm`, stop** — none of
+>   them are in the list above and they must not be reinstalled.
 
 > Building your own draft models? Add the training extras the same careful way
 > (`pip install --no-deps ...` for anything that re-pins torch).
@@ -254,12 +280,18 @@ pip install \
 
 ```bash
 speculators --version
-python3 -c "import speculators, torch, torch_npu, vllm; print('OK — torch', torch.__version__, '| vllm', vllm.__version__)"
+python3 -c "import speculators, torch, torch_npu, vllm, vllm_ascend; print('OK — torch', torch.__version__, '| vllm', vllm.__version__)"
 ```
 
-`torch` must still report **2.10.0**. If it flipped to a non-`+`/CUDA build,
+`torch` must still report **2.10.0** and `vllm_ascend` must still import (if it
+doesn't, vLLM loses its NPU platform and any `LLM(...)` call dies with
+`Device string must not be empty`). If torch flipped to a non-`+`/CUDA build,
 step 8 reinstalled torch — fix with:
 `pip install --force-reinstall --no-deps torch-npu==2.10.0 torch==2.10.0`.
+
+> Run this from a directory that does **not** contain a `vllm/` or `speculators/`
+> folder (e.g. `cd /tmp`). Running next to a source clone shadows the installed
+> package and you'll see `cannot import name 'LLM' from 'vllm' (unknown location)`.
 
 ## 10. Run speculative decoding on the NPU
 
