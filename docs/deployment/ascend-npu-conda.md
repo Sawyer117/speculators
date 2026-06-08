@@ -245,7 +245,7 @@ pip install --no-deps speculators==0.5.0
 ### 8b. Editable / from source (when you'll modify speculators code)
 
 ```bash
-git clone https://github.com/<you>/speculators.git
+git clone https://github.com/Sawyer117/speculators.git
 cd speculators
 git fetch --tags          # needed so setuptools-git-versioning resolves a version
 pip install -e . --no-deps
