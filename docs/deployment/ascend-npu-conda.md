@@ -13,7 +13,8 @@ End-to-end guide for running **Speculators** draft models with **vLLM** on a
 | speculators     | `0.5.0` (latest)        | needs `torch 2.9–2.11`, `transformers 4.56.1–<5.7` |
 | vLLM            | `0.20.2`                | the version vllm-ascend v0.20.2rc1 targets         |
 | vllm-ascend     | `0.20.2rc1` (latest)    | auto-installs `torch-npu`                           |
-| torch / torch-npu | `2.10.0`              | inside speculators' allowed range ✅               |
+| torch / torch-npu | `2.10.0`              | auto-installed by vllm-ascend — don't install yourself |
+| triton-ascend   | `3.2.1`                 | install LAST, separately (see §6e)                 |
 | **CANN**        | **`9.0.0`**             | + NNAL 9.0.0 (provides `libatb.so`)                |
 | Python          | **`3.10` or `3.11`**    | must be `>=3.10, <3.12` — **do NOT use 3.12/3.13**  |
 
@@ -57,35 +58,108 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 ```bash
 # Ubuntu/Debian
-sudo apt-get update -y && sudo apt-get install -y gcc g++ cmake libnuma-dev git curl
-# or RHEL/openEuler:
-# sudo yum install -y gcc g++ cmake numactl-devel git curl
+sudo apt-get update -y && sudo apt-get install -y gcc g++ cmake libnuma-dev git curl wget jq
+# or RHEL/openEuler (note: gcc-c++ not g++, numactl-devel not libnuma-dev):
+# sudo yum install -y gcc gcc-c++ cmake numactl-devel git curl wget jq
 ```
 
 ## 6. Install vLLM + vllm-ascend
 
+> ⚠️ **The install procedure differs by CPU architecture.** On `aarch64` there is
+> no prebuilt `vllm` wheel, so a plain `pip install vllm` falls back to a source
+> build that assumes CUDA and dies with `AssertionError: CUDA_HOME is not set`.
+> Pick the section that matches `uname -m`.
+
+### 6a. (China networks only, optional) Speed up downloads
+
 ```bash
-# On x86_64 only: let pip find the CPU torch build (skip on aarch64)
+pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+```
+
+### 6b. Install vLLM
+
+**On x86_64** — a CPU wheel exists, install directly:
+
+```bash
+# let pip find the CPU torch build (x86_64 only)
 pip config set global.extra-index-url "https://download.pytorch.org/whl/cpu/"
-
-# 1) vLLM core (CPU/empty build — the NPU kernels come from vllm-ascend)
 pip install vllm==0.20.2
+```
 
-# 2) vllm-ascend — this pulls torch-npu==2.10.0 automatically
+**On aarch64** — build from source with an empty target device so vLLM does NOT
+try to compile CUDA kernels (the NPU kernels come from vllm-ascend, not vLLM):
+
+```bash
+git clone --depth 1 --branch v0.20.2 https://github.com/vllm-project/vllm
+cd vllm
+VLLM_TARGET_DEVICE=empty pip install -e .
+cd ..
+```
+
+> `VLLM_TARGET_DEVICE=empty` is the whole trick — without it the build looks for
+> `CUDA_HOME` and fails. The `empty` build skips kernel compilation, so it's fast.
+
+### 6c. Install vllm-ascend (pulls torch==2.10.0 + torch-npu==2.10.0 automatically)
+
+```bash
 pip install \
   --extra-index-url https://mirrors.huaweicloud.com/repository/pypi/simple \
   vllm-ascend==0.20.2rc1
 ```
 
+Equivalently, from source (use the matching tag):
+
+```bash
+git clone --depth 1 --branch v0.20.2rc1 https://github.com/vllm-project/vllm-ascend.git
+cd vllm-ascend
+git submodule update --init --recursive
+pip install -e .
+cd ..
+```
+
+> Do **not** install `torch` / `torch-npu` yourself — vllm-ascend pins them to
+> `2.10.0`. If you pre-install torch you'll fight its resolver.
+
+### 6d. Backfill CANN's Python dependencies (fresh conda env)
+
+CANN ships its own Python packages (`te`, `auto-tune`, `opc-tool`, `superkernel`,
+`ms-service-profiler`, …) that power op compilation. A **fresh** conda env doesn't
+have the scientific-Python libs they declare, so after the install above you'll
+see a wall of `pip` dependency-conflict warnings like
+`te 0.4.0 requires decorator, which is not installed`. The vllm-ascend install
+still "Successfully installed", but op compilation can fail later — backfill them:
+
+```bash
+pip install decorator "scipy>=1.7.3" ml-dtypes tornado absl-py attrs psutil pyyaml
+```
+
+Optional — only if you'll use the `ms-service-profiler` performance tool:
+
+```bash
+pip install matplotlib "pandas~=2.2" openpyxl
+```
+
+### 6e. Install triton-ascend — LAST, after everything else
+
+```bash
+pip install triton-ascend==3.2.1 \
+  --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
+```
+
+> Install `triton-ascend` **last**; installing it earlier lets later packages
+> re-pin its deps and break it.
+
 ## 7. Verify the NPU stack BEFORE touching speculators
 
 ```bash
 npu-smi info
+pip show vllm vllm-ascend torch torch-npu triton-ascend 2>/dev/null | grep -E "^(Name|Version)"
 python3 -c "import vllm, torch, torch_npu; print('vllm', vllm.__version__, '| torch', torch.__version__)"
 ```
 
-Expect `vllm 0.20.2 | torch 2.10.0` and no import errors. If `import torch_npu`
-complains about `libatb.so`, you forgot to `source` the NNAL env (step 4).
+Expect `vllm 0.20.2`, `vllm-ascend 0.20.2rc1`, `torch 2.10.0`, `torch-npu 2.10.0`,
+`triton-ascend 3.2.1`, and no import errors. If `import torch_npu` complains about
+`libatb.so`, you forgot to `source` the NNAL env (step 4).
 
 Optional smoke test with a tiny model:
 
