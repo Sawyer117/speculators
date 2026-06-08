@@ -70,7 +70,34 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
 ```
 
-Device split (8 NPUs): vLLM target on `0,1` (TP=2), FSDP draft training on `2,3`.
+### 3.1 Device split (this is the big difference from SpecForge)
+
+SpecForge runs single-process: the target lives **in** the training process (HF
+replica per NPU, or sglang), so all 8 NPUs do "target forward + draft training"
+together. speculators online runs **two processes** — vLLM serves the target, the
+trainer runs separately — so the 8 NPUs must be **split** between them. You cannot
+put 8-way draft FSDP and target serving on the same cards.
+
+Default split (uses all 8): **vLLM target on `0,1` (TP=2) + draft FSDP on `2-7`
+(6 cards)** — 2 serve, 6 train.
+
+**This split is highly tunable** — it's a throughput tradeoff between target-side
+hidden-state extraction and draft-side data parallelism:
+
+| Lever | Effect |
+|---|---|
+| vLLM `--tensor-parallel-size` (1/2/4) | An 8B target fits TP=1 → frees a card for training (7-way FSDP). Larger targets need more TP. |
+| vLLM `--data-parallel-size N` | Multiple target replicas → more concurrent hidden-state requests, if extraction is the bottleneck. |
+| training `--nproc_per_node` | More cards = more FSDP data parallelism = faster training, if compute is the bottleneck. |
+
+Rule of thumb: if the trainer is starved waiting on hidden states, give vLLM more
+cards (TP or DP); if vLLM sits idle, give the trainer more cards. Measure which
+side is idle, then rebalance.
+
+> To run **true 8-way draft training** (exactly matching SpecForge's 8 cards), use
+> the **offline** path (§7): generate hidden states with all 8 NPUs first, stop
+> vLLM, then train the draft on all 8. Online can't — it always reserves cards for
+> serving.
 
 ## 4. Data: regen JSONL → tokenized dataset
 
@@ -131,9 +158,9 @@ to disk, then train) — see §7.
 ## 6. ⏳ Step 3 — train the DFlash draft (FSDP)
 
 ```bash
-# terminal 2, same NPU env exported
-ASCEND_RT_VISIBLE_DEVICES=2,3 torchrun \
-  --nproc_per_node 2 --nnodes 1 --node_rank 0 \
+# terminal 2, same NPU env exported. 6 training cards (2-7); vLLM holds 0,1.
+ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
+  --nproc_per_node 6 --nnodes 1 --node_rank 0 \
   --master_addr 127.0.0.1 --master_port 29533 \
   scripts/train.py \
   --verifier-name-or-path /share/canada_group_folder/ckpt/Qwen3-8B \
