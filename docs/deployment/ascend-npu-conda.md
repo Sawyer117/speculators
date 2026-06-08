@@ -266,12 +266,31 @@ pip install \
   "tqdm>=4.66.3,<=4.67.3" "typer>=0.12.0"
 ```
 
-> ⚠️ Watch the output of this command:
-> - **numpy** — speculators pins `<=2.4.2`, but the NPU stack may have installed a
->   newer numpy. If pip downgrades it and `import torch_npu` then breaks, drop the
->   `numpy` entry above and keep the stack's version.
-> - **If pip tries to touch `torch` / `transformers` / `vllm`, stop** — none of
->   them are in the list above and they must not be reinstalled.
+> ⚠️ **numpy conflict — expected, and verified harmless.** This command upgrades
+> numpy to `2.4.2` (to satisfy speculators' `numpy>=2.0.0,<=2.4.2`), which prints
+> conflict warnings against the NPU stack's conservative pins:
+>
+> ```
+> triton-ascend 3.2.1 requires numpy==1.26.4, but you have numpy 2.4.2
+> scipy 1.13.1 requires numpy<2.3, but you have numpy 2.4.2
+> mistral-common requires numpy<2.4, but you have numpy 2.4.2
+> ```
+>
+> triton-ascend wants numpy **1.x** and speculators wants numpy **2.x** — the
+> ranges are mutually exclusive, so a pip warning is unavoidable. **In practice
+> numpy 2.4.2 works**: a full `vllm` + `vllm-ascend` generation that exercises
+> triton (run *without* `enforce_eager` so kernels actually compile) succeeds on
+> 2.4.2. So keep 2.4.2 and ignore these warnings. Only if your stack actually
+> crashes on numpy 2.x (e.g. a `numpy.core multiarray failed to import` /
+> `module compiled against API version` error) downgrade with
+> `pip install numpy==1.26.4`, then confirm speculators still imports — its
+> `>=2.0.0` floor is conservative and usually runs fine on 1.26.4.
+>
+> The `ms-service-profiler` / `msguard` / `opentelemetry-exporter-otlp` conflict
+> lines are cosmetic — that's the optional CANN profiling tool from §6d.
+>
+> **If pip tries to touch `torch` / `transformers` / `vllm`, stop** — none of them
+> are in the list above and they must not be reinstalled.
 
 > Building your own draft models? Add the training extras the same careful way
 > (`pip install --no-deps ...` for anything that re-pins torch).
