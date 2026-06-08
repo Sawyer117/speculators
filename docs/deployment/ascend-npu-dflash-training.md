@@ -70,6 +70,16 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
 ```
 
+> ⚠️ **`TASK_QUEUE_ENABLE` per process (verified gotcha).** The value `2` (from the
+> SpecForge ascend_npu scripts) is **incompatible with vLLM's NPU graph capture** —
+> a graph-mode vLLM serve dies with
+> `Do not support TASK_QUEUE_ENABLE = 2 during NPU graph capture, please export
+> TASK_QUEUE_ENABLE=1/0`. So:
+> - **vLLM serve (§5):** use `TASK_QUEUE_ENABLE=1` (or pass `--enforce-eager`, which
+>   skips graph capture and sidesteps the conflict entirely).
+> - **Training (§6):** keep `TASK_QUEUE_ENABLE=2` — plain eager FSDP does no graph
+>   capture, and `2` is faster.
+
 ### 3.1 Device split (this is the big difference from SpecForge)
 
 SpecForge runs single-process: the target lives **in** the training process (HF
@@ -134,31 +144,53 @@ Confirm: logs show `Loaded N samples` (N > 0), and the output dir contains
 boundary wasn't matched — pass an explicit `--assistant-pattern`. Drop
 `--max-samples 200` for the full run once the pipeline is verified.
 
-## 5. ⏳ Step 2 — launch vLLM (target serving + hidden-state extraction)
+## 5. Step 2 — launch vLLM (target serving + hidden-state extraction) ✅ startup verified
 
 The online path relies on two vLLM-core features (both present in the local
 v0.20.2 build: `extract_hidden_states` + `ExampleHiddenStatesConnector`). The
-connector is device-agnostic (CPU-side safetensors), but the extraction hooks live
-partly in the model runner — **NPU support via vllm-ascend is the open risk.**
+connector is device-agnostic; the extraction hooks live partly in the model runner.
+**Verified on NPU:** with `--enforce-eager`, vllm-ascend accepts the
+`extract_hidden_states` speculative_config + connector and reaches
+`Application startup complete`. (Hidden-state files actually appearing during
+training is confirmed in §6.)
 
 ```bash
 # terminal 1, in the speculators repo root (NOT next to a vllm/ source dir)
+export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TASK_QUEUE_ENABLE=1 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+
 ASCEND_RT_VISIBLE_DEVICES=0,1 python scripts/launch_vllm.py \
   /share/canada_group_folder/ckpt/Qwen3-8B \
   --target-layer-ids 1 9 17 25 33 --no-include-last-layer \
-  --hidden-states-path /tmp/hs_qwen3_dflash \
+  --hidden-states-path ./tmp/hs_qwen3_dflash \
   -- --tensor-parallel-size 2 --port 8000 --enforce-eager
 ```
 
-Wait for `Application startup complete`. If startup fails citing
-`extract_hidden_states` / spec_decode / model_runner / attention backend, the NPU
-runner doesn't support this path → fall back to **offline** (generate hidden states
-to disk, then train) — see §7.
+Wait for `Application startup complete`.
+
+- `--enforce-eager` skips NPU graph capture — the verified path. Dropping it for
+  graph-mode speedup is a tuning step (then `TASK_QUEUE_ENABLE=1` is required, see
+  §3 note); graph mode + `extract_hidden_states` on NPU is not yet validated.
+- If startup ever fails citing `extract_hidden_states` / spec_decode / model_runner,
+  the NPU runner doesn't support this path → fall back to **offline** (§7).
+
+> ⚠️ **Write path = read path.** This `--hidden-states-path` (where the connector
+> **writes**) must equal the trainer's `--hidden-states-path` (where it **reads**,
+> §6), and both must resolve to the same absolute dir. With a relative `./tmp/...`
+> path, **launch both terminals from the same cwd**, or export an absolute path once
+> (`export HS_DIR="$(pwd)/tmp/hs_qwen3_dflash"`) and use `$HS_DIR` in both. A
+> mismatch silently stalls online training (vLLM writes, trainer reads elsewhere).
 
 ## 6. ⏳ Step 3 — train the DFlash draft (FSDP)
 
 ```bash
-# terminal 2, same NPU env exported. 6 training cards (2-7); vLLM holds 0,1.
+# terminal 2, 6 training cards (2-7); vLLM holds 0,1. TASK_QUEUE_ENABLE=2 ok here
+# (eager FSDP, no graph capture). --hidden-states-path MUST match §5 (same cwd).
+export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+
 ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
   --nproc_per_node 6 --nnodes 1 --node_rank 0 \
   --master_addr 127.0.0.1 --master_port 29533 \
@@ -166,6 +198,7 @@ ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
   --verifier-name-or-path /share/canada_group_folder/ckpt/Qwen3-8B \
   --data-path ./output/qwen3-8b-dflash-npu \
   --vllm-endpoint http://localhost:8000/v1 \
+  --hidden-states-path ./tmp/hs_qwen3_dflash \
   --save-path ./output/qwen3-8b-dflash-npu/checkpoints \
   --speculator-type dflash \
   --draft-arch qwen3 \
