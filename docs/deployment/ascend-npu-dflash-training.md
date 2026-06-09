@@ -5,19 +5,18 @@ End-to-end guide for training a **DFlash** draft model for **Qwen3-8B** on
 target and extracts hidden states on the fly). Hyperparameters are aligned to the
 SpecForge `docs/ascend_npu/run_qwen3_8b_dflash_npu.sh` reference run.
 
-> **Status (June 2026).** ⚠️ **Partially working — DFlash training is BLOCKED on NPU
-> by an upstream bug.** What's verified: install, data prep, and the online vLLM
-> `extract_hidden_states` path (vLLM serves Qwen3-8B on the NPU runner and writes
-> hidden states; the fc dimension / layer alignment is correct). What's blocked: the
-> **DFlash forward** — it uses `flex_attention` (`simple_flex_attention`), which
-> PyTorch rejects on NPU (`FlexAttention is only supported on CUDA, CPU or HPU
-> devices`, issue
-> [#531](https://github.com/vllm-project/speculators/issues/531), open), and its
-> `@torch.compile` fails to codegen on triton-ascend (NPU flavor of
-> [#544](https://github.com/vllm-project/speculators/issues/544) / PR #547). The
-> training loop never completes a step. **EAGLE3 and PEAGLE share the same flex
-> blocker; only MTP uses eager attention and could train on NPU today.** See §9.
-> Install: [`ascend-npu-conda.md`](./ascend-npu-conda.md).
+> **Status (June 2026).** ✅ **Verified end-to-end on NPU** (vllm-ascend 0.20.2rc1,
+> CANN 9.0.0, Qwen3-8B): install → data prep → online vLLM `extract_hidden_states`
+> → FSDP DFlash training all run and produce loss (`loss ≈ 1.3`,
+> `position_1_acc ≈ 0.40` rising). The original blocker — DFlash forces
+> `flex_attention`, which PyTorch rejects on NPU (`FlexAttention is only supported on
+> CUDA, CPU or HPU devices`, issue
+> [#531](https://github.com/vllm-project/speculators/issues/531)) — is solved by an
+> opt-in SDPA dense-mask attention backend: set **`SPECULATORS_DFLASH_ATTN_IMPL=sdpa`**
+> (+ `TORCHDYNAMO_DISABLE=1` for the `@torch.compile` issue, NPU flavor of
+> [#544](https://github.com/vllm-project/speculators/issues/544)). See §9. Hyperparams
+> align to the SpecForge ascend_npu reference (gaps in §2.1 use defaults). Install:
+> [`ascend-npu-conda.md`](./ascend-npu-conda.md).
 
 ## 1. Prerequisites
 
@@ -223,10 +222,12 @@ appended; that field name is a vLLM naming artifact, the `method` is still
 > an absolute `$HS_DIR` in both terminals removes all cwd ambiguity; a mismatch
 > silently stalls online training.
 
-## 6. Step 3 — train the DFlash draft (FSDP) ⚠️ blocked on NPU (see §9)
+## 6. Step 3 — train the DFlash draft (FSDP) ✅ verified
 
-The command below is correct (hyperparameters + layer alignment), but on NPU it
-currently crashes in the **first forward** before any step completes — see §9.
+Requires the SDPA attention backend on NPU (§9): export
+`SPECULATORS_DFLASH_ATTN_IMPL=sdpa` and `TORCHDYNAMO_DISABLE=1` in this terminal
+(already included in the env block below). Also set `NO_PROXY=localhost,127.0.0.1`
+so the dataloader can reach the local vLLM endpoint through any corporate proxy.
 
 ```bash
 # terminal 2, 6 training cards (2-7); vLLM holds 0,1. TASK_QUEUE_ENABLE=2 ok here
@@ -237,6 +238,10 @@ export HS_DIR=/home/a00652497/2026/dflash-vllm/tmp/hs_qwen3_dflash
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+export SPECULATORS_DFLASH_ATTN_IMPL=sdpa   # SDPA dense-mask path (no flex on NPU); see §9
+export TORCHDYNAMO_DISABLE=1               # the draft forward's @torch.compile fails on triton-ascend
+export NO_PROXY=localhost,127.0.0.1        # let the dataloader reach the local vLLM through the proxy
+export no_proxy=localhost,127.0.0.1
 
 ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
   --nproc_per_node 6 --nnodes 1 --node_rank 0 \
@@ -289,38 +294,39 @@ online path is confirmed or ruled out on NPU.
 speculator (`config.json`, `model.safetensors`, optimizer/scheduler state). Each is
 deployable in vLLM. (Qwen3 draft vLLM-deploy compatibility — see §2 note ².)
 
-## 9. ⚠️ Known blocker: DFlash forward on NPU
+## 9. NPU attention: use the SDPA dense-mask backend ✅ solved
 
-The DFlash draft forward fails on NPU for two compounding reasons (neither is a
-config error):
+By default DFlash forces `simple_flex_attention`, which can't run on NPU for two
+compounding reasons (neither is a config error):
 
-1. **`flex_attention` is not supported on NPU.** DFlash forces
-   `simple_flex_attention` (`models/dflash/core.py`), and PyTorch's `flex_attention`
-   raises `FlexAttention is only supported on CUDA, CPU or HPU devices. Found input
-   tensors on npu device` — tracked in
-   [#531](https://github.com/vllm-project/speculators/issues/531) (open). **EAGLE3
-   and PEAGLE force the same `simple_flex_attention`, so they're blocked too.**
-2. **`@torch.compile` on the forward fails to codegen on triton-ascend.** With
+1. **`flex_attention` is not supported on NPU.** PyTorch's `flex_attention` raises
+   `FlexAttention is only supported on CUDA, CPU or HPU devices. Found input tensors
+   on npu device` ([#531](https://github.com/vllm-project/speculators/issues/531)).
+   EAGLE3 and PEAGLE force the same `simple_flex_attention`, so they're affected too.
+2. **`@torch.compile` on the forward fails to codegen on triton-ascend** — with
    `block_size=16` the generated `copy_full_slice` kernel dies with
    `NoTritonConfigsError: ... Cannot broadcast [8,16] vs [8,1]` (NPU flavor of
-   [#544](https://github.com/vllm-project/speculators/issues/544) / PR #547).
-   `export TORCHDYNAMO_DISABLE=1` makes `@torch.compile` a no-op (eager forward) and
-   gets past this — but then you hit blocker #1.
+   [#544](https://github.com/vllm-project/speculators/issues/544)).
+
+**Fix (this fork):** a selectable attention backend (default stays flex). On NPU set:
+
+```bash
+export SPECULATORS_DFLASH_ATTN_IMPL=sdpa   # dense-mask SDPA path (no flex)
+export TORCHDYNAMO_DISABLE=1               # neutralize the forward's @torch.compile
+```
+
+`sdpa` builds a materialized dense mask (`build_anchor_block_dense_mask`, semantics
+identical to the flex `mask_mod`, unit-tested in
+`tests/unit/models/test_dflash_attention.py`) and dispatches through SDPA, which on
+NPU lowers to fused FlashAttention — scores aren't materialized, so `max_anchors`
+stays large. Verified: Qwen3-8B DFlash trains end-to-end (`loss ≈ 1.3`,
+`position_1_acc ≈ 0.40`). This is upstreamed as a PR closing #531 (the same flag
+extends to EAGLE3/PEAGLE).
 
 **Algorithm support on NPU (by attention impl):**
 
-| Algorithm | Attention | NPU today |
+| Algorithm | Default attention | NPU |
 |---|---|---|
-| DFlash / EAGLE3 / PEAGLE | `simple_flex_attention` | ❌ blocked (#531) |
-| MTP | `eager` (`models/mtp/core.py`) | ✅ viable (no flex) |
-
-**Options:**
-- **Train MTP instead** — uses eager attention, no flex. Different algorithm (needs
-  a native MTP head + `--from-pretrained`), so not a like-for-like DFlash↔SpecForge
-  comparison, but it actually trains on NPU now.
-- **Patch DFlash to an eager / dense-mask attention path** — what #531 needs: replace
-  the flex `BlockMask` (`create_block_mask`) with a materialized dense additive mask
-  and route through `eager_attention_forward`, plus `TORCHDYNAMO_DISABLE=1`.
-  Non-trivial (mask formats differ) but feasible on an editable install; a real
-  upstream contribution.
-- **Track #531 / PR #547** for an upstream fix.
+| DFlash | `simple_flex_attention` | ✅ with `SPECULATORS_DFLASH_ATTN_IMPL=sdpa` |
+| EAGLE3 / PEAGLE | `simple_flex_attention` | ⏳ same fix applies (not yet wired) |
+| MTP | `eager` | ✅ works out of the box (no flex) |
