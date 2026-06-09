@@ -5,12 +5,12 @@ End-to-end guide for training a **DFlash** draft model for **Qwen3-8B** on
 target and extracts hidden states on the fly). Hyperparameters are aligned to the
 SpecForge `docs/ascend_npu/run_qwen3_8b_dflash_npu.sh` reference run.
 
-> **Status (June 2026).** Prerequisite install is verified (see
-> [`ascend-npu-conda.md`](./ascend-npu-conda.md)). The hyperparameter alignment and
-> data-format findings below are confirmed from source. The **run commands are
-> being validated on NPU** — the open risk is whether vllm-ascend's NPU model
-> runner supports the `extract_hidden_states` path (see §5). Sections marked
-> ⏳ are pending NPU confirmation.
+> **Status (June 2026).** ✅ **Verified end-to-end on NPU** (vllm-ascend 0.20.2rc1,
+> CANN 9.0.0): prepare → online vLLM hidden-state extraction → FSDP DFlash training
+> all run and produce loss + checkpoints. The `extract_hidden_states` path works on
+> the vllm-ascend NPU runner. Hyperparameters align to the SpecForge ascend_npu
+> reference (gaps in §2.1 use speculators defaults). Install: see
+> [`ascend-npu-conda.md`](./ascend-npu-conda.md).
 
 ## 1. Prerequisites
 
@@ -128,65 +128,102 @@ a thinking-enabled target). `--seq-length 3072` truncates long reasoning samples
 
 ### Step 1 — prepare data (CPU only)
 
+Run everything below from one fixed working dir (here `~/2026/dflash-vllm`, with the
+repo checked out at `speculators/`), so the relative invocations and the absolute
+paths stay consistent across terminals.
+
 ```bash
-python scripts/prepare_data.py \
+cd /home/a00652497/2026/dflash-vllm
+python speculators/scripts/prepare_data.py \
   --model /share/canada_group_folder/ckpt/Qwen3-8B \
-  --data /share/canada_group_folder/dataset/perfectblend_train_regen.jsonl \
-  --output ./output/qwen3-8b-dflash-npu \
+  --data /share/canada_group_folder/dataset/perfectblend_train_10ksubset.jsonl \
+  --output /home/a00652497/2026/dflash-vllm/train_data \
   --seq-length 3072 \
-  --max-samples 200 \
+  --overwrite \
   --trust-remote-code
 ```
+
+- `--overwrite` `rmtree`s the output dir first — use it on re-runs so any stale
+  cached `hidden_states/` from a previous attempt is cleared.
+- `--seq-length 3072` matches the trainer's `--total-seq-len` and the ascend_npu
+  reference `MAX_LENGTH` (don't drop it — default is 8192).
+- Add `--max-samples N` for a quick first pass; drop it for the full run.
 
 Confirm: logs show `Loaded N samples` (N > 0), and the output dir contains
 `*.arrow`, `dataset_info.json`, `state.json`, `token_freq.pt`. If you see
 `No conversations key found` or 0 processed samples, the Qwen3 thinking assistant
-boundary wasn't matched — pass an explicit `--assistant-pattern`. Drop
-`--max-samples 200` for the full run once the pipeline is verified.
+boundary wasn't matched — pass an explicit `--assistant-pattern`.
 
-## 5. Step 2 — launch vLLM (target serving + hidden-state extraction) ✅ startup verified
+## 5. Step 2 — launch vLLM (target serving + hidden-state extraction) ✅ verified
 
-The online path relies on two vLLM-core features (both present in the local
-v0.20.2 build: `extract_hidden_states` + `ExampleHiddenStatesConnector`). The
-connector is device-agnostic; the extraction hooks live partly in the model runner.
-**Verified on NPU:** with `--enforce-eager`, vllm-ascend accepts the
-`extract_hidden_states` speculative_config + connector and reaches
-`Application startup complete`. (Hidden-state files actually appearing during
-training is confirmed in §6.)
+The online path uses two vLLM-core features (present in the local v0.20.2 build):
+the `extract_hidden_states` speculative method + `ExampleHiddenStatesConnector`.
+**Verified end-to-end on NPU** (vllm-ascend 0.20.2rc1): vLLM serves Qwen3-8B,
+extracts the requested layers, and writes per-request safetensors the trainer reads.
+
+> 🔑 **DO NOT pass `--no-include-last-layer`.** DFlash's forward takes TWO hidden
+> inputs: the aux layers (→ `fc`) and the verifier's **last** layer (→
+> `verifier_last_hidden_states`). The data pipeline splits the **last** layer off
+> the extraction file and feeds the rest to `fc`, which is sized
+> `len(target_layer_ids) × hidden`. So launch_vllm must extract
+> **`target_layer_ids` + the last layer**:
+> - **Correct:** `--target-layer-ids 1 9 17 25 33` (the default `--include-last-layer`
+>   appends layer 36) → file holds **6** layers → pipeline keeps 5 for `fc`
+>   (5×4096 = 20480) ✅
+> - **Wrong:** adding `--no-include-last-layer` → file holds 5 → pipeline keeps 4
+>   for `fc` → `RuntimeError: a and b must have same reduction dim, ... [3072,16384]
+>   X [20480,4096]` (fc wants 20480, gets 16384) ❌
+>
+> Sanity-check a written file — `hidden_states` should be `[tokens, 6, 4096]`:
+> ```bash
+> python3 -c "from safetensors import safe_open; import glob; \
+> f=sorted(glob.glob('$HS_DIR/*'))[0]; g=safe_open(f,'pt'); \
+> [print(k, list(g.get_slice(k).get_shape())) for k in g.keys()]"
+> ```
 
 ```bash
-# terminal 1, in the speculators repo root (NOT next to a vllm/ source dir)
+# terminal 1. Use an ABSOLUTE hs path; same value as §6. Run from a dir with no vllm/.
+cd /home/a00652497/2026/dflash-vllm
+export HS_DIR=/home/a00652497/2026/dflash-vllm/tmp/hs_qwen3_dflash
+rm -rf "$HS_DIR" && mkdir -p "$HS_DIR"
+
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=1 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
 
-ASCEND_RT_VISIBLE_DEVICES=0,1 python scripts/launch_vllm.py \
+ASCEND_RT_VISIBLE_DEVICES=0,1 python speculators/scripts/launch_vllm.py \
   /share/canada_group_folder/ckpt/Qwen3-8B \
-  --target-layer-ids 1 9 17 25 33 --no-include-last-layer \
-  --hidden-states-path ./tmp/hs_qwen3_dflash \
+  --target-layer-ids 1 9 17 25 33 \
+  --hidden-states-path "$HS_DIR" \
   -- --tensor-parallel-size 2 --port 8000 --enforce-eager
 ```
 
-Wait for `Application startup complete`.
+Wait for `Application startup complete`, then confirm the printed `Running command`
+shows `eagle_aux_hidden_state_layer_ids: [1, 9, 17, 25, 33, 36]` (6 ids — note 36
+appended; that field name is a vLLM naming artifact, the `method` is still
+`extract_hidden_states`).
 
-- `--enforce-eager` skips NPU graph capture — the verified path. Dropping it for
-  graph-mode speedup is a tuning step (then `TASK_QUEUE_ENABLE=1` is required, see
-  §3 note); graph mode + `extract_hidden_states` on NPU is not yet validated.
+- `--enforce-eager` skips NPU graph capture (verified path). Graph mode also works
+  (drop `--enforce-eager`) but then `TASK_QUEUE_ENABLE=1` is required (§3).
 - If startup ever fails citing `extract_hidden_states` / spec_decode / model_runner,
-  the NPU runner doesn't support this path → fall back to **offline** (§7).
+  fall back to **offline** (§7).
+- On a re-run, **kill the old vLLM and clear `$HS_DIR` first** (`pkill -f
+  vllm.entrypoints`) — a stale 4-layer server or leftover files silently feed the
+  trainer the wrong layer count.
 
-> ⚠️ **Write path = read path.** This `--hidden-states-path` (where the connector
-> **writes**) must equal the trainer's `--hidden-states-path` (where it **reads**,
-> §6), and both must resolve to the same absolute dir. With a relative `./tmp/...`
-> path, **launch both terminals from the same cwd**, or export an absolute path once
-> (`export HS_DIR="$(pwd)/tmp/hs_qwen3_dflash"`) and use `$HS_DIR` in both. A
-> mismatch silently stalls online training (vLLM writes, trainer reads elsewhere).
+> ⚠️ **Write path = read path.** `$HS_DIR` (connector **writes**) must equal the
+> trainer's `--hidden-states-path` (**reads**, §6) as the same absolute dir. Using
+> an absolute `$HS_DIR` in both terminals removes all cwd ambiguity; a mismatch
+> silently stalls online training.
 
-## 6. ⏳ Step 3 — train the DFlash draft (FSDP)
+## 6. Step 3 — train the DFlash draft (FSDP) ✅ verified
 
 ```bash
 # terminal 2, 6 training cards (2-7); vLLM holds 0,1. TASK_QUEUE_ENABLE=2 ok here
-# (eager FSDP, no graph capture). --hidden-states-path MUST match §5 (same cwd).
+# (eager FSDP, no graph capture). $HS_DIR is the SAME absolute path as §5.
+cd /home/a00652497/2026/dflash-vllm
+export HS_DIR=/home/a00652497/2026/dflash-vllm/tmp/hs_qwen3_dflash
+
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
@@ -194,12 +231,12 @@ export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUN
 ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
   --nproc_per_node 6 --nnodes 1 --node_rank 0 \
   --master_addr 127.0.0.1 --master_port 29533 \
-  scripts/train.py \
+  speculators/scripts/train.py \
   --verifier-name-or-path /share/canada_group_folder/ckpt/Qwen3-8B \
-  --data-path ./output/qwen3-8b-dflash-npu \
+  --data-path /home/a00652497/2026/dflash-vllm/train_data \
   --vllm-endpoint http://localhost:8000/v1 \
-  --hidden-states-path ./tmp/hs_qwen3_dflash \
-  --save-path ./output/qwen3-8b-dflash-npu/checkpoints \
+  --hidden-states-path "$HS_DIR" \
+  --save-path /home/a00652497/2026/dflash-vllm/output/qwen3-8b-dflash-npu/checkpoints \
   --speculator-type dflash \
   --draft-arch qwen3 \
   --num-layers 5 \
@@ -217,6 +254,10 @@ ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7 torchrun \
   --on-generate delete \
   --trust-remote-code
 ```
+
+`--target-layer-ids` here = the **5 aux** layers `[1 9 17 25 33]` (NOT 36 — the last
+layer is added by launch_vllm and consumed as `verifier_last_hidden_states`). This
+must equal the aux subset §5 extracts, or `fc` mismatches.
 
 - `--use-off-policy-tokens`: required for regenerated data (per `train.py` help).
   Drop it only if the data is not target-regenerated.
