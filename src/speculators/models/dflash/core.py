@@ -1,3 +1,4 @@
+import os
 from typing import ClassVar
 
 import torch
@@ -11,7 +12,10 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.dflash import DFlashSpeculatorConfig
-from speculators.models.dflash.attention import create_anchor_block_mask_mod
+from speculators.models.dflash.attention import (
+    build_anchor_block_dense_mask,
+    create_anchor_block_mask_mod,
+)
 from speculators.models.dflash.metrics import compute_metrics
 from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
 from speculators.models.dflash.utils import (
@@ -44,11 +48,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self,
         config: DFlashSpeculatorConfig,
     ) -> None:
-        # Forcibly override config settings
+        # Forcibly override config settings.
+        # Default is flex attention; on backends without flex_attention (e.g. Ascend
+        # NPU) set SPECULATORS_DFLASH_ATTN_IMPL=sdpa to use SDPA (FlashAttention on
+        # NPU) with a materialized dense mask instead. See build_anchor_block_dense_mask.
         if config.transformer_layer_config._attn_implementation is None:  # noqa: SLF001
-            config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
-                "simple_flex_attention"
+            config.transformer_layer_config._attn_implementation = os.environ.get(  # noqa: SLF001
+                "SPECULATORS_DFLASH_ATTN_IMPL", "simple_flex_attention"
             )
+        self._attn_impl = config.transformer_layer_config._attn_implementation  # noqa: SLF001
+        # flex builds a sparse BlockMask; sdpa/eager need a materialized dense mask
+        self._use_dense_mask = self._attn_impl in ("sdpa", "eager")
         super().__init__(config=config)
         self._init_vocab(config)
 
@@ -203,30 +213,51 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         full_attn_mask = None
         if self.uses_full_attn:
-            mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
-                lengths=lengths.to(device),
-                total_seq_len=total_seq_len,
-                anchor_positions=anchor_positions,
-                block_size=self.block_size,
-                sliding_window=None,
-            )
-            full_attn_mask = create_block_mask(
-                mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device
-            )
+            if self._use_dense_mask:
+                full_attn_mask = build_anchor_block_dense_mask(
+                    lengths=lengths.to(device),
+                    total_seq_len=total_seq_len,
+                    anchor_positions=anchor_positions,
+                    block_size=self.block_size,
+                    device=device,
+                    sliding_window=None,
+                )
+            else:
+                mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
+                    lengths=lengths.to(device),
+                    total_seq_len=total_seq_len,
+                    anchor_positions=anchor_positions,
+                    block_size=self.block_size,
+                    sliding_window=None,
+                )
+                full_attn_mask = create_block_mask(
+                    mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device
+                )
 
         sliding_window_attn_mask = None
         if self.uses_sliding_window_attn:
-            mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
-                lengths=lengths.to(device),
-                total_seq_len=total_seq_len,
-                anchor_positions=anchor_positions,
-                block_size=self.block_size,
-                sliding_window=self.sliding_window,
-                sliding_window_non_causal=self.sliding_window_non_causal,
-            )
-            sliding_window_attn_mask = create_block_mask(
-                mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device
-            )
+            if self._use_dense_mask:
+                sliding_window_attn_mask = build_anchor_block_dense_mask(
+                    lengths=lengths.to(device),
+                    total_seq_len=total_seq_len,
+                    anchor_positions=anchor_positions,
+                    block_size=self.block_size,
+                    device=device,
+                    sliding_window=self.sliding_window,
+                    sliding_window_non_causal=self.sliding_window_non_causal,
+                )
+            else:
+                mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
+                    lengths=lengths.to(device),
+                    total_seq_len=total_seq_len,
+                    anchor_positions=anchor_positions,
+                    block_size=self.block_size,
+                    sliding_window=self.sliding_window,
+                    sliding_window_non_causal=self.sliding_window_non_causal,
+                )
+                sliding_window_attn_mask = create_block_mask(
+                    mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len, device=device
+                )
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
