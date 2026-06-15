@@ -97,9 +97,17 @@ export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export VLLM_USE_V1=1
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export VLLM_ASCEND_APPLY_DSV4_PATCH=1
-export VLLM_ASCEND_ENABLE_FLASHCOMM1=${VLLM_ASCEND_ENABLE_FLASHCOMM1:-1}
 export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
+
+# Keep FlashComm1 off by default. When sequence parallelism is enabled, vLLM
+# requires cudagraph capture batch sizes to be multiples of TP size; the small
+# smoke/benchmark default MAX_NUM_SEQS=1 intentionally does not satisfy that.
+if [[ -n "${VLLM_ASCEND_ENABLE_FLASHCOMM1:-}" ]]; then
+  export VLLM_ASCEND_ENABLE_FLASHCOMM1
+else
+  unset VLLM_ASCEND_ENABLE_FLASHCOMM1
+fi
 
 if [[ -z "${GLOO_SOCKET_IFNAME:-}" ]]; then
   GLOO_SOCKET_IFNAME=$(ip -o -4 addr show | awk -v prefix="$NET_PREFIX" 'index($0, prefix) {print $2; exit}')
