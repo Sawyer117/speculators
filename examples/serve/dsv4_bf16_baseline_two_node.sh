@@ -106,7 +106,9 @@ export VLLM_USE_V1=1
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export VLLM_ASCEND_APPLY_DSV4_PATCH=1
 export DSV4_VLLM_SERVE_PATCH=1
-export DFLASH_DISABLE_QLI=1
+# Keep QLI enabled for correctness. Set DFLASH_DISABLE_QLI=1 only for
+# smoke-testing environments where npu_quant_lightning_indexer is unavailable.
+export DFLASH_DISABLE_QLI=${DFLASH_DISABLE_QLI:-0}
 export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-1800}
 
