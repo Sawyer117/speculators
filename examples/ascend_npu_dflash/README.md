@@ -39,3 +39,21 @@ Notes: backend on NPU is `--draft-attn-impl sdpa` (flex_attention is unavailable
 NPU); `TORCHDYNAMO_DISABLE` is no longer needed (#600). Run with `bash`, not `source`
 (the scripts guard against it). `TRAIN_DATA` here is the 10k subset for a quick pass —
 point it at the full `perfectblend_train_regen.jsonl` for a full run.
+
+## Qwen3-4B (same recipe)
+
+Qwen3-4B is also a 36-layer Qwen3 model, so the DFlash hyperparameters are identical
+to 8B (`--target-layer-ids 1 9 17 25 33`, `--num-layers 5`, `--block-size 16`,
+`--max-anchors 512`, `--mask-token-id 151669`). Only the verifier weights differ
+(`hidden_size` 2560, auto-derived → `fc` = 5×2560), and the default split is TP=1
+(serve on card 0, train on 1-7). The **tokenized dataset is shared** with 8B (same
+Qwen3 tokenizer), so no separate prepare — `config_qwen3_4b.sh` points `DATA_DIR` at
+the same Arrow set.
+
+```bash
+bash examples/ascend_npu_dflash/serve_qwen3_4b.sh    # terminal 1
+bash examples/ascend_npu_dflash/train_qwen3_4b.sh    # terminal 2
+```
+
+Config in [`config_qwen3_4b.sh`](./config_qwen3_4b.sh) (TARGET_MODEL points at the
+resolved HF-cache snapshot; verify a checkpoint with `check_ckpt.py`).
