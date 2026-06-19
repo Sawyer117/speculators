@@ -61,9 +61,6 @@ from typing import TYPE_CHECKING, Any, Union
 
 import torch
 
-# Third Party
-from rich.logging import RichHandler
-
 if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
     from wandb import Run  # type: ignore[import-not-found]
@@ -483,17 +480,22 @@ class TrackioHandler(WandbHandler):
 
 
 def setup_root_logger(level="INFO"):
-    """Configure the root logger with rich formatting.
+    """Configure the root logger with a plain StreamHandler.
 
-    This function sets up the root logger with a RichHandler for
-    console output and adds the FormatDictFilter for better dictionary message
-    formatting.
+    NOTE: this used to use rich.RichHandler, but rich's Live rendering deadlocks
+    inside forked DataLoader workers on Ascend NPU: torch_npu's patch_getenv logs
+    every ``os.environ.get`` through this handler, and rich's Live lock is inherited
+    in a locked state across the DataLoader fork, so the worker hangs (and stalls
+    the whole training loop). A plain StreamHandler avoids rich entirely.
     """
-    handler = RichHandler()
+    handler = logging.StreamHandler()
     handler.addFilter(FormatDictFilter())
     handler.addFilter(IsRank0Filter(local_rank=True))
     logging.basicConfig(
-        level=level, format="%(message)s", datefmt="[%X]", handlers=[handler]
+        level=level,
+        format="[%(asctime)s] %(message)s",
+        datefmt="%X",
+        handlers=[handler],
     )
 
     # Disable verbose HTTP response logs from httpx

@@ -10,7 +10,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.utils.data import DataLoader
 from tqdm import TqdmExperimentalWarning
-from tqdm.rich import tqdm
+from tqdm import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
