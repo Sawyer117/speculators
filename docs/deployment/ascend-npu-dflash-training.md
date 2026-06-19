@@ -13,8 +13,8 @@ SpecForge `docs/ascend_npu/run_qwen3_8b_dflash_npu.sh` reference run.
 > CUDA, CPU or HPU devices`, issue
 > [#531](https://github.com/vllm-project/speculators/issues/531)) — is solved by an
 > opt-in SDPA dense-mask attention backend: pass **`--draft-attn-impl sdpa`** to `train.py`
-> (+ `TORCHDYNAMO_DISABLE=1` for the `@torch.compile` issue, NPU flavor of
-> [#544](https://github.com/vllm-project/speculators/issues/544)). See §9. Hyperparams
+> (the `@torch.compile` codegen issue on NPU, [#544](https://github.com/vllm-project/speculators/issues/544),
+> is now auto-handled in-code by `conditional_torch_compile`, [#600](https://github.com/vllm-project/speculators/pull/600)). See §9. Hyperparams
 > align to the SpecForge ascend_npu reference (gaps in §2.1 use defaults). Install:
 > [`ascend-npu-conda.md`](./ascend-npu-conda.md).
 
@@ -154,6 +154,8 @@ python speculators/scripts/prepare_data.py \
 - `--seq-length 3072` matches the trainer's `--total-seq-len` and the ascend_npu
   reference `MAX_LENGTH` (don't drop it — default is 8192).
 - Add `--max-samples N` for a quick first pass; drop it for the full run.
+- `--data` here points at the 10k subset for a quick pass; swap in the full
+  `perfectblend_train_regen.jsonl` (§1) for a full run — both are valid inputs.
 
 Confirm: logs show `Loaded N samples` (N > 0), and the output dir contains
 `*.arrow`, `dataset_info.json`, `state.json`, `token_freq.pt`. If you see
@@ -225,8 +227,10 @@ appended; that field name is a vLLM naming artifact, the `method` is still
 ## 6. Step 3 — train the DFlash draft (FSDP) ✅ verified
 
 Requires the SDPA attention backend on NPU (§9): pass `--draft-attn-impl sdpa` to
-`train.py` (already in the command below) and export `TORCHDYNAMO_DISABLE=1` in this
-terminal. Also set `NO_PROXY=localhost,127.0.0.1`
+`train.py` (already in the command below). As of
+[#600](https://github.com/vllm-project/speculators/pull/600) the draft forward is no
+longer `torch.compile`d on NPU, so `TORCHDYNAMO_DISABLE=1` is optional (kept in the env
+block below as a harmless global guard). Also set `NO_PROXY=localhost,127.0.0.1`
 so the dataloader can reach the local vLLM endpoint through any corporate proxy.
 
 ```bash
@@ -238,7 +242,7 @@ export HS_DIR=/home/a00652497/2026/dflash-vllm/tmp/hs_qwen3_dflash
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
-export TORCHDYNAMO_DISABLE=1               # the draft forward's @torch.compile fails on triton-ascend
+export TORCHDYNAMO_DISABLE=1               # optional since #600 (dflash forward auto-skips compile on NPU); harmless global guard
 export NO_PROXY=localhost,127.0.0.1        # let the dataloader reach the local vLLM through the proxy
 export no_proxy=localhost,127.0.0.1
 
@@ -306,15 +310,18 @@ compounding reasons (neither is a config error):
 2. **`@torch.compile` on the forward fails to codegen on triton-ascend** — with
    `block_size=16` the generated `copy_full_slice` kernel dies with
    `NoTritonConfigsError: ... Cannot broadcast [8,16] vs [8,1]` (NPU flavor of
-   [#544](https://github.com/vllm-project/speculators/issues/544)).
+   [#544](https://github.com/vllm-project/speculators/issues/544)). **Solved by
+   [#600](https://github.com/vllm-project/speculators/pull/600):** DFlash now wraps its
+   forward in `conditional_torch_compile`, which only calls `torch.compile` when CUDA is
+   available — so on NPU the forward runs uncompiled and no `TORCHDYNAMO_DISABLE` is
+   needed.
 
-**Fix (upstream [#589](https://github.com/vllm-project/speculators/pull/589)):** a
-selectable attention backend (default stays flex). On NPU, add `--draft-attn-impl sdpa`
-to the `train.py` command (see §6) and export the compile guard:
-
-```bash
-export TORCHDYNAMO_DISABLE=1   # neutralize the draft forward's @torch.compile
-```
+**Fix (upstream [#589](https://github.com/vllm-project/speculators/pull/589) +
+[#600](https://github.com/vllm-project/speculators/pull/600)):** a selectable attention
+backend (default stays flex) plus `conditional_torch_compile` on the forward. On NPU,
+just add `--draft-attn-impl sdpa` to the `train.py` command (see §6) — flex is avoided
+and the forward runs uncompiled automatically, so `TORCHDYNAMO_DISABLE=1` is no longer
+required (the §6 env block still exports it as a harmless global guard).
 
 `sdpa` builds a materialized dense mask (via PyTorch's `create_mask`, semantics
 identical to the flex `mask_mod`, unit-tested in
