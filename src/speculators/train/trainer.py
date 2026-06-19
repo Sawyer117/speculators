@@ -227,27 +227,67 @@ class Trainer:
             if self.config.checkpoint_freq < 1
             else None
         )
+        # === per-step timing (profiling branch) ===
+        # Splits each step into data_wait (blocking on the dataloader, which for
+        # online training = waiting on vLLM hidden-state generation) vs compute
+        # (h2d/forward/backward/optim). data_wait dominating => serve-bound (give
+        # vLLM more cards / DP). compute dominating => train-bound. Device syncs add
+        # overhead, so trust the RELATIVE %/bottleneck, not the absolute it/s.
+        import time as _time
+        from collections import defaultdict as _dd
+
+        def _accel_sync():
+            try:
+                torch.accelerator.synchronize()
+            except Exception:
+                try:
+                    torch.npu.synchronize()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+        _tm = _dd(float)
+        _tm_n = 0
+        _t_prev = _time.perf_counter()
+        # ===========================================
+
         for local_step, batch in enumerate(train_loader, 1):
+            _tm["data_wait"] += _time.perf_counter() - _t_prev
+            _accel_sync()
+            _t0 = _time.perf_counter()
+
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
                 else v
                 for k, v in batch.items()
             }
+            _accel_sync()
+            _tm["h2d"] += _time.perf_counter() - _t0
+            _t0 = _time.perf_counter()
 
             _draft_tokens, loss, metrics = self.model(
                 **gpu_batch, **self.config.train_call_kwargs
             )
+            _accel_sync()
+            _tm["forward"] += _time.perf_counter() - _t0
+            _t0 = _time.perf_counter()
 
             self._optimizers_zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            _accel_sync()
+            _tm["backward"] += _time.perf_counter() - _t0
+            _t0 = _time.perf_counter()
+
             self._optimizers_step()
 
             current_lrs = {
                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
             }
             self._schedulers_step()
+            _accel_sync()
+            _tm["optim"] += _time.perf_counter() - _t0
+            _tm_n += 1
 
             if self.global_step % self.config.log_freq == 0:
                 if self.is_distributed:
@@ -271,7 +311,23 @@ class Trainer:
                     },
                     extra={"step": self.global_step},
                 )
+                if self.local_rank == 0 and _tm_n > 0:
+                    _tot = sum(_tm.values()) or 1e-9
+                    metric_logger.info(
+                        {
+                            "timing_s_per_step": {k: round(v / _tm_n, 4) for k, v in _tm.items()},
+                            "pct": {k: round(100 * v / _tot) for k, v in _tm.items()},
+                            "step_s": round(_tot / _tm_n, 4),
+                            "it_per_s": round(_tm_n / _tot, 2),
+                            "bottleneck": max(_tm, key=_tm.get),
+                            "global_step": self.global_step,
+                        },
+                        extra={"step": self.global_step},
+                    )
+                _tm = _dd(float)
+                _tm_n = 0
             self.global_step += 1
+            _t_prev = _time.perf_counter()
 
             if (
                 step_interval is not None
