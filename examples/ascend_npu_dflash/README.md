@@ -1,35 +1,41 @@
 # Qwen3-8B DFlash on Ascend NPU — run scripts
 
 Single-machine, online DFlash training (vLLM serves the target + extracts hidden
-states; a separate trainer process trains the draft). Distilled from
+states; a separate trainer trains the draft). Distilled from
 [`docs/deployment/ascend-npu-dflash-training.md`](../../docs/deployment/ascend-npu-dflash-training.md).
 
-8 NPUs are split: **serve on 0,1** (2 cards) + **train on 2-7** (6 cards). Two
-processes, **one machine** (not two nodes).
+8 NPUs split: **serve on 0,1** + **train on 2-7**. Two processes, **one machine**.
+The scripts locate the repo automatically (no hardcoded home dir).
 
-## Order
+## Configure once
 
-1. **Prepare data once** (CPU, §4 of the guide):
-   ```bash
-   python speculators/scripts/prepare_data.py \
-     --model /share/canada_group_folder/ckpt/Qwen3-8B \
-     --data  /share/canada_group_folder/dataset/perfectblend_train_regen.jsonl \
-     --output "$WORKDIR/train_data" --seq-length 3072 --overwrite --trust-remote-code
-   ```
-2. **Terminal 1 — serve** (wait for `Application startup complete`):
-   ```bash
-   bash examples/ascend_npu_dflash/serve_qwen3_8b.sh
-   ```
-3. **Terminal 2 — train**:
-   ```bash
-   bash examples/ascend_npu_dflash/train_qwen3_8b.sh
-   ```
+Edit [`config.sh`](./config.sh) or override via env. Key vars (with current defaults):
 
-## Knobs (override via env, defaults match the guide)
+| var | default | meaning |
+|---|---|---|
+| `TARGET_MODEL` | `/share/canada_group_folder/ckpt/Qwen3-8B` | verifier weights |
+| `TRAIN_DATA` | `/share/canada_group_folder/dataset/perfectblend_train_10ksubset.jsonl` | raw jsonl (prepare input) |
+| `OUTPUT_DIR` | `./outputs/qwen3-8b-dflash-npu` | base dir; resolved to absolute |
+| `DATA_DIR` | `$OUTPUT_DIR/train_data` | tokenized Arrow dataset (prepare output = train input) |
+| `HS_DIR` | `$OUTPUT_DIR/hidden_states` | online hidden-state exchange (must match serve↔train; it does) |
+| `SAVE_DIR` | `$OUTPUT_DIR/checkpoints` | checkpoints |
 
-`MODEL` `WORKDIR` `HS_DIR` `DATA` `SAVE` `PORT` `SERVE_CARDS` `TP` `TRAIN_CARDS` `NPROC`
+## Run (in repo root)
 
-- `HS_DIR` **must be identical** between the two scripts (defaults already match).
-- serve defaults to **graph mode**; fall back to eager with `ENFORCE_EAGER=1 bash serve_qwen3_8b.sh`.
-- backend on NPU is `--draft-attn-impl sdpa` (flex_attention is unavailable on NPU).
-- run with `bash`, do **not** `source` (the scripts guard against it anyway).
+```bash
+# 0) prepare data (CPU, once)
+bash examples/ascend_npu_dflash/prepare_qwen3_8b.sh
+
+# 1) terminal 1 — serve (wait for "Application startup complete")
+bash examples/ascend_npu_dflash/serve_qwen3_8b.sh
+#    graph capture errors? fall back to eager:
+#    ENFORCE_EAGER=1 bash examples/ascend_npu_dflash/serve_qwen3_8b.sh
+
+# 2) terminal 2 — train
+bash examples/ascend_npu_dflash/train_qwen3_8b.sh
+```
+
+Notes: backend on NPU is `--draft-attn-impl sdpa` (flex_attention is unavailable on
+NPU); `TORCHDYNAMO_DISABLE` is no longer needed (#600). Run with `bash`, not `source`
+(the scripts guard against it). `TRAIN_DATA` here is the 10k subset for a quick pass —
+point it at the full `perfectblend_train_regen.jsonl` for a full run.
