@@ -1,4 +1,3 @@
-import os
 from typing import ClassVar
 
 import torch
@@ -12,9 +11,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.dflash import DFlashSpeculatorConfig
-from speculators.models.dflash.attention import (
-    create_anchor_block_mask_mod,
-)
+from speculators.models.dflash.attention import create_anchor_block_mask_mod
 from speculators.models.dflash.metrics import compute_metrics
 from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
 from speculators.models.dflash.utils import (
@@ -47,13 +44,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self,
         config: DFlashSpeculatorConfig,
     ) -> None:
-        # Forcibly override config settings.
-        # Default is flex attention; on backends without flex_attention (e.g. Ascend
-        # NPU) set SPECULATORS_DFLASH_ATTN_IMPL=sdpa to use SDPA (FlashAttention on
-        # NPU) with a materialized dense mask instead (via create_mask).
+        # Forcibly override config settings
         if config.transformer_layer_config._attn_implementation is None:  # noqa: SLF001
-            config.transformer_layer_config._attn_implementation = os.environ.get(  # noqa: SLF001
-                "SPECULATORS_DFLASH_ATTN_IMPL", "simple_flex_attention"
+            config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
+                "simple_flex_attention"
             )
         self._attn_impl = config.transformer_layer_config._attn_implementation  # noqa: SLF001
         self._create_mask_fn = (
