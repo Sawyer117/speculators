@@ -41,7 +41,7 @@ PREP_SEQ_LEN=3072
 TOTAL_SEQ_LEN=3072
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_MAX_MODEL_LEN=$((PREP_SEQ_LEN + 256))
-HS_DIR="$OUTPUT_DIR/hidden_states"          # set explicitly on serve+train so paths can't mismatch
+HS_DIR="${HS_DIR:-$OUTPUT_DIR/hidden_states}"   # serve writes / train reads; with SKIP_SERVE set this to the running serve's --hidden-states-path
 EPOCHS=1
 LR=6e-4
 SEED=42
@@ -68,27 +68,34 @@ else
     rm -f "$DATA_DIR"/d2t.npy "$DATA_DIR"/t2d.npy
 fi
 
-echo "=== Step 2: launch vLLM (NPU $VLLM_NPUS, DP=1, GRAPH mode like his) ==="
-mkdir -p "$OUTPUT_DIR"; rm -rf "$HS_DIR"; mkdir -p "$HS_DIR"
-VLLM_LOG="$OUTPUT_DIR/vllm_server.log"
-TASK_QUEUE_ENABLE=1 ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" python scripts/launch_vllm.py "$MODEL" \
-    --target-layer-ids $TARGET_LAYER_IDS \
-    --hidden-states-path "$HS_DIR" \
-    -- --data-parallel-size 1 --port "$VLLM_PORT" \
-       --max-model-len "$VLLM_MAX_MODEL_LEN" --gpu-memory-utilization 0.85 2>&1 | tee "$VLLM_LOG" &
-VLLM_PROCS="launch_vllm.py|vllm.entrypoints|EngineCore|APIServer|vllm serve|from_engine_args"
-cleanup() { echo "Stopping vLLM..."; pkill -f "$VLLM_PROCS" 2>/dev/null || true; }
-trap cleanup EXIT
+if [ "${SKIP_SERVE:-0}" = "1" ]; then
+    echo "=== Step 2: SKIP launch — reuse the serve already running at port $VLLM_PORT ==="
+    curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 \
+        || { echo "ERROR: SKIP_SERVE=1 but nothing healthy at http://localhost:${VLLM_PORT}/health"; exit 1; }
+    echo "Existing serve healthy at $VLLM_PORT. (make sure HS_DIR=$HS_DIR matches its --hidden-states-path)"
+else
+    echo "=== Step 2: launch vLLM (NPU $VLLM_NPUS, DP=1, GRAPH mode like his) ==="
+    mkdir -p "$OUTPUT_DIR"; rm -rf "$HS_DIR"; mkdir -p "$HS_DIR"
+    VLLM_LOG="$OUTPUT_DIR/vllm_server.log"
+    TASK_QUEUE_ENABLE=1 ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" python scripts/launch_vllm.py "$MODEL" \
+        --target-layer-ids $TARGET_LAYER_IDS \
+        --hidden-states-path "$HS_DIR" \
+        -- --data-parallel-size 1 --port "$VLLM_PORT" \
+           --max-model-len "$VLLM_MAX_MODEL_LEN" --gpu-memory-utilization 0.85 2>&1 | tee "$VLLM_LOG" &
+    VLLM_PROCS="launch_vllm.py|vllm.entrypoints|EngineCore|APIServer|vllm serve|from_engine_args"
+    cleanup() { echo "Stopping vLLM..."; pkill -f "$VLLM_PROCS" 2>/dev/null || true; }
+    trap cleanup EXIT
 
-echo "Waiting for server health (1800s cap)..."
-WAITED=0; BOOT_TIMEOUT=1800; GRACE=120
-until curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1; do
-    if [ "$WAITED" -ge "$GRACE" ] && ! pgrep -f "$VLLM_PROCS" >/dev/null 2>&1; then
-        echo "ERROR: no vLLM process and port down after ${WAITED}s. Last 40 lines:"; tail -n 40 "$VLLM_LOG" || true; exit 1; fi
-    if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then echo "ERROR: vLLM not healthy after ${BOOT_TIMEOUT}s"; tail -n 40 "$VLLM_LOG" || true; exit 1; fi
-    sleep 5; WAITED=$((WAITED+5)); [ $((WAITED % 30)) -eq 0 ] && echo "  ...waiting ${WAITED}s" || true
-done
-echo "Server ready after ${WAITED}s."
+    echo "Waiting for server health (1800s cap)..."
+    WAITED=0; BOOT_TIMEOUT=1800; GRACE=120
+    until curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1; do
+        if [ "$WAITED" -ge "$GRACE" ] && ! pgrep -f "$VLLM_PROCS" >/dev/null 2>&1; then
+            echo "ERROR: no vLLM process and port down after ${WAITED}s. Last 40 lines:"; tail -n 40 "$VLLM_LOG" || true; exit 1; fi
+        if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then echo "ERROR: vLLM not healthy after ${BOOT_TIMEOUT}s"; tail -n 40 "$VLLM_LOG" || true; exit 1; fi
+        sleep 5; WAITED=$((WAITED+5)); [ $((WAITED % 30)) -eq 0 ] && echo "  ...waiting ${WAITED}s" || true
+    done
+    echo "Server ready after ${WAITED}s."
+fi
 
 # his "force eager": disable torch.compile / dynamo on the trainer
 export TORCH_COMPILE_DISABLE=1 TORCHDYNAMO_DISABLE=1
