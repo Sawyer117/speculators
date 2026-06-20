@@ -29,9 +29,14 @@ cd "$REPO_ROOT"
 
 # ---- our paths; colleague's hyperparameters ----
 MODEL="${MODEL:-/share/canada_group_folder/ckpt/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c}"
-DATASET="${DATASET:-/share/canada_group_folder/dataset/open_perfectblend_full.jsonl}"   # his data source
-OUTPUT_DIR="${OUTPUT_DIR:-./output/dflash_aligned_qwen3_4b}"
-MAX_SAMPLES="${MAX_SAMPLES:-200000}"        # colleague used 1420909 (full); cap for a quicker prep
+OUTPUT_DIR="${OUTPUT_DIR:-./output/dflash_aligned_qwen3_4b}"   # local: checkpoints / HS / vllm log
+# Reuse an ALREADY-PREPARED Arrow dataset (no re-prepare). Point at whichever exists:
+#   - your half50:  /share/canada_group_folder/dataset/perfectblend_train_regen.half50.qwen3.seq3072
+#   - colleague's:  /home/n84449292/m84379596/DFlash/vLLM_NPU/speculators/output/dflash_separate_qwen3_4b
+DATA_DIR="${DATA_DIR:-/share/canada_group_folder/dataset/perfectblend_train_regen.half50.qwen3.seq3072}"
+# fallback only (used if DATA_DIR has no *.arrow):
+DATASET="${DATASET:-/share/canada_group_folder/dataset/open_perfectblend_full.jsonl}"
+MAX_SAMPLES="${MAX_SAMPLES:-200000}"
 PREP_SEQ_LEN=3072
 TOTAL_SEQ_LEN=3072
 VLLM_PORT="${VLLM_PORT:-8000}"
@@ -52,11 +57,16 @@ NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-7}"
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-echo "=== Step 1: prepare_data ($MAX_SAMPLES samples from $(basename "$DATASET")) ==="
-python scripts/prepare_data.py \
-    --model "$MODEL" --data "$DATASET" --output "$OUTPUT_DIR" \
-    --max-samples "$MAX_SAMPLES" --seq-length "$PREP_SEQ_LEN" --overwrite --trust-remote-code
-rm -f "$OUTPUT_DIR"/d2t.npy "$OUTPUT_DIR"/t2d.npy
+echo "=== Step 1: data ==="
+if ls "$DATA_DIR"/*.arrow >/dev/null 2>&1; then
+    echo "reusing already-prepared dataset: $DATA_DIR (skip prepare)"
+else
+    echo "no *.arrow in $DATA_DIR -> preparing $MAX_SAMPLES samples from $(basename "$DATASET")"
+    python scripts/prepare_data.py \
+        --model "$MODEL" --data "$DATASET" --output "$DATA_DIR" \
+        --max-samples "$MAX_SAMPLES" --seq-length "$PREP_SEQ_LEN" --overwrite --trust-remote-code
+    rm -f "$DATA_DIR"/d2t.npy "$DATA_DIR"/t2d.npy
+fi
 
 echo "=== Step 2: launch vLLM (NPU $VLLM_NPUS, DP=1, GRAPH mode like his) ==="
 mkdir -p "$OUTPUT_DIR"; rm -rf "$HS_DIR"; mkdir -p "$HS_DIR"
@@ -88,7 +98,7 @@ TASK_QUEUE_ENABLE=2 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
     scripts/train.py \
     --verifier-name-or-path "$MODEL" \
-    --data-path "$OUTPUT_DIR" \
+    --data-path "$DATA_DIR" \
     --hidden-states-path "$HS_DIR" \
     --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
     --save-path "$OUTPUT_DIR/checkpoints" \
