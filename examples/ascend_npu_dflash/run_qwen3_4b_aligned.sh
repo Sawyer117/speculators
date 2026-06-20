@@ -30,10 +30,10 @@ cd "$REPO_ROOT"
 # ---- our paths; colleague's hyperparameters ----
 MODEL="${MODEL:-/share/canada_group_folder/ckpt/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c}"
 OUTPUT_DIR="${OUTPUT_DIR:-./output/dflash_aligned_qwen3_4b}"   # local: checkpoints / HS / vllm log
-# Reuse an ALREADY-PREPARED Arrow dataset (no re-prepare). Point at whichever exists:
-#   - your half50:  /share/canada_group_folder/dataset/perfectblend_train_regen.half50.qwen3.seq3072
-#   - colleague's:  /home/n84449292/m84379596/DFlash/vLLM_NPU/speculators/output/dflash_separate_qwen3_4b
-DATA_DIR="${DATA_DIR:-/share/canada_group_folder/dataset/perfectblend_train_regen.half50.qwen3.seq3072}"
+# Reuse an ALREADY-PREPARED Arrow dataset (no re-prepare). Default = colleague's
+# prepared data (copied to /share). Other option: your half50 set
+#   DATA_DIR=/share/canada_group_folder/dataset/perfectblend_train_regen.half50.qwen3.seq3072
+DATA_DIR="${DATA_DIR:-/share/canada_group_folder/dataset/dflash_separate_qwen3_4b}"
 # fallback only (used if DATA_DIR has no *.arrow):
 DATASET="${DATASET:-/share/canada_group_folder/dataset/open_perfectblend_full.jsonl}"
 MAX_SAMPLES="${MAX_SAMPLES:-200000}"
