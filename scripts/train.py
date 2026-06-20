@@ -67,6 +67,27 @@ def set_seed(seed: int, deterministic: bool = False):
         torch.backends.cudnn.benchmark = False
 
 
+def _silence_dataloader_worker_logging(_worker_id: int) -> None:
+    """Mute logging inside forked DataLoader workers (NPU fork-deadlock fix).
+
+    On Ascend NPU, ``torch_npu``'s ``patch_getenv`` logs every
+    ``os.environ.get()`` through the root logger. When stdout is a real TTY the
+    root logger's ``RichHandler`` shares a console lock with the main process's
+    live progress display; a DataLoader worker forked while that lock is held
+    inherits it locked, so the first ``getenv`` log in the worker deadlocks
+    permanently (the worker never returns its batch and all ranks eventually
+    HCCL-timeout). Workers never need to emit logs, so detach all handlers and
+    raise the level here. Runs once per worker at startup (before any batch is
+    fetched) and only mutates the *worker* process, so the main process keeps its
+    rich logging/progress bar untouched (GPU/interactive UX unaffected).
+    """
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+    root.addHandler(logging.NullHandler())
+    root.setLevel(logging.ERROR)
+
+
 def setup_dataloader(
     dataset: BaseDataset,
     world_size: int,
@@ -103,6 +124,7 @@ def setup_dataloader(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         pin_memory=True,
+        worker_init_fn=_silence_dataloader_worker_logging,
         collate_fn=create_collate_fn(
             args.total_seq_len,
             hidden_size,
