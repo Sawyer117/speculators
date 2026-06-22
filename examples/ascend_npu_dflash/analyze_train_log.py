@@ -220,12 +220,23 @@ def main():
     if med_rate:
         print(f"throughput       : ~{med_rate:.2f} it/s (median)  | "
               f"~{med_rate*3600:.0f} steps/h")
-    # ETA for the (single) epoch being analyzed
+    # total steps for the epoch: explicit flag > tqdm bar total > inferred from LR warmup
     total_steps = args.total_steps or tqdm_total
+    src = "--total-steps" if args.total_steps else ("tqdm-bar" if tqdm_total else None)
+    if med_rate and not total_steps:
+        # The trainer doesn't log steps/epoch, but the LR schedule encodes it: the default
+        # warmup is total_steps // 100 and the (linear/cosine) LR peaks at the end of warmup.
+        # So total_steps ≈ 100 × (global_step at peak LR) — valid only once training is PAST
+        # warmup (peak-LR step strictly before the latest step). Assumes default warmup ratio.
+        lrs = [(s, l) for s, l in zip(steps, lr) if l is not None]
+        if lrs:
+            peak_step = max(lrs, key=lambda x: x[1])[0]
+            if 0 < peak_step < lrs[-1][0]:
+                total_steps = peak_step * 100
+                src = "lr-warmup×100 (assumes default warmup=total//100)"
     if med_rate and total_steps:
         done = steps[-1] - steps[0]            # steps elapsed within the window
         remaining = total_steps - done
-        src = "--total-steps" if args.total_steps else "tqdm bar"
         if remaining > 0:
             print(f"ETA (this epoch) : ~{_hms(remaining / med_rate)} left  "
                   f"(~{remaining}/{total_steps} steps remaining @ {med_rate:.2f} it/s; "
@@ -233,7 +244,8 @@ def main():
         else:
             print(f"ETA (this epoch) : ~done ({done}/{total_steps} steps, src={src})")
     elif med_rate:
-        print("ETA (this epoch) : unknown (no tqdm total in log; pass --total-steps N)")
+        print("ETA (this epoch) : unknown (LR hasn't peaked yet / no tqdm total; "
+              "pass --total-steps N once past warmup)")
     print(f"loss             : last {_fmt(loss[-1])} | min {_fmt(min(lossv))} | "
           f"mean(last {len(late)}) {_fmt(sum(x for x in (r.get('loss') for r in late) if x is not None)/max(1,sum(1 for r in late if r.get('loss') is not None)))}")
     print(f"full_acc         : last {_fmt(full[-1])} | max {_fmt(max(fullv))}")
