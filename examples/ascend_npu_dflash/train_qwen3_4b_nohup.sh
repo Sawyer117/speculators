@@ -26,6 +26,11 @@ export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
 OFF_POLICY_FLAG=""
 [ "${USE_OFF_POLICY:-1}" = "1" ] && OFF_POLICY_FLAG="--use-off-policy-tokens"
 
+# draft vocab: empty DRAFT_VOCAB_SIZE = full verifier vocab (OMIT the flag). Set
+# DRAFT_VOCAB_SIZE=32000 (needs token_freq.pt in DATA_DIR) for a reduced draft vocab.
+VOCAB_FLAG=""
+[ -n "${DRAFT_VOCAB_SIZE:-}" ] && VOCAB_FLAG="--draft-vocab-size $DRAFT_VOCAB_SIZE"
+
 LOG_DIR="${LOG_DIR:-$OUTPUT_DIR/logs}"
 mkdir -p "$LOG_DIR"
 # timestamp from `date`; falls back to PID if `date` is unavailable
@@ -33,14 +38,14 @@ STAMP="$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "$$")"
 LOG_FILE="$LOG_DIR/train_4b_${STAMP}.log"
 PID_FILE="$LOG_DIR/train_4b.pid"
 
-echo ">>> nohup train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$EPOCHS loss=$LOSS_FN off_policy=${USE_OFF_POLICY:-1})"
+echo ">>> nohup train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$EPOCHS loss=$LOSS_FN off_policy=${USE_OFF_POLICY:-1} draft_vocab=${DRAFT_VOCAB_SIZE:-full})"
 echo ">>> data=$DATA_DIR save=$SAVE_DIR"
 echo ">>> log -> $LOG_FILE"
 
 # Record the effective run config as the log's FIRST line (self-documenting).
 # The echoes above print to the terminal only; this is what lands in $LOG_FILE,
 # so `grep '>>> RUN' "$LOG_FILE"` confirms loss/epochs/off_policy after the fact.
-echo ">>> RUN train Qwen3-4B DFlash | nproc=$NPROC epochs=$EPOCHS loss=$LOSS_FN off_policy=${USE_OFF_POLICY:-1} | cards=$TRAIN_CARDS data=$DATA_DIR save=$SAVE_DIR" > "$LOG_FILE"
+echo ">>> RUN train Qwen3-4B DFlash | nproc=$NPROC epochs=$EPOCHS loss=$LOSS_FN off_policy=${USE_OFF_POLICY:-1} draft_vocab=${DRAFT_VOCAB_SIZE:-full} | cards=$TRAIN_CARDS data=$DATA_DIR save=$SAVE_DIR" > "$LOG_FILE"
 
 nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --nproc_per_node "$NPROC" --nnodes 1 --node_rank 0 \
@@ -53,6 +58,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --save-path "$SAVE_DIR" \
   --speculator-type dflash \
   --draft-arch qwen3 \
+  $VOCAB_FLAG \
   --num-layers 5 \
   --block-size 16 \
   --max-anchors 512 \

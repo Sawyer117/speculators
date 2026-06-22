@@ -41,6 +41,11 @@ export EPOCHS="${EPOCHS:-6}"
 # USE_OFF_POLICY=1 passes --use-off-policy-tokens (REQUIRED for regenerated data).
 # Set 0 for original/non-regen datasets (e.g. open_perfectblend).
 export USE_OFF_POLICY="${USE_OFF_POLICY:-1}"
+# Draft vocab. EMPTY = full verifier vocab (151,936) by OMITTING --draft-vocab-size
+# (this is the correct full-vocab path; passing a value == full vocab makes the trainer
+# raise "mappings not needed"). Set e.g. DRAFT_VOCAB_SIZE=32000 to train a reduced draft
+# vocab — requires a token_freq.pt in DATA_DIR (prepare_data writes one by default).
+export DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-}"
 # DFlash loss. Default "ce": that was DFlash's validated/hardcoded default before
 # PR #542, which (per issue #541) was only meant to make the loss configurable but
 # accidentally flipped DFlash's default to kl_div (never validated for DFlash).

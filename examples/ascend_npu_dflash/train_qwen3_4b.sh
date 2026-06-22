@@ -24,7 +24,13 @@ export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
 OFF_POLICY_FLAG=""
 [ "${USE_OFF_POLICY:-1}" = "1" ] && OFF_POLICY_FLAG="--use-off-policy-tokens"
 
-echo ">>> train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$EPOCHS loss=$LOSS_FN off_policy=${USE_OFF_POLICY:-1}); data=$DATA_DIR save=$SAVE_DIR"
+# draft vocab: empty DRAFT_VOCAB_SIZE = full verifier vocab (OMIT the flag — passing a
+# value == full vocab makes the trainer raise). Set DRAFT_VOCAB_SIZE=32000 (needs a
+# token_freq.pt in DATA_DIR) to train a reduced draft vocab. See config_qwen3_4b.sh.
+VOCAB_FLAG=""
+[ -n "${DRAFT_VOCAB_SIZE:-}" ] && VOCAB_FLAG="--draft-vocab-size $DRAFT_VOCAB_SIZE"
+
+echo ">>> train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$EPOCHS loss=$LOSS_FN off_policy=${USE_OFF_POLICY:-1} draft_vocab=${DRAFT_VOCAB_SIZE:-full}); data=$DATA_DIR save=$SAVE_DIR"
 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --nproc_per_node "$NPROC" --nnodes 1 --node_rank 0 \
   --master_addr 127.0.0.1 --master_port "$MASTER_PORT" \
@@ -36,6 +42,7 @@ ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --save-path "$SAVE_DIR" \
   --speculator-type dflash \
   --draft-arch qwen3 \
+  $VOCAB_FLAG \
   --num-layers 5 \
   --block-size 16 \
   --max-anchors 512 \
