@@ -46,14 +46,72 @@ Qwen3-4B is also a 36-layer Qwen3 model, so the DFlash hyperparameters are ident
 to 8B (`--target-layer-ids 1 9 17 25 33`, `--num-layers 5`, `--block-size 16`,
 `--max-anchors 512`, `--mask-token-id 151669`). Only the verifier weights differ
 (`hidden_size` 2560, auto-derived → `fc` = 5×2560), and the default split is TP=1
-(serve on card 0, train on 1-7). The **tokenized dataset is shared** with 8B (same
-Qwen3 tokenizer), so no separate prepare — `config_qwen3_4b.sh` points `DATA_DIR` at
-the same Arrow set.
+(serve on card 0, train on 1-7). Config: [`config_qwen3_4b.sh`](./config_qwen3_4b.sh).
+
+### Quickstart — end-to-end (background / nohup, recommended)
+
+Run from the repo root. **Order matters: serve must be healthy before train.**
 
 ```bash
-bash examples/ascend_npu_dflash/serve_qwen3_4b.sh    # terminal 1
-bash examples/ascend_npu_dflash/train_qwen3_4b.sh    # terminal 2
+# pick where data + outputs live (set in ONE shell; serve & train both read these)
+export DATA_DIR=/share/canada_group_folder/dataset/<your-tokenized-arrow-dir>
+export OUTPUT_DIR=./outputs/qwen3-4b-dflash-npu
+
+# 0) tokenize a raw jsonl into DATA_DIR (CPU, one-time). Skip if DATA_DIR already
+#    contains a prepared Arrow dataset.
+source examples/ascend_npu_dflash/config_qwen3_4b.sh
+python scripts/prepare_data.py --model "$TARGET_MODEL" \
+  --data /share/canada_group_folder/dataset/<raw>.jsonl \
+  --output "$DATA_DIR" --max-samples <N> --seq-length 3072 --overwrite
+
+# 1) serve (background; survives SSH disconnect)
+bash examples/ascend_npu_dflash/serve_qwen3_4b_nohup.sh
+tail -f "$OUTPUT_DIR"/logs/serve_4b_*.log           # wait for "Application startup complete"
+curl -s http://localhost:8001/v1/models | head      # model listed = ready
+
+# 2) train (background)
+bash examples/ascend_npu_dflash/train_qwen3_4b_nohup.sh
+tail -f "$OUTPUT_DIR"/logs/train_4b_*.log            # loss should fall from ~3.6
+
+# 3) analyze the log (loss / per-position acceptance / throughput + charts)
+python examples/ascend_npu_dflash/analyze_train_log.py "$OUTPUT_DIR"/logs/train_4b_*.log
 ```
 
-Config in [`config_qwen3_4b.sh`](./config_qwen3_4b.sh) (TARGET_MODEL points at the
-resolved HF-cache snapshot; verify a checkpoint with `check_ckpt.py`).
+> ⚠️ **Do NOT run the trainer on a bare TTY** (`bash train_qwen3_4b.sh` straight in the
+> terminal): a torch_npu fork + rich-logging deadlock hangs a DataLoader worker after a
+> few steps. The `*_nohup.sh` wrappers — or any `| tee` / `> log` redirect — make stdout
+> non-TTY and sidestep it (details in [`torch_npu_getenv_deadlock_report.md`](./torch_npu_getenv_deadlock_report.md)).
+> The foreground `serve_qwen3_4b.sh` / `train_qwen3_4b.sh` remain for interactive/piped use.
+
+### Env knobs (override inline, or edit `config_qwen3_4b.sh`)
+
+| var | default | meaning |
+|---|---|---|
+| `DATA_DIR` | shared Arrow | tokenized dataset (train input) |
+| `OUTPUT_DIR` | `./outputs/qwen3-4b-dflash-npu` | base dir; `HS_DIR`/`SAVE_DIR`/`logs` derive from it |
+| `EPOCHS` | `6` | training epochs (set `1` for a single-epoch run) |
+| `USE_OFF_POLICY` | `1` | passes `--use-off-policy-tokens`; **REQUIRED for regenerated data, set `0` for original/non-regen datasets** |
+| `MAX_MODEL_LEN` | `SEQ_LEN+256` | vLLM served-context cap (keeps KV cache small → faster serve) |
+| `GPU_MEM_UTIL` | `0.90` | vLLM HBM fraction |
+| `SEQ_LEN` | `3072` | per-sample / per-rank batch token length |
+
+### Example — full open_perfectblend, single epoch (non-regen data)
+
+```bash
+export DATA_DIR=/share/canada_group_folder/dataset/open_perfectblend_full.qwen3.seq3072
+export OUTPUT_DIR=./outputs/qwen3-4b-dflash-npu-openblend
+export EPOCHS=1 USE_OFF_POLICY=0          # original (non-regen) data → off-policy OFF
+source examples/ascend_npu_dflash/config_qwen3_4b.sh
+python scripts/prepare_data.py --model "$TARGET_MODEL" \
+  --data /share/canada_group_folder/dataset/open_perfectblend_full.jsonl \
+  --output "$DATA_DIR" --max-samples 1420909 --seq-length 3072 --overwrite
+# then run serve + train (steps 1-2 above)
+```
+
+> `prepare_data` warns `No assistant response spans found` for conversations whose
+> assistant turn falls past `--seq-length` (open_perfectblend has ~4.3k-token convs; at
+> 3072 they're truncated and dropped). **Expected** — only a small fraction is dropped;
+> confirm the kept count with `load_from_disk(DATA_DIR).num_rows`.
+
+TARGET_MODEL points at the resolved HF-cache snapshot; verify a checkpoint with
+[`check_ckpt.py`](./check_ckpt.py).
