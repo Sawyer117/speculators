@@ -4,15 +4,15 @@ Reproducible baseline for DFlash draft training of **Qwen3-4B** on Ascend NPU
 (vLLM serves the verifier + extracts hidden states online; a separate FSDP trainer
 trains the draft on disjoint cards).
 
-> **Pinned commit:** [`a51024ee1a79c0dee84dfe5be5957d144035e06d`](https://github.com/Sawyer117/speculators/commit/a51024ee1a79c0dee84dfe5be5957d144035e06d)
+> **Pinned commit:** [`6b03432564e9e98d36aa3fe2b75e25da3d02bc01`](https://github.com/Sawyer117/speculators/commit/6b03432564e9e98d36aa3fe2b75e25da3d02bc01)
 > All links below point at this commit so the scripts can't drift. `main` may move on.
 
 ## References (pinned)
 
 - **Environment setup:**
-  https://github.com/Sawyer117/speculators/blob/a51024ee1a79c0dee84dfe5be5957d144035e06d/docs/deployment/ascend-npu-conda.md
+  https://github.com/Sawyer117/speculators/blob/6b03432564e9e98d36aa3fe2b75e25da3d02bc01/docs/deployment/ascend-npu-conda.md
 - **Training scripts + end-to-end how-to-run** (see the Qwen3-4B "Quickstart"):
-  https://github.com/Sawyer117/speculators/tree/a51024ee1a79c0dee84dfe5be5957d144035e06d/examples/ascend_npu_dflash
+  https://github.com/Sawyer117/speculators/tree/6b03432564e9e98d36aa3fe2b75e25da3d02bc01/examples/ascend_npu_dflash
 
 ## Dataset
 
@@ -62,9 +62,12 @@ python examples/ascend_npu_dflash/analyze_train_log.py "$OUTPUT_DIR"/logs/train_
 | DFlash | `--block-size 16`, `--max-anchors 512`, `--target-layer-ids 1 9 17 25 33`, `--mask-token-id 151669` |
 | vocab | **full** verifier vocab (151,936) — `--draft-vocab-size` omitted |
 | data/batch | `--total-seq-len 3072`, multipack token-budget batching, 7-way FSDP |
-| schedule | `--epochs 1`, `--lr 6e-4`, **upstream defaults**: `--loss-fn kl_div`, `--noise-std 0.05`, `--scheduler-type linear` |
+| schedule | `--epochs 1`, `--lr 6e-4`, `--loss-fn ce`, `--noise-std 0.05`, `--scheduler-type linear` |
 | device split | serve TP=1 on card 0; train on cards 1-7 |
 | serve | `--max-model-len 3328` (=SEQ_LEN+256), `--gpu-memory-utilization 0.90`, graph mode |
 
-Loss/noise/scheduler are deliberately the **upstream `scripts/train.py` defaults**
+`--noise-std` and `--scheduler-type` are the **upstream `scripts/train.py` defaults**
 (the official `examples/train/dflash_qwen3_8b_sharegpt_online_5k.sh` omits them too).
+**`--loss-fn ce`** is set explicitly: it is DFlash's validated/hardcoded default per
+[issue #541](https://github.com/vllm-project/speculators/issues/541); PR #542's `kl_div`
+default for DFlash is an unvalidated regression (separate upstream fix pending).
