@@ -32,17 +32,20 @@ echo ">>> nohup serve Qwen3-4B on NPU $SERVE_CARDS (TP=$TP port=$PORT max-model-
 echo ">>> HS_DIR=$HS_DIR"
 echo ">>> log -> $LOG_FILE"
 
+# Record the effective run config as the log's FIRST line (self-documenting).
+echo ">>> RUN serve Qwen3-4B | card=$SERVE_CARDS TP=$TP port=$PORT max-model-len=$MAX_MODEL_LEN gpu-mem=$GPU_MEM_UTIL eager=${ENFORCE_EAGER:-0} | HS_DIR=$HS_DIR" > "$LOG_FILE"
+
 nohup env ASCEND_RT_VISIBLE_DEVICES="$SERVE_CARDS" python "$REPO_ROOT/scripts/launch_vllm.py" \
   "$TARGET_MODEL" \
   --target-layer-ids 1 9 17 25 33 \
   --hidden-states-path "$HS_DIR" \
   -- --tensor-parallel-size "$TP" --port "$PORT" \
      --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTIL" $EAGER_FLAG \
-  > "$LOG_FILE" 2>&1 &
+  >> "$LOG_FILE" 2>&1 &
 
 SERVE_PID=$!
 echo "$SERVE_PID" > "$PID_FILE"
 echo ">>> started, pid=$SERVE_PID (saved to $PID_FILE)"
 echo ">>> wait for ready:  curl -s --noproxy '*' http://localhost:$PORT/v1/models | head"
 echo ">>> follow:  tail -f $LOG_FILE"
-echo ">>> stop:    kill \$(cat $PID_FILE)   # or: pkill -f launch_vllm.py"
+echo ">>> stop:    pkill -f 'launch_vllm|EngineCore|APIServer'   # vLLM forks/retitles; kill the whole family (saved PID alone may miss EngineCore)"

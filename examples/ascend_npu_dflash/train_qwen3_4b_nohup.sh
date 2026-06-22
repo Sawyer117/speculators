@@ -37,6 +37,11 @@ echo ">>> nohup train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$
 echo ">>> data=$DATA_DIR save=$SAVE_DIR"
 echo ">>> log -> $LOG_FILE"
 
+# Record the effective run config as the log's FIRST line (self-documenting).
+# The echoes above print to the terminal only; this is what lands in $LOG_FILE,
+# so `grep '>>> RUN' "$LOG_FILE"` confirms loss/epochs/off_policy after the fact.
+echo ">>> RUN train Qwen3-4B DFlash | nproc=$NPROC epochs=$EPOCHS loss=$LOSS_FN off_policy=${USE_OFF_POLICY:-1} | cards=$TRAIN_CARDS data=$DATA_DIR save=$SAVE_DIR" > "$LOG_FILE"
+
 nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --nproc_per_node "$NPROC" --nnodes 1 --node_rank 0 \
   --master_addr 127.0.0.1 --master_port "$MASTER_PORT" \
@@ -64,7 +69,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --on-missing generate \
   --on-generate delete \
   --trust-remote-code \
-  > "$LOG_FILE" 2>&1 &
+  >> "$LOG_FILE" 2>&1 &
 
 TRAIN_PID=$!
 echo "$TRAIN_PID" > "$PID_FILE"
