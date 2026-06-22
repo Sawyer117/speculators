@@ -1,0 +1,103 @@
+# DFlash Qwen3-4B — NPU speculative-decoding evaluation (acceptance rate)
+
+How to evaluate a trained DFlash draft on Ascend NPU with vLLM + GuideLLM, plus the
+first validated result. **Milestone: vllm-ascend (vLLM 0.20.2) can serve a DFlash
+speculator and run speculative decoding** — the "qwen3 draft not supported in vLLM"
+training warning was NOT a blocker.
+
+## First result (2026-06-23)
+
+- **Checkpoint:** `outputs/qwen3-4b-dflash-npu/checkpoints/0/` (2.5 GB) — Qwen3-4B DFlash,
+  **1 epoch**, half50 data, `kl_div` loss (early/pre-alignment run).
+- **Verifier:** Qwen3-4B   **Dataset:** `RedHatAI/speculator_benchmarks`, subset `math_reasoning`
+- **Load:** 80 requests, **0 errors**, ~1560 gen tok/s, ITL ~13.5 ms.
+
+| Metric | Value |
+|---|---|
+| **Acceptance length** | **4.75** |
+| Num drafts | 32,199 |
+| Num draft tokens | 482,985 |
+| Num accepted tokens | 120,878 |
+
+Per-position acceptance rate (block size 16):
+
+| pos | rate | pos | rate | pos | rate |
+|----|------|----|------|----|------|
+| 0 | 0.848 | 5 | 0.256 | 10 | 0.057 |
+| 1 | 0.678 | 6 | 0.195 | 11 | 0.040 |
+| 2 | 0.537 | 7 | 0.146 | 12 | 0.028 |
+| 3 | 0.421 | 8 | 0.109 | 13 | 0.018 |
+| 4 | 0.329 | 9 | 0.079 | 14 | 0.012 |
+
+**Reading it:** acceptance length 4.75 = ~4.75 tokens produced per verifier step (1 verified
++ ~3.75 accepted draft tokens) → up to ~4.75× fewer decode steps (real wall-clock speedup is
+less, due to draft + multi-token-verify overhead). Solid for a 1-epoch / kl_div / lower-
+effective-LR draft; an aligned `ce` and/or longer-trained checkpoint should beat it.
+
+> Use the **evaluate.py aggregate** acceptance_length (4.75). vLLM's tail `SpecDecoding
+> metrics` log line is an instantaneous snapshot and reads lower (~3.5).
+
+## How to reproduce
+
+### 0. Deps — install GuideLLM ONLY
+```bash
+pip install 'guidellm==0.6.0'
+```
+⚠️ Do **NOT** `pip install -r scripts/evaluate/requirements.txt` — it pins `vllm>=0.12.0`
+and would overwrite vllm-ascend. guidellm is the only missing piece.
+
+### 1. Serve the trained draft as a speculator (one free NPU card)
+```bash
+CKPT=outputs/qwen3-4b-dflash-npu/checkpoints/0      # = SAVE_DIR/<epoch>
+ASCEND_RT_VISIBLE_DEVICES=0 vllm serve "$CKPT" \
+  --port 8108 \
+  --max-model-len 5120 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 32 \
+  2>&1 | tee /tmp/spec_serve.log &
+until curl -sf --noproxy '*' http://localhost:8108/health >/dev/null 2>&1; do sleep 3; done
+echo ready
+```
+Why these flags:
+- `--max-num-batched-tokens 8192 --max-num-seqs 32` — without them, spec-decode scheduling
+  computes a **negative** `max_num_scheduled_tokens` and vLLM refuses to start.
+- `--max-model-len 5120` — evaluate.py (throughput mode) hard-codes `max_tokens=4096`
+  (`evaluate.py:95`), so the server must allow prompt + 4096 output. 5120 ≈ 4096 + headroom.
+
+Startup log should show `Resolved architecture: DFlashDraftModel` (draft loaded) +
+`Qwen3ForCausalLM` (verifier).
+
+### 2. Run the acceptance eval (math_reasoning ≈ GSM8K-style)
+```bash
+export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"   # else localhost 504s via corp proxy
+python scripts/evaluate/evaluate.py \
+  --target http://localhost:8108/v1 \
+  --dataset RedHatAI/speculator_benchmarks \
+  throughput --subsets math_reasoning --max-requests 80
+```
+Valid subset names (there is **no** `GSM8K`):
+`HumanEval, math_reasoning, qa, question, rag, summarization, tool_call, translation, writing`.
+Results land in `outputs_<model>_<timestamp>/` (`acceptance.csv` + `artifacts/run_<subset>.json`).
+
+### 3. Stop the server when done
+```bash
+pkill -f 'launch_vllm|EngineCore|APIServer'   # vLLM forks/retitles; kill the family
+```
+
+## Gotchas recap (all hit during the first run)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `max_num_scheduled_tokens = -1536`, serve won't start | spec draft slots > default batched-tokens | `--max-num-batched-tokens 8192 --max-num-seqs 32` |
+| `504 Gateway Time-out` on /metrics & /v1/models | corp proxy intercepts localhost | `export no_proxy=localhost,127.0.0.1,::1` |
+| `Couldn't find GSM8K.jsonl` | `GSM8K` is not a subset | use `math_reasoning` |
+| `max_tokens=4096 > max_model_len=2048` (400) | eval hard-codes 4096 output | `--max-model-len ≥ prompt+4096` (e.g. 5120) |
+| pip would break vllm-ascend | requirements.txt pins `vllm>=0.12` | install `guidellm==0.6.0` only |
+
+## Notes
+
+- This checkpoint is the early **kl_div / half50 / 1-epoch** run, not the aligned `ce` /
+  open_perfectblend baseline. Re-run the same eval on the aligned checkpoint to compare
+  (expect a higher acceptance length).
+- Acceptance length / per-position rates are the right cross-run comparison metric — **not**
+  the training loss magnitude (which is reduction-dependent; see `dflash_loss_explained.md`).
