@@ -19,6 +19,13 @@ export SAVE_DIR="${SAVE_DIR:-$OUTPUT_DIR/checkpoints}"
 
 export PORT="${PORT:-8001}"            # distinct from 8B (8000) in case both ever run
 export SEQ_LEN="${SEQ_LEN:-3072}"
+# vLLM serve knobs. MAX_MODEL_LEN caps the served context to ~SEQ_LEN: leaving it
+# at the model default (~40960) makes vLLM reserve KV cache / capture ACL graphs
+# for huge sequences we never serve (data is tokenized at SEQ_LEN), wasting memory
+# and serve throughput. Must be >= SEQ_LEN. GPU_MEM_UTIL: fraction of NPU HBM for
+# weights+KV (raise toward 0.95 for more KV cache / concurrency if it fits).
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((SEQ_LEN + 256))}"
+export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 export SERVE_CARDS="${SERVE_CARDS:-0}"           # 4B fits TP=1 on one card
 export TRAIN_CARDS="${TRAIN_CARDS:-1,2,3,4,5,6,7}"   # 7-way FSDP
 export TP="${TP:-1}"
