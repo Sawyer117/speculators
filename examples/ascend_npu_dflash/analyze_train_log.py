@@ -33,17 +33,23 @@ _KV = re.compile(r"([A-Za-z][\w/]*)=([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
 _TS = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\]")
 
 
-def _resolve_log(arg: str) -> str:
-    """Accept a file, a glob, or a dir; return the newest matching .log file."""
-    if os.path.isdir(arg):
-        cands = glob.glob(os.path.join(arg, "*.log"))
-    else:
-        cands = glob.glob(arg)
+def _resolve_log(args_log) -> str:
+    """Accept one-or-more files/globs/dirs (a list, since the shell may expand an
+    unquoted glob into several args) and return the NEWEST matching .log file."""
+    cands = []
+    for a in args_log:
+        if os.path.isdir(a):
+            cands += glob.glob(os.path.join(a, "*.log"))
+        else:
+            g = glob.glob(a)
+            cands += g if g else ([a] if os.path.exists(a) else [])
+    cands = sorted(set(cands))
     if not cands:
-        if os.path.exists(arg):
-            return arg
-        sys.exit(f"No log file matches: {arg}")
-    return max(cands, key=os.path.getmtime)
+        sys.exit(f"No log file matches: {' '.join(args_log)}")
+    newest = max(cands, key=os.path.getmtime)
+    if len(cands) > 1:
+        print(f"[info] {len(cands)} logs matched; using newest: {newest}")
+    return newest
 
 
 def parse_log(path: str):
@@ -116,7 +122,9 @@ def _expected_accept_len(rec, pos_keys):
 
 def main():
     ap = argparse.ArgumentParser(description="Analyze a DFlash training log.")
-    ap.add_argument("log", help="log file, glob, or directory (newest .log used)")
+    ap.add_argument("log", nargs="+",
+                    help="log file(s), glob, or directory; newest match is used "
+                         "(handles a shell-expanded glob of several files)")
     ap.add_argument("--out", default=None, help="output dir (default <log>.analysis)")
     ap.add_argument("--last", type=int, default=2000,
                     help="window size (steps) for 'late' per-position stats")
