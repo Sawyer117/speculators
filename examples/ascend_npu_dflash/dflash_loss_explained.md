@@ -59,13 +59,17 @@ Claim heard: *"vLLM defaults vocab to 32000, it should be 151643."* **Incorrect:
 
 - `scripts/launch_vllm.py` **does not touch vocab**; vLLM serves Qwen3-4B with its real
   config vocab = **151,936**. vocab also doesn't enter hidden-state extraction at all.
-- `32000` only appears as an **eagle-converter fallback default** and in **docs examples**
-  for the *optional* `--draft-vocab-size`. It is **not** a vLLM or DFlash default.
-- DFlash draft vocab defaults to the **full** verifier vocab when `--draft-vocab-size` is
-  omitted (the run logs `Using full verifier vocab`) → **151,936**, not 32000.
+- The DFlash **config dataclass DOES default** `draft_vocab_size = 32000`
+  (`models/dflash/config.py`). **BUT `scripts/train.py` overrides it**: when
+  `--draft-vocab-size` is unset (None), it falls back to the **full** verifier vocab
+  (logs `Using full verifier vocab`) → **151,936**. To actually use 32000 you need a
+  `token_freq.pt` **and** `--draft-vocab-size` (the flag alone falls back to full). So
+  real training runs use **151,936** unless you opt into a reduced vocab.
 - Qwen3-4B vocab is **151,936** (151,643 is a Qwen2-era number).
-- Magnitude check: `ln(32000)=10.4` vs `ln(151936)=11.9` — ~1.5 apart, **nowhere near 12 vs
-  3.5**. vocab cannot explain the discrepancy; §2 does.
+- Magnitude check: `ln(32000)=10.4` vs `ln(151936)=11.9` — only **~1.5 apart**. vocab moves
+  the baseline by ~1.5; it is **not** the ~3.4× (12 vs 3.5) gap — that's the §2 denominator.
+  A colleague reporting ~14 at full vocab is on the pre-#496 weighted-mean reduction (per-
+  token loss ≈ lnV); the same full vocab post-#496 reports ~3.5.
 
 (Reducing draft vocab via a `token_freq.pt` + `--draft-vocab-size` is a legitimate *speed*
 optimization, not a loss-correctness issue, and is unrelated to the magnitude question.)
