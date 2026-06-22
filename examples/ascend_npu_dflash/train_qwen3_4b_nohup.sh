@@ -26,10 +26,11 @@ export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
 OFF_POLICY_FLAG=""
 [ "${USE_OFF_POLICY:-1}" = "1" ] && OFF_POLICY_FLAG="--use-off-policy-tokens"
 
-# draft vocab: empty DRAFT_VOCAB_SIZE = full verifier vocab (OMIT the flag). Set
-# DRAFT_VOCAB_SIZE=32000 (needs token_freq.pt in DATA_DIR) for a reduced draft vocab.
+# draft vocab: pass --draft-vocab-size ONLY when reducing below full (== full makes the
+# trainer raise, so full is requested by OMITTING). DRAFT_VOCAB_SIZE=151936 → full;
+# =32000 → reduced (needs token_freq.pt in DATA_DIR).
 VOCAB_FLAG=""
-[ -n "${DRAFT_VOCAB_SIZE:-}" ] && VOCAB_FLAG="--draft-vocab-size $DRAFT_VOCAB_SIZE"
+[ "${DRAFT_VOCAB_SIZE:-151936}" -lt "${VERIFIER_VOCAB:-151936}" ] && VOCAB_FLAG="--draft-vocab-size $DRAFT_VOCAB_SIZE"
 
 LOG_DIR="${LOG_DIR:-$OUTPUT_DIR/logs}"
 mkdir -p "$LOG_DIR"
