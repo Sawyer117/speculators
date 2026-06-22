@@ -121,12 +121,32 @@ def main():
     ap.add_argument("--last", type=int, default=2000,
                     help="window size (steps) for 'late' per-position stats")
     ap.add_argument("--ema", type=float, default=0.02, help="EMA alpha for smoothing")
+    ap.add_argument("--epochs", type=int, default=1,
+                    help="analyze only the first N epochs present in the log "
+                         "(default 1; runs here are single-epoch). 0 or "
+                         "--all-epochs = analyze everything.")
+    ap.add_argument("--all-epochs", action="store_true",
+                    help="analyze all epochs (overrides --epochs)")
     args = ap.parse_args()
 
     path = _resolve_log(args.log)
     records, pos_keys = parse_log(path)
     if not records:
         sys.exit(f"Parsed 0 step records from {path} — is it a DFlash train log?")
+
+    # restrict to the first N epochs PRESENT in the log (robust to tailing a
+    # mid-run log where epoch 0 has scrolled off: takes the lowest N present).
+    present_epochs = sorted({r["epoch"] for r in records if "epoch" in r})
+    analyzed_epochs = present_epochs
+    if not args.all_epochs and args.epochs > 0 and present_epochs:
+        analyzed_epochs = present_epochs[: args.epochs]
+        keep = set(analyzed_epochs)
+        filtered = [r for r in records if r.get("epoch") in keep]
+        if filtered:
+            records = filtered
+        else:
+            print("[warn] epoch filter matched 0 records; analyzing all instead")
+            analyzed_epochs = present_epochs
 
     outdir = args.out or (path + ".analysis")
     os.makedirs(outdir, exist_ok=True)
@@ -167,8 +187,8 @@ def main():
     print(f"DFlash log analysis  ::  {path}")
     print("=" * 64)
     print(f"steps parsed     : {len(records)}  (global_step {steps[0]} → {steps[-1]})")
-    if "epoch" in records[-1]:
-        print(f"epoch (last)     : {records[-1]['epoch']}")
+    _ep_note = "" if args.all_epochs else f"  (present: {present_epochs}; --all-epochs for all)"
+    print(f"epochs analyzed  : {analyzed_epochs}{_ep_note}")
     print(f"block positions  : {len(pos_keys)}  ({pos_keys[0]}..{pos_keys[-1]})"
           if pos_keys else "block positions  : none found")
     if med_rate:
