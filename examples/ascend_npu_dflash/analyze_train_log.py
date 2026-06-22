@@ -233,7 +233,8 @@ def main():
             peak_step = max(lrs, key=lambda x: x[1])[0]
             if 0 < peak_step < lrs[-1][0]:
                 total_steps = peak_step * 100
-                src = "lr-warmup×100 (assumes default warmup=total//100)"
+                src = ("lr-warmup×100 ROUGH ±~10% — assumes default warmup=total//100 "
+                       "and multipack count varies by shuffle; pass --total-steps for exact")
     if med_rate and total_steps:
         done = steps[-1] - steps[0]            # steps elapsed within the window
         remaining = total_steps - done
