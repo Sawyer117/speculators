@@ -28,18 +28,18 @@ STAMP="$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "$$")"
 LOG_FILE="$LOG_DIR/serve_4b_${STAMP}.log"
 PID_FILE="$LOG_DIR/serve_4b.pid"
 
-echo ">>> nohup serve Qwen3-4B on NPU $SERVE_CARDS (TP=$TP port=$PORT max-model-len=$MAX_MODEL_LEN gpu-mem=$GPU_MEM_UTIL eager=${ENFORCE_EAGER:-0})"
+echo ">>> nohup serve Qwen3-4B on NPU $SERVE_CARDS (TP=$TP DP=$VLLM_DP port=$PORT max-model-len=$MAX_MODEL_LEN gpu-mem=$GPU_MEM_UTIL eager=${ENFORCE_EAGER:-0})"
 echo ">>> HS_DIR=$HS_DIR"
 echo ">>> log -> $LOG_FILE"
 
 # Record the effective run config as the log's FIRST line (self-documenting).
-echo ">>> RUN serve Qwen3-4B | card=$SERVE_CARDS TP=$TP port=$PORT max-model-len=$MAX_MODEL_LEN gpu-mem=$GPU_MEM_UTIL eager=${ENFORCE_EAGER:-0} | HS_DIR=$HS_DIR" > "$LOG_FILE"
+echo ">>> RUN serve Qwen3-4B | card=$SERVE_CARDS TP=$TP DP=$VLLM_DP port=$PORT max-model-len=$MAX_MODEL_LEN gpu-mem=$GPU_MEM_UTIL eager=${ENFORCE_EAGER:-0} | HS_DIR=$HS_DIR" > "$LOG_FILE"
 
 nohup env ASCEND_RT_VISIBLE_DEVICES="$SERVE_CARDS" python "$REPO_ROOT/scripts/launch_vllm.py" \
   "$TARGET_MODEL" \
   --target-layer-ids 1 9 17 25 33 \
   --hidden-states-path "$HS_DIR" \
-  -- --tensor-parallel-size "$TP" --port "$PORT" \
+  -- --tensor-parallel-size "$TP" --data-parallel-size "$VLLM_DP" --port "$PORT" \
      --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTIL" $EAGER_FLAG \
   >> "$LOG_FILE" 2>&1 &
 

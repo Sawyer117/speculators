@@ -29,6 +29,10 @@ export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 export SERVE_CARDS="${SERVE_CARDS:-0}"           # 4B fits TP=1 on one card
 export TRAIN_CARDS="${TRAIN_CARDS:-1,2,3,4,5,6,7}"   # 7-way FSDP
 export TP="${TP:-1}"
+# vLLM data-parallel replicas for serving (throughput lever for serve-bound runs).
+# DP=2 + SERVE_CARDS=0,1 runs two full Qwen3-4B replicas (one per card) → ~2x
+# hidden-state gen; then give the trainer the rest (TRAIN_CARDS=2,3,4,5,6,7, NPROC=6).
+export VLLM_DP="${VLLM_DP:-1}"
 export NPROC="${NPROC:-7}"
 export MASTER_PORT="${MASTER_PORT:-29534}"
 

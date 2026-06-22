@@ -20,10 +20,10 @@ export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREAD
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=1 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
 
-echo ">>> serve Qwen3-4B on NPU $SERVE_CARDS (TP=$TP port=$PORT max-model-len=$MAX_MODEL_LEN gpu-mem=$GPU_MEM_UTIL eager=${ENFORCE_EAGER:-0}); HS_DIR=$HS_DIR"
+echo ">>> serve Qwen3-4B on NPU $SERVE_CARDS (TP=$TP DP=$VLLM_DP port=$PORT max-model-len=$MAX_MODEL_LEN gpu-mem=$GPU_MEM_UTIL eager=${ENFORCE_EAGER:-0}); HS_DIR=$HS_DIR"
 ASCEND_RT_VISIBLE_DEVICES="$SERVE_CARDS" python "$REPO_ROOT/scripts/launch_vllm.py" \
   "$TARGET_MODEL" \
   --target-layer-ids 1 9 17 25 33 \
   --hidden-states-path "$HS_DIR" \
-  -- --tensor-parallel-size "$TP" --port "$PORT" \
+  -- --tensor-parallel-size "$TP" --data-parallel-size "$VLLM_DP" --port "$PORT" \
      --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTIL" $EAGER_FLAG
