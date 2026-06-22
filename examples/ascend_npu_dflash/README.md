@@ -67,7 +67,7 @@ python scripts/prepare_data.py --model "$TARGET_MODEL" \
 # 1) serve (background; survives SSH disconnect)
 bash examples/ascend_npu_dflash/serve_qwen3_4b_nohup.sh
 tail -f "$OUTPUT_DIR"/logs/serve_4b_*.log           # wait for "Application startup complete"
-curl -s http://localhost:8001/v1/models | head      # model listed = ready
+curl -s --noproxy '*' http://localhost:8001/v1/models | head      # model listed = ready
 
 # 2) train (background)
 bash examples/ascend_npu_dflash/train_qwen3_4b_nohup.sh

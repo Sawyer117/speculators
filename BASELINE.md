@@ -41,7 +41,7 @@ python scripts/prepare_data.py --model "$TARGET_MODEL" \
 
 # 2) serve (background; survives SSH disconnect). Wait until ready:
 bash examples/ascend_npu_dflash/serve_qwen3_4b_nohup.sh
-curl -s http://localhost:8001/v1/models | head        # model listed = ready
+curl -s --noproxy '*' http://localhost:8001/v1/models | head        # model listed = ready
 
 # 3) train (background). Startup log must show: epochs=1 off_policy=0
 bash examples/ascend_npu_dflash/train_qwen3_4b_nohup.sh

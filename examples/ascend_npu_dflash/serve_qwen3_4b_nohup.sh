@@ -43,6 +43,6 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$SERVE_CARDS" python "$REPO_ROOT/scripts/la
 SERVE_PID=$!
 echo "$SERVE_PID" > "$PID_FILE"
 echo ">>> started, pid=$SERVE_PID (saved to $PID_FILE)"
-echo ">>> wait for ready:  curl -s http://localhost:$PORT/v1/models | head"
+echo ">>> wait for ready:  curl -s --noproxy '*' http://localhost:$PORT/v1/models | head"
 echo ">>> follow:  tail -f $LOG_FILE"
 echo ">>> stop:    kill \$(cat $PID_FILE)   # or: pkill -f launch_vllm.py"

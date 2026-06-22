@@ -31,6 +31,15 @@ import sys
 # numeric token: ints, floats, scientific
 _KV = re.compile(r"([A-Za-z][\w/]*)=([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
 _TS = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\]")
+# tqdm bar denominator, e.g. "9000/76319 [" -> per-epoch total steps
+_TQDM = re.compile(r"\b(\d+)/(\d+)\s*\[")
+
+
+def _hms(seconds: float) -> str:
+    s = int(seconds)
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m{sec:02d}s"
 
 
 def _resolve_log(args_log) -> str:
@@ -61,9 +70,15 @@ def parse_log(path: str):
     day = 0
     prev_secs = None
     cur_t = None
+    tqdm_total = None
 
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
+            qm = _TQDM.search(line)
+            if qm:
+                tot = int(qm.group(2))
+                if tot > 0 and (tqdm_total is None or tot > tqdm_total):
+                    tqdm_total = tot
             m = _TS.search(line)
             if m:
                 h, mi, s = (int(x) for x in m.groups())
@@ -96,7 +111,7 @@ def parse_log(path: str):
                         cur[f"pos_{n}"] = float(val)
 
     pos_keys = [f"pos_{n}" for n in sorted(pos_nums)]
-    return records, pos_keys
+    return records, pos_keys, tqdm_total
 
 
 def _ema(xs, alpha=0.05):
@@ -135,10 +150,13 @@ def main():
                          "--all-epochs = analyze everything.")
     ap.add_argument("--all-epochs", action="store_true",
                     help="analyze all epochs (overrides --epochs)")
+    ap.add_argument("--total-steps", type=int, default=None,
+                    help="steps per epoch, for ETA (auto-detected from the tqdm bar "
+                         "if present; override here e.g. from steps_per_epoch.py)")
     args = ap.parse_args()
 
     path = _resolve_log(args.log)
-    records, pos_keys = parse_log(path)
+    records, pos_keys, tqdm_total = parse_log(path)
     if not records:
         sys.exit(f"Parsed 0 step records from {path} — is it a DFlash train log?")
 
@@ -202,6 +220,20 @@ def main():
     if med_rate:
         print(f"throughput       : ~{med_rate:.2f} it/s (median)  | "
               f"~{med_rate*3600:.0f} steps/h")
+    # ETA for the (single) epoch being analyzed
+    total_steps = args.total_steps or tqdm_total
+    if med_rate and total_steps:
+        done = steps[-1] - steps[0]            # steps elapsed within the window
+        remaining = total_steps - done
+        src = "--total-steps" if args.total_steps else "tqdm bar"
+        if remaining > 0:
+            print(f"ETA (this epoch) : ~{_hms(remaining / med_rate)} left  "
+                  f"(~{remaining}/{total_steps} steps remaining @ {med_rate:.2f} it/s; "
+                  f"total≈{_hms(total_steps / med_rate)}, src={src})")
+        else:
+            print(f"ETA (this epoch) : ~done ({done}/{total_steps} steps, src={src})")
+    elif med_rate:
+        print("ETA (this epoch) : unknown (no tqdm total in log; pass --total-steps N)")
     print(f"loss             : last {_fmt(loss[-1])} | min {_fmt(min(lossv))} | "
           f"mean(last {len(late)}) {_fmt(sum(x for x in (r.get('loss') for r in late) if x is not None)/max(1,sum(1 for r in late if r.get('loss') is not None)))}")
     print(f"full_acc         : last {_fmt(full[-1])} | max {_fmt(max(fullv))}")
