@@ -31,3 +31,9 @@ export TRAIN_CARDS="${TRAIN_CARDS:-1,2,3,4,5,6,7}"   # 7-way FSDP
 export TP="${TP:-1}"
 export NPROC="${NPROC:-7}"
 export MASTER_PORT="${MASTER_PORT:-29534}"
+
+# Training knobs (env-overridable). Defaults match the existing regen-half50 run.
+export EPOCHS="${EPOCHS:-6}"
+# USE_OFF_POLICY=1 passes --use-off-policy-tokens (REQUIRED for regenerated data).
+# Set 0 for original/non-regen datasets (e.g. open_perfectblend).
+export USE_OFF_POLICY="${USE_OFF_POLICY:-1}"

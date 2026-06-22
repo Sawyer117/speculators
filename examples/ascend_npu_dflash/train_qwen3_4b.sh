@@ -19,7 +19,12 @@ export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUN
 export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
 # TORCHDYNAMO_DISABLE not needed — #600 makes DFlash skip torch.compile on NPU.
 
-echo ">>> train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC); data=$DATA_DIR save=$SAVE_DIR"
+# off-policy tokens: REQUIRED for regenerated data; OMIT for original/non-regen
+# datasets (run with USE_OFF_POLICY=0). See config_qwen3_4b.sh.
+OFF_POLICY_FLAG=""
+[ "${USE_OFF_POLICY:-1}" = "1" ] && OFF_POLICY_FLAG="--use-off-policy-tokens"
+
+echo ">>> train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$EPOCHS off_policy=${USE_OFF_POLICY:-1}); data=$DATA_DIR save=$SAVE_DIR"
 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --nproc_per_node "$NPROC" --nnodes 1 --node_rank 0 \
   --master_addr 127.0.0.1 --master_port "$MASTER_PORT" \
@@ -38,10 +43,10 @@ ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --target-layer-ids 1 9 17 25 33 \
   --mask-token-id 151669 \
   --draft-hidden-act silu \
-  --epochs 6 \
+  --epochs "$EPOCHS" \
   --lr 6e-4 \
   --total-seq-len "$SEQ_LEN" \
-  --use-off-policy-tokens \
+  $OFF_POLICY_FLAG \
   --logger tensorboard \
   --on-missing generate \
   --on-generate delete \
