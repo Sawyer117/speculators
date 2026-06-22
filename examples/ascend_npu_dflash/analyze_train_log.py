@@ -182,7 +182,8 @@ def main():
     full = [r.get("full_acc") for r in records]
     lr = [r.get("lr") for r in records]
 
-    # ---- throughput (it/s) from step/time deltas, robust median ----
+    # ---- throughput (it/s) ----
+    # median of per-step rates = the "typical" step speed (ignores stalls).
     rates = []
     for a, b in zip(records, records[1:]):
         if a.get("t") is not None and b.get("t") is not None:
@@ -191,6 +192,13 @@ def main():
                 rates.append(ds / dt)
     rates.sort()
     med_rate = rates[len(rates) // 2] if rates else None
+    # AVERAGE rate = total steps / total wall-clock elapsed — INCLUDES stalls/idle, and
+    # the cumulative elapsed is immune to the 1s timestamp granularity, so it's the
+    # accurate basis for ETA. (median is optimistic when the run stalls, e.g. serve-bound.)
+    t_vals = [r["t"] for r in records if r.get("t") is not None]
+    elapsed = (t_vals[-1] - t_vals[0]) if len(t_vals) >= 2 else None
+    avg_rate = ((steps[-1] - steps[0]) / elapsed) if (elapsed and elapsed > 0) else None
+    eta_rate = avg_rate or med_rate   # prefer average (stall-inclusive) for ETA
 
     # ---- late-window per-position means ----
     late = records[-args.last:]
@@ -217,13 +225,16 @@ def main():
     print(f"epochs analyzed  : {analyzed_epochs}{_ep_note}")
     print(f"block positions  : {len(pos_keys)}  ({pos_keys[0]}..{pos_keys[-1]})"
           if pos_keys else "block positions  : none found")
-    if med_rate:
-        print(f"throughput       : ~{med_rate:.2f} it/s (median)  | "
-              f"~{med_rate*3600:.0f} steps/h")
+    if avg_rate:
+        print(f"throughput       : ~{avg_rate:.2f} it/s AVG over {_hms(elapsed)} "
+              f"(~{med_rate:.2f} median) | ~{avg_rate*3600:.0f} steps/h | "
+              f"AVG includes stalls → use for ETA")
+    elif med_rate:
+        print(f"throughput       : ~{med_rate:.2f} it/s (median) | ~{med_rate*3600:.0f} steps/h")
     # total steps for the epoch: explicit flag > tqdm bar total > inferred from LR warmup
     total_steps = args.total_steps or tqdm_total
     src = "--total-steps" if args.total_steps else ("tqdm-bar" if tqdm_total else None)
-    if med_rate and not total_steps:
+    if eta_rate and not total_steps:
         # The trainer doesn't log steps/epoch, but the LR schedule encodes it: the default
         # warmup is total_steps // 100 and the (linear/cosine) LR peaks at the end of warmup.
         # So total_steps ≈ 100 × (global_step at peak LR) — valid only once training is PAST
@@ -235,16 +246,16 @@ def main():
                 total_steps = peak_step * 100
                 src = ("lr-warmup×100 ROUGH ±~10% — assumes default warmup=total//100 "
                        "and multipack count varies by shuffle; pass --total-steps for exact")
-    if med_rate and total_steps:
+    if eta_rate and total_steps:
         done = steps[-1] - steps[0]            # steps elapsed within the window
         remaining = total_steps - done
         if remaining > 0:
-            print(f"ETA (this epoch) : ~{_hms(remaining / med_rate)} left  "
-                  f"(~{remaining}/{total_steps} steps remaining @ {med_rate:.2f} it/s; "
-                  f"total≈{_hms(total_steps / med_rate)}, src={src})")
+            print(f"ETA (this epoch) : ~{_hms(remaining / eta_rate)} left  "
+                  f"(~{remaining}/{total_steps} steps remaining @ {eta_rate:.2f} it/s avg; "
+                  f"total≈{_hms(total_steps / eta_rate)}, src={src})")
         else:
             print(f"ETA (this epoch) : ~done ({done}/{total_steps} steps, src={src})")
-    elif med_rate:
+    elif eta_rate:
         print("ETA (this epoch) : unknown (LR hasn't peaked yet / no tqdm total; "
               "pass --total-steps N once past warmup)")
     print(f"loss             : last {_fmt(loss[-1])} | min {_fmt(min(lossv))} | "
