@@ -33,7 +33,7 @@ STAMP="$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "$$")"
 LOG_FILE="$LOG_DIR/train_4b_${STAMP}.log"
 PID_FILE="$LOG_DIR/train_4b.pid"
 
-echo ">>> nohup train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$EPOCHS off_policy=${USE_OFF_POLICY:-1})"
+echo ">>> nohup train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$EPOCHS loss=$LOSS_FN off_policy=${USE_OFF_POLICY:-1})"
 echo ">>> data=$DATA_DIR save=$SAVE_DIR"
 echo ">>> log -> $LOG_FILE"
 
@@ -57,6 +57,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --draft-hidden-act silu \
   --epochs "$EPOCHS" \
   --lr 6e-4 \
+  --loss-fn "$LOSS_FN" \
   --total-seq-len "$SEQ_LEN" \
   $OFF_POLICY_FLAG \
   --logger tensorboard \

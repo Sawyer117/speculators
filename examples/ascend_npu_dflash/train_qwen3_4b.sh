@@ -24,7 +24,7 @@ export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
 OFF_POLICY_FLAG=""
 [ "${USE_OFF_POLICY:-1}" = "1" ] && OFF_POLICY_FLAG="--use-off-policy-tokens"
 
-echo ">>> train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$EPOCHS off_policy=${USE_OFF_POLICY:-1}); data=$DATA_DIR save=$SAVE_DIR"
+echo ">>> train Qwen3-4B DFlash on NPU $TRAIN_CARDS (nproc=$NPROC epochs=$EPOCHS loss=$LOSS_FN off_policy=${USE_OFF_POLICY:-1}); data=$DATA_DIR save=$SAVE_DIR"
 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --nproc_per_node "$NPROC" --nnodes 1 --node_rank 0 \
   --master_addr 127.0.0.1 --master_port "$MASTER_PORT" \
@@ -45,6 +45,7 @@ ASCEND_RT_VISIBLE_DEVICES="$TRAIN_CARDS" torchrun \
   --draft-hidden-act silu \
   --epochs "$EPOCHS" \
   --lr 6e-4 \
+  --loss-fn "$LOSS_FN" \
   --total-seq-len "$SEQ_LEN" \
   $OFF_POLICY_FLAG \
   --logger tensorboard \
