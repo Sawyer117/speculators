@@ -46,7 +46,12 @@ _RUN = re.compile(r">>>\s*RUN\s+train")
 _HDR_NPROC = re.compile(r"\bnproc=(\d+)")
 _HDR_EPOCHS = re.compile(r"\bepochs=(\d+)")
 _HDR_LOSS = re.compile(r"\bloss=([A-Za-z_]+)")
+# fallback when the RUN header is missing (older logs): the distributed-init line
+# "Started distributed with local_rank=.., world_size=N, rank=.." gives nproc on
+# a single node. (Assumes single node; multi-node world_size != per-node nproc.)
+_WSIZE = re.compile(r"\bworld_size=(\d+)")
 _TIMING_KEYS = ("data_wait", "h2d", "forward", "backward", "optim")
+_SPIKE_FACTOR = 3.0  # a step is a "spike" (recompile/stall) if step_s > F * median
 
 
 def _hms(seconds):
@@ -78,10 +83,14 @@ def parse_log(path):
     prev_secs = None
     day = 0
     cur_t = None
-    nproc = epochs = loss_fn = None
+    nproc = epochs = loss_fn = world_size = None
 
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
+            if world_size is None:
+                wm = _WSIZE.search(line)
+                if wm:
+                    world_size = int(wm.group(1))
             if nproc is None and _RUN.search(line):
                 mn, me, ml = (
                     _HDR_NPROC.search(line),
@@ -131,7 +140,8 @@ def parse_log(path):
     recs = [by_step[k] for k in sorted(by_step)]
     return {
         "path": path,
-        "nproc": nproc,
+        "nproc": nproc if nproc is not None else world_size,  # header, else init-line fallback
+        "nproc_from_header": nproc is not None,
         "epochs": epochs,
         "loss_fn": loss_fn,
         "records": recs,
@@ -150,9 +160,15 @@ def analyze(parsed, seq_len, total_cards):
         "n_records": len(recs),
         "step_first": recs[0]["global_step"] if recs else None,
         "step_last": recs[-1]["global_step"] if recs else None,
+        "nproc_hdr": parsed["nproc_from_header"],
         "elapsed": None,
-        "it_s": None,
-        "tok_s": None,
+        "it_s": None,          # avg rate over the window (stall/warmup-inclusive)
+        "tok_s": None,         # avg-rate tokens/s
+        "steady_step_s": None,  # median step_s = typical spike-free step
+        "steady_it_s": None,
+        "steady_tok_s": None,
+        "n_spikes": 0,
+        "spike_time": 0.0,
         "breakdown": None,
         "datawait_pct": None,
         "bottleneck": None,
@@ -172,6 +188,23 @@ def analyze(parsed, seq_len, total_cards):
             out["it_s"] = dsteps / elapsed
             if nproc:
                 out["tok_s"] = out["it_s"] * nproc * seq_len
+
+    # steady rate: median of the instrumented step_s, robust to recompile spikes.
+    # This is the right basis for FULL-epoch ETA (front-loaded recompiles amortize
+    # to ~nothing over 34k+ steps); the avg rate above is dragged down on short runs.
+    step_s = [r["step_s"] for r in recs if "step_s" in r]
+    if step_s:
+        ss = sorted(step_s)
+        med = ss[len(ss) // 2]
+        out["steady_step_s"] = med
+        if med > 0:
+            out["steady_it_s"] = 1.0 / med
+            if nproc:
+                out["steady_tok_s"] = out["steady_it_s"] * nproc * seq_len
+            for v in step_s:
+                if v > _SPIKE_FACTOR * med:
+                    out["n_spikes"] += 1
+                    out["spike_time"] += v - med
 
     # per-component breakdown (profiling logs only); drop the cold first step
     timing = [r for r in recs if any(k in r for k in _TIMING_KEYS)]
@@ -236,61 +269,106 @@ def main():
     if not runs:
         sys.exit("No logs had enough steps/timestamps to analyze.")
 
-    def hpe(a):  # hours per epoch, if packed-per-epoch known
-        if not (args.packed_per_epoch and a["nproc"] and a["it_s"]):
+    def steady_it(a):
+        return a["steady_it_s"] or a["it_s"]
+
+    def steady_tok(a):
+        return a["steady_tok_s"] or a["tok_s"]
+
+    def hpe(a):  # hours per FULL epoch from the STEADY rate (warmup amortizes over 34k+ steps)
+        rate = steady_it(a)
+        if not (args.packed_per_epoch and a["nproc"] and rate):
             return None
-        spe = args.packed_per_epoch / a["nproc"]
-        return (spe / a["it_s"]) / 3600.0
+        return (args.packed_per_epoch / a["nproc"] / rate) / 3600.0
+
+    def marker(a):  # flag nproc recovered from world_size (no RUN header)
+        return "" if (a["nproc_hdr"] or a["nproc"] is None) else "  [nproc<-world_size]"
 
     # ---- per-log detail ----
     runs.sort(key=lambda a: (-(a["nproc"] or 0), a["path"]))
-    print("=" * 100)
-    print("PER-LOG DETAIL  (it/s & tok/s are stall-inclusive averages over the log)")
-    print("=" * 100)
-    hdr = f"{'config':<8} {'steps':>14} {'elapsed':>8} {'it/s':>6} {'tok/s':>9} {'bott':>9} {'dw%':>5}"
+    print("=" * 108)
+    print("PER-LOG DETAIL")
+    print("  avg  = whole-window it/s (INCLUDES warmup + recompile spikes; drops on short runs)")
+    print("  stdy = median-step it/s (spike-free typical speed = the full-epoch basis)")
+    print("  tok/s & h/ep use the STEADY rate;  spk = #steps with step_s > 3x median (recompile/stall)")
+    print("=" * 108)
+    hdr = (f"{'config':<8} {'steps':>13} {'elapsed':>7} {'avg':>5} {'stdy':>5} "
+           f"{'tok/s':>8} {'bott':>9} {'dw%':>4} {'spk':>4}")
     if args.packed_per_epoch:
-        hdr += f" {'h/epoch':>8}"
+        hdr += f" {'h/ep':>6}"
     hdr += "  log"
     print(hdr)
-    print("-" * 100)
+    print("-" * 108)
     for a in runs:
         steprange = f"{a['step_first']}-{a['step_last']}({a['n_records']})"
-        tok = f"{a['tok_s']:,.0f}" if a["tok_s"] else "n/a"
+        stdy = f"{a['steady_it_s']:.2f}" if a["steady_it_s"] else "-"
+        ft = steady_tok(a)
+        tok = f"{ft:,.0f}" if ft else "n/a"
         dw = f"{a['datawait_pct']:.0f}" if a["datawait_pct"] is not None else "-"
         bott = a["bottleneck"] or "-"
+        spk = str(a["n_spikes"]) if a["steady_step_s"] else "-"
         row = (
-            f"{_label(a):<8} {steprange:>14} {_hms(a['elapsed']):>8} "
-            f"{a['it_s']:>6.2f} {tok:>9} {bott:>9} {dw:>5}"
+            f"{_label(a):<8} {steprange:>13} {_hms(a['elapsed']):>7} "
+            f"{a['it_s']:>5.2f} {stdy:>5} {tok:>8} {bott:>9} {dw:>4} {spk:>4}"
         )
         if args.packed_per_epoch:
             h = hpe(a)
             hstr = f"{h:.1f}h" if h else "-"
-            row += f" {hstr:>8}"
-        row += f"  {a['path']}"
+            row += f" {hstr:>6}"
+        row += f"  {a['path']}{marker(a)}"
         print(row)
+
+    # ---- component breakdown (profiling logs) ----
+    bd_runs = [a for a in runs if a["breakdown"]]
+    if bd_runs:
+        print("\n" + "=" * 108)
+        print("COMPONENT BREAKDOWN  (mean seconds/step; MEAN includes recompile spikes, "
+              "MEDIAN step does not)")
+        print("  if forward(mean) >> backward but bott=backward, the recompile spikes live in "
+              "forward; mean_step vs med_step shows their cost")
+        print("=" * 108)
+        bh = (f"{'config':<8} {'data_wait':>9} {'h2d':>7} {'forward':>8} {'backward':>9} "
+              f"{'optim':>7} {'mean_step':>10} {'med_step':>9} {'spikes(lost)':>16}")
+        print(bh)
+        print("-" * 108)
+        for a in bd_runs:
+            bd = a["breakdown"]
+            mean_step = sum(bd.values())
+            med = a["steady_step_s"] or 0.0
+            spikes = f"{a['n_spikes']} ({_hms(a['spike_time'])})"
+            print(
+                f"{_label(a):<8} {bd['data_wait']:>9.3f} {bd['h2d']:>7.3f} "
+                f"{bd['forward']:>8.3f} {bd['backward']:>9.3f} {bd['optim']:>7.3f} "
+                f"{mean_step:>10.3f} {med:>9.3f} {spikes:>16}"
+            )
 
     # ---- per-config summary (representative = run with the most steps) ----
     groups = {}
     for a in runs:
         groups.setdefault(_label(a), []).append(a)
-    reps = {}
-    for label, gs in groups.items():
-        reps[label] = max(gs, key=lambda a: a["n_records"])
+    # representative: prefer a run that HAS steady (timing) data, then most steps —
+    # so a long pre-profiling log can't drag a config's steady number to its avg.
+    reps = {
+        label: max(gs, key=lambda a: (1 if a["steady_it_s"] else 0, a["n_records"]))
+        for label, gs in groups.items()
+    }
 
-    print("\n" + "=" * 100)
-    print("CONFIG COMPARISON  (representative run = most steps; tok/s ratio = per-epoch speedup)")
-    print("=" * 100)
-    ordered = sorted(reps.values(), key=lambda a: (a["tok_s"] or 0))
+    print("\n" + "=" * 108)
+    print("CONFIG COMPARISON  (representative = run with timing & most steps; STEADY tok/s "
+          "ratio = per-epoch speedup, same dataset)")
+    print("=" * 108)
+    ordered = sorted(reps.values(), key=lambda a: (steady_tok(a) or 0))
     base = ordered[0]
     for a in ordered:
-        spd = (a["tok_s"] / base["tok_s"]) if (a["tok_s"] and base["tok_s"]) else None
-        tok = f"{a['tok_s']:,.0f}" if a["tok_s"] else "n/a"
+        ft, fi = steady_tok(a), steady_it(a)
+        spd = (ft / steady_tok(base)) if (ft and steady_tok(base)) else None
+        tok = f"{ft:,.0f}" if ft else "n/a"
         line = (
             f"{_label(a):<8} | {len(groups[_label(a)])} log(s) | "
-            f"{a['it_s']:.2f} it/s | {tok} tok/s"
+            f"{fi:.2f} it/s | {tok} tok/s (steady)"
         )
         if a["bottleneck"]:
-            line += f" | bottleneck={a['bottleneck']}"
+            line += f" | bott={a['bottleneck']}"
         if a["datawait_pct"] is not None:
             line += f" | data_wait={a['datawait_pct']:.0f}%"
         if spd is not None:
@@ -298,38 +376,45 @@ def main():
         h = hpe(a)
         if h:
             line += f" | ~{h:.1f}h/epoch"
-            if a["epochs"]:
-                line += f" (~{h * a['epochs']:.1f}h total @ {a['epochs']}ep)"
         print(line)
 
-    if len(ordered) >= 2 and ordered[-1]["tok_s"] and base["tok_s"]:
+    if len(ordered) >= 2 and steady_tok(ordered[-1]) and steady_tok(base):
         top = ordered[-1]
-        ratio = top["tok_s"] / base["tok_s"]
-        print("-" * 100)
-        print(f">>> {_label(top)} is ~{ratio:.2f}x the throughput of {_label(base)} "
-              f"=> finishes one epoch in ~1/{ratio:.2f} the wall-clock (same dataset).")
-        if base["bottleneck"] is None:
-            print(f"    ({_label(base)} has no timing breakdown — it's a pre-profiling "
-                  f"log; the it/s gap still quantifies the win.)")
+        ratio = steady_tok(top) / steady_tok(base)
+        print("-" * 108)
+        print(f">>> {_label(top)} ~{ratio:.2f}x the steady throughput of {_label(base)} "
+              f"=> ~1/{ratio:.2f} the wall-clock per epoch (same dataset).")
+        print("    NOTE: 'steady' excludes the front-loaded NPU recompile spikes (see spk/spikes "
+              "columns); those are a separate, shared cost worth fixing on BOTH configs.")
 
     # ---- CSV ----
     if args.csv:
-        cols = ["config", "nproc", "serve", "loss_fn", "epochs", "n_records",
-                "step_first", "step_last", "elapsed_s", "it_s", "tok_s",
-                "bottleneck", "datawait_pct", "h_per_epoch", "loss_first",
-                "loss_last", "path"]
+        cols = ["config", "nproc", "nproc_from_header", "serve", "loss_fn", "epochs",
+                "n_records", "step_first", "step_last", "elapsed_s",
+                "avg_it_s", "steady_it_s", "steady_tok_s", "n_spikes", "spike_time_s",
+                "bottleneck", "datawait_pct",
+                "fwd_s", "bwd_s", "h2d_s", "datawait_s", "optim_s",
+                "h_per_epoch_steady", "loss_first", "loss_last", "path"]
         with open(args.csv, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(cols)
             for a in runs:
+                bd = a["breakdown"] or {}
                 w.writerow([
-                    _label(a), a["nproc"], a["serve"], a["loss_fn"], a["epochs"],
-                    a["n_records"], a["step_first"], a["step_last"],
+                    _label(a), a["nproc"], a["nproc_hdr"], a["serve"], a["loss_fn"],
+                    a["epochs"], a["n_records"], a["step_first"], a["step_last"],
                     f"{a['elapsed']:.0f}" if a["elapsed"] else "",
                     f"{a['it_s']:.4f}" if a["it_s"] else "",
-                    f"{a['tok_s']:.0f}" if a["tok_s"] else "",
+                    f"{a['steady_it_s']:.4f}" if a["steady_it_s"] else "",
+                    f"{a['steady_tok_s']:.0f}" if a["steady_tok_s"] else "",
+                    a["n_spikes"], f"{a['spike_time']:.0f}",
                     a["bottleneck"] or "",
                     f"{a['datawait_pct']:.1f}" if a["datawait_pct"] is not None else "",
+                    f"{bd.get('forward'):.3f}" if bd.get("forward") is not None else "",
+                    f"{bd.get('backward'):.3f}" if bd.get("backward") is not None else "",
+                    f"{bd.get('h2d'):.3f}" if bd.get("h2d") is not None else "",
+                    f"{bd.get('data_wait'):.4f}" if bd.get("data_wait") is not None else "",
+                    f"{bd.get('optim'):.3f}" if bd.get("optim") is not None else "",
                     f"{hpe(a):.2f}" if hpe(a) else "",
                     a["loss_first"], a["loss_last"], a["path"],
                 ])
