@@ -32,7 +32,7 @@ Run from the repo root. **Order matters: serve must be healthy before train.**
 # 0) data + output locations (set in ONE shell; serve & train both read these)
 export DATA_DIR=/share/canada_group_folder/dataset/open_perfectblend_full.qwen3.seq3072
 export OUTPUT_DIR=./outputs/qwen3-4b-dflash-npu-openblend
-export EPOCHS=1 USE_OFF_POLICY=0          # original (non-regen) data -> off-policy OFF
+export EPOCHS=1          # NOTE: USE_OFF_POLICY is EAGLE3-only; DFlash ignores it (no effect)
 
 # 1) tokenize (CPU, one-time)
 source examples/ascend_npu_dflash/config_qwen3_4b.sh
@@ -44,7 +44,7 @@ python scripts/prepare_data.py --model "$TARGET_MODEL" \
 bash examples/ascend_npu_dflash/serve_qwen3_4b_nohup.sh
 curl -s --noproxy '*' http://localhost:8001/v1/models | head        # model listed = ready
 
-# 3) train (background). Startup log must show: epochs=1 off_policy=0
+# 3) train (background). Startup log shows epochs=1 (off_policy is a no-op for DFlash)
 bash examples/ascend_npu_dflash/train_qwen3_4b_nohup.sh
 
 # 4) analyze the log (loss / per-position acceptance / throughput + charts)

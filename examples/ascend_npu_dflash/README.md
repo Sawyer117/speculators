@@ -90,7 +90,7 @@ python examples/ascend_npu_dflash/analyze_train_log.py "$OUTPUT_DIR"/logs/train_
 | `DATA_DIR` | shared Arrow | tokenized dataset (train input) |
 | `OUTPUT_DIR` | `./outputs/qwen3-4b-dflash-npu` | base dir; `HS_DIR`/`SAVE_DIR`/`logs` derive from it |
 | `EPOCHS` | `6` | training epochs (set `1` for a single-epoch run) |
-| `USE_OFF_POLICY` | `1` | passes `--use-off-policy-tokens`; **REQUIRED for regenerated data, set `0` for original/non-regen datasets** |
+| `USE_OFF_POLICY` | `0` | passes `--use-off-policy-tokens` — **EAGLE3-only; DFlash IGNORES it (no effect on training)** |
 | `MAX_MODEL_LEN` | `SEQ_LEN+256` | vLLM served-context cap (keeps KV cache small → faster serve) |
 | `GPU_MEM_UTIL` | `0.90` | vLLM HBM fraction |
 | `SEQ_LEN` | `3072` | per-sample / per-rank batch token length |
@@ -100,7 +100,7 @@ python examples/ascend_npu_dflash/analyze_train_log.py "$OUTPUT_DIR"/logs/train_
 ```bash
 export DATA_DIR=/share/canada_group_folder/dataset/open_perfectblend_full.qwen3.seq3072
 export OUTPUT_DIR=./outputs/qwen3-4b-dflash-npu-openblend
-export EPOCHS=1 USE_OFF_POLICY=0          # original (non-regen) data → off-policy OFF
+export EPOCHS=1          # (USE_OFF_POLICY is a no-op for DFlash — EAGLE3-only)
 source examples/ascend_npu_dflash/config_qwen3_4b.sh
 python scripts/prepare_data.py --model "$TARGET_MODEL" \
   --data /share/canada_group_folder/dataset/open_perfectblend_full.jsonl \

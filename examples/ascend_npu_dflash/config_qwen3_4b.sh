@@ -38,9 +38,11 @@ export MASTER_PORT="${MASTER_PORT:-29534}"
 
 # Training knobs (env-overridable). Defaults match the existing regen-half50 run.
 export EPOCHS="${EPOCHS:-6}"
-# USE_OFF_POLICY=1 passes --use-off-policy-tokens (REQUIRED for regenerated data).
-# Set 0 for original/non-regen datasets (e.g. open_perfectblend).
-export USE_OFF_POLICY="${USE_OFF_POLICY:-1}"
+# NOTE: --use-off-policy-tokens is EAGLE3-ONLY. DFlash IGNORES it — DFlash's
+# get_trainer_kwargs passes only {loss_fn, gamma} to the model, so this knob has
+# NO effect on DFlash training (set anything). Kept only because train.py accepts
+# the flag. (It only matters for EAGLE3's TTT autoregressive chain.)
+export USE_OFF_POLICY="${USE_OFF_POLICY:-0}"
 # Draft vocab. Default = full (151,936). The trainer RAISES if you pass
 # --draft-vocab-size == full vocab (with a token_freq.pt present), so "full" is requested
 # by OMITTING the flag — the train scripts do that automatically when DRAFT_VOCAB_SIZE ==

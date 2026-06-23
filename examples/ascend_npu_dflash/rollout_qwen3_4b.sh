@@ -8,7 +8,7 @@
 #
 # PREREQ: a vLLM serve of the target is up on $PORT
 #   (start it with rollout_serve_qwen3_4b.sh). The generated jsonl feeds
-#   scripts/prepare_data.py, then train with USE_OFF_POLICY=1.
+#   scripts/prepare_data.py, then train (DFlash ignores USE_OFF_POLICY — EAGLE-only).
 #
 # Env knobs (all overridable):
 #   LIMIT (empty=full), CONCURRENCY, OUTFILE, DATASET_PATH, PORT, MAX_TOKENS, TEMPERATURE
@@ -50,4 +50,4 @@ python "$REPO_ROOT/scripts/response_regeneration/script.py" \
   --outfile "$OUTFILE"
 
 echo ">>> done -> $OUTFILE"
-echo ">>> next: prepare_data.py --data $OUTFILE --output <Arrow> --seq-length 3072 ; then train with USE_OFF_POLICY=1"
+echo ">>> next: prepare_data.py --data $OUTFILE --output <Arrow> --seq-length 3072 ; then train (DFlash ignores USE_OFF_POLICY, EAGLE-only)"

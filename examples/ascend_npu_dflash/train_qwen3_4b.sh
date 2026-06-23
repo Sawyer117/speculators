@@ -19,8 +19,8 @@ export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUN
 export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
 # TORCHDYNAMO_DISABLE not needed — #600 makes DFlash skip torch.compile on NPU.
 
-# off-policy tokens: REQUIRED for regenerated data; OMIT for original/non-regen
-# datasets (run with USE_OFF_POLICY=0). See config_qwen3_4b.sh.
+# off-policy tokens: EAGLE3-ONLY — DFlash IGNORES --use-off-policy-tokens (no effect
+# on training). Passed only because train.py accepts it. See config_qwen3_4b.sh.
 OFF_POLICY_FLAG=""
 [ "${USE_OFF_POLICY:-1}" = "1" ] && OFF_POLICY_FLAG="--use-off-policy-tokens"
 
