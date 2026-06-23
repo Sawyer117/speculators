@@ -4,15 +4,16 @@ Reproducible baseline for DFlash draft training of **Qwen3-4B** on Ascend NPU
 (vLLM serves the verifier + extracts hidden states online; a separate FSDP trainer
 trains the draft on disjoint cards).
 
-> **Pinned commit:** [`6b03432564e9e98d36aa3fe2b75e25da3d02bc01`](https://github.com/Sawyer117/speculators/commit/6b03432564e9e98d36aa3fe2b75e25da3d02bc01)
-> All links below point at this commit so the scripts can't drift. `main` may move on.
+> **Pinned tag:** [`npu-baseline-2026-06-23`](https://github.com/Sawyer117/speculators/tree/npu-baseline-2026-06-23)
+> All links below point at this tag (a stable ref — it won't drift even as `main` moves on).
+> To reproduce: clone, then `git checkout npu-baseline-2026-06-23`.
 
 ## References (pinned)
 
 - **Environment setup:**
-  https://github.com/Sawyer117/speculators/blob/6b03432564e9e98d36aa3fe2b75e25da3d02bc01/docs/deployment/ascend-npu-conda.md
+  https://github.com/Sawyer117/speculators/blob/npu-baseline-2026-06-23/docs/deployment/ascend-npu-conda.md
 - **Training scripts + end-to-end how-to-run** (see the Qwen3-4B "Quickstart"):
-  https://github.com/Sawyer117/speculators/tree/6b03432564e9e98d36aa3fe2b75e25da3d02bc01/examples/ascend_npu_dflash
+  https://github.com/Sawyer117/speculators/tree/npu-baseline-2026-06-23/examples/ascend_npu_dflash
 
 ## Dataset
 
