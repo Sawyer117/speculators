@@ -117,6 +117,24 @@ def parse_args():
         help="max_tokens for generation",
     )
     parser.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help="Disable Qwen3 thinking mode "
+        "(sends chat_template_kwargs={'enable_thinking': false}).",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature (default: server/model default).",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Sampling top_p (default: server/model default).",
+    )
+    parser.add_argument(
         "--outfile",
         default=None,
         help="Output JSONL path (auto-generated if not specified)",
@@ -208,6 +226,12 @@ async def worker(
             "messages": [{"role": "user", "content": item["prompt"]}],
             "max_tokens": args.max_tokens,
         }
+        if args.no_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if args.temperature is not None:
+            payload["temperature"] = args.temperature
+        if args.top_p is not None:
+            payload["top_p"] = args.top_p
 
         start_time = time.time()
         try:
