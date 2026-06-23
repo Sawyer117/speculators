@@ -29,7 +29,32 @@ DATASET_CONFIGS = {
         "default_split": "train",
         "subset": "main",
     },
+    # open-perfectblend (mlabonne/open-perfectblend): ShareGPT-style `conversations`
+    # list. The prompt is the first human/user turn, so it needs extraction rather
+    # than a flat string field (see prompt_from_conversations below).
+    "open_perfectblend": {
+        "id": "mlabonne/open-perfectblend",
+        "prompt_field": "conversations",
+        "default_split": "train",
+        "prompt_from_conversations": True,
+    },
 }
+
+
+def first_user_prompt(conversations):
+    """Return the first human/user turn's text from a ShareGPT-style list, or None.
+
+    Handles both {"from": "human", "value": ...} and {"role": "user", "content": ...}.
+    """
+    if not isinstance(conversations, list):
+        return None
+    for turn in conversations:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("from") or turn.get("role")
+        if role in ("human", "user"):
+            return turn.get("value") or turn.get("content")
+    return None
 
 
 def parse_args():
@@ -65,6 +90,18 @@ def parse_args():
             "Dataset subset/config name "
             "(auto-detected from dataset config if not specified)"
         ),
+    )
+    parser.add_argument(
+        "--dataset-path",
+        default=None,
+        help="Local jsonl/parquet of prompts to use INSTEAD of downloading the HF "
+        "dataset id (same schema; uses the chosen dataset's prompt_field). Lets you "
+        "regenerate from a dataset you already have on disk (no HF download).",
+    )
+    parser.add_argument(
+        "--prompt-field",
+        default=None,
+        help="Override the prompt field name (defaults to the dataset's config).",
     )
     parser.add_argument("--limit", type=int, default=None, help="Stop after N rows")
     parser.add_argument(
@@ -249,7 +286,7 @@ async def main():
     # Get dataset configuration
     dataset_config = DATASET_CONFIGS[args.dataset]
     dataset_id = dataset_config["id"]
-    prompt_field = dataset_config["prompt_field"]
+    prompt_field = args.prompt_field or dataset_config["prompt_field"]
 
     # Use dataset-specific defaults if not provided
     split = args.split if args.split is not None else dataset_config["default_split"]
@@ -269,7 +306,14 @@ async def main():
     print()
 
     seen_ids = load_seen(args.outfile) if args.resume else set()
-    dataset = load_dataset(dataset_id, name=subset, split=split, streaming=True)
+    if args.dataset_path:
+        fmt = "parquet" if args.dataset_path.endswith(".parquet") else "json"
+        print(f"Loading local {fmt}: {args.dataset_path}")
+        dataset = load_dataset(
+            fmt, data_files=args.dataset_path, split="train", streaming=True
+        )
+    else:
+        dataset = load_dataset(dataset_id, name=subset, split=split, streaming=True)
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
     semaphore = asyncio.Semaphore(args.concurrency)
@@ -321,7 +365,9 @@ async def main():
                     continue
 
                 prompt = row.get(prompt_field)
-                if not prompt:
+                if dataset_config.get("prompt_from_conversations"):
+                    prompt = first_user_prompt(prompt)
+                if not prompt or not isinstance(prompt, str):
                     continue
 
                 uuid = row.get("uuid")
