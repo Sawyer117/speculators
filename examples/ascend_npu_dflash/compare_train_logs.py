@@ -164,6 +164,8 @@ def analyze(parsed, seq_len, total_cards):
         "elapsed": None,
         "it_s": None,          # avg rate over the window (stall/warmup-inclusive)
         "tok_s": None,         # avg-rate tokens/s
+        "tail_it_s": None,      # avg rate over the LAST half (sustained-rate test)
+        "tail_tok_s": None,
         "steady_step_s": None,  # median step_s = typical spike-free step
         "steady_it_s": None,
         "steady_tok_s": None,
@@ -188,6 +190,18 @@ def analyze(parsed, seq_len, total_cards):
             out["it_s"] = dsteps / elapsed
             if nproc:
                 out["tok_s"] = out["it_s"] * nproc * seq_len
+
+    # tail rate: avg-rate over the LAST half of the run. avg < tail ≈ steady => spikes
+    # were front-loaded (full epoch ~ steady). avg ≈ tail << steady => spikes PERSIST
+    # (full epoch ~ avg; steady is a fantasy). Needs a long-enough run to be meaningful.
+    if len(tp) >= 6:
+        mid = tp[len(tp) // 2:]
+        e2 = mid[-1][1] - mid[0][1]
+        d2 = mid[-1][0] - mid[0][0]
+        if e2 > 0 and d2 > 0:
+            out["tail_it_s"] = d2 / e2
+            if nproc:
+                out["tail_tok_s"] = out["tail_it_s"] * nproc * seq_len
 
     # steady rate: median of the instrumented step_s, robust to recompile spikes.
     # This is the right basis for FULL-epoch ETA (front-loaded recompiles amortize
@@ -269,14 +283,14 @@ def main():
     if not runs:
         sys.exit("No logs had enough steps/timestamps to analyze.")
 
-    def steady_it(a):
-        return a["steady_it_s"] or a["it_s"]
+    def sust_it(a):  # best honest sustained rate: tail (last half) > whole-window avg
+        return a["tail_it_s"] or a["it_s"]
 
-    def steady_tok(a):
-        return a["steady_tok_s"] or a["tok_s"]
+    def sust_tok(a):
+        return a["tail_tok_s"] or a["tok_s"]
 
-    def hpe(a):  # hours per FULL epoch from the STEADY rate (warmup amortizes over 34k+ steps)
-        rate = steady_it(a)
+    def hpe(a):  # hours per FULL epoch from the SUSTAINED (tail) rate, NOT the steady ceiling
+        rate = sust_it(a)
         if not (args.packed_per_epoch and a["nproc"] and rate):
             return None
         return (args.packed_per_epoch / a["nproc"] / rate) / 3600.0
@@ -288,11 +302,13 @@ def main():
     runs.sort(key=lambda a: (-(a["nproc"] or 0), a["path"]))
     print("=" * 108)
     print("PER-LOG DETAIL")
-    print("  avg  = whole-window it/s (INCLUDES warmup + recompile spikes; drops on short runs)")
-    print("  stdy = median-step it/s (spike-free typical speed = the full-epoch basis)")
-    print("  tok/s & h/ep use the STEADY rate;  spk = #steps with step_s > 3x median (recompile/stall)")
+    print("  avg  = whole-window it/s (INCLUDES warmup + recompile spikes)")
+    print("  tail = avg over the LAST half (sustained rate) — THE honest full-epoch basis")
+    print("  stdy = median-step it/s (spike-free CEILING; reality is between tail and stdy)")
+    print("  --> avg<tail~stdy = spikes front-loaded;  avg~tail<<stdy = spikes PERSIST")
+    print("  tok/s & h/ep use the TAIL rate;  spk = #steps with step_s > 3x median (recompile/stall)")
     print("=" * 108)
-    hdr = (f"{'config':<8} {'steps':>13} {'elapsed':>7} {'avg':>5} {'stdy':>5} "
+    hdr = (f"{'config':<8} {'steps':>13} {'elapsed':>7} {'avg':>5} {'tail':>5} {'stdy':>5} "
            f"{'tok/s':>8} {'bott':>9} {'dw%':>4} {'spk':>4}")
     if args.packed_per_epoch:
         hdr += f" {'h/ep':>6}"
@@ -301,15 +317,16 @@ def main():
     print("-" * 108)
     for a in runs:
         steprange = f"{a['step_first']}-{a['step_last']}({a['n_records']})"
+        tail = f"{a['tail_it_s']:.2f}" if a["tail_it_s"] else "-"
         stdy = f"{a['steady_it_s']:.2f}" if a["steady_it_s"] else "-"
-        ft = steady_tok(a)
+        ft = sust_tok(a)
         tok = f"{ft:,.0f}" if ft else "n/a"
         dw = f"{a['datawait_pct']:.0f}" if a["datawait_pct"] is not None else "-"
         bott = a["bottleneck"] or "-"
         spk = str(a["n_spikes"]) if a["steady_step_s"] else "-"
         row = (
             f"{_label(a):<8} {steprange:>13} {_hms(a['elapsed']):>7} "
-            f"{a['it_s']:>5.2f} {stdy:>5} {tok:>8} {bott:>9} {dw:>4} {spk:>4}"
+            f"{a['it_s']:>5.2f} {tail:>5} {stdy:>5} {tok:>8} {bott:>9} {dw:>4} {spk:>4}"
         )
         if args.packed_per_epoch:
             h = hpe(a)
@@ -354,18 +371,18 @@ def main():
     }
 
     print("\n" + "=" * 108)
-    print("CONFIG COMPARISON  (representative = run with timing & most steps; STEADY tok/s "
+    print("CONFIG COMPARISON  (representative = longest run with timing; SUSTAINED=tail tok/s "
           "ratio = per-epoch speedup, same dataset)")
     print("=" * 108)
-    ordered = sorted(reps.values(), key=lambda a: (steady_tok(a) or 0))
+    ordered = sorted(reps.values(), key=lambda a: (sust_tok(a) or 0))
     base = ordered[0]
     for a in ordered:
-        ft, fi = steady_tok(a), steady_it(a)
-        spd = (ft / steady_tok(base)) if (ft and steady_tok(base)) else None
+        ft, fi = sust_tok(a), sust_it(a)
+        spd = (ft / sust_tok(base)) if (ft and sust_tok(base)) else None
         tok = f"{ft:,.0f}" if ft else "n/a"
         line = (
             f"{_label(a):<8} | {len(groups[_label(a)])} log(s) | "
-            f"{fi:.2f} it/s | {tok} tok/s (steady)"
+            f"{fi:.2f} it/s | {tok} tok/s (sustained)"
         )
         if a["bottleneck"]:
             line += f" | bott={a['bottleneck']}"
@@ -378,20 +395,21 @@ def main():
             line += f" | ~{h:.1f}h/epoch"
         print(line)
 
-    if len(ordered) >= 2 and steady_tok(ordered[-1]) and steady_tok(base):
+    if len(ordered) >= 2 and sust_tok(ordered[-1]) and sust_tok(base):
         top = ordered[-1]
-        ratio = steady_tok(top) / steady_tok(base)
+        ratio = sust_tok(top) / sust_tok(base)
         print("-" * 108)
-        print(f">>> {_label(top)} ~{ratio:.2f}x the steady throughput of {_label(base)} "
+        print(f">>> {_label(top)} ~{ratio:.2f}x the sustained throughput of {_label(base)} "
               f"=> ~1/{ratio:.2f} the wall-clock per epoch (same dataset).")
-        print("    NOTE: 'steady' excludes the front-loaded NPU recompile spikes (see spk/spikes "
-              "columns); those are a separate, shared cost worth fixing on BOTH configs.")
+        print("    h/epoch uses the TAIL rate (NOT steady). If a config's longest run is short, its")
+        print("    tail is still warmup-noisy — run it longer for a trustworthy number.")
 
     # ---- CSV ----
     if args.csv:
         cols = ["config", "nproc", "nproc_from_header", "serve", "loss_fn", "epochs",
                 "n_records", "step_first", "step_last", "elapsed_s",
-                "avg_it_s", "steady_it_s", "steady_tok_s", "n_spikes", "spike_time_s",
+                "avg_it_s", "tail_it_s", "tail_tok_s", "steady_it_s", "steady_tok_s",
+                "n_spikes", "spike_time_s",
                 "bottleneck", "datawait_pct",
                 "fwd_s", "bwd_s", "h2d_s", "datawait_s", "optim_s",
                 "h_per_epoch_steady", "loss_first", "loss_last", "path"]
@@ -405,6 +423,8 @@ def main():
                     a["epochs"], a["n_records"], a["step_first"], a["step_last"],
                     f"{a['elapsed']:.0f}" if a["elapsed"] else "",
                     f"{a['it_s']:.4f}" if a["it_s"] else "",
+                    f"{a['tail_it_s']:.4f}" if a["tail_it_s"] else "",
+                    f"{a['tail_tok_s']:.0f}" if a["tail_tok_s"] else "",
                     f"{a['steady_it_s']:.4f}" if a["steady_it_s"] else "",
                     f"{a['steady_tok_s']:.0f}" if a["steady_tok_s"] else "",
                     a["n_spikes"], f"{a['spike_time']:.0f}",
