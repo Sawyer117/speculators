@@ -125,8 +125,10 @@ def parse_args():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=None,
-        help="Sampling temperature (default: server/model default).",
+        default=0.0,
+        help="Sampling temperature (default: 0 = greedy — the standard for "
+        "draft-training response regeneration, deterministic/reproducible; raise "
+        "for sampled data). At temp=0, top_p/top_k are irrelevant (argmax).",
     )
     parser.add_argument(
         "--top-p",
