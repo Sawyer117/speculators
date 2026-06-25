@@ -80,7 +80,7 @@ python examples/ascend_npu_dflash/analyze_train_log.py "$OUTPUT_DIR"/logs/train_
 > ⚠️ **Do NOT run the trainer on a bare TTY** (`bash train_qwen3_4b.sh` straight in the
 > terminal): a torch_npu fork + rich-logging deadlock hangs a DataLoader worker after a
 > few steps. The `*_nohup.sh` wrappers — or any `| tee` / `> log` redirect — make stdout
-> non-TTY and sidestep it (details in [`torch_npu_getenv_deadlock_report.md`](./torch_npu_getenv_deadlock_report.md)).
+> non-TTY and sidestep it (details in [`ascend-npu-torch-fork-deadlock.md`](../../docs/deployment/ascend-npu-torch-fork-deadlock.md)).
 > The foreground `serve_qwen3_4b.sh` / `train_qwen3_4b.sh` remain for interactive/piped use.
 
 ### Env knobs (override inline, or edit `config_qwen3_4b.sh`)
@@ -94,6 +94,17 @@ python examples/ascend_npu_dflash/analyze_train_log.py "$OUTPUT_DIR"/logs/train_
 | `MAX_MODEL_LEN` | `SEQ_LEN+256` | vLLM served-context cap (keeps KV cache small → faster serve) |
 | `GPU_MEM_UTIL` | `0.90` | vLLM HBM fraction |
 | `SEQ_LEN` | `3072` | per-sample / per-rank batch token length |
+| `VLLM_DP` / `SERVE_CARDS` | `1` / `0` | serve replicas + their cards (HS extraction throughput) |
+| `TRAIN_CARDS` / `NPROC` | `1,2,3,4,5,6,7` / `7` | trainer cards + FSDP world size |
+
+> **Device split — recommended: 2 serve + 6 train.** The defaults serve on one card
+> (`SERVE_CARDS=0`, `VLLM_DP=1`, `TRAIN_CARDS=1-7`, `NPROC=7`), which usually leaves
+> hidden-state extraction as the bottleneck. For faster runs prefer two serve replicas
+> (cards 0–1, ~2× HS gen) and six trainer cards — set this in the same shell before
+> launching serve & train:
+> ```bash
+> export VLLM_DP=2 SERVE_CARDS=0,1 TRAIN_CARDS=2,3,4,5,6,7 NPROC=6
+> ```
 
 ### Example — full open_perfectblend, single epoch (non-regen data)
 

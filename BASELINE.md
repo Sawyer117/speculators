@@ -53,7 +53,7 @@ python examples/ascend_npu_dflash/analyze_train_log.py "$OUTPUT_DIR"/logs/train_
 
 > ⚠️ Use the `*_nohup.sh` wrappers (or any `| tee` / `> log` redirect). Do **not** run
 > the trainer on a bare TTY — a torch_npu fork + rich-logging deadlock hangs a
-> DataLoader worker after a few steps (see `examples/ascend_npu_dflash/torch_npu_getenv_deadlock_report.md`).
+> DataLoader worker after a few steps (see `docs/deployment/ascend-npu-torch-fork-deadlock.md`).
 
 ## Baseline hyperparameters (for the record)
 
@@ -64,7 +64,7 @@ python examples/ascend_npu_dflash/analyze_train_log.py "$OUTPUT_DIR"/logs/train_
 | vocab | **full** verifier vocab (151,936) — `--draft-vocab-size` omitted |
 | data/batch | `--total-seq-len 3072`, multipack token-budget batching, 7-way FSDP |
 | schedule | `--epochs 1`, `--lr 6e-4`, `--loss-fn ce`, `--noise-std 0.05`, `--scheduler-type linear` |
-| device split | serve TP=1 on card 0; train on cards 1-7 |
+| device split | serve TP=1 on card 0; train on cards 1-7 (**but prefer 2 serve + 6 train — see throughput tip below**) |
 | serve | `--max-model-len 3328` (=SEQ_LEN+256), `--gpu-memory-utilization 0.90`, graph mode |
 
 `--noise-std` and `--scheduler-type` are the **upstream `scripts/train.py` defaults**
@@ -72,3 +72,15 @@ python examples/ascend_npu_dflash/analyze_train_log.py "$OUTPUT_DIR"/logs/train_
 **`--loss-fn ce`** is set explicitly: it is DFlash's validated/hardcoded default per
 [issue #541](https://github.com/vllm-project/speculators/issues/541); PR #542's `kl_div`
 default for DFlash is an unvalidated regression (separate upstream fix pending).
+
+> **Throughput tip — recommended: 2 serve + 6 train.** The table's split serves on a
+> single card (`SERVE_CARDS=0`, `VLLM_DP=1`, 7-way FSDP), which leaves hidden-state
+> extraction as the usual bottleneck. On an 8-card box, prefer **two serve replicas and
+> six trainer cards** — set these before launching serve & train (everything else,
+> hyperparameters and data, is unchanged):
+> ```bash
+> export VLLM_DP=2 SERVE_CARDS=0,1 TRAIN_CARDS=2,3,4,5,6,7 NPROC=6
+> ```
+> Two Qwen3-4B replicas on cards 0–1 roughly double HS generation; the trainer runs
+> 6-way FSDP on cards 2–7. The serve log's first line (`>>> RUN serve … card=… DP=…`)
+> records the effective split, so you can confirm what actually ran.

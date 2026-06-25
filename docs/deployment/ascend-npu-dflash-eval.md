@@ -100,4 +100,4 @@ pkill -f 'launch_vllm|EngineCore|APIServer'   # vLLM forks/retitles; kill the fa
   open_perfectblend baseline. Re-run the same eval on the aligned checkpoint to compare
   (expect a higher acceptance length).
 - Acceptance length / per-position rates are the right cross-run comparison metric — **not**
-  the training loss magnitude (which is reduction-dependent; see `dflash_loss_explained.md`).
+  the training loss magnitude (which is reduction-dependent; see `ascend-npu-dflash-loss.md`).
