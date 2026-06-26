@@ -146,8 +146,8 @@ def _report(pts, lrs, total_arg, source):
         print(f"剩余       : ~{_hms(remaining * step_t)}   ({remaining} 步)")
         print(f"预计总时长 : ~{_hms(total * step_t)}   (本 epoch)")
     else:
-        print("总步数/ETA : 未知(LR 还没过 warmup 峰值)→ 知道每 epoch 步数后加 "
-              "--total-steps N;或单步时间×总步数自己估")
+        print("总步数/ETA : 未知(LR 还没过 warmup 峰值)→ 用 steps_per_epoch.py 精确算出"
+              "总步数再加 --total-steps N(见 examples/ascend_npu_dflash/steps_per_epoch.py)")
 
 
 def main():
