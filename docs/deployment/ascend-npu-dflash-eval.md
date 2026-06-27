@@ -101,3 +101,62 @@ pkill -f 'launch_vllm|EngineCore|APIServer'   # vLLM forks/retitles; kill the fa
   (expect a higher acceptance length).
 - Acceptance length / per-position rates are the right cross-run comparison metric — **not**
   the training loss magnitude (which is reduction-dependent; see `ascend-npu-dflash-loss.md`).
+
+---
+
+## Team-internal alignment harness (FORK-ONLY — do NOT upstream)
+
+The GuideLLM path above is the upstream-official one. For day-to-day **team baseline
+sync** we standardise on a lighter, dependency-free client + the standard public
+spec-decode datasets, so every member reports comparable numbers. **These scripts and
+this section are fork-only — they are never part of an upstream PR (we only upstream
+`src/` core changes).**
+
+Scripts (in `examples/ascend_npu_dflash/`):
+
+| file | role |
+|---|---|
+| `run_server.sh`  | serve the Qwen3-4B verifier + the trained DFlash draft via `--speculative-config` |
+| `Evaluator.py`   | the shared benchmark client (== colleague's `bench_dflash_vllm_all.py`, **keep identical across the team**) — pure `requests`, no GuideLLM |
+| `run_eval.sh`    | one-command wrapper that runs `Evaluator.py` with the team-standard args |
+
+### Pinned alignment params (everyone identical, or numbers are not comparable)
+
+| knob | value | why |
+|---|---|---|
+| datasets | `gsm8k, math500, humaneval, mbpp, mt-bench` | standard spec-decode benchmarks |
+| `num_speculative_tokens` | **15** | = training `block_size` (16) − 1 |
+| temperature / top_p / top_k | **0 / 1 / 1** | greedy = deterministic headline; top_p/top_k inert at temp 0 |
+| sample shuffle seed | **42** | fixed in `Evaluator.py` (`random.seed(42)`) |
+| concurrency / warmup / max-new-tokens | 8 / 10 / 2048 | team defaults |
+
+Defaults in `run_server.sh` derive from `config_qwen3_4b.sh` (`TARGET_MODEL`) and the
+training output (`SAVE_DIR/checkpoint_best`), so after a training run it just works.
+
+### Run it
+
+```bash
+# 1) serve (one free NPU card; defaults already aligned)
+bash examples/ascend_npu_dflash/run_server.sh
+curl -s --noproxy '*' http://localhost:30000/v1/models | head   # model listed = ready
+
+# 2) benchmark all datasets (acceptance length + per-position + throughput)
+bash examples/ascend_npu_dflash/run_eval.sh
+```
+
+The client reads the **same** vLLM Prometheus spec-decode counters as `evaluate.py`
+(`vllm:spec_decode_num_drafts_total / num_accepted_tokens_total / ...per_pos_total`)
+and computes acceptance length the same way (`1 + accepted/drafts`), so its numbers are
+directly comparable to the GuideLLM result above (4.75) — only the dataset differs.
+
+### Two NPU "if"s (match the colleague's config first; only change if you hit these)
+
+1. **vLLM refuses to start with a negative `max_num_scheduled_tokens`** — spec-decode
+   reserves `max_num_seqs*(1+num_speculative_tokens)` token slots/step. Set
+   `EXTRA_FLAGS="--max-num-batched-tokens 8192" bash run_server.sh` **and tell the team**
+   so everyone adds it (stay aligned).
+2. **Long-prompt 400s** (`gsm8k`/`humaneval` prompt + 2048 output > `--max-model-len 2048`)
+   — raise it for the whole team, e.g. `EVAL_MAX_MODEL_LEN=4096`.
+
+`run_eval.sh` exports `no_proxy=localhost,...` so the corp proxy (`netentsec`) does not
+504 the localhost `/metrics` + `/v1` calls.
