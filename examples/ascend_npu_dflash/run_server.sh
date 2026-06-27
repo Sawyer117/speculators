@@ -33,10 +33,14 @@ EXTRA_FLAGS="${EXTRA_FLAGS:-}"
 # optional CANN / NNAL sourcing (override per box; default = standard install path)
 CANN_ENV="${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
 NNAL_ENV="${NNAL_ENV:-/usr/local/Ascend/nnal/atb/set_env.sh}"
+# CANN/NNAL set_env.sh reference unguarded $ZSH_VERSION etc.; source them with
+# nounset OFF so the `set -u` above doesn't abort on their unbound-var checks.
+set +u
 # shellcheck disable=SC1090
 [ -f "$CANN_ENV" ] && source "$CANN_ENV"
 # shellcheck disable=SC1090
 [ -f "$NNAL_ENV" ] && source "$NNAL_ENV"
+set -u
 # Running vLLM/vllm-ascend from source trees instead of the wheel? Prepend them:
 #   export PYTHONPATH=/path/to/vllm:/path/to/vllm-ascend:$PYTHONPATH
 
