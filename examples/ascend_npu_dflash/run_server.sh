@@ -24,7 +24,7 @@ NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-15}"                   # = training block_si
 EVAL_PORT="${EVAL_PORT:-30000}"
 EVAL_CARD="${EVAL_CARD:-0}"                                # one free NPU card
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
-EVAL_MAX_MODEL_LEN="${EVAL_MAX_MODEL_LEN:-2048}"
+EVAL_MAX_MODEL_LEN="${EVAL_MAX_MODEL_LEN:-4096}"   # >= longest prompt + MAX_NEW_TOKENS (2048+2048 overflowed 2048 -> 400)
 # NPU spec-decode gotcha: the scheduler reserves max_num_seqs*(1+num_spec_tokens)
 # token slots/step. If vLLM refuses to start with a NEGATIVE max_num_scheduled_tokens,
 # set EXTRA_FLAGS="--max-num-batched-tokens 8192" (and tell the team so all stay aligned).
