@@ -52,5 +52,9 @@ export DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-151936}"
 # DFlash loss. Default "ce": that was DFlash's validated/hardcoded default before
 # PR #542, which (per issue #541) was only meant to make the loss configurable but
 # accidentally flipped DFlash's default to kl_div (never validated for DFlash).
-# Override with LOSS_FN=kl_div if desired. choices: ce | kl_div.
+# Override with LOSS_FN=kl_div if desired. choices: ce | kl_div | tv | nla.
+# nla = negative log-acceptance (LK): directly optimizes acceptance overlap alpha
+# (= -log alpha); reduces to CE on point-mass targets. For the CE vs KL vs LK study,
+# run three identical trainings with LOSS_FN=ce / kl_div / nla and compare EVAL
+# acceptance length (NOT training loss — the three have different scales).
 export LOSS_FN="${LOSS_FN:-ce}"

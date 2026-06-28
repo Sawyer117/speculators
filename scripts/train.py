@@ -963,11 +963,15 @@ def parse_args():
         "--loss-fn",
         type=str,
         default="kl_div",
-        choices=["kl_div", "ce"],
+        choices=["kl_div", "ce", "tv", "nla"],
         help=(
             "Loss function used during draft model training. "
             "'kl_div' = KL divergence (default). "
-            "'ce' = cross-entropy."
+            "'ce' = cross-entropy. "
+            "'tv' = total variation. "
+            "'nla' = negative log-acceptance (LK) — directly optimizes acceptance "
+            "overlap alpha; all four are wired through resolve_loss_fn / DFlash "
+            "get_trainer_kwargs."
         ),
     )
     parser.add_argument(
