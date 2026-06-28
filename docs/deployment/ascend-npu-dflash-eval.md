@@ -156,10 +156,13 @@ directly comparable to the GuideLLM result above (4.75) — only the dataset dif
    `EXTRA_FLAGS="--max-num-batched-tokens 8192" bash run_server.sh` **and tell the team**
    so everyone adds it (stay aligned).
 2. **Long-prompt 400s** (prompt + `max_new_tokens` > `--max-model-len`). Default is now
-   **4096** (fits all 5 datasets incl. mt-bench multi-turn in the baseline run below). If
-   a future mt-bench turn overflows, bump for the whole team: `EVAL_MAX_MODEL_LEN=8192`.
-   `max_model_len` is server context CAPACITY, not the generation length (`max_new_tokens`
-   stays 2048) — raising it doesn't change the measured acceptance, only whether requests run.
+   **8192**. 4096 looked fine on the first machine but a cross-machine repro hit a boundary
+   prompt at 4097 > 4096 → 400 → crash: cross-machine noise (NPU-numeric generation-length
+   drift or a tokenizer-version diff of ±1 token) tips borderline prompts over. 8192 removes
+   the sensitivity. `max_model_len` is server context CAPACITY, not the generation length
+   (`max_new_tokens` stays 2048) — raising it does NOT change the measured acceptance, only
+   whether requests run, so 4096-run and 8192-run numbers are directly comparable. **Use the
+   same value (8192) on every machine.**
 
 `run_eval.sh` exports `no_proxy=localhost,...` so the corp proxy (`netentsec`) does not
 504 the localhost `/metrics` + `/v1` calls.
@@ -168,19 +171,32 @@ directly comparable to the GuideLLM result above (4.75) — only the dataset dif
 
 Checkpoint: rollout-trained DFlash Qwen3-4B (`ce` loss, on-policy
 `open_perfectblend.qwen3-4b-rollout` data, `checkpoint_best`). Served `num_speculative_tokens=15`,
-`max_model_len 4096`, `max_num_seqs 64`; benchmarked temp 0 / top_p 1 / top_k 1, seed 42,
+`max_model_len 8192`, `max_num_seqs 64`; benchmarked temp 0 / top_p 1 / top_k 1, seed 42,
 concurrency 8, `max_new_tokens 2048`, FULL datasets.
 
-| Dataset | Samples | **Accept length** | Accept rate | Throughput (tok/s) |
-|---|---|---|---|---|
-| gsm8k | 1309 | **5.878** | 32.52% | 1268 |
-| math500 | 490 | **5.408** | 29.39% | 1172 |
-| humaneval | 154 | **4.120** | 20.80% | 896 |
-| mbpp | 247 | **3.972** | 19.81% | 866 |
-| mt-bench | 70 (140 turns) | **2.636** | 10.91% | 529 |
+**Accept length = baseline ± err** (err = spread of TWO independent reproductions — two NPU
+machines, each retrained from scratch on the same data/config; centre = mean):
 
-These are the **team alignment targets** — same checkpoint should reproduce these; a material
-deviation flags config drift (wrong `num_speculative_tokens`, sampling params, or serve flags).
+| Dataset | **Accept length (baseline ± err)** | Accept rate | Samples |
+|---|---|---|---|
+| **gsm8k** | **5.876 ± 0.004** | ~32.5% | 1309 |
+| math500 | **5.446 ± 0.075** | ~29.6% | 490 |
+| humaneval | **4.108 ± 0.024** | ~20.7% | 154 |
+| mbpp | **4.006 ± 0.068** | ~20.0% | 247 |
+| mt-bench | **2.670 ± 0.067** | ~11.1% | 70 (140 turns) |
+
+These are the **team alignment targets** + their **noise floor**. Use them two ways:
+- **Reproduction**: a fresh run reproduces the baseline if its accept length is within `± err`.
+- **Signal vs noise**: a change (e.g. a different loss) is a *real* improvement only if it
+  **exceeds `+ err`**; anything inside the band is noise. **gsm8k is the tightest (±0.004) → the
+  best discriminator.** Easy rule: **±0.08 everywhere, ±0.01 for gsm8k.**
+
+Caveats: (a) `± err` is an **n=2 point estimate** (a 3rd repro firms it up, esp. the ~0.07 on
+math500/mbpp/mt-bench). (b) This is the **cross-machine** err (separately retrained drafts) — the
+conservative, *portable* threshold. A *same-machine* comparison (e.g. CE/KL/LK on one box) has a
+smaller same-machine err; don't apply the cross-machine band there. (c) bit-level reproduction is
+impossible on NPU (kernel nondeterminism) — accept length is the robust cross-run metric, not loss.
+
 Ordering math > code > chat is expected; per-position decays monotonically. Beats the earlier
 kl_div/half50/1-epoch checkpoint (4.75 on math_reasoning above), confirming the rollout + `ce` recipe.
 
