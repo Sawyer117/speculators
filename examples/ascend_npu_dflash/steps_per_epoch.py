@@ -36,11 +36,22 @@ def main():
                     help="per-rank token budget = --total-seq-len (must match training)")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0, help="sampler seed (trainer default 0)")
+    ap.add_argument("--split-ratio", type=float, default=0.9,
+                    help="train fraction; trainer holds out the last (1-ratio) as val "
+                         "(scripts/train.py builds ArrowDataset split_ratio=0.9). Use 1.0 "
+                         "to count the full set.")
     args = ap.parse_args()
 
     d = load_from_disk(args.data_path)
     # exactly what ArrowDataset.approx_lengths returns (data.py:_compute_approx_lengths)
     lengths = list(d.with_format(None)["seq_len"])
+
+    # Trainer trains on only the first split_ratio of the data (last 1-ratio is the
+    # val split: scripts/train.py ArrowDataset(split_ratio=0.9)). Match it, else this
+    # over-counts by ~11% (full 57,985 vs real 52,227 for the rollout set at 6 cards).
+    n_full = len(lengths)
+    if 0 < args.split_ratio < 1.0:
+        lengths = lengths[: int(n_full * args.split_ratio)]
 
     sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=args.total_seq_len,
@@ -55,7 +66,8 @@ def main():
     sl = np.array(lengths)
     print("=" * 60)
     print(f"data             : {args.data_path}")
-    print(f"samples          : {len(sl):,}  (seq_len mean {sl.mean():.0f}, max {int(sl.max())})")
+    print(f"samples (train)  : {len(sl):,} of {n_full:,}  (split_ratio={args.split_ratio}; "
+          f"seq_len mean {sl.mean():.0f}, max {int(sl.max())})")
     print(f"batch_max_length : {args.total_seq_len} tokens/rank")
     print(f"world_size(NPROC): {args.world_size}")
     print(f"steps/epoch      : {steps_per_epoch:,}")
