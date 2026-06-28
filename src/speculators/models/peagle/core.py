@@ -3,7 +3,6 @@
 from typing import ClassVar
 
 import torch
-from torch.nn.attention.flex_attention import create_block_mask
 from transformers import PretrainedConfig
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
@@ -116,6 +115,8 @@ class PEagleDraftModel(Eagle3DraftModel):
         ).unsqueeze(0)  # [1, total_sampled, 3*hidden_size]
 
         # Project concatenated hidden states (3*hidden_size) -> hidden_size
+        if self.input_norm is not None:
+            sampled_hidden = self.input_norm(sampled_hidden)
         sampled_hidden = self.fc(sampled_hidden)  # [1, total_sampled, hidden_size]
 
         layer_input = torch.cat(
@@ -132,7 +133,7 @@ class PEagleDraftModel(Eagle3DraftModel):
             document_ids=document_ids.squeeze(0).to(device),
         )
 
-        attention_mask = create_block_mask(  # type: ignore[assignment]
+        attention_mask = self._create_mask_fn(
             mask_mod,
             B=None,
             H=None,
@@ -206,10 +207,16 @@ class PEagleDraftModel(Eagle3DraftModel):
             kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
         )
 
+        verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
+            "draft_attn_impl", "simple_flex_attention"
+        )
+
         config = PEagleSpeculatorConfig(
             transformer_layer_config=verifier_config,
             draft_vocab_size=kwargs["draft_vocab_size"],
             norm_before_residual=kwargs.get("norm_before_residual", False),
+            norm_before_fc=kwargs.get("norm_before_fc", False),
+            norm_output=kwargs.get("norm_output", False),
             eagle_aux_hidden_state_layer_ids=target_layer_ids,
             num_depths=kwargs.get("num_depths", 8),
             down_sample_ratio=kwargs.get("down_sample_ratio", 0.7),
@@ -223,8 +230,8 @@ class PEagleDraftModel(Eagle3DraftModel):
                     )
                 ],
                 default_proposal_method="greedy",
-                verifier=VerifierConfig.from_config(
-                    verifier_config, name_or_path=kwargs["verifier_name_or_path"]
+                verifier=VerifierConfig.from_pretrained(
+                    kwargs["verifier_name_or_path"]
                 ),
             ),
         )

@@ -2,7 +2,7 @@ import copy
 from typing import ClassVar
 
 import torch
-from torch.nn.attention.flex_attention import create_block_mask
+from torch.nn.attention.flex_attention import create_block_mask, create_mask
 from transformers import AutoConfig, DynamicCache, PretrainedConfig
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
@@ -10,6 +10,7 @@ from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.eagle3 import Eagle3SpeculatorConfig
 from speculators.models.eagle3.attention import (
     create_combined_mask_mod,
+    extend_dense_mask_for_draft_tokens,
     extend_mask_for_draft_tokens,
 )
 from speculators.models.eagle3.metrics import compute_metrics
@@ -40,8 +41,16 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
 
     def __init__(self, config: Eagle3SpeculatorConfig):
         # Forcibly override config settings
-        impl = "simple_flex_attention"
-        config.transformer_layer_config._attn_implementation = impl  # noqa: SLF001
+        if config.transformer_layer_config._attn_implementation is None:  # noqa: SLF001
+            config.transformer_layer_config._attn_implementation = (  # noqa: SLF001
+                "simple_flex_attention"
+            )
+        self._attn_impl = config.transformer_layer_config._attn_implementation  # noqa: SLF001
+        self._create_mask_fn = (
+            create_block_mask
+            if self._attn_impl == "simple_flex_attention"
+            else create_mask
+        )
         super().__init__(config=config)
         self._init_vocab(config)
 
@@ -84,7 +93,6 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         self.verifier_norm = norm_class(self.hidden_size, eps=tl_config.rms_norm_eps)
         self.verifier_norm.weight.requires_grad = False
 
-        # Normalize draft path input (gpt-oss only)
         if config.norm_before_fc:
             self.input_norm = self._model_definitions.norm_class(
                 3 * self.hidden_size,
@@ -129,7 +137,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
     @conditional_torch_compile
-    def forward(
+    def forward(  # noqa: C901
         self,
         hidden_states: torch.Tensor,  # shape: [1, total_seq_len, 3 * hidden_size]
         input_ids: torch.Tensor,  # shape: [1, total_seq_len]
@@ -160,7 +168,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             document_ids.squeeze(0).to(device), total_seq_len
         )
         # Note: Attention mask is stored as a BlockMask object
-        attention_mask = create_block_mask(
+        attention_mask = self._create_mask_fn(
             combined_mask_mod,
             B=None,
             H=None,
@@ -224,7 +232,11 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     **kwargs,
                 )
 
-            logits = self.lm_head(self.norm(hidden_states))
+            if self.config.norm_output:
+                hidden_states = self.norm(hidden_states)
+                logits = self.lm_head(hidden_states)
+            else:
+                logits = self.lm_head(self.norm(hidden_states))
             # shape: [1, total_seq_len, draft_vocab_size]
 
             if return_loss:
@@ -264,7 +276,13 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                 )
                 # shape: [1, total_seq_len]
 
-            attention_mask = extend_mask_for_draft_tokens(attention_mask)
+            if self._attn_impl == "simple_flex_attention":
+                attention_mask = extend_mask_for_draft_tokens(attention_mask)
+            else:
+                attention_mask = extend_dense_mask_for_draft_tokens(
+                    attention_mask,  # type: ignore[arg-type]
+                    total_seq_len,
+                )
             position_ids = position_ids + 1
             # shape: [1, total_seq_len]
 
@@ -303,11 +321,16 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
         )
 
+        verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
+            "draft_attn_impl", "simple_flex_attention"
+        )
+
         config = Eagle3SpeculatorConfig(
             transformer_layer_config=verifier_config,
             draft_vocab_size=kwargs["draft_vocab_size"],
             norm_before_residual=kwargs["norm_before_residual"],
             norm_before_fc=kwargs.get("norm_before_fc", False),
+            norm_output=kwargs.get("norm_output", False),
             embed_requires_grad=kwargs.get("embed_requires_grad", False),
             eagle_aux_hidden_state_layer_ids=target_layer_ids,
             speculators_config=SpeculatorsConfig(
@@ -318,8 +341,8 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     )
                 ],
                 default_proposal_method="greedy",
-                verifier=VerifierConfig.from_config(
-                    verifier_config, name_or_path=kwargs["verifier_name_or_path"]
+                verifier=VerifierConfig.from_pretrained(
+                    kwargs["verifier_name_or_path"]
                 ),
             ),
         )
