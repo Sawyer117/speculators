@@ -155,8 +155,41 @@ directly comparable to the GuideLLM result above (4.75) — only the dataset dif
    reserves `max_num_seqs*(1+num_speculative_tokens)` token slots/step. Set
    `EXTRA_FLAGS="--max-num-batched-tokens 8192" bash run_server.sh` **and tell the team**
    so everyone adds it (stay aligned).
-2. **Long-prompt 400s** (`gsm8k`/`humaneval` prompt + 2048 output > `--max-model-len 2048`)
-   — raise it for the whole team, e.g. `EVAL_MAX_MODEL_LEN=4096`.
+2. **Long-prompt 400s** (prompt + `max_new_tokens` > `--max-model-len`). Default is now
+   **4096** (fits all 5 datasets incl. mt-bench multi-turn in the baseline run below). If
+   a future mt-bench turn overflows, bump for the whole team: `EVAL_MAX_MODEL_LEN=8192`.
+   `max_model_len` is server context CAPACITY, not the generation length (`max_new_tokens`
+   stays 2048) — raising it doesn't change the measured acceptance, only whether requests run.
 
 `run_eval.sh` exports `no_proxy=localhost,...` so the corp proxy (`netentsec`) does not
 504 the localhost `/metrics` + `/v1` calls.
+
+### Baseline result (2026-06-28) — rollout draft, the team reference numbers
+
+Checkpoint: rollout-trained DFlash Qwen3-4B (`ce` loss, on-policy
+`open_perfectblend.qwen3-4b-rollout` data, `checkpoint_best`). Served `num_speculative_tokens=15`,
+`max_model_len 4096`, `max_num_seqs 64`; benchmarked temp 0 / top_p 1 / top_k 1, seed 42,
+concurrency 8, `max_new_tokens 2048`, FULL datasets.
+
+| Dataset | Samples | **Accept length** | Accept rate | Throughput (tok/s) |
+|---|---|---|---|---|
+| gsm8k | 1309 | **5.878** | 32.52% | 1268 |
+| math500 | 490 | **5.408** | 29.39% | 1172 |
+| humaneval | 154 | **4.120** | 20.80% | 896 |
+| mbpp | 247 | **3.972** | 19.81% | 866 |
+| mt-bench | 70 (140 turns) | **2.636** | 10.91% | 529 |
+
+These are the **team alignment targets** — same checkpoint should reproduce these; a material
+deviation flags config drift (wrong `num_speculative_tokens`, sampling params, or serve flags).
+Ordering math > code > chat is expected; per-position decays monotonically. Beats the earlier
+kl_div/half50/1-epoch checkpoint (4.75 on math_reasoning above), confirming the rollout + `ce` recipe.
+
+gsm8k per-position accept rate (block size 16, the headline curve):
+
+| pos | rate | pos | rate | pos | rate |
+|----|------|----|------|----|------|
+| 0 | 88.4% | 5 | 36.4% | 10 | 12.3% |
+| 1 | 75.3% | 6 | 30.0% | 11 | 9.3% |
+| 2 | 63.4% | 7 | 24.4% | 12 | 7.0% |
+| 3 | 53.0% | 8 | 19.8% | 13 | 5.1% |
+| 4 | 44.0% | 9 | 15.9% | 14 | 3.5% |
