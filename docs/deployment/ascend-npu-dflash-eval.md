@@ -135,6 +135,13 @@ training output (`SAVE_DIR/checkpoint_best`), so after a training run it just wo
 
 ### Run it
 
+One command (backgrounds the serve, waits for ready, benchmarks, stops the serve — same terminal):
+```bash
+export DRAFT=<OUTPUT_DIR>/checkpoints/checkpoint_best   # the trained draft to eval
+bash examples/ascend_npu_dflash/run_eval_full.sh        # KEEP_SERVE=1 to leave serve up for re-eval
+```
+
+Or the two steps by hand (e.g. across two terminals):
 ```bash
 # 1) serve (one free NPU card; defaults already aligned)
 bash examples/ascend_npu_dflash/run_server.sh
