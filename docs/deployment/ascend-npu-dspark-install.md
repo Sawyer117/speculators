@@ -13,7 +13,7 @@
 - **Qwen3 path needs NO custom Ascend kernels** — SparseMLA / TiLang HC / fused deepseek
   kernels are all **DeepSeek-V4-only**. Qwen3 (GQA) = the DFlash backbone (already merged on
   vllm-ascend) **+ a per-step low-rank Markov logit bias**. That's the whole delta.
-- Built on **vllm-ascend PR #11153 + our 3 bug fixes** (branch below).
+- Built on **vllm-ascend PR #11153 + our fixes** (loading + runtime + cudagraph-safe; branch below). Now merged into PR #11153.
 - **New env baseline** (vLLM 0.23.0), replacing the old 0.20.2rc1 DFlash setup — we follow
   upstream, no backport. **CANN stays 9.0.0; only vLLM + vllm-ascend move.**
 
@@ -27,7 +27,7 @@
 | torch-npu   | **2.10.0**                                     | pinned by vllm-ascend main `requirements.txt` |
 | numpy       | **1.26.4** (pinned)                            | 2.x breaks triton-ascend / scipy on NPU |
 | vLLM        | **v0.23.0**, built `VLLM_TARGET_DEVICE=empty`  | → "0.23.0+empty" |
-| vllm-ascend | `Sawyer117/vllm-ascend` @ **`dspark-qwen3-npu`** (`a9709b8e`) | PR #11153 + 3 fixes |
+| vllm-ascend | `Sawyer117/vllm-ascend` @ **`dspark-npu-fixes`** (`ee549165`) | PR #11153 fixes: loading + runtime + cudagraph-safe |
 | draft ckpt  | `deepseek-ai/dspark_qwen3_4b_block7`           | **must edit `config.json`** — step 5 |
 
 ## Project layout
@@ -39,7 +39,7 @@ vLLM + vllm-ascend live under `installation/`, siblings of the speculators check
 ├── speculators/               # this fork (run scripts in examples/ascend_npu_dflash/)
 └── installation/
     ├── vllm-v0.23.0/          # vLLM source (editable) — step 3
-    └── vllm-ascend/           # fork @ dspark-qwen3-npu (editable / PYTHONPATH) — step 4
+    └── vllm-ascend/           # fork @ dspark-npu-fixes (editable) — step 4
 ```
 
 ---
@@ -57,6 +57,14 @@ If CANN missing → install CANN 9.0.0 toolkit + nnal first.
 
 ## 1. Fresh py3.11 env (from scratch — do NOT clone)
 
+**No `conda` on the box?** Bootstrap miniconda first (step 4's clang-15 also needs conda). Match
+`uname -m` (aarch64 = Kunpeng, the usual 910b host; else swap to x86_64):
+```bash
+cd ~ && curl -fsSLO https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh
+bash Miniconda3-latest-Linux-aarch64.sh -b -p ~/miniconda3
+source ~/miniconda3/etc/profile.d/conda.sh
+```
+Then create + activate the env:
 ```bash
 conda create -n dspark-base python=3.11 -y
 conda activate dspark-base
@@ -115,7 +123,7 @@ python -c "import torch, torch_npu, vllm, numpy; print('vllm', vllm.__version__,
 cd <root>/dspark/installation
 git clone https://github.com/Sawyer117/vllm-ascend.git
 cd vllm-ascend
-git checkout dspark-qwen3-npu     # = PR #11153 + fixes (commit a9709b8e)
+git checkout dspark-npu-fixes     # PR #11153 fixes: loading + runtime + cudagraph-safe (eager AND graph)
 ```
 **Must build from source** — there is no prebuilt wheel for our main-based branch, so a
 PYTHONPATH overlay won't work (the CANN custom ops must be compiled). The CANN backfill from
@@ -152,6 +160,10 @@ If the op compile dies on a missing module → it's a CANN backfill dep; install
 
 ## 5. Draft checkpoint + FIX its architecture ⚠️ (required)
 
+**On a shared FS (e.g. `/share`)?** If an architecture-edited copy already exists (e.g.
+`/share/canada_group_folder/ckpt/dspark_qwen3_4b_block7-austin`), point `DRAFT` at it and **skip
+this whole step** — just verify `grep -m1 architectures "$DRAFT/config.json"` says
+`DFlashDraftModel`. Otherwise download + edit:
 ```bash
 huggingface-cli download deepseek-ai/dspark_qwen3_4b_block7 --local-dir ./dspark_qwen3_4b_block7
 ```
@@ -228,30 +240,32 @@ Accept length: gsm8k **~6.2** @ `num_speculative_tokens=7` (Qwen3-4B; DSpark pap
 
 ## What's in the branch (vs raw PR #11153)
 
-7 fixes on top of PR #11153 (commits `a9709b8e`, `3681038b`, `636a07e1`, `401725db`, `1a9e9d2f`):
-1. **`hf_confif` → `hf_config`** (×2, `spec_decode/llm_base_proposer.py`) — the typo raised
-   `AttributeError` during `hasattr()` arg-eval, crashing the proposer's else-branch for **all**
-   requests, not just DSpark.
-2. **`_linear_output(...)` (undefined) → `confidence, _ = self.proj(...)`** — vLLM linear layers
-   return `(output, bias)`; unpack it. (Confidence head is dormant at inference; now correct.)
-3. **`dspark_markov_rank` → `markov_rank`** — read the actual released-checkpoint field.
-4. **patch `DFlashQwen3Model.__init__`, not `._init`** — PR #11153 wrapped `._init`, but vLLM
-   v0.23.0's `DFlashQwen3Model` uses the standard `__init__` (no `_init` helper); the stale
+Branch `dspark-npu-fixes` = **2 clean commits** on top of chenaoxuan's PR #11153 (`071c10bf`).
+Already merged into chenaoxuan's `dspark` branch, so PR #11153 itself now carries these.
+
+**Commit 1 — load on vLLM 0.23.0 + the released checkpoint** (`patch/platform/patch_dspark_proposer.py`):
+1. **patch `DFlashQwen3Model.__init__`, not `._init`** — v0.23.0 renamed it; the stale `._init`
    reference crashed vllm-ascend at import (`AttributeError: ... has no attribute '_init'`).
-5. **`confidence_head.proj` `bias=False` → `bias=True`** — the released checkpoint has a
-   `confidence_head.proj.bias` weight; without the bias param, weight loading dies with
-   `KeyError: 'confidence_head.proj.bias'`.
-6. **guard `_next_token_ids` in `_run_merged_draft`** — in graph mode the cudagraph-capture
-   dummy_run runs the Markov loop before any real `prepare()` sets `_next_token_ids` → use it
-   when set, else `0` (capture only needs shapes). Eager dodged this (its profiling run takes a
-   different branch). Required for `--enforce-eager`-OFF (graph) mode.
-7. **Markov logits from `sample_hidden_states` + `num_spec`** (not `last_hidden_states` +
-   `num_spec+1`) — the branch reshaped `compute_logits(last_hidden_states)` to `[batch, num_spec+1,
-   vocab]`, assuming `num_input_tokens == batch*(num_spec+1)` (true in real decode, so eager
-   worked). cudagraph capture uses an arbitrary `num_tokens` → `view(-1)` mis-inferred the vocab
-   (`147188` vs `151936`) → `cannot broadcast` on `logits[:, idx] += markov_bias`. Use
-   `sample_hidden_states` (the canonical draft positions, also used by the non-DSpark branch),
-   reshape to `num_spec`. Required for graph mode. **Verify accept length matches the eager run.**
+2. **`dspark_markov_rank` → `markov_rank`** — read the actual released-checkpoint field.
+3. **`_linear_output(...)` (undefined) → `confidence, _ = self.proj(...)`** — `ReplicatedLinear`
+   returns `(output, bias)`; unpack it. (Confidence head is dormant at inference; now correct.)
+4. **`confidence_head.proj` `bias=True`** — the released checkpoint has a `confidence_head.proj.bias`
+   weight; without it, weight loading dies with `KeyError: 'confidence_head.proj.bias'`.
+
+**Commit 2 — proposer runtime + cudagraph-safe drafting** (`spec_decode/llm_base_proposer.py`,
+`spec_decode/dflash_proposer.py`):
+5. **`hf_confif` → `hf_config`** (×2) — the typo raised `AttributeError` during `hasattr()`
+   arg-eval, crashing the proposer for **every** request (not just DSpark).
+6. **cudagraph-safe Markov drafting** — the draft loop allocated a fresh `torch.empty` each call and
+   seeded Markov position 0 from `self._next_token_ids`, which is reassigned to a new tensor every
+   decode step. Under FULL cudagraph the captured graph kept copying the **stale capture-time seed**
+   → the Markov chain went stale → accept length collapsed (~5.7 eager → ~3.4 graph). Fix:
+   persistent seed/draft buffers in `AscendDflashProposer` + in-place `copy_` of the seed in
+   `set_inputs_first_pass`, so graph replay always reads fresh data. Makes graph mode (drop
+   `--enforce-eager`) correct **and** fast (~5×). Eager path unchanged.
+
+> The older `dspark-qwen3-npu` branch had these as 7 messier commits (incl. an intermediate
+> wrong-then-corrected graph fix); `dspark-npu-fixes` is the cleaned-up, PR-ready version.
 
 ## Troubleshooting
 
