@@ -146,7 +146,10 @@ python -m pip install triton-ascend==3.2.1 \
   --extra-index-url https://mirrors.huaweicloud.com/repository/pypi/simple \
   --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
 # clang-15: triton-ascend JIT-compiles kernels with it (the repo Dockerfile installs clang-15 for this).
-conda install -y -c conda-forge clang=15 clangxx=15 lld=15
+# gxx_linux-aarch64: gives clang the libstdc++ C++ headers (<string> etc.) — REQUIRED on a fresh box
+#   with no system g++, else triton's clang JIT dies "fatal error: 'string' file not found" at serve
+#   startup. (x86_64 host → gxx_linux-64.) The old box only worked because it had a system g++.
+conda install -y -c conda-forge clang=15 clangxx=15 lld=15 gxx_linux-aarch64
 python -m pip install "numpy==1.26.4"     # re-pin after the build + extras
 
 # verify (also exercises our DSpark patch import). Note: vllm_ascend has NO __version__
@@ -281,6 +284,7 @@ Already merged into chenaoxuan's `dspark` branch, so PR #11153 itself now carrie
 | `'vllm' object has no attribute 'qkv_rmsnorm_rope'` (compile pass) | from-scratch build lacks the triton-ascend fusion op — serve with `--enforce-eager` (or install triton-ascend) |
 | `AttributeError: ... has no attribute '_next_token_ids'` (dummy_run) | DSpark ran on the wrong proposer — add `"method": "dflash"` to `--speculative-config` |
 | `TypeError: 'function' object is not subscriptable` (block_table.compute_slot_mapping, at first request) | triton-ascend missing — `pip install triton-ascend==3.2.1` + `conda install -c conda-forge clang=15` |
+| triton clang JIT `fatal error: 'string' file not found` at serve startup (fresh box) | conda clang has no C++ stdlib headers + no system g++ — `conda install -y -c conda-forge gxx_linux-aarch64` (x86: `gxx_linux-64`), then `rm -rf ~/.triton/cache`, restart |
 | `Model architectures ['Qwen3DSparkModel'] are not supported` | step 5 not done — edit config.json → `["DFlashDraftModel"]` |
 | weight-load `missing/unexpected keys` for `markov_*`/`confidence_*` | head weight-name mapping — report; may need a loader tweak |
 | accept length ≈ plain DFlash | wrong `NUM_SPEC_TOKENS`, or DSpark path inactive (`markov_head_type` missing) |
