@@ -39,6 +39,7 @@ import argparse
 import random
 import re
 import statistics
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -173,7 +174,7 @@ def _per_pos(text, base_name):
     return out
 
 
-def get_spec_metrics(base_url):
+def get_spec_metrics(base_url, quiet=False):
     """
     Reads speculative decoding metrics from /metrics.
 
@@ -188,7 +189,8 @@ def get_spec_metrics(base_url):
         r.raise_for_status()
         text = r.text
     except Exception as e:
-        print(f"WARN: could not fetch /metrics: {e}")
+        if not quiet:
+            print(f"WARN: could not fetch /metrics: {e}")
         return None
 
     return {
@@ -197,6 +199,72 @@ def get_spec_metrics(base_url):
         "num_accepted_tokens": _sum_counter(text, "vllm:spec_decode_num_accepted_tokens_total"),
         "per_pos": _per_pos(text, "vllm:spec_decode_num_accepted_tokens_per_pos_total"),
     }
+
+
+class SpecMetricsAccumulator:
+    """Reset-aware accumulation of spec-decode counters.
+
+    This vllm-ascend build's `vllm:spec_decode_*_total` counters are NOT
+    monotonic across a long run -- they reset mid-run, so a naive
+    after-minus-before delta goes negative/garbage for some datasets. Here we
+    poll /metrics on a background thread and sum positive increments, treating
+    any decrease as a counter reset (count the post-reset value as the
+    increment). Polling fast keeps the per-reset loss negligible.
+    """
+
+    _KEYS = ("num_drafts", "num_draft_tokens", "num_accepted_tokens")
+
+    def __init__(self, base_url, interval=0.5):
+        self.base_url = base_url
+        self.interval = interval
+        self.totals = {k: 0.0 for k in self._KEYS}
+        self.per_pos = {}
+        self.available = False
+        self.start_reading = None
+        self._last = None
+        self._last_pp = {}
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _accumulate(self, m):
+        self.available = True
+        cur = {k: (m.get(k) or 0.0) for k in self._KEYS}
+        cur_pp = m.get("per_pos") or {}
+        if self._last is not None:
+            for k in self._KEYS:
+                self.totals[k] += (cur[k] - self._last[k]) if cur[k] >= self._last[k] else cur[k]
+            for i, v in cur_pp.items():
+                lastv = self._last_pp.get(i, 0.0)
+                self.per_pos[i] = self.per_pos.get(i, 0.0) + ((v - lastv) if v >= lastv else v)
+        else:
+            self.start_reading = cur
+        self._last = cur
+        self._last_pp = dict(cur_pp)
+
+    def _poll_once(self):
+        m = get_spec_metrics(self.base_url, quiet=True)
+        if m and m.get("num_drafts") is not None:
+            self._accumulate(m)
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self._poll_once()
+            except Exception:
+                pass
+            self._stop.wait(self.interval)
+
+    def start(self):
+        self._poll_once()  # prime _last / start_reading before the run
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        self._poll_once()  # final tail sample
 
 
 # ---------------------------------------------------------------------
@@ -456,13 +524,16 @@ def run_one_dataset(args, dataset_name, tokenizer):
 
             samples = samples[actual_warmup:]
 
-    # Snapshot acceptance counters AFTER warmup.
-    m_before = get_spec_metrics(args.base_url)
+    # Reset-aware accumulation: this build's spec_decode_*_total counters reset
+    # mid-run, so a single after-minus-before delta is unreliable. Poll throughout.
+    spec_acc = SpecMetricsAccumulator(args.base_url)
+    spec_acc.start()
 
-    if m_before:
+    if spec_acc.available:
+        s = spec_acc.start_reading
         print(
-            f"Spec metrics BEFORE: drafts={m_before['num_drafts']} "
-            f"accepted={m_before['num_accepted_tokens']}"
+            f"Spec metrics START: drafts={s['num_drafts']} "
+            f"accepted={s['num_accepted_tokens']}"
         )
 
     total_expected_turns = sum(len(x["turns"]) for x in samples)
@@ -510,35 +581,25 @@ def run_one_dataset(args, dataset_name, tokenizer):
 
     elapsed = time.perf_counter() - start
 
-    m_after = get_spec_metrics(args.base_url)
+    spec_acc.stop()
 
     # -------------------------
-    # Acceptance length
+    # Acceptance length (reset-aware totals accumulated during the run)
     # -------------------------
     accept_length = float("nan")
     accept_rate = float("nan")
 
-    d_drafts = 0.0
-    d_acc = 0.0
-    d_draft_tok = 0.0
+    d_drafts = spec_acc.totals["num_drafts"]
+    d_acc = spec_acc.totals["num_accepted_tokens"]
+    d_draft_tok = spec_acc.totals["num_draft_tokens"]
+    per_pos = spec_acc.per_pos
 
-    if m_before and m_after and m_after["num_drafts"] is not None:
-        d_drafts = m_after["num_drafts"] - m_before["num_drafts"]
-        d_acc = m_after["num_accepted_tokens"] - m_before["num_accepted_tokens"]
+    if d_drafts > 0:
+        # accepted bonus token + accepted draft tokens per draft.
+        accept_length = 1.0 + d_acc / d_drafts
 
-        if m_after["num_draft_tokens"] is not None:
-            d_draft_tok = (
-                m_after["num_draft_tokens"]
-                - m_before["num_draft_tokens"]
-            )
-
-        if d_drafts > 0:
-            # Same convention as your original script:
-            # accepted bonus token + accepted draft tokens per draft.
-            accept_length = 1.0 + d_acc / d_drafts
-
-        if d_draft_tok > 0:
-            accept_rate = d_acc / d_draft_tok
+    if d_draft_tok > 0:
+        accept_rate = d_acc / d_draft_tok
 
     throughput = total_tokens / elapsed if elapsed > 0 else float("nan")
 
@@ -572,20 +633,13 @@ def run_one_dataset(args, dataset_name, tokenizer):
         print(f"   Mean ITL:                {statistics.mean(all_itls):.2f} ms")
         print(f"   Median ITL:              {statistics.median(all_itls):.2f} ms")
 
-    if (
-        m_before
-        and m_after
-        and m_after.get("per_pos")
-        and m_before.get("per_pos")
-        and d_drafts > 0
-    ):
+    if per_pos and d_drafts > 0:
         print("   Per-position accept rate:")
 
-        for i in sorted(m_after["per_pos"]):
-            c = m_after["per_pos"].get(i, 0) - m_before["per_pos"].get(i, 0)
-            print(f"     pos {i}: {100 * c / d_drafts:.2f}%")
+        for i in sorted(per_pos):
+            print(f"     pos {i}: {100 * per_pos[i] / d_drafts:.2f}%")
 
-    if m_after and m_after["num_drafts"] in (None, 0):
+    if not spec_acc.available:
         print()
         print("NOTE: no spec-decode counters from /metrics.")
         print("      Server may not be on the V1 engine, or this vllm-ascend")
