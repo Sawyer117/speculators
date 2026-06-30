@@ -166,15 +166,18 @@ this edit the server **won't start** (`architectures ... are not supported`).
 
 ## 6. Serve + eval (reuse the DFlash harness)
 
-Serve directly (the run scripts predate this stack; a plain `vllm serve` is simplest). Two
-DSpark-specific flags are **required**:
-- **`--enforce-eager`** — disables torch.compile; our from-scratch build lacks the graph-fusion
-  op `torch.ops.vllm.qkv_rmsnorm_rope` (a triton-ascend kernel we skipped), which crashes the
-  compile pass. Eager doesn't affect accept length. (Install triton-ascend later for graph throughput.)
+Serve directly (the run scripts predate this stack; a plain `vllm serve` is simplest). Three
+DSpark-specific knobs **matter**:
+- **`"num_speculative_tokens": 7`** — the `block7` ckpt drafts **7** tokens (DSpark paper config),
+  NOT block-1=6. Setting 6 follows the DFlash convention but drops the 7th draft position (~0.58 of
+  the accept length): gsm8k accept **5.66 @ 6 vs ~6.2 @ 7**. Always set it to the ckpt's block size.
 - **`"method": "dflash"`** in `--speculative-config` — DSpark MUST run on the DFlash proposer
   (`AscendDflashProposer`), which sets up the HS pipeline + `_next_token_ids` the Markov head
   needs. Without it vLLM defaults to the generic `draft_model` proposer → `AttributeError:
   ... has no attribute '_next_token_ids'` in dummy_run.
+- **`--enforce-eager`** — simplest path (disables torch.compile). Accept length is identical to
+  graph mode. For **~5× throughput**, install triton-ascend and **drop `--enforce-eager`** to run
+  full cudagraph — correct accept there needs the cudagraph-safe Markov fix (vllm-ascend PR #11153).
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0 VLLM_USE_V1=1
@@ -184,7 +187,7 @@ nohup vllm serve "$TARGET" \
   --trust-remote-code --tensor-parallel-size 1 \
   --max-num-seqs 64 --max-model-len 8192 \
   --enforce-eager \
-  --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":6,\"method\":\"dflash\",\"draft_tensor_parallel_size\":1}" \
+  --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":7,\"method\":\"dflash\",\"draft_tensor_parallel_size\":1}" \
   --host 0.0.0.0 --port 30000 \
   > dspark_serve.log 2>&1 &
 tail -f dspark_serve.log            # wait for "Application startup complete"
@@ -195,7 +198,8 @@ cd <root>/dspark/speculators/examples/ascend_npu_dflash
 pip install datasets requests       # Evaluator deps, if missing
 bash run_eval.sh                     # accept length + throughput per benchmark
 ```
-Accept length should beat plain DFlash (paper: Qwen3-8B gsm8k 6.30 @ 7 spec tokens vs 4.91).
+Accept length: gsm8k **~6.2** @ `num_speculative_tokens=7` (Qwen3-4B; DSpark paper Qwen3-8B 6.30 @
+7 vs plain DFlash 4.91). Graph mode (drop `--enforce-eager`) adds ~5× throughput at the same accept.
 
 ---
 
