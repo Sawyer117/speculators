@@ -261,20 +261,33 @@ the Qwen3 DFlash-vs-DSpark table.
 
 ---
 
-## 8. Open risks / TODO
+## 8. Status (2026-07-03) — BLOCKED on a vLLM-0.23/main w8a8 regression
 
-- [ ] **V4 CANN ops build** (`pip install -e .`) — does the new CANN carry the V4 kernels? (main's
-      base is `cann:9.0.0`; the `quay.io/ascend/vllm-ascend:deepseekv4` image, 2026-05-06, bakes them
-      in.) First failure point.
-- [ ] **torch_npu ↔ CANN match** — torch_npu 2.10.0 targets CANN 9.0.0; if the new CANN is newer and
-      torch_npu won't load, swap to the matching torch_npu.
-- [ ] **AR/MTP baseline on the new stack** — if it regresses vs the v0.13.0rc3 image, that's a
-      fix + PR opportunity (expected, acceptable).
-- [ ] **DSpark serve wiring** — target = w8a8 (msmodelslim int8) vs draft = DeepSeek MX int8/fp8:
-      confirm how `quant_config` is routed to each; confirm the draft's tied `embed/head` don't clash
-      with the int8 target (shipping bf16 embed/head with the draft avoids it).
-- [ ] **Graph mode for the draft** — #11196 validated with `enforce_eager` on the draft; putting the
-      draft into ACLGraph is the same cudagraph-safe-drafting win we already landed for Qwen3.
+Env built fine (V4 CANN ops compiled on CANN **9.0.0.0512**). Two bugs on serve (A2 TP8/DP1):
+
+1. **[FIXED] ACL-graph capture crash** — DSA `_forward_o_proj` fed a **2D `wo_a.weight`** (w8a8 loads
+   some o_proj weights 2D) to `npu_transpose_batchmatmul`, which needs 3D →
+   *"Dimension out of range … got 2"*. Fix = plain `torch.matmul` o_proj for `n_local_groups==1`
+   (TP8). The ONLY code change; on `Sawyer117/vllm-ascend@dspark-dsv4` commit `6036507`.
+
+2. **[BLOCKED] Garbage output** — coherent English words stuck repeating ("X as X as…"), eager AND
+   graph. **Ruled out:** o_proj (bulletproof matmul still garbles), sliding window (traced identical),
+   act_fn (#11184 present), the DSpark HS-capture in `_forward` (guarded, no-op for base), prefix
+   caching (`--no-enable-prefix-caching` didn't fix), config (matched official verbatim), and the
+   checkpoint (works on the official image).
+
+**Root cause (proven, not guessed): NOT CANN — a vLLM-0.23/main w8a8 regression.** The official
+`quay.io/ascend/vllm-ascend:v0.22.1rc1` image runs this exact w8a8-mtp model **coherently** on
+**CANN 9.0.0** (same as us) + **vLLM v0.22.1** + vllm-ascend **v0.22.1rc1**. We differ ONLY in
+**vLLM 0.23.0** and **vllm-ascend #11196/main** (~150 commits past rc1, incl. `1c57c6a0a` fused-moe
+refactor, `55b8cd0d8` SFA o_proj TP weights). Same CANN → **don't reinstall CANN.** QwertyJack
+validated #11196 in **bf16** → dtype-independent code is fine → the bug is the **w8a8 path on
+vLLM-0.23/main**. Exact regression not findable by static read (~150-commit bisect).
+
+**Next:** (A) get a working w8a8 baseline on the **v0.22.1 stack** (the `:v0.22.1rc1` image, or build
+vllm-ascend @ `v0.22.1rc1` + vLLM 0.22.1 on the same CANN 9.0.0); (B) **ask QwertyJack** whether
+#11196 supports w8a8 or only bf16 — the authoritative answer. (bf16 needs ~16 cards; we have 8 → OOM.)
+Old `:deepseekv4` image (5/6) = CANN **8.5.1** + vLLM **0.18** — a different OLD stack, not comparable.
 
 ## 9. References
 
