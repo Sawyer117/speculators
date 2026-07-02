@@ -130,7 +130,7 @@ the Qwen3 env — the discrepancy is small.
 | Python | 3.11 | |
 | CANN | new (≥ 9.0.0; main's Dockerfile base = `cann:9.0.0-910b`) | V4 kernels compiled during the vllm-ascend build |
 | torch / torch-npu | 2.10.0 | main `requirements.txt` pin |
-| numpy | **2.3.5** | the old 1.26.4 pin is dropped — 2.x verified fine on this stack |
+| numpy | **2.3.5** (force after triton-ascend) | triton-ascend 3.2.1 pulls it down to 1.26.4; re-force `pip install --no-deps numpy==2.3.5` — verified fine at 2.3.5 |
 | vLLM | v0.23.0 `VLLM_TARGET_DEVICE=empty` | "0.23.0+empty" |
 | vllm-ascend | `Sawyer117/vllm-ascend @ dspark-dsv4` (= QwertyJack `qwertyjack/deepseek-v4-dspark-main`, `6cdb99e`) | PR #11196 |
 | triton-ascend | 3.2.1 + clang-15 + gxx_linux-aarch64 | runtime slot-mapping kernel + JIT headers |
@@ -168,16 +168,33 @@ python -c "import vllm; print(vllm.__version__)"   # 0.23.0+empty
 # vllm-ascend V4 DSpark (read-only clone of the fork branch)
 cd "$ROOT/installation"
 git clone --branch dspark-dsv4 --single-branch https://github.com/Sawyer117/vllm-ascend.git vllm-ascend-v4 && cd vllm-ascend-v4
-pip install -e . --no-deps --no-build-isolation -v        # compiles the V4 CANN ops — the moment of truth
+
+# runtime extras FIRST (the build doesn't import them; clang/gxx are runtime-only → conda goes LAST)
 python -m pip install numba einops pandas msgpack
 python -m pip install --no-deps torchvision==0.25.0 torchaudio==2.10.0 --extra-index-url https://mirrors.huaweicloud.com/repository/pypi/simple
 python -m pip install triton-ascend==3.2.1 --extra-index-url https://mirrors.huaweicloud.com/repository/pypi/simple --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
+# ⚠️ triton-ascend 3.2.1 metadata REQUIRES numpy<2 → it silently DOWNGRADES numpy 2.3.5 → 1.26.4.
+#    Force it back (verified to run fine at 2.3.5; the "requires numpy<2" warning is expected/ignored):
+pip install --no-deps "numpy==2.3.5"
+
+# compile vllm-ascend WITH numpy 2.3.5 (compiles the V4 CANN ops — the moment of truth)
+pip install -e . --no-deps --no-build-isolation -v
+
+# conda clang/gxx LAST — runtime triton JIT only; doing it BEFORE the build can perturb the env / error
 conda install -y -c conda-forge clang=15 clangxx=15 lld=15 gxx_linux-aarch64
+
+python -c "import numpy; print(numpy.__version__)"          # confirm still 2.3.5 (re-force if conda moved it)
 python -c "import vllm_ascend; print('vllm_ascend import OK')"
 ```
 
-Harmless: `ms-service-profiler` / `schedule-search` pip dependency-conflict warnings (CANN profiling
-tools, not used at inference). If the op compile dies on a missing python module → install it, then
+**Ordering rule:** runtime extras (numba/einops/pandas/msgpack/torchvision/triton-ascend) + the
+numpy re-force go BEFORE `pip install -e .`; **conda clang/gxx goes LAST** (after the compile) — doing
+the conda step earlier can perturb the build env and error.
+
+Harmless warnings: `ms-service-profiler` / `schedule-search` (CANN profiling tools, unused at
+inference); `opencv-python-headless requires numpy>=2` (opencv is vLLM's multimodal dep — never
+imported for V4 text, so 1.26.4/2.3.5 either way is fine); `triton-ascend requires numpy<2` (we
+override to 2.3.5 on purpose). If the op compile dies on a missing python module → install it, then
 `rm -rf csrc/build` and rebuild. If it dies on a missing CANN symbol → the new CANN may lack a V4 op
 (the real risk; capture the error).
 
