@@ -200,33 +200,38 @@ override to 2.3.5 on purpose). If the op compile dies on a missing python module
 
 ---
 
-## 5. Serve — AR / MTP baseline (official vllm-ascend V4-Flash recipe)
+## 5. Serve — AR / MTP baseline (official vllm-ascend V4-Flash recipe, **A2 64G×8**)
 
-Env (A3 128G×8 shown; **A2 64G×8** = adjust the A3-only vars + DP/TP):
+Needs the **~300 GB `DeepSeek-V4-Flash-w8a8-mtp` target** (not the 13 GB draft). Env (Atlas 800 A2):
 
 ```bash
-export OMP_PROC_BIND=false OMP_NUM_THREADS=10 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ACL_OP_INIT_MODE=1 USE_MULTI_BLOCK_POOL=1 HCCL_BUFFSIZE=1024
-export VLLM_ASCEND_ENABLE_FUSED_MC2=1 VLLM_ASCEND_ENABLE_FLASHCOMM1=1
-# A3 only: export ASCEND_A3_ENABLE=1 USE_MULTI_GROUPS_KV_CACHE=1
+export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export OMP_PROC_BIND=false OMP_NUM_THREADS=8 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ACL_OP_INIT_MODE=1 VLLM_ASCEND_ENABLE_FLASHCOMM1=1 USE_MULTI_GROUPS_KV_CACHE=1
+export TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE="AIV" HCCL_BUFFSIZE=512 USE_MULTI_BLOCK_POOL=1
 ```
+
+A2 = single node, **TP8 / DP1** (A3 128G×8 differs: DP4/TP4, method name `deepseek_mtp`, other env):
 
 ```bash
 MODEL=/path/DeepSeek-V4-Flash-w8a8-mtp
-vllm serve "$MODEL" --served-model-name dsv4 --trust-remote-code \
-  --data-parallel-size 4 --tensor-parallel-size 4 --enable-expert-parallel \
+vllm serve "$MODEL" --served-model-name dsv4 \
+  --data-parallel-size 1 --tensor-parallel-size 8 --enable-expert-parallel \
   --quantization ascend \
   --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 --enable-auto-tool-choice \
-  --max-model-len 8192 --max-num-seqs 16 --max-num-batched-tokens 8192 \
-  --gpu-memory-utilization 0.9 --block-size 128 --safetensors-load-strategy prefetch --async-scheduling \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --additional-config '{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false},"enable_cpu_binding":"true","multistream_overlap_shared_expert":false,"multistream_dsa_preprocess":false}' \
-  --port 8008
-# MTP baseline: add   --speculative-config '{"num_speculative_tokens":1,"method":"deepseek_mtp"}'
+  --max-model-len 135168 --max-num-seqs 16 --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.92 --block-size 128 \
+  --safetensors-load-strategy prefetch --enable-chunked-prefill --enable-prefix-caching --async-scheduling \
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}' \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[2,4,6,8,10,12,14,16,18,20,22,24,32,36,40]}' \
+  --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":false}' \
+  --port 7000
+# MTP baseline: add   --speculative-config '{"num_speculative_tokens":1,"method":"mtp"}'   (A2 = "mtp"; A3 = "deepseek_mtp")
 # AR baseline:  omit --speculative-config entirely.
+# Reaching "Application startup complete" = V4 kernels run on the new CANN → env moment-of-truth passed.
 ```
 
-Smoke test (bypass the netentsec proxy): `curl --noproxy '*' http://localhost:8008/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"dsv4","messages":[{"role":"user","content":"Who are you?"}],"max_tokens":128,"temperature":0}'`
+Smoke test (bypass the netentsec proxy): `curl --noproxy '*' http://localhost:7000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"dsv4","messages":[{"role":"user","content":"Who are you?"}],"max_tokens":128,"temperature":0}'`
 
 ---
 
@@ -246,8 +251,8 @@ as-is (no architecture edit, no dequant flag). Exact flag wiring to be confirmed
 
 ```bash
 cd examples/ascend_npu_dflash
-TARGET=dsv4 EVAL_PORT=8008 DATASET=gsm8k bash run_eval.sh      # smoke
-TARGET=dsv4 EVAL_PORT=8008 DATASET=all   bash run_eval.sh      # full
+TARGET=dsv4 EVAL_PORT=7000 DATASET=gsm8k bash run_eval.sh      # smoke
+TARGET=dsv4 EVAL_PORT=7000 DATASET=all   bash run_eval.sh      # full
 ```
 Record, same box / same graph config: **AR → tok/s** (accept nan, the denominator); **MTP → tok/s +
 accept** (num_spec 1 → accept ≤ 2); **DSpark → tok/s + accept** (num_spec 5). The three form the
