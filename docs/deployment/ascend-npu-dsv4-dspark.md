@@ -256,51 +256,57 @@ and yielding real AR/MTP numbers. The maintainer-validated stack is **vLLM v0.22
 v0.22.1rc1** (the official image bundles exactly this). We do NOT use the image: DSpark work needs to
 edit/recompile vLLM & vllm-ascend constantly, so we reproduce that stack **from source in a conda env**.
 
-**Key finding (why this is cheap):** diffing the `v0.22.1rc1` tag's `requirements.txt` against `main`
-(6cdb99e), EVERYTHING is identical — **torch/torch_npu 2.10.0, torchvision 0.25.0, triton-ascend
-3.2.1, transformers 5.5.4, fastapi<0.124.0, numpy** — the ONLY differences are **vLLM (0.23.0 →
-v0.22.1)** and **vllm-ascend (main → v0.22.1rc1)**. So: **clone the working `dspark-dsv4-base` env and
-swap just those two source packages.** No dependency re-juggling; CANN 9.0.0 unchanged.
+**Key finding:** diffing the `v0.22.1rc1` tag's `requirements.txt` against `main` (6cdb99e),
+EVERYTHING is identical — **torch/torch_npu 2.10.0, torchvision 0.25.0, triton-ascend 3.2.1,
+transformers 5.5.4, fastapi<0.124.0, numpy** — the ONLY differences are **vLLM (0.23.0 → v0.22.1)**
+and **vllm-ascend (main → v0.22.1rc1)**. (Cloning `dspark-dsv4-base` + swapping just those two would
+also work, but for a fully-isolated clean-room reference we build **from scratch** under a NEW root
+`/home/a00652497/dspark_base` with CANN `source /home/a00652497/910env_npu.sh` — no shared state.)
 
-**Step 0 — clone the env** (keeps torch_npu / triton-ascend / numpy 2.3.5 / transformers / fastapi all
-correct; leaves `dspark-dsv4-base` — the DSpark/0.23 dev env — untouched):
+**Step 0 — fresh env + fresh source root** (identical recipe to §4, only the two version pins + paths
+change; the numpy-after-triton-ascend and conda-clang-LAST ordering rules from §4 still apply):
 ```bash
-conda create --clone dspark-dsv4-base -n dsv4-rc1-base
-conda activate dsv4-rc1-base
-# make sure CANN is sourced (custom-kernel compile needs it), same as the 0.23 build:
-source /home/a00652497/dspark_2026/set_env.sh   # or wherever your CANN set_env lives
+export ROOT=/home/a00652497/dspark_base && mkdir -p "$ROOT/installation"
+source /home/a00652497/910env_npu.sh              # CANN + nnal; npu-smi should show 8 cards
+conda create -n dsv4-rc1-base python=3.11 -y && conda activate dsv4-rc1-base
 ```
 
-**Step 1 — get the two source trees at the rc1 versions** (fresh dirs; do NOT disturb the existing
-`vllm-v0.23.0` / `vllm-ascend-v4` checkouts):
+**Step 1 — build deps + torch/torch_npu 2.10.0** (same as §4):
 ```bash
-cd /home/a00652497/dspark_2026/installation
-git clone --depth 1 -b v0.22.1     https://github.com/vllm-project/vllm.git        vllm-v0.22.1
-git clone --depth 1 -b v0.22.1rc1  https://github.com/vllm-project/vllm-ascend.git vllm-ascend-rc1
+python -m pip install -U pip setuptools "setuptools-scm>=8" wheel packaging "cmake>=3.26" ninja jinja2 setuptools-rust pybind11
+python -m pip install --extra-index-url https://mirrors.huaweicloud.com/repository/pypi/simple \
+  --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi torch==2.10.0 torch-npu==2.10.0 pyyaml
+python -m pip install decorator "scipy>=1.7.3" ml-dtypes attrs psutil pyyaml matplotlib openpyxl tornado
+python -c "import torch, torch_npu; print(torch.__version__, torch_npu.__version__, torch_npu.npu.is_available(), torch_npu.npu.device_count())"  # ... True 8
 ```
 
-**Step 2 — swap vLLM to v0.22.1** (empty target = no device compile for vLLM itself; drop the x86
-triton it pulls):
+**Step 2 — vLLM v0.22.1 (+empty)** — the ONLY change from §4 is the tag `v0.23.0`→`v0.22.1`:
 ```bash
-pip uninstall -y vllm
-cd /home/a00652497/dspark_2026/installation/vllm-v0.22.1
-VLLM_TARGET_DEVICE="empty" pip install -e . --extra-index-url https://download.pytorch.org/whl/cpu/
-pip uninstall -y triton
+cd "$ROOT/installation"
+git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git vllm-v0.22.1 && cd vllm-v0.22.1
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation -v
+python -c "import vllm; print(vllm.__version__)"   # 0.22.1
+# rc1 pins these exactly; vLLM 0.22.1 usually pulls them, but force to be safe:
+python -m pip install "transformers==5.5.4" "fastapi<0.124.0"
 ```
 
-**Step 3 — swap vllm-ascend to v0.22.1rc1** (recompiles the CANN custom kernels; then restore the
-Ascend triton + re-force numpy — the known triton-ascend-downgrades-numpy gotcha):
+**Step 3 — vllm-ascend v0.22.1rc1 (upstream tag, NOT the fork branch)** — runtime extras first, numpy
+re-force, compile, conda clang LAST (exactly §4's ordering):
 ```bash
-pip uninstall -y vllm-ascend
-cd /home/a00652497/dspark_2026/installation/vllm-ascend-rc1
-export SOC_VERSION=ascend910b1 COMPILE_CUSTOM_KERNELS=1 VLLM_BATCH_INVARIANT=1
-pip install -e . --extra-index-url https://download.pytorch.org/whl/cpu/
-pip uninstall -y triton triton-ascend
-pip install triton-ascend==3.2.1 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
-pip install --no-deps numpy==2.3.5     # re-force; triton-ascend pins numpy<2
+cd "$ROOT/installation"
+git clone --depth 1 --branch v0.22.1rc1 https://github.com/vllm-project/vllm-ascend.git vllm-ascend-rc1 && cd vllm-ascend-rc1
+
+python -m pip install numba einops pandas msgpack
+python -m pip install --no-deps torchvision==0.25.0 torchaudio==2.10.0 --extra-index-url https://mirrors.huaweicloud.com/repository/pypi/simple
+python -m pip install triton-ascend==3.2.1 --extra-index-url https://mirrors.huaweicloud.com/repository/pypi/simple --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
+pip install --no-deps "numpy==2.3.5"     # triton-ascend downgrades it → re-force (runs fine at 2.3.5)
+
+pip install -e . --no-deps --no-build-isolation -v   # compiles the V4 CANN ops (moment of truth)
+
+conda install -y -c conda-forge clang=15 clangxx=15 lld=15 gxx_linux-aarch64   # runtime JIT only → LAST
 ```
 
-**Step 4 — verify the swap:**
+**Step 4 — verify:**
 ```bash
 python -c "import vllm; print('vllm', vllm.__version__)"                       # 0.22.1
 python -c "import vllm_ascend; print('vllm_ascend OK')"
