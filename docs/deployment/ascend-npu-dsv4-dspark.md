@@ -248,64 +248,83 @@ Smoke test (bypass the netentsec proxy): `curl --noproxy '*' http://localhost:70
 
 ---
 
-## 5.5 GUARANTEED baseline — official v0.22.1rc1 Docker image (肯定能跑)
+## 5.5 GUARANTEED baseline — v0.22.1rc1 stack in a CONDA env (肯定能跑, still source-editable)
 
 The source-built stack above (vLLM 0.23.0 + vllm-ascend main) produces **garbage w8a8 output**
-(see §8). To get a *definitely-working* reference — proving the checkpoint + host driver + NPUs are
-all fine, and yielding real AR/MTP numbers — run the **exact stack the maintainers validated**: the
-`v0.22.1rc1` image (vLLM 0.22.1 + vllm-ascend v0.22.1rc1 + bundled CANN). This locks BOTH variables
-that the drifted source build leaves open: **userspace versions** AND **serve config**. Only the host
-driver and the checkpoint remain, and both are already proven.
+(see §8). We need a *definitely-working* reference — proving the checkpoint + driver + NPUs are fine,
+and yielding real AR/MTP numbers. The maintainer-validated stack is **vLLM v0.22.1 + vllm-ascend
+v0.22.1rc1** (the official image bundles exactly this). We do NOT use the image: DSpark work needs to
+edit/recompile vLLM & vllm-ascend constantly, so we reproduce that stack **from source in a conda env**.
 
-**Step 0 — check Docker + NPU access on the host (outside any container):**
+**Key finding (why this is cheap):** diffing the `v0.22.1rc1` tag's `requirements.txt` against `main`
+(6cdb99e), EVERYTHING is identical — **torch/torch_npu 2.10.0, torchvision 0.25.0, triton-ascend
+3.2.1, transformers 5.5.4, fastapi<0.124.0, numpy** — the ONLY differences are **vLLM (0.23.0 →
+v0.22.1)** and **vllm-ascend (main → v0.22.1rc1)**. So: **clone the working `dspark-dsv4-base` env and
+swap just those two source packages.** No dependency re-juggling; CANN 9.0.0 unchanged.
+
+**Step 0 — clone the env** (keeps torch_npu / triton-ascend / numpy 2.3.5 / transformers / fastapi all
+correct; leaves `dspark-dsv4-base` — the DSpark/0.23 dev env — untouched):
 ```bash
-docker --version && docker ps >/dev/null 2>&1 && echo "docker OK"   # if this fails → no docker; use the source-build fallback at the end
-ls /dev/davinci0 /dev/davinci_manager                                 # devices must exist on host
-npu-smi info                                                          # all 8 cards idle (no leftover procs holding HBM)
+conda create --clone dspark-dsv4-base -n dsv4-rc1-base
+conda activate dsv4-rc1-base
+# make sure CANN is sourced (custom-kernel compile needs it), same as the 0.23 build:
+source /home/a00652497/dspark_2026/set_env.sh   # or wherever your CANN set_env lives
 ```
 
-**Step 1 — pull the A2 image** (quay.io slow/blocked → use the daocloud mirror):
+**Step 1 — get the two source trees at the rc1 versions** (fresh dirs; do NOT disturb the existing
+`vllm-v0.23.0` / `vllm-ascend-v4` checkouts):
 ```bash
-export IMAGE=quay.io/ascend/vllm-ascend:v0.22.1rc1
-docker pull "$IMAGE" || { export IMAGE=quay.m.daocloud.io/ascend/vllm-ascend:v0.22.1rc1; docker pull "$IMAGE"; }
+cd /home/a00652497/dspark_2026/installation
+git clone --depth 1 -b v0.22.1     https://github.com/vllm-project/vllm.git        vllm-v0.22.1
+git clone --depth 1 -b v0.22.1rc1  https://github.com/vllm-project/vllm-ascend.git vllm-ascend-rc1
 ```
 
-**Step 2 — run the container**, bind-mounting the existing checkpoint (no re-download) + host driver:
+**Step 2 — swap vLLM to v0.22.1** (empty target = no device compile for vLLM itself; drop the x86
+triton it pulls):
 ```bash
-docker run --rm -it --name dsv4-base \
-  --shm-size=512g --net=host \
-  --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3 \
-  --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7 \
-  --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc \
-  -v /usr/local/dcmi:/usr/local/dcmi \
-  -v /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool \
-  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-  -v /etc/ascend_install.info:/etc/ascend_install.info \
-  -v /etc/hccn.conf:/etc/hccn.conf \
-  -v /share/canada_group_folder/ckpt:/models:ro \
-  "$IMAGE" bash
+pip uninstall -y vllm
+cd /home/a00652497/dspark_2026/installation/vllm-v0.22.1
+VLLM_TARGET_DEVICE="empty" pip install -e . --extra-index-url https://download.pytorch.org/whl/cpu/
+pip uninstall -y triton
 ```
 
-**Step 3 — inside the container, export the official A2 env** (jemalloc IS present in the image at the
-Ubuntu path, so keep it; do NOT add the extra ACL_OP_INIT_MODE / USE_MULTI_GROUPS_KV_CACHE /
-USE_MULTI_BLOCK_POOL knobs — the tutorial does not set them):
+**Step 3 — swap vllm-ascend to v0.22.1rc1** (recompiles the CANN custom kernels; then restore the
+Ascend triton + re-force numpy — the known triton-ascend-downgrades-numpy gotcha):
+```bash
+pip uninstall -y vllm-ascend
+cd /home/a00652497/dspark_2026/installation/vllm-ascend-rc1
+export SOC_VERSION=ascend910b1 COMPILE_CUSTOM_KERNELS=1 VLLM_BATCH_INVARIANT=1
+pip install -e . --extra-index-url https://download.pytorch.org/whl/cpu/
+pip uninstall -y triton triton-ascend
+pip install triton-ascend==3.2.1 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
+pip install --no-deps numpy==2.3.5     # re-force; triton-ascend pins numpy<2
+```
+
+**Step 4 — verify the swap:**
+```bash
+python -c "import vllm; print('vllm', vllm.__version__)"                       # 0.22.1
+python -c "import vllm_ascend; print('vllm_ascend OK')"
+python -c "import torch_npu, numpy; print('torch_npu', torch_npu.__version__, 'numpy', numpy.__version__)"  # 2.10.0 / 2.3.5
+```
+
+**Step 5 — export the official A2 env** (verbatim from the tutorial; do NOT add the extra
+ACL_OP_INIT_MODE / USE_MULTI_GROUPS_KV_CACHE / USE_MULTI_BLOCK_POOL knobs — the tutorial has none;
+drop LD_PRELOAD if jemalloc isn't installed, see §5 top):
 ```bash
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:$LD_PRELOAD   # or drop this line if not installed
 export HCCL_BUFFSIZE=1024
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 ```
 
-**Step 4 — serve with the EXACT official A2 command** (verbatim from the tutorial; MTP on,
-`enforce_eager:true`, prefix caching OFF, `enable_dsa_cp:true`):
+**Step 6 — serve with the EXACT official A2 command** (verbatim from the tutorial; MTP on,
+`enforce_eager:true`, prefix caching OFF, `enable_dsa_cp:true`; point it at your local checkpoint):
 ```bash
-vllm serve /models/DeepSeek-V4-Flash-w8a8-mtp \
+vllm serve /share/canada_group_folder/ckpt/DeepSeek-V4-Flash-w8a8-mtp \
     --max-model-len 133120 \
     --max-num-batched-tokens 8192 \
     --served-model-name dsv4 \
@@ -332,27 +351,29 @@ vllm serve /models/DeepSeek-V4-Flash-w8a8-mtp \
 AR baseline: drop `--speculative-config`. (A3 differs: TP4/DP4, `--max-model-len 1048576`,
 `--max-num-batched-tokens 10240`, `--max-num-seqs 64`, `--api-server-count 1`, and no `enable_dsa_cp`.)
 
-**Step 5 — smoke test** (from host or container; long answer to catch the repetition bug):
+**Step 7 — smoke test** (long answer to catch the repetition bug):
 ```bash
 curl --noproxy '*' http://localhost:8900/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"dsv4","messages":[{"role":"user","content":"从1数到40"}],"max_tokens":512,"temperature":0}'
 ```
 Coherent count → **baseline confirmed**: checkpoint + hardware + driver all good; the garbage is
-categorically a source-stack (vLLM-0.23/main) problem, not ours.
+categorically a source-stack (vLLM-0.23/main) problem, not ours. You now have TWO conda envs:
+`dspark-dsv4-base` (0.23 + main, DSpark dev) and `dsv4-rc1-base` (known-good baseline), each with its
+own editable vLLM + vllm-ascend source trees — edit/recompile freely in either.
 
-**Config drift — the source-build §5 command differs from official in 8 places** (fix these if you ever
-run w8a8 on the source stack): (1) prefix caching ON vs official `--no-enable-prefix-caching`;
+**Config drift — the source-build §5 command differs from this official one in 8 places** (so the §5
+garbage is NOT purely a version issue — config differs too; when moving DSpark onto rc1, start from
+THIS command, not §5's): (1) prefix caching ON vs official `--no-enable-prefix-caching`;
 (2) **missing `enable_dsa_cp:true`**; (3) missing `ascend_compilation_config`
 (enable_npugraph_ex/enable_static_kernel); (4) `multistream_overlap_shared_expert` false vs true;
 (5) explicit `cudagraph_capture_sizes` vs none; (6) max-model-len 135168 vs 133120; (7) num_seqs 16 /
 batched 4096 / mem-util 0.92 / num_threads 16 vs 32 / 8192 / 0.9 / 128; (8) env: extra
 ACL_OP_INIT_MODE + USE_MULTI_GROUPS_KV_CACHE + USE_MULTI_BLOCK_POOL, OMP 8 vs 10, HCCL_BUFFSIZE 512 vs 1024.
 
-**Fallback — no Docker access** → build the v0.22.1rc1 tag from source in a FRESH conda env (do NOT
-reuse `dspark-dsv4-base`, its vLLM is 0.23). Same recipe as §3/§4 but pin: **vLLM `v0.22.1`** (git
-checkout tag), **vllm-ascend `v0.22.1rc1`** (git checkout tag), Py3.11, CANN 9.0.0. Then use the Step-4
-command with the local model path. This reintroduces the build as a variable (less guaranteed than the
-image) but stays in conda.
+**Then layer DSpark (step 2 of the plan):** once this rc1 baseline is coherent, add DSpark by porting
+#11196's commits onto the `vllm-ascend-rc1` tree (backport is non-trivial — dsa_v1.py/model_runner
+drifted ~580 lines main↔rc1 — so prefer asking QwertyJack to rebase #11196 onto v0.22.1rc1, else
+hand-port commit-by-commit). The rc1 baseline is the reference the DSpark serve must match token-for-token.
 
 ---
 
