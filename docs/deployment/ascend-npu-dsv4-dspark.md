@@ -202,10 +202,23 @@ override to 2.3.5 on purpose). If the op compile dies on a missing python module
 
 ## 5. Serve — AR / MTP baseline (official vllm-ascend V4-Flash recipe, **A2 64G×8**)
 
-Needs the **~300 GB `DeepSeek-V4-Flash-w8a8-mtp` target** (not the 13 GB draft). Env (Atlas 800 A2):
+Needs the **~300 GB `DeepSeek-V4-Flash-w8a8-mtp` target** (not the 13 GB draft).
+
+jemalloc is NOT preinstalled on the group's boxes — install it first, or every process spams
+`libjemalloc.so.2 cannot be preloaded` (harmless but noisy; serve also runs fine without it,
+it's just an allocator perf tweak):
 
 ```bash
-export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:$LD_PRELOAD
+sudo yum install -y jemalloc
+# yum-based distros (openEuler/EulerOS) install to /usr/lib64/, NOT the Ubuntu-style
+# /usr/lib/aarch64-linux-gnu/ path the official tutorial uses. Confirm with:
+#   ldconfig -p | grep jemalloc
+```
+
+Env (Atlas 800 A2):
+
+```bash
+export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:$LD_PRELOAD   # Ubuntu images: /usr/lib/aarch64-linux-gnu/libjemalloc.so.2
 export OMP_PROC_BIND=false OMP_NUM_THREADS=8 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1 VLLM_ASCEND_ENABLE_FLASHCOMM1=1 USE_MULTI_GROUPS_KV_CACHE=1
 export TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE="AIV" HCCL_BUFFSIZE=512 USE_MULTI_BLOCK_POOL=1
