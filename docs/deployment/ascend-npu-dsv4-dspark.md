@@ -200,28 +200,39 @@ Two failure modes we actually hit and their REAL causes:
 1. **`opbuild_gen_* Error 1` / "ops prepare build failed"** = a conda `gxx_linux-aarch64` was
    installed and **hijacked CMake** to conda GCC 15.2 (`aarch64-conda-linux-gnu-cc`) → ABI mismatch
    with CANN opbuild. Fix: remove the conda compilers.
-2. **`build_aclnn.sh exit 127`** = the device-link step couldn't find **`lld`** → CANN's `bin/` (which
-   carries lld) is not on `PATH` because CANN wasn't fully sourced. Fix: `source` the CANN `set_env`
-   so `which lld` returns `…/cann-9.0.0/bin/lld`. (It is NOT "system gcc missing" — that was a wrong
-   earlier guess; and do NOT `export CC/CXX=/usr/bin/g++`, that pollutes the AICPU cross-compile:
-   `aarch64-target-linux-gnu-g++: /usr/bin/g++: linker input file unused`.)
+2. **`build_aclnn.sh exit 127`** = a build sub-step invoked a command that **isn't installed** ("command
+   not found" → shell exit 127). The one we actually hit (cost days): the bundled **ascend_protobuf**
+   is patched with the **`patch`** utility (`FAILED: [code=127] … patch -p1 < protobuf_25.1_change_version.patch`
+   → `/bin/sh: patch: command not found`) — **`patch` was simply not installed.** Fix: `sudo yum
+   install -y patch` (or `conda install -y -c conda-forge patch`). NOTE: ninja runs jobs in parallel,
+   so the *reported* step number (401, 575, …) jumps around — the real culprit is always the
+   `FAILED: [code=127]` line, NOT wherever ninja happened to stop. It was NOT missing lld/gcc and NOT a
+   CC/CXX issue — those were wrong earlier guesses; do NOT `export CC/CXX=/usr/bin/g++`, that pollutes
+   the AICPU cross-compile (`aarch64-target-linux-gnu-g++: /usr/bin/g++: linker input file unused`).
 
-**Verify the toolchain matches a working node BEFORE building:**
+**Pin the EXACT missing command instead of guessing** (this is what finally solved it):
 ```bash
-which gcc g++ lld ld.lld
-#  expect: /usr/bin/gcc  /usr/bin/g++  <CANN>/bin/lld  <CANN>/bin/ld.lld   (clang/conda-gcc absent)
+rm -rf build csrc/build
+pip install -e . --no-deps --no-build-isolation -v > ~/va_build.log 2>&1
+grep -n -B1 -A8 "FAILED:" ~/va_build.log | head    # prints the failed cmd + its "… not found" line
+```
+
+**Verify the toolchain + host utils match a working node BEFORE building:**
+```bash
+which gcc g++ lld ld.lld ccec bisheng patch
+#  expect: system gcc/g++ (/usr/bin or /usr/lib64/ccache), CANN's lld/ld.lld/ccec/bisheng, and patch.
+#  ANY blank = the exit-127 culprit. `patch` is the easy-to-miss one (not pulled by CANN or the env).
 ```
 
 **If a build is failing, align to a known-good node:**
 ```bash
+sudo yum install -y patch gcc gcc-c++ make                 # host utils the op build shells out to
 conda remove -y gxx_linux-aarch64 gcc_linux-aarch64 clang clangxx lld 2>/dev/null; true  # unhijack CMake
 unset CC CXX                                                # never override — breaks AICPU cross-compile
-source <your CANN set_env>                                 # puts CANN's lld on PATH (fixes exit 127)
-which gcc && gcc --version | head -1                       # must be system /usr/bin/gcc (~10.3.1)
-export CC=/usr/bin/gcc CXX=/usr/bin/g++
-rm -rf build csrc/build                                     # MANDATORY: CMakeCache.txt pins the compiler
-rm -rf build csrc/build                                    # MANDATORY between retries (see below)
-pip install -e . --no-deps --no-build-isolation -v         # rebuild with system gcc + CANN lld
+source <your CANN set_env>                                 # puts CANN's lld/ccec/bisheng on PATH
+which gcc lld ccec patch                                    # all four must resolve
+rm -rf build csrc/build                                     # MANDATORY between retries (see below)
+pip install -e . --no-deps --no-build-isolation -v         # rebuild with system gcc + CANN toolchain
 ```
 `rm -rf build csrc/build` is REQUIRED between every retry — CMake caches the compiler choice, so a
 stale `build/` keeps reusing the wrong (conda) gcc even after you remove it. Do NOT reinstall conda
