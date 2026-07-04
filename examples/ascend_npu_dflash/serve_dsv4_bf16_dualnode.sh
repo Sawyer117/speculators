@@ -99,7 +99,12 @@ COMMON=( "$MODEL"
   --tokenizer-mode deepseek_v4
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS"
   --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching
+  --safetensors-load-strategy prefetch
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}'
   $EAGER_FLAG )
+# NB: the ckpt FS reports as "DPC" → vLLM disables auto-prefetch (only NFS/Lustre
+# auto-detected), so weight load took ~20 min. --safetensors-load-strategy prefetch
+# + multithread_load force it faster (RAM is ~1.4 TB, half-model prefetch fits easily).
 
 pkill -9 -u "$USER" -f vllm 2>/dev/null; sleep 15
 
