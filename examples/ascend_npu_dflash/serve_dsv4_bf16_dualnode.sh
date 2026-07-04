@@ -119,7 +119,11 @@ export OMP_PROC_BIND=false OMP_NUM_THREADS=10 PYTORCH_NPU_ALLOC_CONF=expandable_
 export ACL_OP_INIT_MODE=1 TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=1024
 export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_HOST_SOCKET_PORT_RANGE:-60000-61000}" HCCL_NPU_SOCKET_PORT_RANGE="${HCCL_NPU_SOCKET_PORT_RANGE:-61000-62000}"  # from the AtomGit bf16 A2 report
 
-EAGER_FLAG=""; [ "$EAGER" = "1" ] && EAGER_FLAG="--enforce-eager"
+# EAGER=1 → --enforce-eager (simple/reliable first bring-up). EAGER=0 → graph mode
+# (cudagraph FULL_DECODE_ONLY, the AtomGit report's config) for faster decode / higher throughput.
+EAGER_FLAG=""; GRAPH_ARGS=()
+if [ "$EAGER" = "1" ]; then EAGER_FLAG="--enforce-eager"
+else GRAPH_ARGS=(--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'); fi
 QUANT_ARGS=(); [ -n "$QUANT" ] && QUANT_ARGS=(--quantization "$QUANT")
 EP_ARGS=(); [ -n "$ENABLE_EP" ] && EP_ARGS=(--enable-expert-parallel)   # default OFF — see ENABLE_EP above
 # worker uses lower gpu-mem-util (0.85 vs 0.90) — avoids cudagraph-warmup OOM (per the AtomGit report)
@@ -134,10 +138,10 @@ COMMON=( "$MODEL"
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --block-size 128
   --max-num-batched-tokens "$MAXBATCHTOK"
   --gpu-memory-utilization "$GPUUTIL_EFF" --no-enable-prefix-caching
-  --additional-config '{"enable_cpu_binding":true}'
+  --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}'
   --safetensors-load-strategy prefetch
   --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}'
-  $EAGER_FLAG )
+  $EAGER_FLAG "${GRAPH_ARGS[@]}" )
 # NB: the ckpt FS reports as "DPC" → vLLM disables auto-prefetch (only NFS/Lustre
 # auto-detected), so weight load took ~20 min. --safetensors-load-strategy prefetch
 # + multithread_load force it faster (RAM is ~1.4 TB, half-model prefetch fits easily).
