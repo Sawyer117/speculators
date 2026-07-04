@@ -82,19 +82,22 @@ source "$CANN_ENV"
 source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null || true
 conda activate "$CONDA_ENV"
 
-export VLLM_HOST_IP="$THIS_IP"
-# Do NOT set HCCL_IF_IP to the host (1GbE) IP: HCCL's data plane must run over the
-# device RoCE NICs (hccn_tool IPs, e.g. 124.0.9.x), which HCCL auto-selects. Pinning
-# HCCL_IF_IP to the 1GbE host NIC misdirects it → the first cross-node collective
-# hangs (cards idle, EngineCore stuck in shm_broadcast). Only the host SOCKET ifname
-# (out-of-band rendezvous) is needed — matches examples/serve/dsv4_bf16_baseline_two_node.sh.
+export VLLM_HOST_IP="$THIS_IP" HCCL_IF_IP="$THIS_IP"   # host NIC IP — the official recipe DOES set this
 export GLOO_SOCKET_IFNAME="$NIC" TP_SOCKET_IFNAME="$NIC" HCCL_SOCKET_IFNAME="$NIC" GLOO_USE_IPV6=0
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
+# ★ THE multi-node fix (verbatim from the official Ascend-SACT A2 DP2/TP8/EP16 recipe,
+#   ai.gitcode.com/Ascend-SACT/DeepSeek-V4-Flash-A2): force intra-node HCCL over
+#   PCIe/SDMA and DISABLE intra-node RoCE. Otherwise the intra-node collective fights
+#   the RoCE fabric and the first forward deadlocks — NPUs idle at AICore 0%, EngineCore
+#   stuck repeating shm_broadcast "no available block" — even though inter-node RoCE
+#   pings fine. This pair is the piece our earlier DP2 attempts were missing.
+export HCCL_INTRA_PCIE_ENABLE=1 HCCL_INTRA_ROCE_ENABLE=0
+export VLLM_ASCEND_BALANCE_SCHEDULING=1 USE_MULTI_BLOCK_POOL=1 TRITON_ALL_BLOCKS_PARALLEL=1
+export VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-1800}"   # 30 min: model load is slow, ranks must wait
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"  # bf16 568GB load ≈16min/node ≫ default 600s → ApiServer else times out mid-load
-export OMP_PROC_BIND=false OMP_NUM_THREADS=8 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ACL_OP_INIT_MODE=1 TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=512
+export OMP_PROC_BIND=false OMP_NUM_THREADS=10 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ACL_OP_INIT_MODE=1 TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=1024
 
 EAGER_FLAG=""; [ "$EAGER" = "1" ] && EAGER_FLAG="--enforce-eager"
 
@@ -104,8 +107,9 @@ COMMON=( "$MODEL"
   --data-parallel-address "$HEAD_IP" --data-parallel-rpc-port "$DP_RPC_PORT"
   --tensor-parallel-size "$TP" --enable-expert-parallel
   --tokenizer-mode deepseek_v4
-  --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS"
+  --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --block-size 128
   --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching
+  --additional-config '{"enable_cpu_binding":true}'
   --safetensors-load-strategy prefetch
   --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}'
   $EAGER_FLAG )
