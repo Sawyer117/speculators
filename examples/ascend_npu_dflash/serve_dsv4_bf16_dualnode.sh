@@ -4,20 +4,23 @@
 # WHY 2 nodes: bf16 weights ≈ 568 GB > a single node's 8×64 = 512 GB. w8a8 (284 GB)
 # fits on one node; bf16 does NOT — it needs 2 nodes.
 #
-# PARALLELISM: TP8 / DP2 / EP16.
-#   - Each node = 1 DP replica × TP8 = 8 cards. Two nodes → data_parallel_size=2.
-#   - EP auto-expands to the whole world: ep_world_size = (DP2 × TP8) / PP1 = 16.
-#   - EP16 is exactly what trips vllm-ascend's MC2 fast path (256 routed experts /
-#     16 = 16 experts/device ≤ 24 AND ep_world_size ≥ 16). So DP2×TP8 is not just
-#     "fits", it's the good config.
+# PARALLELISM: TP8 / DP2, **expert-parallel OFF** (default).
+#   - Each node = 1 DP replica × TP8 = 8 cards, holding a FULL copy of the model
+#     (w8a8 ≈ 35 GB/card, bf16 more). Two nodes → data_parallel_size=2 = 2 replicas.
+#   - ⚠️ DO NOT pass --enable-expert-parallel: on two-node A2 it makes the MoE do a
+#     CROSS-node EP16 all-gather (HcclAllGather) that DEADLOCKS at startup (the endless
+#     `shm_broadcast: No available block` hang). Proven by the AtomGit A2 two-node
+#     V4-Flash report ("删除 --enable-expert-parallel 后不再报错") + our own plog
+#     (HcclAllGather stuck at seq_num 1, NPUs idle). Without EP the MoE is TP-sharded
+#     INSIDE each node → all collectives stay intra-node → no hang. (ENABLE_EP=1 to opt in.)
 #   - NO ray: vLLM native DP rendezvous over --data-parallel-address / -rpc-port.
 #
-# ┌─ RUN ORDER (three commands total) ────────────────────────────────────────┐
-# │ 0. ONCE per node, with sudo (firewalld blocks HCCL otherwise → deadlock):  │
-# │       sudo bash serve_dsv4_bf16_dualnode.sh firewall                       │
-# │ 1. HEAD node (rank 0, hosts the API):   bash ... head                      │
-# │ 2. WORKER node (rank 1, headless):      bash ... worker                    │
-# │    Start head first; the worker connects to the head's rpc port and waits. │
+# ┌─ RUN ORDER ───────────────────────────────────────────────────────────────┐
+# │ (firewalld is usually not running on these nodes; the 'firewall' step is a  │
+# │  no-op then — skip it. Run it only if `firewall-cmd --state` says running.) │
+# │ 1. HEAD node (rank 0, hosts the API):   bash ... head                       │
+# │ 2. WORKER node (rank 1, headless):      bash ... worker                     │
+# │    Start head first; the worker connects to the head's rpc port and waits.  │
 # └────────────────────────────────────────────────────────────────────────────┘
 #
 # PREREQS (BOTH nodes, identical):
@@ -52,20 +55,21 @@ CONDA_ENV="${CONDA_ENV:-dspark-dsv4-base}"
 TP="${TP:-8}"
 DP="${DP:-2}"
 MAXLEN="${MAXLEN:-8192}"
-MAXBATCHTOK="${MAXBATCHTOK:-1024}"        # ★ per-forward token cap. Keep SMALL (≤ ~tp*512) so MoE stays on
-                                          # the MC2 path and DODGES the cross-node HcclAllGather that hangs on
-                                          # large messages — the real op error in plog ("Inner error … CAN_EXIT
-                                          # … HcclAllGather"). 1024 = the value the colleague's VALIDATED
-                                          # two-node recipe uses (examples/serve/dsv4_bf16_baseline_two_node.sh:
-                                          # MAX_NUM_BATCHED_TOKENS=1024) + #3717 (2×A2: small works, large hangs).
-                                          # Raise gradually only after that HCCL bug is fixed upstream.
+MAXBATCHTOK="${MAXBATCHTOK:-8192}"        # per-forward token budget. Token SIZE was a RED HERRING for the
+                                          # two-node hang — the AtomGit A2 two-node V4-Flash report runs 8192
+                                          # fine. The real cause was --enable-expert-parallel (now default-off,
+                                          # see ENABLE_EP). 8192 = the report's value.
 MAXSEQS="${MAXSEQS:-16}"
 GPUUTIL="${GPUUTIL:-0.9}"
 EAGER="${EAGER:-1}"                       # 1 = --enforce-eager (reliable first bring-up); 0 = graph mode (faster)
 QUANT="${QUANT:-}"                        # empty = bf16; set QUANT=ascend (+ MODEL=<w8a8 ckpt>) to serve w8a8.
-                                          # w8a8 test isolates whether a two-node hang is the bf16 MC2 op
-                                          # (dispatch_ffn_combine_bf16, vllm-ascend #7154: OOM/stall when M>2048)
-                                          # vs the multi-node DP mechanism itself. w8a8's MoE path is fine.
+ENABLE_EP="${ENABLE_EP:-}"                # ★ empty = NO expert-parallel (DEFAULT). --enable-expert-parallel on
+                                          # two-node A2 triggers a cross-node EP16 HcclAllGather deadlock (the
+                                          # shm_broadcast hang). Confirmed by the AtomGit A2 two-node V4-Flash
+                                          # report ("删除 --enable-expert-parallel 后不再报错") + our plog
+                                          # (HcclAllGather stuck at seq_num 1). Without EP, MoE experts are
+                                          # TP-sharded intra-node (no cross-node all-gather). Set ENABLE_EP=1
+                                          # only after the cross-node HCCL AllGather is actually fixed.
 
 # ---- firewall subcommand: whitelist BOTH peer IPs in firewalld's trusted zone ----
 # Ascend HCCL opens many ephemeral ports between ranks; the default zone REJECTs them
@@ -94,7 +98,7 @@ source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null || true
 conda activate "$CONDA_ENV"
 
 export VLLM_HOST_IP="$THIS_IP" HCCL_IF_IP="$THIS_IP"   # host NIC IP — the official recipe DOES set this
-export GLOO_SOCKET_IFNAME="$NIC" TP_SOCKET_IFNAME="$NIC" HCCL_SOCKET_IFNAME="$NIC" GLOO_USE_IPV6=0
+export GLOO_SOCKET_IFNAME="$NIC" TP_SOCKET_IFNAME="$NIC" HCCL_SOCKET_IFNAME="$NIC" GLOO_TCP_IFACE="$NIC" GLOO_USE_IPV6=0
 # ★ THE multi-node fix (verbatim from the official Ascend-SACT A2 DP2/TP8/EP16 recipe,
 #   ai.gitcode.com/Ascend-SACT/DeepSeek-V4-Flash-A2): force intra-node HCCL over
 #   PCIe/SDMA and DISABLE intra-node RoCE. Otherwise the intra-node collective fights
@@ -107,17 +111,19 @@ export VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-1800}"   # 30 min: model load is slow, ranks must wait
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"  # bf16 568GB load ≈16min/node ≫ default 600s → ApiServer else times out mid-load
+export VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-600000}" VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-6000}"  # from the AtomGit A2 report
 export OMP_PROC_BIND=false OMP_NUM_THREADS=10 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1 TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=1024
 
 EAGER_FLAG=""; [ "$EAGER" = "1" ] && EAGER_FLAG="--enforce-eager"
 QUANT_ARGS=(); [ -n "$QUANT" ] && QUANT_ARGS=(--quantization "$QUANT")
+EP_ARGS=(); [ -n "$ENABLE_EP" ] && EP_ARGS=(--enable-expert-parallel)   # default OFF — see ENABLE_EP above
 
-# common serve flags (bf16 = NO --quantization)
+# common serve flags (bf16 = NO --quantization; NO --enable-expert-parallel by default)
 COMMON=( "$MODEL"
   --data-parallel-size "$DP" --data-parallel-size-local 1
   --data-parallel-address "$HEAD_IP" --data-parallel-rpc-port "$DP_RPC_PORT"
-  --tensor-parallel-size "$TP" --enable-expert-parallel "${QUANT_ARGS[@]}"
+  --tensor-parallel-size "$TP" "${EP_ARGS[@]}" "${QUANT_ARGS[@]}"
   --tokenizer-mode deepseek_v4
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --block-size 128
   --max-num-batched-tokens "$MAXBATCHTOK"
