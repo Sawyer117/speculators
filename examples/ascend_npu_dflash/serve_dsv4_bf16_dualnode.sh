@@ -115,19 +115,34 @@ fi
 LOG=~/dsv4_bf16_head.log
 echo ">>> [head/rank0] starting API serve on :$API_PORT → $LOG"
 nohup vllm serve "${COMMON[@]}" --served-model-name dsv4 --port "$API_PORT" > "$LOG" 2>&1 &
-echo ">>> head PID $!"
+SERVE_PID=$!
+echo ">>> head PID $SERVE_PID"
 
+# Readiness = poll /v1/models. Failure = the serve PROCESS actually died (kill -0),
+# NOT a keyword grep — vLLM's startup config dump contains 'asserts'/'error_*'/etc.
+# which used to false-trip an over-eager grep. A still-loading engine keeps its PID.
 echo ">>> waiting for cluster ready (both nodes load ~half of 568 GB — minutes)…"
-until curl -s --noproxy '*' "http://localhost:$API_PORT/v1/models" >/dev/null 2>&1; do
-  if grep -qiE "error|traceback|out of memory|assert|refused|timed? ?out" "$LOG"; then
-    echo "=== FAIL — tail of $LOG ==="; tail -50 "$LOG"
-    echo "!! if it's a connect/timeout: (1) run the 'firewall' step on BOTH nodes,"
-    echo "!!   (2) check the worker is up (tail ~/dsv4_bf16_worker.log), (3) confirm HEAD_IP/NIC."
+WAITED=0; MAX_WAIT="${MAX_WAIT:-1800}"
+while true; do
+  if curl -s --noproxy '*' "http://localhost:$API_PORT/v1/models" >/dev/null 2>&1; then
+    echo ">>> READY"; break
+  fi
+  if ! kill -0 "$SERVE_PID" 2>/dev/null; then
+    echo "=== FAIL: serve process $SERVE_PID exited — tail of $LOG ==="; tail -60 "$LOG"
+    echo "!! usual causes: (1) 'firewall' not run on BOTH nodes → HCCL REJECT (a real HCCL"
+    echo "!!   timeout traceback shows above), (2) worker not up / wrong HEAD_IP/NIC,"
+    echo "!!   (3) bf16 weights incomplete. Fix, pkill -9 -f vllm on BOTH nodes, rerun."
     exit 3
   fi
-  echo "  …still loading (tail: $(tail -1 "$LOG" | cut -c1-100))"; sleep 15
+  if [ "$WAITED" -ge "$MAX_WAIT" ]; then
+    echo "=== process alive but not serving after ${MAX_WAIT}s — likely HCCL stuck at comm init ==="
+    echo "!! run 'firewall' on BOTH nodes (trust peer /32), confirm the worker joined"
+    echo "!! (tail ~/dsv4_bf16_worker.log for 'rank 1'). tail of head log:"; tail -40 "$LOG"
+    exit 4
+  fi
+  sleep 15; WAITED=$((WAITED+15))
+  echo "  …still loading (${WAITED}s, tail: $(tail -1 "$LOG" | cut -c1-100))"
 done
-echo ">>> READY"
 
 echo ">>> smoke test — 数数:"
 curl -s --noproxy '*' "http://localhost:$API_PORT/v1/chat/completions" \
