@@ -105,6 +105,10 @@ export GLOO_SOCKET_IFNAME="$NIC" TP_SOCKET_IFNAME="$NIC" HCCL_SOCKET_IFNAME="$NI
 #   --enable-expert-parallel, which DEADLOCKS two-node, see ENABLE_EP). The two AtomGit
 #   reports that actually validate two-node V4-Flash (gsm8k 97.27) don't set it.
 export HCCL_INTRA_PCIE_ENABLE=1
+# Flash Comm v1 ASSERTS enable_expert_parallel=True for MoE — but we run WITHOUT EP
+# (cross-node EP dispatch unsupported). If the user's shell exported
+# VLLM_ASCEND_ENABLE_FLASHCOMM1=1 it crashes config validation. Force it OFF here.
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
 export VLLM_ASCEND_BALANCE_SCHEDULING=1 USE_MULTI_BLOCK_POOL=1 TRITON_ALL_BLOCKS_PARALLEL=1
 export VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
