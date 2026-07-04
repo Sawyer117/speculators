@@ -82,8 +82,15 @@ source "$CANN_ENV"
 source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null || true
 conda activate "$CONDA_ENV"
 
-export VLLM_HOST_IP="$THIS_IP" HCCL_IF_IP="$THIS_IP"
-export GLOO_SOCKET_IFNAME="$NIC" TP_SOCKET_IFNAME="$NIC" HCCL_SOCKET_IFNAME="$NIC"
+export VLLM_HOST_IP="$THIS_IP"
+# Do NOT set HCCL_IF_IP to the host (1GbE) IP: HCCL's data plane must run over the
+# device RoCE NICs (hccn_tool IPs, e.g. 124.0.9.x), which HCCL auto-selects. Pinning
+# HCCL_IF_IP to the 1GbE host NIC misdirects it → the first cross-node collective
+# hangs (cards idle, EngineCore stuck in shm_broadcast). Only the host SOCKET ifname
+# (out-of-band rendezvous) is needed — matches examples/serve/dsv4_bf16_baseline_two_node.sh.
+export GLOO_SOCKET_IFNAME="$NIC" TP_SOCKET_IFNAME="$NIC" HCCL_SOCKET_IFNAME="$NIC" GLOO_USE_IPV6=0
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-1800}"   # 30 min: model load is slow, ranks must wait
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"  # bf16 568GB load ≈16min/node ≫ default 600s → ApiServer else times out mid-load
 export OMP_PROC_BIND=false OMP_NUM_THREADS=8 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
