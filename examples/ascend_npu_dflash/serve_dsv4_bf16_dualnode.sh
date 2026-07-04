@@ -114,10 +114,13 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"  # bf1
 export VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-600000}" VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-6000}"  # from the AtomGit A2 report
 export OMP_PROC_BIND=false OMP_NUM_THREADS=10 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ACL_OP_INIT_MODE=1 TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=1024
+export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_HOST_SOCKET_PORT_RANGE:-60000-61000}" HCCL_NPU_SOCKET_PORT_RANGE="${HCCL_NPU_SOCKET_PORT_RANGE:-61000-62000}"  # from the AtomGit bf16 A2 report
 
 EAGER_FLAG=""; [ "$EAGER" = "1" ] && EAGER_FLAG="--enforce-eager"
 QUANT_ARGS=(); [ -n "$QUANT" ] && QUANT_ARGS=(--quantization "$QUANT")
 EP_ARGS=(); [ -n "$ENABLE_EP" ] && EP_ARGS=(--enable-expert-parallel)   # default OFF — see ENABLE_EP above
+# worker uses lower gpu-mem-util (0.85 vs 0.90) — avoids cudagraph-warmup OOM (per the AtomGit report)
+GPUUTIL_EFF="$GPUUTIL"; [ "$ROLE" = "worker" ] && GPUUTIL_EFF="${WORKER_GPUUTIL:-0.85}"
 
 # common serve flags (bf16 = NO --quantization; NO --enable-expert-parallel by default)
 COMMON=( "$MODEL"
@@ -127,7 +130,7 @@ COMMON=( "$MODEL"
   --tokenizer-mode deepseek_v4
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --block-size 128
   --max-num-batched-tokens "$MAXBATCHTOK"
-  --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching
+  --gpu-memory-utilization "$GPUUTIL_EFF" --no-enable-prefix-caching
   --additional-config '{"enable_cpu_binding":true}'
   --safetensors-load-strategy prefetch
   --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}'
