@@ -52,11 +52,13 @@ CONDA_ENV="${CONDA_ENV:-dspark-dsv4-base}"
 TP="${TP:-8}"
 DP="${DP:-2}"
 MAXLEN="${MAXLEN:-8192}"
-MAXBATCHTOK="${MAXBATCHTOK:-2048}"        # ★ per-forward token cap. Keep SMALL (≤ ~tp*512) so MoE stays on
+MAXBATCHTOK="${MAXBATCHTOK:-1024}"        # ★ per-forward token cap. Keep SMALL (≤ ~tp*512) so MoE stays on
                                           # the MC2 path and DODGES the cross-node HcclAllGather that hangs on
                                           # large messages — the real op error in plog ("Inner error … CAN_EXIT
-                                          # … HcclAllGather"), corroborated by #3717 (small max_tokens works,
-                                          # large hangs on 2×A2). Raise only after that HCCL bug is fixed upstream.
+                                          # … HcclAllGather"). 1024 = the value the colleague's VALIDATED
+                                          # two-node recipe uses (examples/serve/dsv4_bf16_baseline_two_node.sh:
+                                          # MAX_NUM_BATCHED_TOKENS=1024) + #3717 (2×A2: small works, large hangs).
+                                          # Raise gradually only after that HCCL bug is fixed upstream.
 MAXSEQS="${MAXSEQS:-16}"
 GPUUTIL="${GPUUTIL:-0.9}"
 EAGER="${EAGER:-1}"                       # 1 = --enforce-eager (reliable first bring-up); 0 = graph mode (faster)
