@@ -180,41 +180,53 @@ pip install --no-deps "numpy==2.3.5"
 # compile vllm-ascend WITH numpy 2.3.5 (compiles the V4 CANN ops — the moment of truth)
 pip install -e . --no-deps --no-build-isolation -v
 
-# conda clang/gxx LAST — runtime triton-ascend JIT only (slot-mapping kernel); it MUST NOT be present
-# during the CANN op compile above. See the ⚠️ ordering rule below for the exact failure mode.
-conda install -y -c conda-forge clang=15 clangxx=15 lld=15 gxx_linux-aarch64
+# DO NOT install conda clang/gxx/lld. The op build uses SYSTEM gcc + CANN's OWN lld (see the rule
+# below). A working node has NO conda compilers at all — `which clang` returns nothing there.
 
 python -c "import numpy; print(numpy.__version__)"          # confirm still 2.3.5 (re-force if conda moved it)
 python -c "import vllm_ascend; print('vllm_ascend import OK')"
 ```
 
-**⚠️ Ordering rule (learned the hard way on a fresh node, 2026-07-04):** runtime extras
-(numba/einops/pandas/msgpack/torchvision/triton-ascend) + the numpy re-force go BEFORE
-`pip install -e .`; **conda clang/gxx goes DEAD LAST, only AFTER a successful `pip install -e .`.**
-It is required (triton-ascend runtime JIT) but must be ABSENT during the CANN op build.
+**⚠️ Toolchain rule (CORRECTED 2026-07-04 by diffing a working node vs a failing one):**
+**Install ZERO conda compilers.** The CANN op build wants exactly what a sourced CANN + a base
+system already provide:
+- **host C++** = **system `/usr/bin/gcc` (~10.3.1)** — CANN's `opbuild` was built against this ABI;
+- **device-kernel linker** = **`lld` shipped INSIDE CANN** (`…/cann-9.0.0/bin/lld` + `ld.lld`),
+  put on `PATH` by sourcing CANN;
+- **AICPU** = CANN's cross-compiler `aarch64-target-linux-gnu-g++` (also from CANN);
+- cmake/ninja = the pip ones in the env.
 
-Why: the conda `gxx_linux-aarch64` toolchain **hijacks CMake** — it makes the build use conda's
-**GCC 15.2** (`aarch64-conda-linux-gnu-cc`) instead of the **system gcc** (`/usr/lib64/ccache/gcc`,
-~10.3.1) that CANN's `opbuild` tool was built against. ABI mismatch → `opbuild_gen_*` fails →
-`Error: ops prepare build failed` / `Configuring incomplete`. (A DIFFERENT failure, `exit 127` from
-`build_aclnn.sh`, means **system gcc/g++ is missing entirely** on a fresh node → `sudo yum install -y
-gcc gcc-c++ make`.)
+Two failure modes we actually hit and their REAL causes:
+1. **`opbuild_gen_* Error 1` / "ops prepare build failed"** = a conda `gxx_linux-aarch64` was
+   installed and **hijacked CMake** to conda GCC 15.2 (`aarch64-conda-linux-gnu-cc`) → ABI mismatch
+   with CANN opbuild. Fix: remove the conda compilers.
+2. **`build_aclnn.sh exit 127`** = the device-link step couldn't find **`lld`** → CANN's `bin/` (which
+   carries lld) is not on `PATH` because CANN wasn't fully sourced. Fix: `source` the CANN `set_env`
+   so `which lld` returns `…/cann-9.0.0/bin/lld`. (It is NOT "system gcc missing" — that was a wrong
+   earlier guess; and do NOT `export CC/CXX=/usr/bin/g++`, that pollutes the AICPU cross-compile:
+   `aarch64-target-linux-gnu-g++: /usr/bin/g++: linker input file unused`.)
 
-**Prereqs before the op build:** (1) system gcc present — `which gcc g++` should point to
-`/usr/lib64/ccache/gcc` (system 10.x), NOT a conda path; (2) no conda compilers installed yet.
+**Verify the toolchain matches a working node BEFORE building:**
+```bash
+which gcc g++ lld ld.lld
+#  expect: /usr/bin/gcc  /usr/bin/g++  <CANN>/bin/lld  <CANN>/bin/ld.lld   (clang/conda-gcc absent)
+```
 
-**If you botched the order** (conda clang already installed → build fails with opbuild/ABI error):
+**If a build is failing, align to a known-good node:**
 ```bash
 conda remove -y gxx_linux-aarch64 gcc_linux-aarch64 clang clangxx lld 2>/dev/null; true  # unhijack CMake
-which gcc && gcc --version | head -1                       # must be system /usr/lib64/ccache/gcc (~10.3.1)
+unset CC CXX                                                # never override — breaks AICPU cross-compile
+source <your CANN set_env>                                 # puts CANN's lld on PATH (fixes exit 127)
+which gcc && gcc --version | head -1                       # must be system /usr/bin/gcc (~10.3.1)
 export CC=/usr/bin/gcc CXX=/usr/bin/g++
 rm -rf build csrc/build                                     # MANDATORY: CMakeCache.txt pins the compiler
-pip install -e . --no-deps --no-build-isolation -v         # rebuild with system gcc
-# only NOW reinstall conda clang for runtime:
-conda install -y -c conda-forge clang=15 clangxx=15 lld=15 gxx_linux-aarch64
+rm -rf build csrc/build                                    # MANDATORY between retries (see below)
+pip install -e . --no-deps --no-build-isolation -v         # rebuild with system gcc + CANN lld
 ```
 `rm -rf build csrc/build` is REQUIRED between every retry — CMake caches the compiler choice, so a
-stale `build/` keeps reusing the wrong (conda) gcc even after you remove it.
+stale `build/` keeps reusing the wrong (conda) gcc even after you remove it. Do NOT reinstall conda
+clang afterwards — a working node never had it (triton-ascend runs fine without conda clang; that
+earlier claim was wrong).
 
 Harmless warnings: `ms-service-profiler` / `schedule-search` (CANN profiling tools, unused at
 inference); `opencv-python-headless requires numpy>=2` (opencv is vLLM's multimodal dep — never
