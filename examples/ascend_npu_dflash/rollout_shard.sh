@@ -20,7 +20,9 @@
 #   - AR (NO speculative-config): MTP/spec is a net throughput LOSS at batch.
 #   - max-num-seqs 64 + multistream_overlap true: throughput saturates ~64 on 284B MoE.
 #   - --resume: crash-safe; rerun the same command to skip already-generated rows.
-set -uo pipefail
+# NB: no `set -u` — sourcing CANN's set_env.sh under nounset aborts on unbound
+# vars ($ZSH_VERSION etc.).
+set -o pipefail
 
 SHARD_ID="${1:?usage: bash rollout_shard.sh <SHARD_ID 0..N-1>}"
 SID=$(printf "%02d" "$SHARD_ID")

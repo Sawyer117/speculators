@@ -34,7 +34,9 @@
 #
 # Everything below is env-overridable, e.g.:
 #   HEAD_IP=80.5.5.115 WORKER_IP=80.5.5.116 NIC=enp189s0f0 bash ... head
-set -uo pipefail
+# NB: no `set -u` — CANN's set_env.sh / conda activate reference unbound vars
+# ($ZSH_VERSION etc.) and would abort the script under nounset.
+set -o pipefail
 
 ROLE="${1:?usage: bash serve_dsv4_bf16_dualnode.sh <firewall|head|worker>}"
 
