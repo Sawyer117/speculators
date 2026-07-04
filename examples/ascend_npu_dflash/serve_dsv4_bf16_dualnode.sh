@@ -22,8 +22,14 @@
 #
 # PREREQS (BOTH nodes, identical):
 #   - conda env `dspark-dsv4-base`, CANN 9.0.0 (source 900env), vllm-ascend built
-#     (patch installed! see docs §4), on the **6cdb99e** checkout (clean bf16 stack,
-#     no o_proj fix — bf16 wo_a is 3D so it doesn't need it).
+#     (patch installed! see docs §4).
+#   - ⚠️ BOTH nodes MUST be on the **same vllm-ascend commit** — a multi-node serve
+#     shards weights and runs collectives across ranks, so mismatched op code =
+#     silent-wrong / crash. Verify: `git -C <src> log --oneline -1` matches on both.
+#     Either commit works for bf16: the o_proj-fix build (6036507, the one that also
+#     serves w8a8) only ADDS a 2-D wo_a branch, so bf16's 3-D path is unchanged; or
+#     the pristine 6cdb99e. Just make them EQUAL. (If your node ran the w8a8 数数
+#     smoke, it's already on 6036507 — put the other node there too, no rebuild.)
 #   - bf16 ckpt on shared /share, same path on both nodes.
 #
 # Everything below is env-overridable, e.g.:
