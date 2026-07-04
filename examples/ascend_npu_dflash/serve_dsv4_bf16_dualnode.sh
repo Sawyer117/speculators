@@ -99,13 +99,12 @@ conda activate "$CONDA_ENV"
 
 export VLLM_HOST_IP="$THIS_IP" HCCL_IF_IP="$THIS_IP"   # host NIC IP — the official recipe DOES set this
 export GLOO_SOCKET_IFNAME="$NIC" TP_SOCKET_IFNAME="$NIC" HCCL_SOCKET_IFNAME="$NIC" GLOO_TCP_IFACE="$NIC" GLOO_USE_IPV6=0
-# ★ THE multi-node fix (verbatim from the official Ascend-SACT A2 DP2/TP8/EP16 recipe,
-#   ai.gitcode.com/Ascend-SACT/DeepSeek-V4-Flash-A2): force intra-node HCCL over
-#   PCIe/SDMA and DISABLE intra-node RoCE. Otherwise the intra-node collective fights
-#   the RoCE fabric and the first forward deadlocks — NPUs idle at AICore 0%, EngineCore
-#   stuck repeating shm_broadcast "no available block" — even though inter-node RoCE
-#   pings fine. This pair is the piece our earlier DP2 attempts were missing.
-export HCCL_INTRA_PCIE_ENABLE=1 HCCL_INTRA_ROCE_ENABLE=0
+# HCCL_INTRA_PCIE_ENABLE=1: intra-node MoE comm over PCIe/SDMA (both AtomGit A2 two-node
+#   V4-Flash reports set this). We do NOT set HCCL_INTRA_ROCE_ENABLE=0 — that came from the
+#   Ascend-SACT gitcode recipe, which is UNRELIABLE (it also told us to pass
+#   --enable-expert-parallel, which DEADLOCKS two-node, see ENABLE_EP). The two AtomGit
+#   reports that actually validate two-node V4-Flash (gsm8k 97.27) don't set it.
+export HCCL_INTRA_PCIE_ENABLE=1
 export VLLM_ASCEND_BALANCE_SCHEDULING=1 USE_MULTI_BLOCK_POOL=1 TRITON_ALL_BLOCKS_PARALLEL=1
 export VLLM_USE_V1=1 VLLM_WORKER_MULTIPROC_METHOD=spawn
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
