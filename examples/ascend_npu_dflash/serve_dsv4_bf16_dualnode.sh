@@ -128,7 +128,8 @@ if [ "$ROLE" = "worker" ]; then
   LOG=~/dsv4_bf16_worker.log
   echo ">>> [worker/rank1] starting headless engine → $LOG  (connects to head $HEAD_IP:$DP_RPC_PORT)"
   nohup vllm serve "${COMMON[@]}" --headless --data-parallel-start-rank 1 > "$LOG" 2>&1 &
-  echo ">>> worker PID $!  —  tail -f $LOG"
+  echo ">>> worker PID $!"
+  echo ">>> 📋 FULL engine log (tail THIS for ALL detail/errors):  tail -f $LOG"
   echo ">>> (worker has no API; it joins the head. Watch for 'init … rank 1' then steady state.)"
   exit 0
 fi
@@ -139,6 +140,9 @@ echo ">>> [head/rank0] starting API serve on :$API_PORT → $LOG"
 nohup vllm serve "${COMMON[@]}" --served-model-name dsv4 --port "$API_PORT" > "$LOG" 2>&1 &
 SERVE_PID=$!
 echo ">>> head PID $SERVE_PID"
+echo ">>> 📋 FULL engine log (tail THIS for ALL detail/errors):  tail -f $LOG"
+echo ">>>    (if you ran this via 'nohup … > ~/head_run.log', that file is ONLY this wrapper's"
+echo ">>>     summary — the real per-rank detail is in $LOG)"
 
 # Readiness = poll /v1/models. Failure = the serve PROCESS actually died (kill -0),
 # NOT a keyword grep — vLLM's startup config dump contains 'asserts'/'error_*'/etc.
