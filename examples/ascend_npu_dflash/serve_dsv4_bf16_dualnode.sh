@@ -55,6 +55,10 @@ MAXLEN="${MAXLEN:-8192}"
 MAXSEQS="${MAXSEQS:-16}"
 GPUUTIL="${GPUUTIL:-0.9}"
 EAGER="${EAGER:-1}"                       # 1 = --enforce-eager (reliable first bring-up); 0 = graph mode (faster)
+QUANT="${QUANT:-}"                        # empty = bf16; set QUANT=ascend (+ MODEL=<w8a8 ckpt>) to serve w8a8.
+                                          # w8a8 test isolates whether a two-node hang is the bf16 MC2 op
+                                          # (dispatch_ffn_combine_bf16, vllm-ascend #7154: OOM/stall when M>2048)
+                                          # vs the multi-node DP mechanism itself. w8a8's MoE path is fine.
 
 # ---- firewall subcommand: whitelist BOTH peer IPs in firewalld's trusted zone ----
 # Ascend HCCL opens many ephemeral ports between ranks; the default zone REJECTs them
@@ -100,12 +104,13 @@ export OMP_PROC_BIND=false OMP_NUM_THREADS=10 PYTORCH_NPU_ALLOC_CONF=expandable_
 export ACL_OP_INIT_MODE=1 TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=1024
 
 EAGER_FLAG=""; [ "$EAGER" = "1" ] && EAGER_FLAG="--enforce-eager"
+QUANT_ARGS=(); [ -n "$QUANT" ] && QUANT_ARGS=(--quantization "$QUANT")
 
 # common serve flags (bf16 = NO --quantization)
 COMMON=( "$MODEL"
   --data-parallel-size "$DP" --data-parallel-size-local 1
   --data-parallel-address "$HEAD_IP" --data-parallel-rpc-port "$DP_RPC_PORT"
-  --tensor-parallel-size "$TP" --enable-expert-parallel
+  --tensor-parallel-size "$TP" --enable-expert-parallel "${QUANT_ARGS[@]}"
   --tokenizer-mode deepseek_v4
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --block-size 128
   --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching
