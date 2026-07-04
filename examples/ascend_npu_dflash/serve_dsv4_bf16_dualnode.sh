@@ -52,6 +52,11 @@ CONDA_ENV="${CONDA_ENV:-dspark-dsv4-base}"
 TP="${TP:-8}"
 DP="${DP:-2}"
 MAXLEN="${MAXLEN:-8192}"
+MAXBATCHTOK="${MAXBATCHTOK:-2048}"        # ★ per-forward token cap. Keep SMALL (≤ ~tp*512) so MoE stays on
+                                          # the MC2 path and DODGES the cross-node HcclAllGather that hangs on
+                                          # large messages — the real op error in plog ("Inner error … CAN_EXIT
+                                          # … HcclAllGather"), corroborated by #3717 (small max_tokens works,
+                                          # large hangs on 2×A2). Raise only after that HCCL bug is fixed upstream.
 MAXSEQS="${MAXSEQS:-16}"
 GPUUTIL="${GPUUTIL:-0.9}"
 EAGER="${EAGER:-1}"                       # 1 = --enforce-eager (reliable first bring-up); 0 = graph mode (faster)
@@ -113,6 +118,7 @@ COMMON=( "$MODEL"
   --tensor-parallel-size "$TP" --enable-expert-parallel "${QUANT_ARGS[@]}"
   --tokenizer-mode deepseek_v4
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --block-size 128
+  --max-num-batched-tokens "$MAXBATCHTOK"
   --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching
   --additional-config '{"enable_cpu_binding":true}'
   --safetensors-load-strategy prefetch
