@@ -58,7 +58,12 @@ def is_correct(resp, gt):
 
 
 async def main_async(args):
-    ds = load_dataset("openai/gsm8k", "main", split="test")
+    if args.local_file:
+        # local jsonl/parquet with {question, answer} — no HF hub access needed.
+        fmt = "parquet" if args.local_file.endswith(".parquet") else "json"
+        ds = load_dataset(fmt, data_files=args.local_file, split="train")
+    else:
+        ds = load_dataset("openai/gsm8k", "main", split="test")
     if args.limit:
         ds = ds.select(range(min(args.limit, len(ds))))
     sem = asyncio.Semaphore(args.concurrency)
@@ -83,6 +88,8 @@ def main():
     ap.add_argument("--endpoint", required=True)
     ap.add_argument("--model", default="dsv4")
     ap.add_argument("--limit", type=int, default=300, help="0 = full 1319 test set")
+    ap.add_argument("--local-file", help="local gsm8k jsonl/parquet ({question,answer}) — "
+                    "skips the HF download (for offline/proxied machines)")
     ap.add_argument("--concurrency", type=int, default=64)
     ap.add_argument("--max-tokens", type=int, default=1024)
     args = ap.parse_args()
