@@ -48,11 +48,35 @@ DT = {"bfloat16": torch.bfloat16, "float32": torch.float32}.get(
     os.environ.get("DTYPE", "bfloat16"), torch.bfloat16)
 ATOL = float(os.environ.get("ATOL", "2e-2"))
 RTOL = float(os.environ.get("RTOL", "2e-2"))
-NBLK = int(os.environ.get("NBLK", "64"))       # draft blocks (crank to ~num_anchors=512 for real scale)
-BS = int(os.environ.get("BS", "7"))            # dspark block_size
-WIN = int(os.environ.get("WIN", "128"))        # sliding_window (crank to DSV4's real window to see memory)
-Hh = int(os.environ.get("H", "8"))             # heads
-Dh = int(os.environ.get("D", "64"))            # head dim
+# Auto-read the target model's real attention params from its config.json (MODEL_CONFIG overrides
+# the path). Individual NBLK/BS/WIN/H/D env vars still override. The DSpark draft copies the target's
+# attention shape, so num_attention_heads / head_dim / sliding_window come straight from the target.
+import json as _json  # noqa: E402
+
+_CFG_PATH = os.environ.get(
+    "MODEL_CONFIG", "/share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16/config.json")
+try:
+    _CFG = _json.load(open(_CFG_PATH))
+    print(f">>> read attn params from {_CFG_PATH}")
+except Exception:  # noqa: BLE001
+    _CFG = {}
+    print(f">>> (no config at {_CFG_PATH}; using defaults — override with MODEL_CONFIG or H=/D=/WIN=)")
+
+
+def _cfg_int(key, default):
+    try:
+        return int(_CFG.get(key))
+    except (TypeError, ValueError):
+        return default
+
+
+NBLK = int(os.environ.get("NBLK", "64"))                                  # ~num_anchors at real scale
+BS = int(os.environ.get("BS", str(_cfg_int("dspark_block_size", 7))))
+WIN = int(os.environ.get("WIN", str(_cfg_int("sliding_window", 128))))
+Hh = int(os.environ.get("H", str(_cfg_int("num_attention_heads", 8))))
+_D = (_cfg_int("head_dim", 0) or _cfg_int("v_head_dim", 0)
+      or _cfg_int("hidden_size", 512) // max(_cfg_int("num_attention_heads", 8), 1))
+Dh = int(os.environ.get("D", str(_D)))
 CTX = WIN
 KV = CTX + BS
 SCALE = Dh ** -0.5
