@@ -105,6 +105,19 @@ def parse_args():
     )
     parser.add_argument("--limit", type=int, default=None, help="Stop after N rows")
     parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Total shards (e.g. machines) splitting the dataset by row index. Default 1.",
+    )
+    parser.add_argument(
+        "--shard",
+        type=int,
+        default=0,
+        help="This worker's shard in [0, num-shards): processes rows where "
+        "(index mod num-shards) == shard. Use with --num-shards for multi-machine.",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=64,
@@ -162,7 +175,14 @@ def sanitize_filename(name: str) -> str:
 
 
 def load_seen(path: str):
-    """Load previously processed record IDs from output file."""
+    """Load previously processed record IDs from output file.
+
+    Resume matches the key main() checks: ``str(uuid or index)``. Each output row
+    stores that index as ``metadata.idx`` and, for uuid datasets, as the top-level
+    ``id`` (which is ``sample_<idx>`` when the row has no uuid). Collect both forms
+    so ``--resume`` actually SKIPS completed rows instead of re-running and
+    appending duplicates.
+    """
     seen = set()
     if not os.path.isfile(path):
         return seen
@@ -173,9 +193,16 @@ def load_seen(path: str):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # legacy top-level uuid/idx (older dumps)
             key = obj.get("uuid") or obj.get("idx")
             if key is not None:
                 seen.add(str(key))
+            meta = obj.get("metadata") or {}
+            if meta.get("idx") is not None:
+                seen.add(str(meta["idx"]))
+            _id = obj.get("id")
+            if _id is not None and not str(_id).startswith("sample_"):
+                seen.add(str(_id))
     return seen
 
 
@@ -386,6 +413,10 @@ async def main():
             for index, row in enumerate(dataset):
                 if args.limit is not None and processed_count >= args.limit:
                     break
+
+                # multi-shard: each worker handles a disjoint slice by row index
+                if args.num_shards > 1 and index % args.num_shards != args.shard:
+                    continue
 
                 if args.language_filter and row.get("language") != args.language_filter:
                     continue
