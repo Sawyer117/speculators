@@ -157,6 +157,29 @@ def block_sdpa():
 check("BLOCK ATTENTION via SDPA (flex replacement)", block_sdpa)
 
 
+# 6b. NON-CAUSAL SLIDING-WINDOW via SDPA — the colleague's "bidirectional SWA" concern.
+# DSV4-Flash is a sliding-window arch and the DSpark draft is non-causal (is_causal=False),
+# so the draft attends within a window BOTH ways (win_left>0 AND win_right>0). The fused
+# NPU SWA kernel is causal-only (ori_win_right=0) — but a DENSE-mask SDPA can express the
+# bidirectional window. This checks whether that dense non-causal-SWA path runs on NPU
+# (the training path). If this passes, training isn't blocked; the fused-kernel bidirectional
+# support (vllm-ascend #11125) is a separate INFERENCE-side question.
+def swa_noncausal_sdpa():
+    H, hd = 4, D // 4
+    L = KVLEN
+    win = 16
+    q = torch.randn(B, H, L, hd, device=DEV, dtype=DT)
+    k = torch.randn(B, H, L, hd, device=DEV, dtype=DT)
+    v = torch.randn(B, H, L, hd, device=DEV, dtype=DT)
+    qi = torch.arange(L, device=DEV).view(L, 1)
+    ki = torch.arange(L, device=DEV).view(1, L)
+    mask = ((ki >= qi - win) & (ki <= qi + win)).view(1, 1, L, L)  # BIDIRECTIONAL window (no causal cut)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+
+check("NON-CAUSAL sliding-window via SDPA (bidir SWA)", swa_noncausal_sdpa)
+
+
 # 7. FlexAttention — EXPECTED to fail on NPU (documents why DFlash/DSpark use SDPA)
 def flex():
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
