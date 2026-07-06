@@ -8,14 +8,18 @@
 #   - A3: all 16 cards live in ONE node on the HCCS fabric, so the official DP2 / TP8 /
 #     **EP16** recipe runs with `--enable-expert-parallel` ON — the EP dispatch/allgather
 #     stays intra-node, no cross-node hang. This is the faster (native EP dispatch) path.
-#   Layout: DP4 × TP4 = 16 devices (the official vllm-ascend A3 recipe; A3 = 128G×8 cards = 16
-#   64G logical devices — 1 card holds 2 dies); experts EP-sharded across all 16. TP=8 DP=2 also
-#   valid (o_groups=8 allows TP8). Env aligned to the official A3 recipe: ASCEND_A3_ENABLE=1,
-#   VLLM_ASCEND_ENABLE_FUSED_MC2=1, HCCL_BUFFSIZE=1024.
+#   A3 = 128G×8 cards = 16 × 64G logical devices (1 card holds 2 dies). Experts EP-sharded across
+#   all 16 (ep_world=16) ≈ 38GB/device either layout — that part fits regardless.
+#   Layout for BF16 = **DP2 × TP8 / EP16** (default) — matches the A2-proven per-device fit
+#   (~37GB weights, ~15GB KV). The official vllm-ascend A3 recipe uses DP4×TP4, but that's for
+#   **w8a8** (half the size, 2× headroom); on bf16 TP4 shards the dense weights less (dense/4 vs
+#   dense/8) → smaller per-device KV → more KV-overflow-garbage risk, so we keep TP8/DP2 for bf16.
+#   Env aligned to the official A3 recipe: ASCEND_A3_ENABLE=1, VLLM_ASCEND_ENABLE_FUSED_MC2=1,
+#   HCCL_BUFFSIZE=1024.
 #
-#   PRECISION: the official A3 recipe is **w8a8** (--quantization ascend, faster). We DEFAULT to
-#   bf16 to match the 115/116 rollout (same target distribution → consistent training data).
-#   For w8a8 instead: QUANT=ascend MODEL=<…-w8a8-mtp>.
+#   PRECISION: official A3 recipe is **w8a8** (--quantization ascend, faster, and DP4/TP4 fits it
+#   comfortably). We DEFAULT to bf16 to match the 115/116 rollout (consistent training data).
+#   For w8a8 instead: QUANT=ascend MODEL=<…-w8a8-mtp> TP=4 DP=4.
 #
 # Runs `vllm serve` in the FOREGROUND (this script's stdout IS the full engine log — no
 # wrapper/poll, so nothing to Ctrl+C by accident). Launch it under nohup:
@@ -32,7 +36,11 @@ MODEL="${MODEL:-/share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"     # CANN 9.0.0 (same across the fleet)
 CONDA_ENV="${CONDA_ENV:-dspark-dsv4-base}"
 API_PORT="${API_PORT:-7000}"
-TP="${TP:-4}"; DP="${DP:-4}"       # official vllm-ascend A3 recipe = DP4×TP4 (=16 devices). TP=8 DP=2 also valid (o_groups=8 allows TP8).
+TP="${TP:-8}"; DP="${DP:-2}"       # DP2×TP8/EP16 for BF16 = matches the A2-proven fit (~37GB weights,
+                                   # ~15GB KV/device). The official A3 recipe's DP4/TP4 shards the dense
+                                   # weights LESS (dense/4 vs dense/8) → smaller per-device KV — fine for
+                                   # w8a8 (2× headroom), but tighter for bf16 (more KV-overflow risk).
+                                   # For w8a8 you can use TP=4 DP=4 (the official layout).
 MAXLEN="${MAXLEN:-8192}"; MAXBATCHTOK="${MAXBATCHTOK:-8192}"; MAXSEQS="${MAXSEQS:-64}"
 GPUUTIL="${GPUUTIL:-0.9}"
 EAGER="${EAGER:-1}"                # 1 = --enforce-eager (reliable FIRST bring-up); 0 = graph (peak)
