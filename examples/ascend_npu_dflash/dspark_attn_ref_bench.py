@@ -48,7 +48,11 @@ DT = {"bfloat16": torch.bfloat16, "float32": torch.float32}.get(
     os.environ.get("DTYPE", "bfloat16"), torch.bfloat16)
 ATOL = float(os.environ.get("ATOL", "2e-2"))
 RTOL = float(os.environ.get("RTOL", "2e-2"))
-NBLK, BS, WIN, Hh, Dh = 64, 7, 128, 8, 64      # blocks, block_size, window, heads, head_dim
+NBLK = int(os.environ.get("NBLK", "64"))       # draft blocks (crank to ~num_anchors=512 for real scale)
+BS = int(os.environ.get("BS", "7"))            # dspark block_size
+WIN = int(os.environ.get("WIN", "128"))        # sliding_window (crank to DSV4's real window to see memory)
+Hh = int(os.environ.get("H", "8"))             # heads
+Dh = int(os.environ.get("D", "64"))            # head dim
 CTX = WIN
 KV = CTX + BS
 SCALE = Dh ** -0.5
@@ -120,10 +124,12 @@ REF = {}
 
 def bench(name, fn):
     try:
+        torch.npu.reset_peak_memory_stats()
         q, k, v = fresh()
         out = fn(q, k, v)
         out.float().sum().backward()
         torch.npu.synchronize()
+        peak = torch.npu.max_memory_allocated() / 1e6  # MB, fwd+bwd peak
     except Exception as e:  # noqa: BLE001
         print(f"  {name:<12} FAILED (fwd/bwd): {type(e).__name__}: {str(e)[:55]}")
         return
@@ -132,11 +138,11 @@ def bench(name, fn):
     fb = time_ms(lambda: _fb(fn))
     if not REF:
         REF.update(out=outf, gq=gqf, fwd=fwd, fb=fb)
-        print(f"  {name:<12} fwd={fwd:6.3f}ms fwd+bwd={fb:6.3f}ms  speedup 1.00x/1.00x  (GOLD reference)")
+        print(f"  {name:<12} fwd={fwd:6.3f}ms fwd+bwd={fb:6.3f}ms  peak={peak:7.1f}MB  speedup 1.00x/1.00x  (GOLD)")
         return
     oc, oae, ore = compare(outf, REF["out"])
     gc, gae, gre = compare(gqf, REF["gq"])
-    print(f"  {name:<12} fwd={fwd:6.3f}ms fwd+bwd={fb:6.3f}ms  speedup {REF['fwd']/fwd:4.2f}x/{REF['fb']/fb:4.2f}x")
+    print(f"  {name:<12} fwd={fwd:6.3f}ms fwd+bwd={fb:6.3f}ms  peak={peak:7.1f}MB  speedup {REF['fwd']/fwd:4.2f}x/{REF['fb']/fb:4.2f}x")
     print(f"               out : allclose={str(oc):<5} meanAbs={oae:.2e} meanRel={ore:.2e}")
     print(f"               grad: allclose={str(gc):<5} meanAbs={gae:.2e} meanRel={gre:.2e}")
 
