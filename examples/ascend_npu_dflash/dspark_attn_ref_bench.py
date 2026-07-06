@@ -118,7 +118,7 @@ def time_ms(step):
 
 
 def compare(x, ref):
-    xf = x.float()
+    xf = x.detach().float().cpu()   # ref is kept on CPU to free NPU memory between candidates
     d = (xf - ref).abs()
     return (torch.allclose(xf, ref, atol=ATOL, rtol=RTOL), d.mean().item(),
             (d / (ref.abs() + 1e-6)).mean().item())
@@ -128,6 +128,7 @@ REF = {}
 
 
 def bench(name, fn):
+    torch.npu.empty_cache()
     try:
         torch.npu.reset_peak_memory_stats()
         q, k, v = fresh()
@@ -137,19 +138,25 @@ def bench(name, fn):
         peak = torch.npu.max_memory_allocated() / 1e6  # MB, fwd+bwd peak
     except Exception as e:  # noqa: BLE001
         print(f"  {name:<12} FAILED (fwd/bwd): {type(e).__name__}: {str(e)[:55]}")
+        torch.npu.empty_cache()
         return
-    outf, gqf = out.detach().float(), q.grad.detach().float()
+    outf = out.detach().float().cpu()
+    gqf = q.grad.detach().float().cpu()
+    del q, k, v, out
+    torch.npu.empty_cache()
     fwd = time_ms(lambda: _fwd(fn))
     fb = time_ms(lambda: _fb(fn))
     if not REF:
-        REF.update(out=outf, gq=gqf, fwd=fwd, fb=fb)
+        REF.update(out=outf, gq=gqf, fwd=fwd, fb=fb)   # kept on CPU
         print(f"  {name:<12} fwd={fwd:6.3f}ms fwd+bwd={fb:6.3f}ms  peak={peak:7.1f}MB  speedup 1.00x/1.00x  (GOLD)")
+        torch.npu.empty_cache()
         return
     oc, oae, ore = compare(outf, REF["out"])
     gc, gae, gre = compare(gqf, REF["gq"])
     print(f"  {name:<12} fwd={fwd:6.3f}ms fwd+bwd={fb:6.3f}ms  peak={peak:7.1f}MB  speedup {REF['fwd']/fwd:4.2f}x/{REF['fb']/fb:4.2f}x")
     print(f"               out : allclose={str(oc):<5} meanAbs={oae:.2e} meanRel={ore:.2e}")
     print(f"               grad: allclose={str(gc):<5} meanAbs={gae:.2e} meanRel={gre:.2e}")
+    torch.npu.empty_cache()
 
 
 def _fwd(fn):
