@@ -8,7 +8,14 @@
 #   - A3: all 16 cards live in ONE node on the HCCS fabric, so the official DP2 / TP8 /
 #     **EP16** recipe runs with `--enable-expert-parallel` ON — the EP dispatch/allgather
 #     stays intra-node, no cross-node hang. This is the faster (native EP dispatch) path.
-#   Layout: DP2 × TP8 = 16 cards (o_groups=8 caps TP at 8); experts EP-sharded across all 16.
+#   Layout: DP4 × TP4 = 16 devices (the official vllm-ascend A3 recipe; A3 = 128G×8 cards = 16
+#   64G logical devices — 1 card holds 2 dies); experts EP-sharded across all 16. TP=8 DP=2 also
+#   valid (o_groups=8 allows TP8). Env aligned to the official A3 recipe: ASCEND_A3_ENABLE=1,
+#   VLLM_ASCEND_ENABLE_FUSED_MC2=1, HCCL_BUFFSIZE=1024.
+#
+#   PRECISION: the official A3 recipe is **w8a8** (--quantization ascend, faster). We DEFAULT to
+#   bf16 to match the 115/116 rollout (same target distribution → consistent training data).
+#   For w8a8 instead: QUANT=ascend MODEL=<…-w8a8-mtp>.
 #
 # Runs `vllm serve` in the FOREGROUND (this script's stdout IS the full engine log — no
 # wrapper/poll, so nothing to Ctrl+C by accident). Launch it under nohup:
@@ -25,7 +32,7 @@ MODEL="${MODEL:-/share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"     # CANN 9.0.0 (same across the fleet)
 CONDA_ENV="${CONDA_ENV:-dspark-dsv4-base}"
 API_PORT="${API_PORT:-7000}"
-TP="${TP:-8}"; DP="${DP:-2}"                               # DP2×TP8 = 16 cards
+TP="${TP:-4}"; DP="${DP:-4}"       # official vllm-ascend A3 recipe = DP4×TP4 (=16 devices). TP=8 DP=2 also valid (o_groups=8 allows TP8).
 MAXLEN="${MAXLEN:-8192}"; MAXBATCHTOK="${MAXBATCHTOK:-8192}"; MAXSEQS="${MAXSEQS:-64}"
 GPUUTIL="${GPUUTIL:-0.9}"
 EAGER="${EAGER:-1}"                # 1 = --enforce-eager (reliable FIRST bring-up); 0 = graph (peak)
@@ -41,8 +48,12 @@ conda activate "$CONDA_ENV"
 # --- single-node env (NO cross-node socket / HCCL_IF_IP / port-range stuff — this is ONE box;
 #     no HCCL_INTRA_PCIE_ENABLE either — A3's 16 cards talk over HCCS, let HCCL pick it) ---
 export OMP_PROC_BIND=false OMP_NUM_THREADS=10 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ACL_OP_INIT_MODE=1 TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=512
+export ACL_OP_INIT_MODE=1 TASK_QUEUE_ENABLE=1 HCCL_OP_EXPANSION_MODE=AIV HCCL_BUFFSIZE=1024
 export USE_MULTI_BLOCK_POOL=1 USE_MULTI_GROUPS_KV_CACHE=1 VLLM_ASCEND_BALANCE_SCHEDULING=1
+# ★ A3-SPECIFIC (from the official vllm-ascend DeepSeek-V4-Flash A3 recipe) — the A3 enable flag
+# and the fused-MC2 MoE dispatch/combine fast path. WITHOUT these the A3 EP path is wrong or slow.
+export ASCEND_A3_ENABLE="${ASCEND_A3_ENABLE:-1}"
+export VLLM_ASCEND_ENABLE_FUSED_MC2="${VLLM_ASCEND_ENABLE_FUSED_MC2:-1}"
 # EP is ON here, so Flash Comm v1 (which asserts enable_expert_parallel=True) is allowed. If the
 # first bring-up misbehaves, try VLLM_ASCEND_ENABLE_FLASHCOMM1=0.
 export VLLM_ASCEND_ENABLE_FLASHCOMM1="${VLLM_ASCEND_ENABLE_FLASHCOMM1:-1}"
