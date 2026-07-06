@@ -129,6 +129,15 @@ EP_ARGS=(); [ -n "$ENABLE_EP" ] && EP_ARGS=(--enable-expert-parallel)   # defaul
 # worker uses lower gpu-mem-util (0.85 vs 0.90) — avoids cudagraph-warmup OOM (per the AtomGit report)
 GPUUTIL_EFF="$GPUUTIL"; [ "$ROLE" = "worker" ] && GPUUTIL_EFF="${WORKER_GPUUTIL:-0.85}"
 
+# weight-load strategy. prefetch reads shards into RAM BEFORE committing to NPU — fast on a quick FS,
+# but on a SLOW /share it stalls at "0/46" for minutes with zero committed, so the HEAD's API server
+# times out and tears the cluster down while the headless WORKER (no such timeout) keeps loading.
+# If the head dies at 0/46 but the worker survives → set PREFETCH=0 (incremental load: progress shows
+# immediately, engine stays responsive). LOAD_THREADS lowers the multithread fan-out on a slow mount.
+PREFETCH="${PREFETCH:-1}"; LOAD_THREADS="${LOAD_THREADS:-16}"
+LOAD_ARGS=(); [ "$PREFETCH" = "1" ] && LOAD_ARGS=(--safetensors-load-strategy prefetch)
+LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num_threads\":$LOAD_THREADS}")
+
 # common serve flags (bf16 = NO --quantization; NO --enable-expert-parallel by default)
 COMMON=( "$MODEL"
   --data-parallel-size "$DP" --data-parallel-size-local 1
@@ -139,8 +148,7 @@ COMMON=( "$MODEL"
   --max-num-batched-tokens "$MAXBATCHTOK"
   --gpu-memory-utilization "$GPUUTIL_EFF" --no-enable-prefix-caching
   --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}'
-  --safetensors-load-strategy prefetch
-  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":16}'
+  "${LOAD_ARGS[@]}"
   $EAGER_FLAG "${GRAPH_ARGS[@]}" )
 # NB: the ckpt FS reports as "DPC" → vLLM disables auto-prefetch (only NFS/Lustre
 # auto-detected), so weight load took ~20 min. --safetensors-load-strategy prefetch
