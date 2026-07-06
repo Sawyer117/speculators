@@ -18,6 +18,7 @@ precision), not a bug.
 
 Run in dspark-dsv4-base on ONE NPU:  python dspark_swa_attn_bench.py
 """
+import os
 import time
 
 import torch
@@ -31,7 +32,9 @@ except Exception as e:  # noqa: BLE001
     raise SystemExit(1)
 
 torch.manual_seed(0)
-DT = torch.bfloat16
+# DTYPE=float32 to prove the bf16 diffs are just dtype rounding (they drop to ~1e-6), not a math bug.
+DT = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}.get(
+    os.environ.get("DTYPE", "bfloat16"), torch.bfloat16)
 B, H, L, D = 2, 8, 512, 64          # batch, heads, seq len, head dim (draft-block scale)
 WIN = 16                            # bidirectional sliding-window half-width
 SCALE = D ** -0.5
