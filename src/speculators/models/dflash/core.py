@@ -18,7 +18,7 @@ from speculators.models.dflash.utils import (
     get_base_indices_for_anchored_blocks,
     select_anchors,
 )
-from speculators.models.metrics import kl_div_loss, resolve_loss_fn
+from speculators.models.metrics import combo_ce_l1_loss, kl_div_loss, resolve_loss_fn
 from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
 
 
@@ -102,6 +102,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         self.verifier_norm.weight.requires_grad = False
         self.block_size = config.block_size
+
+        # DSpark accept-rate (confidence) head — optional, off by default.
+        # A Linear(hidden, 1) on the draft hidden state (same input as lm_head),
+        # trained with BCE to predict each draft token's soft acceptance rate.
+        self.confidence_head_enabled = config.confidence_head
+        if self.confidence_head_enabled:
+            self.confidence_head = nn.Linear(
+                config.transformer_layer_config.hidden_size, 1
+            )
+
         self.post_init()
 
     @property
@@ -163,6 +173,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             aux_hidden_state_layer_ids=target_layer_ids,
             mask_token_id=kwargs.get("mask_token_id"),
             sliding_window_non_causal=kwargs.get("sliding_window_non_causal", False),
+            confidence_head=kwargs.get("confidence_head", False),
+            confidence_head_alpha=kwargs.get("confidence_head_alpha", 1.0),
             speculators_config=SpeculatorsConfig(
                 algorithm="dflash",
                 proposal_methods=[
@@ -193,7 +205,15 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         Returns:
             Tuple of (train_call_kwargs, val_call_kwargs)
         """
-        loss_fn = resolve_loss_fn(kwargs["loss_fn"])
+        name = kwargs["loss_fn"]
+        if name == "combo":
+            # DSpark distribution term: weighted CE + full-L1 (defaults 0.1 / 0.9).
+            loss_fn = combo_ce_l1_loss(
+                kwargs.get("ce_loss_alpha", 0.1),
+                kwargs.get("l1_loss_alpha", 0.9),
+            )
+        else:
+            loss_fn = resolve_loss_fn(name)
         gamma = kwargs.get("dflash_decay_gamma", 4.0)
         return {"loss_fn": loss_fn, "gamma": gamma}, {
             "loss_fn": loss_fn,
@@ -346,8 +366,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 **kwargs,
             )
 
-        logits = self.lm_head(self.norm(noise_embedding))
+        normed_embedding = self.norm(noise_embedding)
+        logits = self.lm_head(normed_embedding)
         # shape: [1, num_anchors*block_size, vocab_size]
+
+        confidence_logits = None
+        if self.confidence_head_enabled:
+            confidence_logits = self.confidence_head(normed_embedding).squeeze(-1)
+            # shape: [1, num_anchors*block_size]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
         # shape: [1, num_anchors*block_size]
@@ -367,6 +393,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             self.block_size,
             gamma=gamma,
             loss_fn=loss_fn,
+            confidence_logits=confidence_logits,
+            confidence_alpha=self.config.confidence_head_alpha,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
 

@@ -963,16 +963,45 @@ def parse_args():
         "--loss-fn",
         type=str,
         default="kl_div",
-        choices=["kl_div", "ce", "tv", "nla"],
+        choices=["kl_div", "ce", "tv", "nla", "combo"],
         help=(
             "Loss function used during draft model training. "
             "'kl_div' = KL divergence (default). "
             "'ce' = cross-entropy. "
             "'tv' = total variation. "
             "'nla' = negative log-acceptance (LK) — directly optimizes acceptance "
-            "overlap alpha; all four are wired through resolve_loss_fn / DFlash "
-            "get_trainer_kwargs."
+            "overlap alpha. "
+            "'combo' = DSpark distribution term ce_loss_alpha*CE + l1_loss_alpha*L1 "
+            "(defaults 0.1 / 0.9; L1 is the full sum|p-q|). All wired through "
+            "resolve_loss_fn / DFlash get_trainer_kwargs."
         ),
+    )
+    parser.add_argument(
+        "--ce-loss-alpha",
+        type=float,
+        default=0.1,
+        help="Weight on the CE term of the 'combo' loss (DSpark default 0.1).",
+    )
+    parser.add_argument(
+        "--l1-loss-alpha",
+        type=float,
+        default=0.9,
+        help="Weight on the L1 term of the 'combo' loss (DSpark default 0.9).",
+    )
+    parser.add_argument(
+        "--confidence-head",
+        action="store_true",
+        default=False,
+        help="Enable the DSpark accept-rate (confidence) head + BCE loss (DFlash only). "
+        "A Linear(hidden, 1) trained to predict each draft token's soft acceptance "
+        "rate alpha = 1 - d_TV. Off by default.",
+    )
+    parser.add_argument(
+        "--confidence-head-alpha",
+        type=float,
+        default=1.0,
+        help="Weight on the confidence-head BCE loss (DSpark default 1.0). Only used "
+        "with --confidence-head.",
     )
     parser.add_argument(
         "--step-weight-beta",

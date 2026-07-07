@@ -78,6 +78,19 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         "bidirectional.",
     )
 
+    confidence_head: bool = Field(
+        default=False,
+        description="Enable the DSpark accept-rate (confidence) head: a Linear(hidden, 1) "
+        "on the draft hidden state, trained with BCE to predict each draft token's soft "
+        "acceptance rate (alpha = 1 - d_TV). Off by default (no behavior change).",
+    )
+
+    confidence_head_alpha: float = Field(
+        default=1.0,
+        description="Weight on the confidence-head BCE loss added to the distribution "
+        "loss (DSpark default 1.0). Only used when confidence_head is enabled.",
+    )
+
     @field_serializer("transformer_layer_config")
     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
         """Serialize transformer config to dict."""

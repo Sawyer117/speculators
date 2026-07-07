@@ -8,10 +8,13 @@ import torch
 
 from speculators.models.metrics import (
     compute_accuracy_multi_step,
+    confidence_loss,
     dflash_loss_decay,
     kl_div_loss,
     loss_function,
 )
+
+_EPS = 1e-5
 
 
 def compute_metrics(
@@ -21,6 +24,8 @@ def compute_metrics(
     block_size: int = 1,
     gamma: float = 4.0,
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = kl_div_loss,
+    confidence_logits: torch.Tensor | None = None,  # shape: [1, num_anchors*block_size]
+    confidence_alpha: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute loss and accuracy metrics for draft model predictions.
 
@@ -53,6 +58,19 @@ def compute_metrics(
         decay_fn=partial(dflash_loss_decay, gamma=gamma),
     )
 
+    # DSpark accept-rate (confidence) head: masked + position-decayed BCE against the
+    # soft acceptance rate, added to the distribution loss. Same mask/decay convention
+    # as the main term (anchors at position 0 are excluded by dflash_loss_decay).
+    confidence_scalar = None
+    if confidence_logits is not None and confidence_alpha > 0:
+        conf_elementwise = confidence_loss(confidence_logits, logits, targets)
+        conf_mask = loss_mask.to(conf_elementwise.dtype)
+        conf_decay = dflash_loss_decay(pos_idx.to(conf_elementwise.dtype), gamma)
+        conf_elementwise = conf_elementwise * conf_mask * conf_decay
+        conf_denom = conf_mask.sum(dim=1) + _EPS
+        confidence_scalar = (conf_elementwise.sum(dim=1) / conf_denom).mean()
+        loss = loss + confidence_alpha * confidence_scalar
+
     pred_ids = torch.argmax(logits, dim=-1)
     target_ids = torch.argmax(targets, dim=-1)
 
@@ -63,6 +81,9 @@ def compute_metrics(
     metrics: dict[str, Any] = {}
     metrics["loss_sum"] = loss.detach().clone()
     metrics["loss_total"] = torch.tensor(1.0, device=logits.device)
+    if confidence_scalar is not None:
+        metrics["confidence_loss_sum"] = confidence_scalar.detach().clone()
+        metrics["confidence_loss_total"] = torch.tensor(1.0, device=logits.device)
     # Position 0 is the anchor — intentionally excluded from accuracy
     metrics["full_acc_sum"] = correct_per_pos[1:].sum()
     metrics["full_acc_total"] = total_per_pos[1:].sum()

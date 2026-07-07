@@ -175,6 +175,90 @@ def neg_log_acceptance_loss(
     return elementwise_loss  # noqa: RET504
 
 
+def confidence_loss(
+    confidence_logits: torch.Tensor,  # shape: [1, seq_len]
+    logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+):
+    """Per-position BCE loss for the DSpark accept-rate (confidence) head.
+
+    The DSpark draft carries an ``AcceptRatePredictor`` (a ``Linear(hidden, 1)``)
+    that predicts, from each draft position's hidden state, the probability the
+    drafted token is accepted by the verifier. It is trained (BCE-with-logits) to
+    regress the **soft acceptance rate** ``alpha = sum_v min(q_v, p_v) = 1 - d_TV``
+    — the rejection-sampling accept probability, NOT a hard argmax match. The target
+    is detached: the head learns to *predict* acceptance, it must not move the draft
+    distribution.
+
+    Mirrors DeepSpec ``deepspec/modeling/dspark/loss.py`` (``_compute_accept_rate_3d``
+    forms ``alpha`` then ``F.binary_cross_entropy_with_logits`` against the detached
+    ``alpha``). Cross-checked against that source.
+
+    Args:
+        confidence_logits: Raw (pre-sigmoid) accept-rate head output [1, seq_len].
+        logits: Draft model logits [1, seq_len, V].
+        targets: Verifier logits in draft-vocab space [1, seq_len, V].
+
+    Returns:
+        Per-position BCE loss with shape [1, seq_len].
+    """
+    with torch.no_grad():
+        draft_p = torch.nn.functional.softmax(logits.float(), dim=-1)
+        target_p = torch.nn.functional.softmax(targets.float(), dim=-1)
+        accept_rate = (
+            torch.minimum(draft_p, target_p).sum(dim=-1).clamp_(0.0, 1.0)
+        )  # alpha = overlap = 1 - d_TV, shape: [1, seq_len]
+    elementwise_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        confidence_logits.float(), accept_rate, reduction="none"
+    )  # shape: [1, seq_len]
+
+    return elementwise_loss  # noqa: RET504
+
+
+def l1_loss(
+    logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+):
+    """Per-position L1 distance ``sum_v |q_v - p_v|`` between draft and target.
+
+    This is the DSpark "l1" term (``deepspec/.../loss.py:_compute_local_l1_term``).
+    Note it is exactly **twice** the total-variation distance — :func:`tv_loss`
+    returns ``1 - overlap == 0.5 * L1`` — so DSpark's ``l1_loss_alpha`` (default 0.9)
+    weights this full-L1 form directly.
+
+    Returns:
+        Per-position L1 distance with shape [1, seq_len].
+    """
+    draft_p = torch.nn.functional.softmax(logits, dim=-1)
+    target_p = torch.nn.functional.softmax(targets, dim=-1)
+    elementwise_loss = (draft_p - target_p).abs().sum(dim=-1)  # shape: [1, seq_len]
+
+    return elementwise_loss  # noqa: RET504
+
+
+def combo_ce_l1_loss(ce_alpha: float = 0.1, l1_alpha: float = 0.9):
+    """Return a weighted ``ce_alpha * CE + l1_alpha * L1`` per-position loss fn.
+
+    Reproduces the DSpark distribution term (DeepSpec defaults ``0.1 * CE + 0.9 * L1``
+    with L1 the full ``sum_v |q_v - p_v|`` from :func:`l1_loss`). ``speculators`` ships
+    CE and TV (== L1/2) as *separate* selectable losses; this factory returns a single
+    ``(logits, targets) -> [1, seq_len]`` callable so it drops into
+    :func:`loss_function` unchanged (masking + decay applied there).
+
+    Args:
+        ce_alpha: Weight on the cross-entropy term (DSpark default 0.1).
+        l1_alpha: Weight on the L1 term (DSpark default 0.9).
+
+    Returns:
+        A per-position loss callable ``(logits, targets) -> [1, seq_len]``.
+    """
+
+    def _combo(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return ce_alpha * ce_loss(logits, targets) + l1_alpha * l1_loss(logits, targets)
+
+    return _combo
+
+
 def dflash_loss_decay(pos_idx: torch.Tensor, gamma: float):
     """Compute DFlash-style exponential decay weights per position.
 
