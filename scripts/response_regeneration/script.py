@@ -358,6 +358,11 @@ async def main():
     print(f"Output file: {args.outfile}")
     print()
 
+    # open(..., "a") creates the file but NOT missing parent dirs -> create them here
+    out_dir = os.path.dirname(args.outfile)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     seen_ids = load_seen(args.outfile) if args.resume else set()
     if args.dataset_path:
         fmt = "parquet" if args.dataset_path.endswith(".parquet") else "json"

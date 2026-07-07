@@ -49,6 +49,9 @@ unset CC CXX
 python -m pip install -U pip setuptools "setuptools-scm>=8" wheel packaging "cmake>=3.26" ninja jinja2 setuptools-rust pybind11
 python -m pip install --extra-index-url $HW/repository/pypi/simple --extra-index-url $HW/ascend/repos/pypi torch==2.10.0 torch-npu==2.10.0 pyyaml
 python -m pip install decorator "scipy>=1.7.3" ml-dtypes attrs psutil pyyaml matplotlib openpyxl tornado
+# rollout / eval CLIENT deps — response_regeneration/script.py + Evaluator.py need these
+# (serve itself doesn't; easy to miss until a rollout errors `No module named datasets`).
+python -m pip install datasets aiohttp tqdm
 python -c "import torch, torch_npu; print('torch', torch.__version__, torch_npu.__version__, torch_npu.npu.is_available(), torch_npu.npu.device_count())"
 
 # ---- vLLM 0.23.0 (+empty) ----
@@ -70,6 +73,28 @@ pip install -e . --no-deps --no-build-isolation -v 2>&1 | tee ~/va_build.log
 python -c "import numpy; print('numpy', numpy.__version__)"
 python -c "import vllm_ascend; print('vllm_ascend OK', vllm_ascend.__file__)"
 
+# ---- ATB/NNAL env GATE (the libatb.so / "Mki::Dl undefined symbol" lesson) ----
+# The serve loads torch_npu's ATB ops, which needs THIS node's CANN 9.0.0 `nnal/atb/set_env.sh`
+# sourced by your CANN_ENV — NOT a stale CANN 8.5.1 atb, and NOT only nnal/asdsip. Fail LOUD here
+# so a bad 900env is caught at setup, not 20 minutes into a serve. (Also: the serve reads the file
+# at its hardcoded CANN_ENV — edit THAT file, not a personal copy in your own $HOME.)
+echo ""; echo ">>> ATB/NNAL gate (must pass, else serve dies with libatb.so / Mki undefined symbol):"
+echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -qi '/nnal/atb/.*/lib' \
+  || echo "   WARN: no nnal/atb lib dir on LD_LIBRARY_PATH — CANN_ENV ($CANN_ENV) probably doesn't source the 9.0.0 nnal/atb/set_env.sh"
+if python -c "from torch_npu.op_plugin.atb import _atb_ops" 2>/dev/null; then
+  echo "   atb ops OK"
+else
+  echo "!! ATB FAILED to load. Fix CANN_ENV ($CANN_ENV) — add THIS node's CANN 9.0.0 atb (verify the path with"
+  echo "   'find <CANN> -name libatb.so'; use the 9.0.0 tree, NOT any CANN 8.5.1 copy):"
+  echo "       source <CANN>/nnal/atb/set_env.sh"
+  echo "   Re-verify in a FRESH shell that sourced ONLY that file:"
+  echo "       echo \$LD_LIBRARY_PATH | tr : '\\n' | grep atb   # must show the atb lib dir"
+  echo "       python -c 'from torch_npu.op_plugin.atb import _atb_ops; print(1)'"
+  echo "   And confirm you edited the file the SERVE sources (its CANN_ENV), not a personal copy:"
+  echo "       grep -nE 'atb|nnal' /home/a00652497/900env_npu.sh"
+  exit 3
+fi
+
 # ---- speculators repo (no-op if you already cloned it to run this script) ----
 [ -d "$ROOT/speculators/.git" ] || git clone --branch docs/dsv4-dspark https://github.com/Sawyer117/speculators.git "$ROOT/speculators"
 git -C "$ROOT/speculators" checkout docs/dsv4-dspark && git -C "$ROOT/speculators" pull
@@ -79,4 +104,5 @@ echo ">>> DONE on $(hostname). Consistency check — must be IDENTICAL on 108 & 
 echo "    vllm-ascend: $(git -C "$INST/vllm-ascend-v4" log --oneline -1)"
 echo "    vllm       : $(python -c 'import vllm; print(vllm.__version__)')"
 echo "    numpy      : $(python -c 'import numpy; print(numpy.__version__)')"
-echo ">>> next: serve with examples/ascend_npu_dflash/serve_dsv4_bf16_dualnode.sh (108=head, 109=worker)"
+echo ">>> next (A2 pair): serve_dsv4_bf16_dualnode.sh (108=head, 109=worker)"
+echo ">>> next (A3 single node): serve_dsv4_a3_singlenode.sh  (DP2/TP8/EP16; run under nohup)"
