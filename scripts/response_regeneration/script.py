@@ -300,6 +300,8 @@ async def worker(
             out_fh.write(json.dumps(output, ensure_ascii=False) + "\n")
             out_fh.flush()
             stats["ok"] += 1
+            usage = data.get("usage") or {}
+            stats["gen_tokens"] += int(usage.get("completion_tokens") or 0)
         except Exception as e:  # noqa: BLE001
             error_output = {
                 "id": item.get("uuid") or f"sample_{idx}",
@@ -314,9 +316,11 @@ async def worker(
             out_fh.flush()
             stats["errors"] += 1
         finally:
+            elapsed = time.time() - stats["start"]
             progress.set_postfix(
                 ok=stats["ok"],
                 errors=stats["errors"],
+                gen_tok_s=round(stats["gen_tokens"] / elapsed, 1) if elapsed > 0 else 0.0,
                 refresh=False,
             )
             progress.update(1)
@@ -397,7 +401,7 @@ async def main():
                 dynamic_ncols=True,
             ) as progress,
         ):
-            stats = {"ok": 0, "errors": 0}
+            stats = {"ok": 0, "errors": 0, "gen_tokens": 0, "start": time.time()}
             workers = [
                 asyncio.create_task(
                     worker(
@@ -450,6 +454,15 @@ async def main():
             for _ in range(len(workers)):
                 await queue.put(None)
             await asyncio.gather(*workers)
+
+            elapsed = max(time.time() - stats["start"], 1e-9)
+            gt = stats["gen_tokens"]
+            print(
+                f"\n>>> done: {stats['ok']} ok, {stats['errors']} errors | "
+                f"{gt} gen tokens in {elapsed:.1f}s | "
+                f"{gt / elapsed:.1f} gen tok/s | "
+                f"{stats['ok'] / elapsed:.2f} samples/s"
+            )
 
 
 if __name__ == "__main__":
