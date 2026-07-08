@@ -138,6 +138,24 @@ PREFETCH="${PREFETCH:-1}"; LOAD_THREADS="${LOAD_THREADS:-16}"
 LOAD_ARGS=(); [ "$PREFETCH" = "1" ] && LOAD_ARGS=(--safetensors-load-strategy prefetch)
 LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num_threads\":$LOAD_THREADS}")
 
+# ---- optional HIDDEN-STATE EXTRACTION (DSpark/DFlash training-data producer) ----
+# HS_EXTRACT=1 turns this serve into a HS producer: vLLM's `extract_hidden_states`
+# spec method dumps aux hidden states at EAGLE_AUX_LAYERS (target layers + last), and
+# the ExampleHiddenStatesConnector (kv_producer) writes them as hs_*.safetensors to
+# HS_PATH. Put HS_PATH on SHARED storage (both nodes + the trainer must see it).
+# Default OFF => identical to the plain bf16 serve. Enable both HEAD and WORKER.
+HS_ARGS=()
+if [ "$HS_EXTRACT" = "1" ]; then
+  HS_PATH="${HS_PATH:-/home/canada_group_folder/dataset/dsv4_hs_smoketest}"
+  EAGLE_AUX_LAYERS="${EAGLE_AUX_LAYERS:-[40,41,42,43]}"   # target 40/41/42 + last layer 43
+  mkdir -p "$HS_PATH"
+  HS_ARGS=(
+    --speculative_config "{\"method\":\"extract_hidden_states\",\"num_speculative_tokens\":1,\"draft_model_config\":{\"hf_config\":{\"eagle_aux_hidden_state_layer_ids\":$EAGLE_AUX_LAYERS}}}"
+    --kv_transfer_config "{\"kv_connector\":\"ExampleHiddenStatesConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"shared_storage_path\":\"$HS_PATH\"}}"
+    --no-enable-chunked-prefill )
+  echo ">>> [HS_EXTRACT] aux hidden layers $EAGLE_AUX_LAYERS -> $HS_PATH (hs_*.safetensors)"
+fi
+
 # common serve flags (bf16 = NO --quantization; NO --enable-expert-parallel by default)
 COMMON=( "$MODEL"
   --data-parallel-size "$DP" --data-parallel-size-local 1
@@ -148,7 +166,7 @@ COMMON=( "$MODEL"
   --max-num-batched-tokens "$MAXBATCHTOK"
   --gpu-memory-utilization "$GPUUTIL_EFF" --no-enable-prefix-caching
   --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}'
-  "${LOAD_ARGS[@]}"
+  "${LOAD_ARGS[@]}" "${HS_ARGS[@]}"
   $EAGER_FLAG "${GRAPH_ARGS[@]}" )
 # NB: the ckpt FS reports as "DPC" → vLLM disables auto-prefetch (only NFS/Lustre
 # auto-detected), so weight load took ~20 min. --safetensors-load-strategy prefetch
