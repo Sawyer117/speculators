@@ -64,7 +64,8 @@ class DSparkConfidenceHead(nn.Module):
         self.proj = nn.Linear(dim + markov_rank, 1).float()      # fp32 for stable confidence
 
     def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor):
-        x = torch.cat([hidden, markov_embed], dim=-1).float()
+        # cast to the proj's dtype (fp32 in real use; matches module dtype under .double()/.half())
+        x = torch.cat([hidden, markov_embed], dim=-1).to(self.proj.weight.dtype)
         return self.proj(x).squeeze(-1)            # [...] logit
 
 
@@ -123,7 +124,10 @@ def dspark_compound_loss(draft_logits, target_logits, target_tokens, conf_logits
 
 def _selftest():
     torch.manual_seed(0)
-    cfg = DSparkConfig(vocab_size=512, dim=64, block_size=5, markov_rank=16, window_size=6)
+    # small config for CPU: noise_token_id must be < vocab_size (in the real model
+    # vocab=129280 > 128799, so it's a valid token id; here we shrink both).
+    cfg = DSparkConfig(vocab_size=512, dim=64, block_size=5, markov_rank=16,
+                       window_size=6, noise_token_id=511)
     b, ctx = 3, 10
 
     mk = DSparkMarkovHead(cfg.vocab_size, cfg.markov_rank).double()
