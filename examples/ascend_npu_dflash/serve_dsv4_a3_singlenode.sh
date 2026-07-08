@@ -32,7 +32,7 @@
 # NB: no `set -u` — sourcing CANN/conda references unbound vars ($ZSH_VERSION).
 set -o pipefail
 
-MODEL="${MODEL:-/share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
+MODEL="${MODEL:-/home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"   # A3 convention: /home/canada_group_folder (symlink-faked per box)
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"     # CANN 9.0.0 (same across the fleet)
 CONDA_ENV="${CONDA_ENV:-dspark-dsv4-base}"
 API_PORT="${API_PORT:-7000}"
