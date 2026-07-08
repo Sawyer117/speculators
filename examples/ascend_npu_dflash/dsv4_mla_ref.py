@@ -88,6 +88,44 @@ def sliding_window_causal_mask(seqlen, window, device):
     return torch.where(keep, 0.0, float("-inf"))
 
 
+def sink_attention(q, kv, attn_sink, add_mask, scale):
+    """MLA sink attention (the training path). q[b,s,h,d], kv[b,sk,d] (single latent
+    shared across heads = MLA), attn_sink[h], add_mask[s,sk] (0/-inf), scale.
+    einsum + concat per-head sink -> softmax over [kv+sink] -> drop sink. -> o[b,s,h,d]."""
+    b, s, h, _ = q.shape
+    scores = torch.einsum("bshd,btd->bhst", q, kv).float() * scale     # [b,h,s,sk]
+    scores = scores + add_mask                                          # broadcast [s,sk]
+    sink = attn_sink.view(1, h, 1, 1).expand(b, -1, s, 1)              # [b,h,s,1]
+    combined = torch.cat([scores, sink], dim=-1)
+    combined = combined - combined.max(dim=-1, keepdim=True).values
+    probs = combined.softmax(dim=-1)[..., :-1]                          # drop sink col
+    return torch.einsum("bhst,btd->bshd", probs.to(kv.dtype), kv)       # [b,s,h,d]
+
+
+def _naive_sink_attention(q, kv, attn_sink, add_mask, scale):
+    """INDEPENDENT per-(b,h,s) reference (loops + plain softmax, no shared einsum).
+    Only to produce a real parity error number vs sink_attention()."""
+    b, s, h, d = q.shape
+    out = torch.zeros(b, s, h, d, dtype=q.dtype)
+    for bi in range(b):
+        for hi in range(h):
+            for si in range(s):
+                sc = (q[bi, si, hi].float() @ kv[bi].float().T) * scale + add_mask[si]  # [sk]
+                logits = torch.cat([sc, attn_sink[hi].float().view(1)])                # [sk+1]
+                p = torch.softmax(logits, -1)[:-1]                                     # [sk]
+                out[bi, si, hi] = (p.to(kv.dtype) @ kv[bi])
+    return out
+
+
+def compare(a, b, atol=1e-8, rtol=1e-5):
+    """Per-tensor parity: allclose + MEAN ABSOLUTE + MEAN RELATIVE error (the real metric)."""
+    a, b = a.float(), b.float()
+    d = (a - b).abs()
+    return {"allclose": bool(torch.allclose(a, b, atol=atol, rtol=rtol)),
+            "mean_abs": d.mean().item(),
+            "mean_rel": (d / (b.abs() + 1e-12)).mean().item()}
+
+
 class DSV4MLA(nn.Module):
     """Backbone MLA (no compress). Attention math is einsum + explicit sink so
     the reference is autograd-clean. `attn_mask` is pluggable (base causal-SWA
@@ -123,14 +161,9 @@ class DSV4MLA(nn.Module):
         kv = self.kv_norm(self.wkv(x))
         kv = torch.cat([kv[..., :-rd], apply_rotary_emb(kv[..., -rd:], freqs_cis)], dim=-1)
 
-        # attention: scores[b,h,sq,sk] = q . kv ; window mask ; concat sink ; softmax ; drop sink
-        scores = torch.einsum("bshd,btd->bhst", q, kv).float() * self.softmax_scale
-        scores = scores + attn_mask  # [sq, sk] broadcast over [b, h]
-        sink = self.attn_sink.view(1, cfg.n_heads, 1, 1).expand(b, -1, s, 1)
-        combined = torch.cat([scores, sink], dim=-1)
-        combined = combined - combined.max(dim=-1, keepdim=True).values
-        probs = combined.softmax(dim=-1)[..., :-1]           # drop sink column
-        o = torch.einsum("bhst,btd->bshd", probs.to(kv.dtype), kv)  # [b,s,h,head_dim]
+        # attention with per-head sink (see sink_attention); mask = base causal-SWA here,
+        # DSpark draft swaps in a block-non-causal window (dspark_method.dspark_block_mask)
+        o = sink_attention(q, kv, self.attn_sink, attn_mask, self.softmax_scale)
 
         # inverse RoPE on the output rope dims
         o = torch.cat([o[..., :-rd], apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)], dim=-1)
@@ -143,38 +176,44 @@ class DSV4MLA(nn.Module):
 
 def _selftest():
     torch.manual_seed(0)
-    # small config for a fast CPU run (same STRUCTURE as DSV4, tiny dims)
     cfg = MLAConfig(dim=128, n_heads=4, head_dim=32, rope_head_dim=8,
                     q_lora_rank=48, o_lora_rank=48, o_groups=2, window_size=6, eps=1e-6)
     b, s = 2, 12
+    dev = "cpu"
+    mask = sliding_window_causal_mask(s, cfg.window_size, dev).double()
+
+    # (1) PRECISION CHECK — our einsum+sink attention vs an INDEPENDENT loop reference.
+    #     Same math two ways => fp64 mean_abs/mean_rel ~1e-15 (identical); >1e-10 = a real bug.
+    q = torch.randn(b, s, cfg.n_heads, cfg.head_dim, dtype=torch.double)
+    kv = torch.randn(b, s, cfg.head_dim, dtype=torch.double)
+    sink = torch.randn(cfg.n_heads, dtype=torch.double)
+    scale = cfg.head_dim ** -0.5
+    m = compare(sink_attention(q, kv, sink, mask, scale),
+                _naive_sink_attention(q, kv, sink, mask, scale))
+    print(f"[attn-parity] ours(einsum+sink) vs naive-loop ref: allclose={m['allclose']}  "
+          f"mean_abs={m['mean_abs']:.2e}  mean_rel={m['mean_rel']:.2e}")
+    print(f"[attn-parity] => ~1e-15 = math identical (our sink attention is correct); >1e-10 = bug.")
+
+    # (2) FULL LAYER — shape + autograd (finite grads incl. the trainable sink).
     mla = DSV4MLA(cfg).double()
     x = torch.randn(b, s, cfg.dim, dtype=torch.double, requires_grad=True)
     freqs = precompute_freqs_cis(cfg.rope_head_dim, s, cfg.rope_theta)
-    mask = sliding_window_causal_mask(s, cfg.window_size, x.device)
-
     y = mla(x, freqs, mask)
-    print(f"[shape]   in {tuple(x.shape)} -> out {tuple(y.shape)}  (expect [{b},{s},{cfg.dim}])")
+    print(f"[layer]   in {tuple(x.shape)} -> out {tuple(y.shape)}  (expect [{b},{s},{cfg.dim}])")
     assert y.shape == (b, s, cfg.dim)
-
-    # backward works (autograd-clean einsum+sink path)
     y.sum().backward()
-    print(f"[bwd]     grad(x) finite={torch.isfinite(x.grad).all().item()}  "
-          f"grad(sink) nonzero={mla.attn_sink.grad.abs().sum().item():.3e}")
+    print(f"[layer]   grad(x) finite={torch.isfinite(x.grad).all().item()}  "
+          f"grad(sink) nonzero={mla.attn_sink.grad.abs().sum().item():.3e} (sink trainable)")
 
-    # sink actually changes the output (set sink -> -inf effectively removes it)
+    # (3) SINK EFFECT — NOT an error; just how much moving the sink moves the output.
     with torch.no_grad():
-        y0 = mla(x, freqs, mask)
-        mla.attn_sink.fill_(-30.0)          # exp(-30) ~ 0 -> sink absorbs ~no mass
-        y1 = mla(x, freqs, mask)
-        mla.attn_sink.fill_(3.0)            # large sink -> absorbs a lot of mass
-        y2 = mla(x, freqs, mask)
-    d_off = (y0 - y1).abs().mean().item()
-    d_on = (y0 - y2).abs().mean().item()
-    print(f"[sink]    |y(sink=0) - y(sink=-30)|={d_off:.3e}   |y(sink=0) - y(sink=+3)|={d_on:.3e}")
-    print(f"[sink]    => sink materially changes the output ({d_on:.2e} >> {d_off:.2e}); "
-          f"sink=+3 pulls mass off the real keys as expected")
-    print("OK: DSV4 MLA reference runs fwd+bwd, sink is live. "
-          "Next: bit-parity vs official inference/model.py on-box (bf16, real dims).")
+        y0 = mla(x, freqs, mask); mla.attn_sink.fill_(3.0); y2 = mla(x, freqs, mask); mla.attn_sink.zero_()
+    print(f"[sink-effect] mean_abs |y(sink=0)-y(sink=+3)|={compare(y0, y2)['mean_abs']:.2e}  "
+          f"(EFFECT magnitude, not a parity error)")
+
+    print("OK. [attn-parity] is the real precision number (independent refs). BACKBONE parity vs the "
+          "gold = run official inference/model.py MLA on-box (bf16, real dims, same weights+input), "
+          "save its output, and compare(our_layer_out, official_out) -> mean_abs/mean_rel/allclose.")
 
 
 if __name__ == "__main__":
