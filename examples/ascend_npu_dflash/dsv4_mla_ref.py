@@ -88,21 +88,23 @@ def sliding_window_causal_mask(seqlen, window, device):
     return torch.where(keep, 0.0, float("-inf"))
 
 
-def sink_attention(q, kv, attn_sink, add_mask, scale):
+def sink_attention(q, kv, attn_sink, add_mask, scale, compute_dtype=torch.float32):
     """MLA sink attention (the training path). q[b,s,h,d], kv[b,sk,d] (single latent
     shared across heads = MLA), attn_sink[h], add_mask[s,sk] (0/-inf), scale.
-    einsum + concat per-head sink -> softmax over [kv+sink] -> drop sink. -> o[b,s,h,d]."""
+    einsum + concat per-head sink -> softmax over [kv+sink] -> drop sink. -> o[b,s,h,d].
+    Scores/softmax run in `compute_dtype` (fp32 by default — faithful to the model's
+    fp32 softmax; use fp64 to check math identity vs an independent path)."""
     b, s, h, _ = q.shape
-    scores = torch.einsum("bshd,btd->bhst", q, kv).float() * scale     # [b,h,s,sk]
-    scores = scores + add_mask                                          # broadcast [s,sk]
-    sink = attn_sink.view(1, h, 1, 1).expand(b, -1, s, 1)              # [b,h,s,1]
+    scores = torch.einsum("bshd,btd->bhst", q, kv).to(compute_dtype) * scale     # [b,h,s,sk]
+    scores = scores + add_mask.to(compute_dtype)                                  # broadcast [s,sk]
+    sink = attn_sink.view(1, h, 1, 1).expand(b, -1, s, 1).to(compute_dtype)       # [b,h,s,1]
     combined = torch.cat([scores, sink], dim=-1)
     combined = combined - combined.max(dim=-1, keepdim=True).values
-    probs = combined.softmax(dim=-1)[..., :-1]                          # drop sink col
-    return torch.einsum("bhst,btd->bshd", probs.to(kv.dtype), kv)       # [b,s,h,d]
+    probs = combined.softmax(dim=-1)[..., :-1]                                    # drop sink col
+    return torch.einsum("bhst,btd->bshd", probs.to(kv.dtype), kv)                 # [b,s,h,d]
 
 
-def _naive_sink_attention(q, kv, attn_sink, add_mask, scale):
+def _naive_sink_attention(q, kv, attn_sink, add_mask, scale, compute_dtype=torch.float32):
     """INDEPENDENT per-(b,h,s) reference (loops + plain softmax, no shared einsum).
     Only to produce a real parity error number vs sink_attention()."""
     b, s, h, d = q.shape
@@ -110,8 +112,9 @@ def _naive_sink_attention(q, kv, attn_sink, add_mask, scale):
     for bi in range(b):
         for hi in range(h):
             for si in range(s):
-                sc = (q[bi, si, hi].float() @ kv[bi].float().T) * scale + add_mask[si]  # [sk]
-                logits = torch.cat([sc, attn_sink[hi].float().view(1)])                # [sk+1]
+                sc = (q[bi, si, hi].to(compute_dtype) @ kv[bi].to(compute_dtype).T) * scale \
+                    + add_mask[si].to(compute_dtype)                                   # [sk]
+                logits = torch.cat([sc, attn_sink[hi].to(compute_dtype).view(1)])      # [sk+1]
                 p = torch.softmax(logits, -1)[:-1]                                     # [sk]
                 out[bi, si, hi] = (p.to(kv.dtype) @ kv[bi])
     return out
@@ -182,17 +185,23 @@ def _selftest():
     dev = "cpu"
     mask = sliding_window_causal_mask(s, cfg.window_size, dev).double()
 
-    # (1) PRECISION CHECK — our einsum+sink attention vs an INDEPENDENT loop reference.
-    #     Same math two ways => fp64 mean_abs/mean_rel ~1e-15 (identical); >1e-10 = a real bug.
+    # (1) PRECISION CHECK — our einsum+sink attention vs an INDEPENDENT loop reference,
+    #     at two compute precisions:
+    #       fp32 = the REAL path (model's fp32 softmax) -> agreement ~1e-7 is CORRECT
+    #       fp64 = math-identity check -> ~1e-14 proves the two paths are the same math
+    #     (a real bug shows ~1e-2 at BOTH precisions).
     q = torch.randn(b, s, cfg.n_heads, cfg.head_dim, dtype=torch.double)
     kv = torch.randn(b, s, cfg.head_dim, dtype=torch.double)
     sink = torch.randn(cfg.n_heads, dtype=torch.double)
     scale = cfg.head_dim ** -0.5
-    m = compare(sink_attention(q, kv, sink, mask, scale),
-                _naive_sink_attention(q, kv, sink, mask, scale))
-    print(f"[attn-parity] ours(einsum+sink) vs naive-loop ref: allclose={m['allclose']}  "
-          f"mean_abs={m['mean_abs']:.2e}  mean_rel={m['mean_rel']:.2e}")
-    print(f"[attn-parity] => ~1e-15 = math identical (our sink attention is correct); >1e-10 = bug.")
+    for name, cdt, tol in [("fp32 real-path", torch.float32, 1e-5),
+                           ("fp64 math-check", torch.float64, 1e-10)]:
+        m = compare(sink_attention(q, kv, sink, mask, scale, cdt),
+                    _naive_sink_attention(q, kv, sink, mask, scale, cdt), atol=tol, rtol=tol)
+        print(f"[attn-parity {name:15}] allclose={m['allclose']}  "
+              f"mean_abs={m['mean_abs']:.2e}  mean_rel={m['mean_rel']:.2e}")
+    print(f"[attn-parity] => expect fp32 ~1e-7 (softmax runs in fp32 like the model), "
+          f"fp64 ~1e-14 (math identical). Bug would be ~1e-2 at both.")
 
     # (2) FULL LAYER — shape + autograd (finite grads incl. the trainable sink).
     mla = DSV4MLA(cfg).double()
