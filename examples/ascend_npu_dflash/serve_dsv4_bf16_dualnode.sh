@@ -146,7 +146,7 @@ LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num
 # Default OFF => identical to the plain bf16 serve. Enable both HEAD and WORKER.
 HS_ARGS=()
 if [ "$HS_EXTRACT" = "1" ]; then
-  HS_PATH="${HS_PATH:-/home/canada_group_folder/dataset/dsv4_hs_smoketest}"
+  HS_PATH="${HS_PATH:-/share/canada_group_folder/dataset/dsv4_hs_smoketest}"   # A2 = real /share shared storage (NOT A3's faked /home)
   EAGLE_AUX_LAYERS="${EAGLE_AUX_LAYERS:-[40,41,42,43]}"   # target 40/41/42 + last layer 43
   mkdir -p "$HS_PATH"
   HS_ARGS=(
