@@ -19,18 +19,27 @@ predated the Alloy/hf-npu-binder discovery and the official-gold anchoring). Pla
   trainer prefetches N shards.
 - **Draft size reality check:** the draft is **NOT tiny** — 3 layers × 256-expert MoE ≈ **~20B params**
   (~40 GB bf16; the 13 GB released file is fp4/fp8 quantized). Full fp32 Adam ~320 GB.
-- **MoE training parallelism = EXPERT PARALLEL (EP), not FSDP2-all-gather.** No 8-bit Adam (fidelity).
-  Math: full-fp32-Adam 20B on **1 A2 (8 cards)** = 40 GB/card sharded + the FSDP2 **all-gather of all 256
-  experts** (~26 GB fwd+bwd) ⇒ ~66 GB > 64 GB → **OOM**. So the FSDP2-gather-all-experts path is dropped.
-  **EP is the correct primary** (not a fallback): it is the canonical DSV4 training layout (MindSpeed uses
-  `expert_model_parallel_size=32`), matches how the model is served, and is memory-correct — each card
-  holds only 256/EP experts, so the all-gather peak disappears. EP=8 on 1 A2 fits full fp32 Adam (~50
-  GB/card) → **unlocks 2S1T with no 8-bit**. Design = **EP for the experts (~19 B) + FSDP2/DDP for the
-  small dense parts (MLA/mHC/norms ~0.6 B)**, one EP-MoE impl with an `EP_size` knob (1 = dense/smoke,
-  8 = 1 A2, 16 = 2 A2). EP=1 degenerates to dense for GPU smoke tests. Cost: implement EP dispatch
-  (`torch.dist.all_to_all`, device-agnostic NCCL/HCCL) + EP-aware autograd in the torch-native path;
-  expert **compute** reuses `hf-npu-binder` grouped-GEMM, we add the **routing** all-to-all layer.
-- **No megatron / MindSpeed in the draft training path** (torch-native FSDP2 + EP).
+- **TWO PARALLEL TRACKS (2026-07-09):** (A, colleague) **speculators-native FSDP2, 2S2T** — reuses the
+  proven speculators online trainer (FSDP2, no EP; upstream `train/distributed.py` = `fully_shard` only,
+  no expert-parallel) + MTP-MoE converter (`convert/mtp`, has `_fuse_moe_experts`) + DSpark heads (#677);
+  the 20B draft fits FSDP2 on **2 A2** (~46 GB/card, full fp32 Adam, no 8-bit) — needs FSDP2-on-Ascend to
+  work. (B, us/user, "the hard one") **MindSpeed-native EP → single-machine training (2S1T)**; the rest
+  of this doc details B.
+- **Training framework (track B) = MindSpeed-native (DECIDED).** GPU portability is NOT a requirement. The draft
+  (~20B, 256-expert MoE ×3) needs EP, and no-8-bit-Adam full-fp32 on 1 A2 with FSDP2-all-gather-256-experts
+  OOMs (~66GB > 64GB). Self-implementing correct EP-MoE training (all-to-all + EP-aware autograd + load
+  balance) is a large, risky sub-project. **MindSpeed already has proven EP (`expert_model_parallel_size=32`
+  trains DSV4) + the full DSV4 backbone training + fused MoE grouped-GEMM/dense ops.** MindSpeed is a PUBLIC
+  Ascend repo (not the private-repo problem). So we **reuse MindSpeed's DSV4 training and ADD only the DSpark
+  method to its MTP** (mtp_num_layers=3, main_proj/main_norm, Markov head, Confidence head, TV/BCE loss,
+  block-γ=5, noise_token). **CORRECTION:** MindSpeed does NOT hand us the DSpark sink attention — it has NO
+  DSpark code; its fused sink-backward kernel (`_attn_bwd_dq_dsink`) is the BASE model's CAUSAL g2 attention.
+  The **DSpark draft's block-non-causal + sink attention is einsum (autograd-clean, validated vs the
+  vllm-ascend GOLD in `dspark_attn_ref_bench.py`)** — we add it regardless of framework. What MindSpeed
+  buys = EP + backbone-training + MoE fused ops, NOT the DSpark attention.
+- **Conditional import via FLAG:** the shareable `speculators` core does NOT top-level-import MindSpeed;
+  MindSpeed is imported only when actually running DSV4-DSpark training on Ascend, so users on other models
+  never pull it. (This replaces GPU-portability — we don't chase a torch-native GPU training path.)
 - **Gold source: MindSpeed/MindSpeed-LLM = PRIMARY reference** (Ascend-official, team-defensible; agrees
   with the official code on architecture + rope-factor). **Official code = the weights-matched
   cross-check** (`deepseek-ai/DeepSeek-V4-Flash` `inference/model.py`+`config.json` HEAD 60d8d70;
