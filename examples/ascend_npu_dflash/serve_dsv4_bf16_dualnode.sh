@@ -149,6 +149,10 @@ if [ "$HS_EXTRACT" = "1" ]; then
   HS_PATH="${HS_PATH:-/share/canada_group_folder/dataset/dsv4_hs_smoketest}"   # A2 = real /share shared storage (NOT A3's faked /home)
   EAGLE_AUX_LAYERS="${EAGLE_AUX_LAYERS:-[40,41,42,43]}"   # target 40/41/42 + last layer 43
   mkdir -p "$HS_PATH"
+  # kv_role=kv_producer puts vLLM in PD-DISAGGREGATED mode, which is INCOMPATIBLE with
+  # Ascend balance-scheduling (pydantic: "enable_balance_scheduling only supports PD-mixed
+  # mode"). Force it OFF when extracting HS.
+  export VLLM_ASCEND_BALANCE_SCHEDULING=0
   HS_ARGS=(
     --speculative_config "{\"method\":\"extract_hidden_states\",\"num_speculative_tokens\":1,\"draft_model_config\":{\"hf_config\":{\"eagle_aux_hidden_state_layer_ids\":$EAGLE_AUX_LAYERS}}}"
     --kv_transfer_config "{\"kv_connector\":\"ExampleHiddenStatesConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"shared_storage_path\":\"$HS_PATH\"}}"
