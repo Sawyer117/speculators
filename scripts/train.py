@@ -963,7 +963,7 @@ def parse_args():
         "--loss-fn",
         type=str,
         default="kl_div",
-        choices=["kl_div", "ce", "tv", "nla", "combo"],
+        choices=["kl_div", "ce", "tv", "nla", "dspark"],
         help=(
             "Loss function used during draft model training. "
             "'kl_div' = KL divergence (default). "
@@ -971,7 +971,7 @@ def parse_args():
             "'tv' = total variation. "
             "'nla' = negative log-acceptance (LK) — directly optimizes acceptance "
             "overlap alpha. "
-            "'combo' = DSpark distribution term ce_loss_alpha*CE + l1_loss_alpha*L1 "
+            "'dspark' = DSpark distribution term ce_loss_alpha*CE + l1_loss_alpha*L1 "
             "(defaults 0.1 / 0.9; L1 is the full sum|p-q|). All wired through "
             "resolve_loss_fn / DFlash get_trainer_kwargs."
         ),
@@ -980,13 +980,13 @@ def parse_args():
         "--ce-loss-alpha",
         type=float,
         default=0.1,
-        help="Weight on the CE term of the 'combo' loss (DSpark default 0.1).",
+        help="Weight on the CE term of the 'dspark' loss (DSpark default 0.1).",
     )
     parser.add_argument(
         "--l1-loss-alpha",
         type=float,
         default=0.9,
-        help="Weight on the L1 term of the 'combo' loss (DSpark default 0.9).",
+        help="Weight on the L1 term of the 'dspark' loss (DSpark default 0.9).",
     )
     parser.add_argument(
         "--confidence-head",
@@ -1205,7 +1205,11 @@ def parse_args():
     args = parser.parse_args()
     provided = explicitly_provided_dests(parser, DECODER_SHAPING_FLAGS)
     validate_draft_init_args(parser, args, provided)
-    resolve_loss_fn(args.loss_fn)
+    # 'dspark' (CE+L1 distribution term) is a DFlash-only composite resolved in
+    # DFlash.get_trainer_kwargs with the ce/l1 alphas; resolve_loss_fn only knows the
+    # atomic losses, so validating it here would wrongly reject the DSpark loss.
+    if args.loss_fn != "dspark":
+        resolve_loss_fn(args.loss_fn)
     return args
 
 

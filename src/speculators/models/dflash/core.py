@@ -206,8 +206,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             Tuple of (train_call_kwargs, val_call_kwargs)
         """
         name = kwargs["loss_fn"]
-        if name == "combo":
-            # DSpark distribution term: weighted CE + full-L1 (defaults 0.1 / 0.9).
+        if name == "dspark":
+            # DSpark distribution term: weighted CE + full-L1 (defaults 0.1 / 0.9),
+            # implemented by combo_ce_l1_loss.
             loss_fn = combo_ce_l1_loss(
                 kwargs.get("ce_loss_alpha", 0.1),
                 kwargs.get("l1_loss_alpha", 0.9),
