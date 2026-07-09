@@ -1,5 +1,6 @@
 import bisect
 import json
+import os
 import random
 import re
 from collections.abc import Callable
@@ -729,6 +730,7 @@ def load_and_preprocess_dataset(
     turn_dropout: bool = False,
     minimum_valid_tokens: int | None = None,
     trust_remote_code: bool = False,
+    chat_template: str | None = None,
 ) -> tuple[HFDataset, ProcessorLike]:
     """Load, tokenize, and preprocess a dataset for EAGLE3 training.
 
@@ -766,10 +768,22 @@ def load_and_preprocess_dataset(
     log.subsection("Loading processor")
     processor = load_processor(target_model_path, trust_remote_code=trust_remote_code)
 
+    # Some models (e.g. DeepSeek-V4) ship NO Jinja chat_template — they use a custom
+    # encoder instead. Inject an explicit template (a .jinja file path or inline string)
+    # so apply_chat_template works. MUST match what the serve used to roll the data —
+    # verify against the serve's /tokenize before a full run.
+    if chat_template is not None:
+        tmpl = chat_template
+        if os.path.isfile(chat_template):
+            with open(chat_template, encoding="utf-8") as f:
+                tmpl = f.read()
+        processor.chat_template = tmpl
+        log.info(f"Set chat_template from {'file' if os.path.isfile(chat_template) else 'string'} ({len(tmpl)} chars)")
+
     if not hasattr(processor, "apply_chat_template") or processor.chat_template is None:
         raise ValueError(
             f"Processor for {target_model_path} does not support chat templates. "
-            "Please use a model with a pre-configured chat template."
+            "Please pass --chat-template <file.jinja> (DeepSeek-V4 ships none)."
         )
 
     processed_datasets = []
