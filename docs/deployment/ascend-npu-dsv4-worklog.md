@@ -133,9 +133,52 @@ Several DSV4-is-bleeding-edge blockers, each fixed:
   `loss_mask` non-zero on all rows (frac 0.62–0.95). `--chat-template` + `{% generation %}` → loss on
   the response only. See rollout-data doc §6.
 
+## 2026-07-10 — pre-launch audit of the DSpark train.py command (3 fixes + FSDP2/attn confirmations)
+
+Before launching on 108, audited the recorded train.py command line-by-line against `scripts/train.py`
+argparse + the DFlash loss/verifier/trainer code. All arg *names* matched, but found three things:
+
+1. **The DSpark distribution loss was unreachable from the CLI** (commit `bcde32b`). Its factory
+   `combo_ce_l1_loss` (ce·0.1 + l1·0.9) was wired only under the loss-fn name `combo`, consumed ONLY when
+   `loss_fn=="..."` in `DFlash.get_trainer_kwargs` (core.py:209). But `parse_args()` ended with an
+   unconditional `resolve_loss_fn(args.loss_fn)` validation whose map holds only the atomic losses
+   {kl_div, ce, tv, nla} — so selecting it raised `ValueError: Unknown loss function` before training.
+   This path had NEVER been exercised (DFlash-4B used ce/nla). Fix: (a) **renamed the selectable loss
+   `combo` → `dspark`** (clearer; it's our own DSpark addition — commit `56066c1` — not upstream, so
+   nothing to align to; the internal factory keeps the descriptive name `combo_ce_l1_loss`); (b) guard the
+   validation `if args.loss_fn != "dspark": resolve_loss_fn(...)`. So the command must pass
+   **`--loss-fn dspark`** — WITHOUT it the ce/l1 alphas are inert and training silently uses default kl_div.
+2. **Missing `--draft-attn-impl sdpa`** (would crash on NPU). The default is `simple_flex_attention`, which
+   is unavailable on Ascend (README §attn + all three ascend train scripts — `train_qwen3_{4b,8b}*.sh` —
+   pass `--draft-attn-impl sdpa`; the SDPA block-attention path is the validated flex replacement, see
+   `dspark_npu_op_check.py`). Added to the command.
+3. Command hygiene: filled `--vllm-endpoint http://80.5.5.115:7000/v1` (API_PORT 7000, HEAD_IP 80.5.5.115),
+   `--nproc_per_node 8` (108 = A2, 8 cards), `--num-workers 4` (online HS concurrency = ranks×workers = 32,
+   under the serve's clean ceiling 64).
+
+Confirmed (no change needed):
+- **FSDP2 is already the trainer's mechanism** — `train/utils.py:apply_fully_sharded` uses `fully_shard`
+  (FSDP2, with `MixedPrecisionPolicy` bf16 params / fp32 reduce), per-layer then whole-model; optimizers.py
+  notes params become DTensors. `torchrun --standalone --nproc_per_node 8 scripts/train.py` → FSDP2 directly.
+- **Verifier loading is memory-safe on a single 108 node.** `build_draft_model` → `from_training_args` →
+  `load_verifier_weights` → `load_model_layers` reads ONLY `embed_tokens.weight` / `lm_head.weight` /
+  `model.norm.weight` from the verifier's `model.safetensors.index.json` via `safe_open`+`get_tensor`
+  (≈2 GB bf16), NOT the 568 GB full DSV4 model. `parse_vocab_mappings` falls through to "full verifier
+  vocab" (no `--draft-vocab-size`/token_freq) via a config-only `AutoConfig.from_pretrained`.
+- **draft depth (5) vs HS taps (3) are orthogonal.** `--num-layers 5` = the DRAFT's own Qwen3 decoder
+  depth. `--target-layer-ids 40 41 42` = which 3 VERIFIER layers we tap for aux hidden states, fused by
+  `fc = Linear(3·hidden → hidden)` as the draft's INPUT conditioning. The HS file carries `[seq, 4, H]` =
+  those 3 aux (input) + the verifier's final hidden (last), which through `verifier_lm_head` forms the
+  training TARGET distribution. num_target_layers = len([40,41,42]) = 3 (no auto layer-add).
+
 ## Open items / next
 
-- Prep the cleaned rollout → Arrow (`prepare_data.py`), verify `loss_mask` non-zero (assistant-pattern),
-  then launch DSpark draft training with the online HS config.
-- Deploy env on 108/109 for 3–4 machine training (setup script retargeted to `dspark_2026` + Plan B branches).
+- **Launch DSpark draft training on 108** with the corrected online command (must include
+  `--loss-fn dspark` and `--draft-attn-impl sdpa`). Pre-flight: (a) 108 env deployed on
+  `feat/dspark-confidence-head` **including commit `bcde32b`** (fresh clone or `git pull`); (b) HS_DUMP
+  serve up on 115/116, `DSPARK_HS_DIR == /share/canada_group_folder/dataset/dsv4_hs_dump`; (c) 108 can
+  reach `http://80.5.5.115:7000/v1`. Watch: online HS-request concurrency ≈ world_size × num_workers —
+  reduce `--num-workers` if the serve is stressed; draft as-is (`--num-layers 5 --block-size 5`), shrink
+  only on OOM.
+- Deploy env on 109 for 3–4 machine scale-out (setup script retargeted to `dspark_2026` + Plan B branches).
 - Deferred: extract track on vLLM 0.24 (upstream-standard; needs the serve re-validation + memory pathology).
