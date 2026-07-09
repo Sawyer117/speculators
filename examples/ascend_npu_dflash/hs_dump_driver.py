@@ -46,8 +46,14 @@ async def _amain(args):
     from openai import AsyncOpenAI
     from tqdm import tqdm
 
-    data = _load_input_ids(args.datapath)
-    n = len(data)
+    if args.bench:
+        data = None
+        n = args.bench
+        bench_prompt = [(k % 2000) + 100 for k in range(args.bench_len)]
+    else:
+        data = _load_input_ids(args.datapath)
+        n = len(data)
+        bench_prompt = None
     start = args.start
     end = args.end if args.end is not None else n
     end = min(end, n)
@@ -60,7 +66,7 @@ async def _amain(args):
     def hs_path(i):
         return os.path.join(args.hs_dir, f"hs_{i}.safetensors")
 
-    done0 = sum(1 for i in rows if os.path.exists(hs_path(i)))
+    done0 = 0 if args.bench else sum(1 for i in rows if os.path.exists(hs_path(i)))
     print(
         f">>> dataset={args.datapath}  rows={n}  range=[{start},{end})  "
         f"already done={done0}  to do={span - done0}"
@@ -79,15 +85,17 @@ async def _amain(args):
                 i = next(it, None)
             if i is None:
                 return
-            if args.resume and os.path.exists(hs_path(i)):
+            if not args.bench and args.resume and os.path.exists(hs_path(i)):
                 stats["skip"] += 1  # already counted in `initial`
                 continue
+            prompt = bench_prompt if args.bench else _row_ids(data, i)
+            rid = f"hs_bench{i}" if args.bench else f"hs_{i}"
             try:
                 await client.completions.create(
                     model=args.model,
-                    prompt=_row_ids(data, i),
+                    prompt=prompt,
                     max_tokens=1,
-                    extra_headers={"X-Request-Id": f"hs_{i}"},
+                    extra_headers={"X-Request-Id": rid},
                     extra_body={"return_token_ids": True},
                     timeout=args.timeout,
                 )
@@ -107,6 +115,14 @@ async def _amain(args):
         f"\n>>> done: {stats['ok']} written, {stats['skip']} already-had, {stats['err']} errors "
         f"in {dt:.1f}s ({stats['ok'] / dt:.2f} row/s)"
     )
+    if args.bench:
+        toks = stats["ok"] * args.bench_len
+        print(
+            f">>> BENCH: {stats['ok']} reqs x {args.bench_len} tok = {toks} tok in {dt:.1f}s "
+            f"= {toks / dt:.0f} tok/s (prefill+dump end-to-end). "
+            f"HTTP@117MB/s carries ~3600 tok/s -> {'HTTP HIDDEN (extraction-bound)' if toks / dt < 3600 else 'HTTP BOUND'}. "
+            f"Clean up: rm {args.hs_dir}/*bench*.safetensors"
+        )
     if stats["err"]:
         print(f"!! {stats['err']} rows errored (wrote nothing) — re-run to retry them "
               f"(resume skips the ones that landed). If errors persist, lower --concurrency.")
@@ -116,7 +132,7 @@ async def _amain(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--datapath", required=True, help="preprocessed Arrow dataset dir (load_from_disk)")
+    ap.add_argument("--datapath", help="preprocessed Arrow dataset dir (load_from_disk); omit with --bench")
     ap.add_argument("--hs-dir", default=os.environ.get("DSPARK_HS_DIR", ""),
                     help="serve's DSPARK_HS_DIR (for resume-by-existence + naming target)")
     ap.add_argument("--endpoint", default="http://127.0.0.1:7000/v1", help="OpenAI base URL")
@@ -127,10 +143,17 @@ def main():
     ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--no-resume", dest="resume", action="store_false",
                     help="do NOT skip rows whose hs_<i>.safetensors already exists")
+    ap.add_argument("--bench", type=int, default=0, metavar="N",
+                    help="THROUGHPUT probe: send N synthetic prompts (no dataset needed), report tok/s")
+    ap.add_argument("--bench-len", type=int, default=1024, metavar="L",
+                    help="tokens per synthetic prompt in --bench mode (default 1024)")
     args = ap.parse_args()
 
     if not args.hs_dir:
         print("!! --hs-dir (or DSPARK_HS_DIR) required")
+        return 2
+    if not args.bench and not args.datapath:
+        print("!! --datapath required (or use --bench N for a throughput probe)")
         return 2
     return asyncio.run(_amain(args))
 
