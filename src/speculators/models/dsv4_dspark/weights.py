@@ -126,6 +126,85 @@ def expected_draft_keys(cfg: DSparkDraftConfig) -> set[str]:
     return keys
 
 
+def expected_draft_shapes(cfg: DSparkDraftConfig) -> dict[str, list[int]]:
+    """Expected parameter shapes (as ``nn.Linear`` weight ``[out, in]`` etc.).
+
+    Analytic (no torch) so it can be diffed against a released safetensors
+    header. Matches the module definitions in :mod:`.backbone` / :mod:`.draft`.
+    """
+    H, V = cfg.hidden_size, cfg.vocab_size
+    hd, nh = cfg.head_dim, cfg.num_heads
+    qlr, olr, og = cfg.q_lora_rank, cfg.o_lora_rank, cfg.o_groups
+    mi, ne, mr = cfg.moe_inter_dim, cfg.n_routed_experts, cfg.markov_rank
+    hc = cfg.hc_mult
+    mix = (2 + hc) * hc
+    s: dict[str, list[int]] = {
+        "embed_tokens.weight": [V, H],
+        "lm_head.weight": [V, H],
+        "main_proj.weight": [H, H * cfg.num_target_layers],
+        "main_norm.weight": [H],
+        "norm.weight": [H],
+        "hc_head.hc_fn": [hc, hc * H],
+        "hc_head.hc_base": [hc],
+        "hc_head.hc_scale": [1],
+        "markov_head.markov_w1.weight": [V, mr],
+        "markov_head.markov_w2.weight": [V, mr],
+        "confidence_head.proj.weight": [1, H + mr],
+    }
+    for n in range(cfg.n_draft_layers):
+        p = f"layers.{n}."
+        s |= {
+            p + "attn.wq_a.weight": [qlr, H], p + "attn.q_norm.weight": [qlr],
+            p + "attn.wq_b.weight": [nh * hd, qlr],
+            p + "attn.wkv.weight": [hd, H], p + "attn.kv_norm.weight": [hd],
+            p + "attn.wo_a.weight": [og * olr, nh * hd // og],
+            p + "attn.wo_b.weight": [H, og * olr],
+            p + "attn.attn_sink": [nh],
+            p + "attn_norm.weight": [H], p + "ffn_norm.weight": [H],
+            p + "ffn.router.weight": [ne, H], p + "ffn.router.bias": [ne],
+        }
+        for w, out in (("w1", mi), ("w2", H), ("w3", mi)):
+            in_ = H if w != "w2" else mi
+            s[p + f"ffn.shared_experts.{w}.weight"] = [out, in_]
+            for e in range(ne):
+                s[p + f"ffn.experts.{e}.{w}.weight"] = [out, in_]
+        for site in ("attn_hc", "ffn_hc"):
+            s[p + f"{site}.fn"] = [mix, hc * H]
+            s[p + f"{site}.base"] = [mix]
+            s[p + f"{site}.scale"] = [3]
+    return s
+
+
+# Released quant dtypes: attn/shared linears are fp8 (1 byte/value, unpacked);
+# experts are fp4 packed 2-per-byte (stored as I8), so their last dim is halved.
+_FP4_DTYPES = {"I8", "U8", "F4_E2M1", "F4", "FP4"}
+
+
+def verify_shapes(released: dict, cfg: DSparkDraftConfig) -> dict:
+    """Check released tensor shapes against ours (fp4 experts unpacked ×2).
+
+    ``released`` maps checkpoint key -> ``{"shape": [...], "dtype": "..."}``
+    (e.g. parsed from safetensors headers). Skips ``.scale`` sidecars. Returns
+    a report with ``ok`` and any ``mismatches``.
+    """
+    exp = expected_draft_shapes(cfg)
+    checked = 0
+    mismatches: list[tuple] = []
+    for rk, info in released.items():
+        if rk.endswith(".scale"):
+            continue
+        tgt = map_released_key(rk, cfg.n_draft_layers)
+        if tgt is None or tgt not in exp:
+            continue
+        shape = list(info["shape"])
+        if info.get("dtype") in _FP4_DTYPES and len(shape) == 2:
+            shape = [shape[0], shape[1] * 2]  # unpack fp4 nibble packing
+        checked += 1
+        if shape != list(exp[tgt]):
+            mismatches.append((rk, tgt, info["shape"], info.get("dtype"), exp[tgt]))
+    return {"ok": not mismatches, "checked": checked, "mismatches": mismatches}
+
+
 def verify_mapping(released_keys, cfg: DSparkDraftConfig) -> dict:
     """Check the release↔ours key bijection (no torch, no download).
 
