@@ -5,8 +5,8 @@
 # hardcoded so nodes never diverge (the 115/116 dspark_2026-vs-dspark_base mixup lesson).
 #
 #   # once per node:
-#   git clone -b docs/dsv4-dspark https://github.com/Sawyer117/speculators.git /home/a00652497/dsv4/speculators
-#   CANN_ENV=<your CANN 9.0.0 set_env.sh> bash /home/a00652497/dsv4/speculators/examples/ascend_npu_dflash/setup_dsv4_env.sh
+#   git clone -b feat/dspark-confidence-head https://github.com/Sawyer117/speculators.git /home/a00652497/dspark_2026/speculators
+#   CANN_ENV=<your CANN 9.0.0 set_env.sh> bash /home/a00652497/dspark_2026/speculators/examples/ascend_npu_dflash/setup_dsv4_env.sh
 #
 # PREREQS on the node (this script does NOT install them):
 #   - CANN 9.0.0 installed + a source script (set CANN_ENV to it; it must put lld/ccec on PATH).
@@ -14,19 +14,21 @@
 #   - conda available; 8× NPU visible (`npu-smi info`).
 #
 # It builds: conda env `dspark-dsv4-base` (py3.11, torch/torch_npu 2.10.0, numpy 2.3.5),
-# vLLM 0.23.0+empty, vllm-ascend @ 6036507 (compiles the V4 CANN ops). Recipe = doc §4 verbatim,
-# with consistent paths + the vllm-ascend commit PINNED to match 115/116.
+# vLLM 0.23.0+empty, vllm-ascend @ `feat/dsv4-hs-dumper` (compiles the V4 CANN ops; our Plan B
+# HS-dumper branch, based off dspark-dsv4 — pure-Python delta, same ops). Recipe = doc §4 verbatim,
+# with consistent paths + the vllm-ascend ref PINNED to match 115/116.
 # NB: no `set -u` — sourcing CANN/conda references unbound vars ($ZSH_VERSION) and would abort.
 set -o pipefail
 
 # ---- consistent config (override via env; defaults are the canonical layout) ----
-ROOT="${ROOT:-/home/a00652497/dsv4}"
+ROOT="${ROOT:-/home/a00652497/dspark_2026}"
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"   # ★ CANN 9.0.0 source script — CONFIRM it exists on this node
 CONDA_ENV="${CONDA_ENV:-dspark-dsv4-base}"
-VA_COMMIT="${VA_COMMIT:-6036507}"                        # pinned == 115/116 (serves bf16 AND w8a8)
+VA_REF="${VA_REF:-feat/dsv4-hs-dumper}"                  # pinned == 115/116 (Plan B HS-dumper branch)
+SPEC_REF="${SPEC_REF:-feat/dspark-confidence-head}"      # speculators branch (serve + smoke + P3 driver + fixes)
 HW="https://mirrors.huaweicloud.com"
 INST="$ROOT/installation"; mkdir -p "$INST"
-echo ">>> ROOT=$ROOT  CANN_ENV=$CANN_ENV  env=$CONDA_ENV  vllm-ascend=$VA_COMMIT"
+echo ">>> ROOT=$ROOT  CANN_ENV=$CANN_ENV  env=$CONDA_ENV  vllm-ascend=$VA_REF  speculators=$SPEC_REF"
 
 # ---- source CANN + verify the toolchain (the exit-127 lesson: fail loud, don't guess) ----
 [ -f "$CANN_ENV" ] || { echo "!! CANN source script not found: $CANN_ENV — set CANN_ENV=<set_env.sh>"; exit 2; }
@@ -60,10 +62,10 @@ cd "$INST/vllm-v0.23.0"
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation -v
 python -c "import vllm; print('vllm', vllm.__version__)"
 
-# ---- vllm-ascend @ pinned commit (compiles V4 CANN ops — the moment of truth) ----
-[ -d "$INST/vllm-ascend-v4/.git" ] || git clone --branch dspark-dsv4 --single-branch https://github.com/Sawyer117/vllm-ascend.git "$INST/vllm-ascend-v4"
+# ---- vllm-ascend @ pinned ref (compiles V4 CANN ops — the moment of truth) ----
+[ -d "$INST/vllm-ascend-v4/.git" ] || git clone --branch "$VA_REF" https://github.com/Sawyer117/vllm-ascend.git "$INST/vllm-ascend-v4"
 cd "$INST/vllm-ascend-v4"
-git fetch origin && git checkout "$VA_COMMIT"
+git fetch origin && git checkout -B "$VA_REF" "origin/$VA_REF"
 python -m pip install numba einops pandas msgpack
 python -m pip install --no-deps torchvision==0.25.0 torchaudio==2.10.0 --extra-index-url $HW/repository/pypi/simple
 python -m pip install triton-ascend==3.2.1 --extra-index-url $HW/repository/pypi/simple --extra-index-url $HW/ascend/repos/pypi
@@ -96,8 +98,8 @@ else
 fi
 
 # ---- speculators repo (no-op if you already cloned it to run this script) ----
-[ -d "$ROOT/speculators/.git" ] || git clone --branch docs/dsv4-dspark https://github.com/Sawyer117/speculators.git "$ROOT/speculators"
-git -C "$ROOT/speculators" checkout docs/dsv4-dspark && git -C "$ROOT/speculators" pull
+[ -d "$ROOT/speculators/.git" ] || git clone --branch "$SPEC_REF" https://github.com/Sawyer117/speculators.git "$ROOT/speculators"
+git -C "$ROOT/speculators" fetch origin && git -C "$ROOT/speculators" checkout -B "$SPEC_REF" "origin/$SPEC_REF"
 
 echo ""
 echo ">>> DONE on $(hostname). Consistency check — must be IDENTICAL on 108 & 109:"
