@@ -175,6 +175,51 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         model.load_verifier_weights()
         return model
 
+    def load_verifier_weights(self) -> None:
+        """Load the shared frozen embed + lm_head + verifier norm from the DSV4
+        verifier, which uses the OFFICIAL DeepSeek key names (``embed.weight`` /
+        ``head.weight`` / ``norm.weight``) rather than HF's (``embed_tokens`` /
+        ``lm_head`` / ``model.norm``). Same masking/freezing as the base."""
+        import warnings  # noqa: PLC0415
+
+        from speculators.utils.loading import load_model_layers  # noqa: PLC0415
+
+        sc = getattr(getattr(self, "config", None), "speculators_config", None)
+        if sc is None or sc.verifier.name_or_path is None:
+            return
+        w = load_model_layers(
+            ["embed.weight", "head.weight", "norm.weight"], sc.verifier.name_or_path
+        )
+        embed_w = w["embed.weight"]
+        lm_head_w = w.get("head.weight", embed_w)
+
+        if self.embed_tokens.weight.isnan().any():
+            self.embed_tokens.load_state_dict({"weight": embed_w})
+        if self.use_draft_vocab:
+            if self.t2d is None or not torch.any(self.t2d).item():
+                raise ValueError(
+                    "t2d not set; call load_vocab_mappings before load_verifier_weights."
+                )
+            lm_head_w = lm_head_w[self.t2d.to(device=lm_head_w.device, dtype=torch.bool), :]
+        if self.lm_head.weight.isnan().any():
+            self.lm_head.load_state_dict({"weight": lm_head_w.detach().clone()}, strict=False)
+        self.verifier_lm_head.load_state_dict(
+            {"weight": lm_head_w.detach().clone()}, strict=False
+        )
+        if hasattr(self, "verifier_norm"):
+            if "norm.weight" not in w:
+                warnings.warn(
+                    f"no norm.weight in {sc.verifier.name_or_path}; using default.",
+                    UserWarning, stacklevel=2,
+                )
+            else:
+                self.verifier_norm.load_state_dict({"weight": w["norm.weight"]})
+        self.embed_tokens.weight.requires_grad_(False)
+        self.lm_head.weight.requires_grad_(False)
+        self.verifier_lm_head.weight.requires_grad_(False)
+        if hasattr(self, "verifier_norm"):
+            self.verifier_norm.weight.requires_grad_(False)
+
     def _init_backbone_params(self) -> None:
         """Initialize the freshly-built backbone params (post_init ran on the old
         Qwen3 layers). Uninitialized ``torch.empty`` params (mHC fn) would NaN."""
