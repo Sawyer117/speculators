@@ -154,12 +154,21 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
     ) -> "DSV4DSparkDraftModel":
         """Build a DSV4 DSpark model from CLI args (DSV4 backbone fields default to
         the released config; the DSpark method fields mirror upstream)."""
+        # DSV4 backbone hyperparameters default to the released config; any passed
+        # on the CLI (e.g. --n-routed-experts for a reduced first run) override.
+        _BACKBONE = (
+            "num_heads", "head_dim", "rope_head_dim", "q_lora_rank", "o_lora_rank",
+            "o_groups", "window_size", "n_routed_experts", "n_shared_experts",
+            "n_activated_experts", "moe_inter_dim", "hc_mult", "hc_sinkhorn_iters",
+        )
+        overrides = {k: kwargs[k] for k in _BACKBONE if kwargs.get(k) is not None}
         config = DSV4DSparkConfig(
             **cls._build_base_config_kwargs("dsv4_dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
             enable_confidence_head=kwargs.get("enable_confidence_head", True),
             confidence_head_with_markov=kwargs.get("confidence_head_with_markov", True),
+            **overrides,
         )
         model = cls(config=config)
         model.load_vocab_mappings(t2d, d2t)

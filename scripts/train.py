@@ -975,6 +975,20 @@ def parse_args():
         default=0.5,
         help="Smoothing constant for D-PACE loss (default: 0.5)",
     )
+    # DSV4 DSpark sparse-backbone overrides (default to the released config; used
+    # to shrink the draft for a first single-card run, e.g. --n-routed-experts 32).
+    parser.add_argument(
+        "--n-routed-experts",
+        type=int,
+        default=None,
+        help="dsv4_dspark: number of routed MoE experts (default: released 256).",
+    )
+    parser.add_argument(
+        "--n-activated-experts",
+        type=int,
+        default=None,
+        help="dsv4_dspark: MoE top-k (default: released 6).",
+    )
     # DSpark-specific arguments (sequential Markov head + confidence head).
     parser.add_argument(
         "--markov-rank",
