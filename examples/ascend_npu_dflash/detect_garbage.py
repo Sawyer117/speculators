@@ -24,6 +24,7 @@ Usage:
   python detect_garbage.py rollout_00.jsonl                 # summary
   python detect_garbage.py rollout_00.jsonl --show 8        # + worst examples per flag
   python detect_garbage.py rollout_00.jsonl --dump bad.jsonl
+  python detect_garbage.py rollout_00.jsonl --clean rollout_00.clean.jsonl   # cleaned rollout for prepare_data.py
 """
 import argparse
 import json
@@ -89,13 +90,17 @@ def main():
     ap.add_argument("--rep-ngram", type=float, default=0.25, help="flag if distinct-4gram ratio below this")
     ap.add_argument("--show", type=int, default=0, help="print N worst examples per flag")
     ap.add_argument("--dump", help="write all flagged rows {idx,flags,finish_reason,response} to this jsonl")
+    ap.add_argument("--clean", help="write NON-flagged (good) rows VERBATIM to this jsonl — the cleaned "
+                                    "rollout to feed prepare_data.py (also drops error/empty rows)")
     args = ap.parse_args()
 
     counts = Counter()
     fr_flagged = Counter()          # finish_reason breakdown of flagged rows
     examples = {k: [] for k in ("REPEAT", "TOO_SHORT", "LOW_ALPHA", "EMPTY")}
     total = 0
+    kept = 0
     dumpf = open(args.dump, "w", encoding="utf-8") if args.dump else None
+    cleanf = open(args.clean, "w", encoding="utf-8") if args.clean else None
 
     with open(args.infile, encoding="utf-8") as f:
         for line in f:
@@ -110,6 +115,9 @@ def main():
                 continue
             flags, text, cr = classify(row, args)
             if not flags:
+                if cleanf:
+                    cleanf.write(line + "\n")
+                    kept += 1
                 continue
             counts["FLAGGED"] += 1
             fr = (row.get("metadata") or {}).get("finish_reason")
@@ -128,11 +136,15 @@ def main():
                                        ensure_ascii=False) + "\n")
     if dumpf:
         dumpf.close()
+    if cleanf:
+        cleanf.close()
 
     flagged = counts["FLAGGED"]
     print(f"\n===== rollout 质量检测: {args.infile} =====")
     print(f"总行数            {total}")
     print(f"疑似问题(合计)   {flagged}  ({100 * flagged / max(total, 1):.2f}%)")
+    if args.clean:
+        print(f"干净行(已写)     {kept}  ({100 * kept / max(total, 1):.2f}%)  -> {args.clean}")
     for k, label in (("REPEAT", "重复/退化循环"), ("TOO_SHORT", "过短(乱码)"),
                      ("LOW_ALPHA", "非文本开头"), ("EMPTY", "空/报错"), ("BADJSON", "坏JSON")):
         if counts[k]:
