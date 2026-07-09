@@ -28,10 +28,14 @@ from speculators.model import SpeculatorModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.core import DSparkDraftModel
 
-from .backbone.block import MhcDecoderBlock
-from .backbone.hyper import HyperHead
-from .backbone.rotary import precompute_freqs_cis
-from .config import DSparkDraftConfig
+# Absolute (not relative) imports: transformers' custom_object_save parses the
+# config module's RELATIVE imports to bundle them for trust_remote_code, and
+# mishandles two-level ones (``from .backbone.block`` -> looks for the file
+# ``backbone.block.py``). Absolute imports are not parsed, so save_pretrained works.
+from speculators.models.dsv4_dspark.backbone.block import MhcDecoderBlock
+from speculators.models.dsv4_dspark.backbone.hyper import HyperHead
+from speculators.models.dsv4_dspark.backbone.rotary import precompute_freqs_cis
+from speculators.models.dsv4_dspark.config import DSparkDraftConfig
 
 __all__ = ["DSV4DSparkConfig", "DSV4DSparkDraftModel"]
 
