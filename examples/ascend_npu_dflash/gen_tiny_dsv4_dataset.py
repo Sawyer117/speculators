@@ -65,6 +65,9 @@ def main() -> None:
     ds = Dataset.from_dict(
         {"input_ids": input_ids_col, "loss_mask": loss_mask_col, "seq_len": seq_len_col}
     )
+    # ArrowDataset expects torch-formatted columns (data[i]["input_ids"] is a
+    # Tensor), matching the real prep (preprocessing.py set_format(type="torch")).
+    ds.set_format(type="torch")
     ds.save_to_disk(str(out / "arrow"))
     print(f"wrote {args.n} samples")
     print(f"  arrow: {out / 'arrow'}")
