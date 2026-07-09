@@ -14,6 +14,7 @@ from datasets import concatenate_datasets, load_dataset
 from packaging.version import Version
 from transformers import (
     AutoProcessor,
+    AutoTokenizer,
     BatchEncoding,
     BatchFeature,
     PreTrainedTokenizerBase,
@@ -687,10 +688,19 @@ def _resolve_pad_token(processor: ProcessorLike):
 
 
 def load_processor(target_model_path: str, *, trust_remote_code: bool = False):
-    processor = AutoProcessor.from_pretrained(
-        target_model_path,
-        trust_remote_code=trust_remote_code,
-    )
+    try:
+        processor = AutoProcessor.from_pretrained(
+            target_model_path,
+            trust_remote_code=trust_remote_code,
+        )
+    except (ValueError, OSError, KeyError):
+        # Text-only models (e.g. DeepSeek-V4) expose a tokenizer, not an AutoProcessor.
+        # get_tokenizer() returns a plain tokenizer as-is, and the pipeline only uses
+        # apply_chat_template/decode — both of which a tokenizer provides.
+        processor = AutoTokenizer.from_pretrained(
+            target_model_path,
+            trust_remote_code=trust_remote_code,
+        )
     _resolve_pad_token(processor)
 
     return processor
