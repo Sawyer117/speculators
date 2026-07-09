@@ -122,8 +122,13 @@ def part_b() -> None:
     check("confidence shape", tuple(conf.shape) == (n, g), str(tuple(conf.shape)))
     check("outputs finite", torch.isfinite(logits).all().item() and torch.isfinite(conf).all().item())
 
-    # A stand-in loss (real loss lives in loss.py); just exercise autograd.
-    loss = logits.float().log_softmax(-1).mean() + conf.float().mean()
+    # Exercise the real DSpark loss (CE+L1 distribution term + confidence BCE + block decay).
+    from speculators.models.dsv4_dspark.loss import compute_dspark_loss
+
+    target_dist = torch.softmax(torch.randn(n, g, cfg.vocab_size), dim=-1)
+    loss_mask = torch.ones(n, g)
+    loss, lm = compute_dspark_loss(logits, target_dist, conf, loss_mask, cfg)
+    check("dspark loss finite", torch.isfinite(loss).item(), f"loss={loss.item():.4f}")
     loss.backward()
 
     trained = [n_ for n_, p in model.named_parameters() if p.requires_grad]

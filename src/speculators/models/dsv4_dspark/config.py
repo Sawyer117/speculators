@@ -74,6 +74,13 @@ class DSparkDraftConfig:
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
+    # ---- loss (DSpark distribution term + confidence BCE + block decay) -----
+    # L = Σ_k w_k·[ce_alpha·CE + l1_alpha·L1 + conf_alpha·BCE_conf], w_k=exp(-(k-1)/γ).
+    ce_loss_alpha: float = 0.1
+    l1_loss_alpha: float = 0.9
+    confidence_alpha: float = 1.0
+    decay_gamma: float = 4.0
+
     # ---- training-time weight dtype (bf16; the released ckpt is fp4/fp8) ----
     dtype: str = "bfloat16"
 
