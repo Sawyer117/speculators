@@ -13,5 +13,6 @@ only the DSV4-native backbone and the thin subclass that swaps it in.
 from __future__ import annotations
 
 from .config import DSparkDraftConfig
+from .core import DSV4DSparkConfig, DSV4DSparkDraftModel
 
-__all__ = ["DSparkDraftConfig"]
+__all__ = ["DSV4DSparkConfig", "DSV4DSparkDraftModel", "DSparkDraftConfig"]
