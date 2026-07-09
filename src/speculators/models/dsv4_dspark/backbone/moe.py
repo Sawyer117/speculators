@@ -36,7 +36,11 @@ class Router(nn.Module):
         self.route_scale = cfg.route_scale
         self.score_func = cfg.score_func
         self.weight = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.hidden_size))
-        self.bias = nn.Parameter(torch.zeros(cfg.n_routed_experts))
+        # Aux-loss-free load-balancing bias (DeepSeek noaux_tc): shifts the top-k
+        # SELECTION only (never the combine weights), and is nudged by a heuristic
+        # load-balance rule at train time — NOT by backprop. So it carries no
+        # gradient; the trainer updates it separately (or leaves it at 0).
+        self.bias = nn.Parameter(torch.zeros(cfg.n_routed_experts), requires_grad=False)
 
     def _score(self, scores: torch.Tensor) -> torch.Tensor:
         if self.score_func == "softmax":
