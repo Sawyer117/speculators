@@ -184,8 +184,9 @@ def load_seen(path: str):
     appending duplicates.
     """
     seen = set()
+    done_rows: set[str] = set()  # distinct COMPLETED rows (for the progress-bar initial)
     if not os.path.isfile(path):
-        return seen
+        return seen, 0
 
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -206,10 +207,30 @@ def load_seen(path: str):
                 seen.add(str(key))
             if meta.get("idx") is not None:
                 seen.add(str(meta["idx"]))
+                done_rows.add(str(meta["idx"]))
             _id = obj.get("id")
             if _id is not None and not str(_id).startswith("sample_"):
                 seen.add(str(_id))
-    return seen
+    return seen, len(done_rows)
+
+
+def count_rows(path: str) -> int | None:
+    """Cheap total-row count for a LOCAL dataset file (progress-bar total).
+
+    Streaming datasets have no length, so with a local shard we count directly:
+    parquet from footer metadata, jsonl by non-blank lines. Returns None if the
+    count can't be taken (remote dataset / unreadable) — the bar then falls back
+    to count-only mode.
+    """
+    try:
+        if path.endswith(".parquet"):
+            import pyarrow.parquet as pq
+
+            return pq.ParquetFile(path).metadata.num_rows
+        with open(path, encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except Exception:
+        return None
 
 
 async def detect_model(endpoint: str) -> str:
@@ -373,7 +394,7 @@ async def main():
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    seen_ids = load_seen(args.outfile) if args.resume else set()
+    seen_ids, num_done = load_seen(args.outfile) if args.resume else (set(), 0)
     if args.dataset_path:
         fmt = "parquet" if args.dataset_path.endswith(".parquet") else "json"
         print(f"Loading local {fmt}: {args.dataset_path}")
@@ -382,6 +403,16 @@ async def main():
         )
     else:
         dataset = load_dataset(dataset_id, name=subset, split=split, streaming=True)
+
+    # Progress-bar total: explicit --limit wins; else count the local shard so the
+    # bar shows X/Y + ETA (streaming datasets have no length). initial = rows already
+    # done, so on --resume the bar STARTS at e.g. 31900/88807 — you can see at a glance
+    # that resume skipped the completed rows (instead of a bare, ambiguous count).
+    total_rows = args.limit if args.limit is not None else (
+        count_rows(args.dataset_path) if args.dataset_path else None
+    )
+    if total_rows is not None:
+        print(f"Shard rows: {total_rows}  |  already done: {num_done}  |  to do: {max(total_rows - num_done, 0)}")
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
     semaphore = asyncio.Semaphore(args.concurrency)
@@ -401,7 +432,8 @@ async def main():
         with (
             open(args.outfile, "a", encoding="utf-8") as output_file,  # noqa: ASYNC230
             tqdm(
-                total=args.limit,
+                total=total_rows,
+                initial=num_done,
                 desc="Generating responses",
                 unit="sample",
                 dynamic_ncols=True,
