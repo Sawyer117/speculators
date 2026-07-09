@@ -66,18 +66,24 @@ budget → OOM / squeezed KV. On GQA/MHA (Mohammad's Qwen3) the same `s_hidden` 
 non-issue. **DSV4 is the worst case for extract; Mohammad's code is identical, only his model's
 KV is big.** No knob fixes this (it's `L_aux·H` uncompressed by construction).
 
-## 2. Output contract (speculators v1 — `train/data.py:96-114`)
+## 2. Output contract (standard `ArrowDataset` / extract-connector format)
 
-Each `hs_<id>.safetensors` (v1 format consumed by `standardize_data_v1`) carries:
+We target the **standard `ArrowDataset`** training path (`scripts/train.py:581` — the default;
+`SampleFileDataset` / `--legacy-data` is deprecated). The dumper writes the **SAME on-disk
+format the `extract_hidden_states` connector writes**, so `ArrowDataset` reads it unchanged:
 
-- `input_ids`  : `[seq]`  (the sequence's token ids)
-- `loss_mask`  : `[seq]`  (1 on tokens to train, e.g. response; 0 on prompt)
-- `hidden_states` : a **per-layer list of `[seq, H]`** — the FIRST N are the target layers
-  ([40,41,42]); the **LAST is the verifier-last = the target's final post-norm hidden** (the
-  one lm_head consumes). `standardize_data_v1` then does
-  `hidden_states = cat(list[:-1], dim=-1)` → `[seq, (N-1)·H]` and `verifier_last = list[-1]`.
+- `token_ids`     : `[seq]` (long) — must EQUAL the rollout row's `input_ids`
+  (`data_generation/offline.py:check_hidden_states` asserts this).
+- `hidden_states` : `[seq, num_aux + 1, H]` — the aux target layers ([40,41,42]) stacked,
+  then the **verifier-last (final post-norm hidden) as the LAST layer**. `ArrowDataset._get_raw_data`
+  (`train/data.py:432-441`) reads `hidden_states[:, :-1].flatten(1)` → `[seq, num_aux·H]` (aux) and
+  `hidden_states[:, -1]` → verifier-last.
 
-⇒ The dumper must capture **TWO things**: the target layers [40,41,42] AND the final hidden.
+**`loss_mask` is NOT in this file.** `ArrowDataset` pulls it from the paired **rollout Arrow
+dataset** (`self.data[index]["loss_mask"]`, `data.py:440`), which the dataset-prep computed from
+the prompt/response split. So the dumper needs **no prompt/response split and no tokenizer** — it
+only stacks the hidden it captured + the token ids the serve prefilled. (The `token_ids` match is
+guaranteed by driving the serve with the dataset's own `input_ids` as a token-id prompt — §7b.)
 
 ## 3. Carrier serve (validated, memory-light)
 
@@ -162,7 +168,8 @@ Plan B follows the same, and this resolves the shard-vs-single-writer tension:
 Rollout is pre-generated (prompt+response). HS extraction = a **prefill-only forward over known
 sequences** (regime A). Send each (prompt+response) as a completion with `max_tokens=1`; the
 prefill computes all tokens' [40,41,42] + final hidden; the dumper writes them keyed by request.
-`loss_mask` = 0 on prompt tokens, 1 on response tokens (from the request's prompt/response split).
+`loss_mask` is NOT written by the dumper — `ArrowDataset` takes it from the paired rollout dataset
+(§2), so the producer needs no prompt/response split and no tokenizer.
 
 ## 7b. Granularity & length (derived from `train/data.py`, NOT a choice)
 
@@ -189,28 +196,29 @@ prefill computes all tokens' [40,41,42] + final hidden; the dumper writes them k
   speculators' DATA layer is model-agnostic — DSV4 needs no data-side support; only the DRAFT
   model side (our dspark_method) is DSV4-specific.
 
-## 8. Open decisions before coding
+## 8. Open decisions — RESOLVED
 
-1. Plain serve vs `method=dspark` for the capture (step 0 verify).
-2. Hook (B) vs connector (A) — recommend B.
-3. Exact on-disk safetensors key layout — match `ExampleHiddenStatesConnector` /
-   `_maybe_load_hs_file` so `standardize_data_v1` reads it unchanged (verify keys: does it store
-   `hidden_states` as a stacked `[seq, N, H]` or per-key? + `input_ids`/`loss_mask`).
-4. Where `loss_mask` + the prompt/response split come from (request metadata vs a sidecar map).
+1. ✅ Capture trigger — plain serve (target config carries `dspark_target_layer_ids`); no
+   `method=dspark` / draft ckpt needed (§9 P0).
+2. ✅ Hook (B) over connector (A) — runner post-forward hook, no kv_transfer.
+3. ✅ On-disk layout — the extract-connector format `{token_ids:[seq], hidden_states:[seq, num_aux+1, H]}`
+   (§2); `ArrowDataset._get_raw_data` (`data.py:432-441`) reads it unchanged.
+4. ✅ `loss_mask` — comes from the paired rollout Arrow dataset, NOT this file (§2). No prompt/response
+   split or tokenizer needed producer-side.
 
 ## 9. Phased plan
 
 - **P0 — RESOLVED (from code).** Capture trigger: the `_dspark_hidden_buffer` is filled in
   `DeepseekV4Model.forward` gated ONLY on `config.dspark_target_layer_ids` (`deepseek_v4.py:1190,
   1236-1242`), **independent of the speculative method** → a **plain serve** populates it (no draft
-  ckpt needed) as long as the target config carries `dspark_target_layer_ids`. On-disk format: the
-  reader (`speculators/train/data.py:175-206`) loads the **standardized 4-key** layout DIRECTLY
-  (`hidden_states` `[seq, L_aux·H]`, `verifier_last_hidden_states` `[seq, H]`, `input_ids`,
-  `loss_mask`); `standardize_data_v1` is NOT applied on file load, so the dumper writes those 4 keys.
-- **P1 — DONE** (branch `feat/dsv4-hs-dumper`, commit `0ca26de`):
+  ckpt needed) as long as the target config carries `dspark_target_layer_ids`. On-disk format: we
+  target the **standard `ArrowDataset`** (`train.py:581`; `SampleFileDataset`/`--legacy-data` is
+  deprecated) → the dumper writes the **extract-connector format** `{token_ids:[seq],
+  hidden_states:[seq, num_aux+1, H]}` (§2); `loss_mask` comes from the paired rollout dataset.
+- **P1 — DONE** (branch `feat/dsv4-hs-dumper`, commits `0ca26de` + connector-format follow-up):
   - `vllm_ascend/dspark_hs_dumper.py` — `DsparkHSDumper`: TP-rank-0 writer, per-request CPU
     accumulate (timing-independent flush when accumulated len ≥ `num_prompt_tokens`), atomic
-    tmp+rename write of the standardized 4-key safetensors.
+    tmp+rename write of the extract-connector safetensors (`{token_ids, hidden_states[seq, num_aux+1, H]}`).
   - `vllm_ascend/worker/model_runner_v1.py` — lazy-init + `capture(...)` hook in `execute_model`
     post-process (after aux/pcp handling, last PP rank only), sourcing the aux from
     `get_mtp_target_hidden_states()` and the verifier-last from the post-norm forward output.
@@ -219,9 +227,11 @@ prefill computes all tokens' [40,41,42] + final hidden; the dumper writes them k
     if absent). Client drives prefill-only (`max_tokens=1`) and sets each request id to its rollout
     row index → `hs_<index>.safetensors`.
 - **P2 — smoke (on box, NEXT):** plain dspark serve + `DSPARK_HS_DUMP=1`; send 1–2 teacher-forced
-  requests; confirm `hs_<id>.safetensors` written with shapes `[seq, 3·4096]` + `[seq, 4096]` and
-  load back through `ArrowDataset.__getitem__`. Watch that `max_num_batched_tokens ≥ max_model_len`
-  so each sequence prefills in one chunk (else the accumulator spans chunks — supported, but verify).
-- **P3 — full rollout:** drive the whole rollout (prefill-only), refine `loss_mask` (prompt/response
-  split, §8.4), watch CPU RAM + write throughput; wire the `hs_sidecar.py` HTTP fetch if the trainer
-  box has no shared FS to the serve box.
+  requests (`hs_dump_smoke.py`); confirm `hs_<id>.safetensors` written with `hidden_states`
+  `[seq, num_aux+1, 4096]` (= `[seq, 4, 4096]`) + `token_ids [seq]`. Watch that
+  `max_num_batched_tokens ≥ max_model_len` so each sequence prefills in one chunk (else the
+  accumulator spans chunks — supported, but verify).
+- **P3 — full rollout:** a driver reads the rollout Arrow dataset and sends each row's `input_ids`
+  as a token-id prompt (prefill-only, request id = row index) so `token_ids` match by construction;
+  the dumper writes `hs_<index>.safetensors`. `loss_mask` needs NO producer work (rollout dataset).
+  Watch CPU RAM + write throughput; wire `hs_sidecar.py` HTTP fetch if the trainer box has no shared FS.

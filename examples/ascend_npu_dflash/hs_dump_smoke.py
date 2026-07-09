@@ -12,11 +12,11 @@ What it does (prefill-only, teacher-forced):
   1. POST a couple of raw-text prompts to /v1/completions with max_tokens=1 (the prefill
      computes every prompt token's hidden; the runner hook dumps them).
   2. Poll DSPARK_HS_DIR for the new hs_*.safetensors.
-  3. Load each and assert the standardized 4-key layout + shapes:
-        hidden_states               [seq, num_layers * hidden_size]   (aux [40,41,42])
-        verifier_last_hidden_states [seq, hidden_size]                (post-norm final)
-        input_ids                   [seq]  (long)
-        loss_mask                   [seq]  (bool)
+  3. Load each and assert the extract_hidden_states connector layout + shapes
+     (what speculators' ArrowDataset reads; loss_mask comes from the rollout dataset,
+     NOT this file):
+        hidden_states  [seq, num_aux + 1, hidden_size]  (aux [40,41,42] + verifier-last)
+        token_ids      [seq]  (long)
      seq must equal the prompt's token count.
 
 Exit code 0 = all captured files well-formed; non-zero otherwise.
@@ -62,32 +62,30 @@ def _load_and_check(path, hidden_size, num_layers, expect_seq):
 
     d = load_file(path)
     keys = set(d.keys())
-    want = {"hidden_states", "verifier_last_hidden_states", "input_ids", "loss_mask"}
+    want = {"hidden_states", "token_ids"}
     problems = []
     if not want.issubset(keys):
         problems.append(f"missing keys: {sorted(want - keys)} (have {sorted(keys)})")
         return problems  # can't check shapes without the keys
 
-    seq = d["input_ids"].shape[0]
+    seq = d["token_ids"].shape[0]
     hs = tuple(d["hidden_states"].shape)
-    vl = tuple(d["verifier_last_hidden_states"].shape)
-    lm = tuple(d["loss_mask"].shape)
 
-    if hs != (seq, num_layers * hidden_size):
-        problems.append(f"hidden_states {hs} != ({seq}, {num_layers}*{hidden_size})")
-    if vl != (seq, hidden_size):
-        problems.append(f"verifier_last_hidden_states {vl} != ({seq}, {hidden_size})")
-    if lm != (seq,):
-        problems.append(f"loss_mask {lm} != ({seq},)")
-    if d["input_ids"].dtype != torch.long:
-        problems.append(f"input_ids dtype {d['input_ids'].dtype} != long")
+    # connector format (ArrowDataset): hidden_states = [seq, num_aux + 1, hidden_size]
+    #   (aux target layers, then verifier-last as the LAST layer). loss_mask is NOT in
+    #   the file — it comes from the paired rollout dataset.
+    if hs != (seq, num_layers + 1, hidden_size):
+        problems.append(f"hidden_states {hs} != ({seq}, {num_layers}+1, {hidden_size})")
+    if d["token_ids"].dtype != torch.long:
+        problems.append(f"token_ids dtype {d['token_ids'].dtype} != long")
+    if d["hidden_states"].isnan().any():
+        problems.append("hidden_states contains NaN")
     if expect_seq is not None and expect_seq >= 0 and seq != expect_seq:
         problems.append(f"seq {seq} != prompt_tokens {expect_seq}")
     if not problems:
         print(
             f"  OK {os.path.basename(path)}: seq={seq}  "
-            f"hidden_states={hs}  verifier_last={vl}  "
-            f"dtypes={d['hidden_states'].dtype}/{d['verifier_last_hidden_states'].dtype}"
+            f"hidden_states={hs} (aux+verifier_last)  dtype={d['hidden_states'].dtype}"
         )
     return problems
 
