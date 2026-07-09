@@ -8,6 +8,18 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+# Ascend NPU: torch is the CPU build + torch_npu provides the device backend, so
+# torch.cuda.is_available() is False and any torch.cuda.* call raises. Importing
+# transfer_to_npu monkeypatches torch.cuda.* -> torch.npu.* (and the distributed
+# backend -> hccl) so the trainer's CUDA-assuming perf timer + seeding run
+# unmodified. No-op on CUDA/CPU (guarded + best-effort import).
+if not torch.cuda.is_available():
+    try:
+        from torch_npu.contrib import transfer_to_npu  # noqa: F401
+    except ImportError:
+        pass
+
 import transformers
 from packaging import version
 from transformers import LlamaConfig, PretrainedConfig
