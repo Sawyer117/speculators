@@ -114,6 +114,25 @@ vllm-ascend `feat/dsv4-supports-eagle3@f7a1e25`.
 
 ---
 
+## 2026-07-10 — rollout → Arrow prep (the DSV4 tokenizer/chat-template saga)
+
+Cleaned rollout (`out_bf16/rollout_0{0,1}.clean.jsonl`, ~99.95% kept) → `prepare_data.py` → Arrow.
+Several DSV4-is-bleeding-edge blockers, each fixed:
+- `speculators` not importable → `pip install -e speculators --no-deps` (setup script only cloned it).
+- `AutoProcessor.from_pretrained` fails (DSV4 has no processor class) → `load_processor` falls back to
+  `AutoTokenizer` (`ba8fd38`); that ALSO fails (`deepseek_v4` unregistered → generic config →
+  rope_scaling `max_position_embeddings` crash) → 3rd fallback `PreTrainedTokenizerFast` (`ea93c18`).
+  Upgrading transformers 5.5→5.12 gives native `deepseek_v4` + clean load; vLLM 0.23.0 still imports
+  (`import vllm` OK) so it's safe — kept 5.12.
+- Then `Processor does not support chat templates`: **DSV4 ships NO Jinja template** (uses vLLM's custom
+  `encode_messages`). Added `--chat-template` (`562120c`) + reconstructed a **byte-exact** jinja
+  (`7682be6`) from `encode_messages` chat mode. Verified `ALL MATCH: True` in-sandbox against
+  **vllm-project v0.23.0** `encode_messages` (cloned to /workspace, NOT Mohammad's main). Community mlx
+  jinja rejected (double-`</think>` bug).
+- Prep succeeds: `Using HF assistant token mask`, sample viz shows correct format + blue=response, and
+  `loss_mask` non-zero on all rows (frac 0.62–0.95). `--chat-template` + `{% generation %}` → loss on
+  the response only. See rollout-data doc §6.
+
 ## Open items / next
 
 - Prep the cleaned rollout → Arrow (`prepare_data.py`), verify `loss_mask` non-zero (assistant-pattern),

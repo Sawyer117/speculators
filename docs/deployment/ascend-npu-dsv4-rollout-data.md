@@ -116,9 +116,22 @@ python scripts/prepare_data.py \
 
 - `--data` takes local `.jsonl` (ShareGPT `conversations`) and can repeat for multiple shards.
 - `--minimum-valid-tokens 1` drops zero-trainable-token samples (backstop; garbage already gone).
-- **Gotcha:** the assistant-response span is auto-detected from the chat template to build `loss_mask`.
-  If `loss_mask` comes out all-zero, pass `--assistant-pattern '<regex>'`. Verify after prep:
-  `load_from_disk(arrow); assert int(d[0]["loss_mask"].sum()) > 0`.
+
+**⚠️ DSV4 chat-template gotcha (resolved).** DeepSeek-V4 ships **NO Jinja `chat_template`** — the
+serve renders chat via vLLM's custom Python encoder `vllm/tokenizers/deepseek_v4_encoding.py`
+(`encode_messages`, chat/non-thinking mode). So `apply_chat_template` fails ("does not support chat
+templates"). Also: `AutoProcessor`/`AutoTokenizer` can't even load the config on older transformers
+(`deepseek_v4` unregistered → rope_scaling crash) — needs transformers ≥ ~5.12 (native support; vLLM
+0.23.0 still imports, so safe) OR the `PreTrainedTokenizerFast` fallback in `load_processor`. The fix:
+pass **`--chat-template examples/ascend_npu_dflash/dsv4_chat_template.jinja`** — a Jinja reconstructed
+**byte-for-byte** from `encode_messages` (verified `ALL MATCH` vs vllm-project v0.23.0 in-sandbox):
+```
+<｜begin▁of▁sentence｜><｜User｜>{prompt}<｜Assistant｜></think>{response}<｜end▁of▁sentence｜>
+```
+The `{% generation %}` markers around the assistant span drive `return_assistant_tokens_mask` →
+`loss_mask` = 1 on the response only. Verify after prep: `frac` of `loss_mask.sum()/seq_len` ≈ 0.2–0.9
+(response-heavy), non-zero on every row. (Do NOT use the community mlx `chat_template.jinja` — it has a
+double-`</think>` bug and won't match the serve.)
 
 ## 7. Next: online HS extraction + training
 
