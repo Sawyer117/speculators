@@ -694,13 +694,23 @@ def load_processor(target_model_path: str, *, trust_remote_code: bool = False):
             trust_remote_code=trust_remote_code,
         )
     except (ValueError, OSError, KeyError):
-        # Text-only models (e.g. DeepSeek-V4) expose a tokenizer, not an AutoProcessor.
-        # get_tokenizer() returns a plain tokenizer as-is, and the pipeline only uses
+        # Text-only models expose a tokenizer, not an AutoProcessor. get_tokenizer()
+        # returns a plain tokenizer as-is, and the pipeline only uses
         # apply_chat_template/decode — both of which a tokenizer provides.
-        processor = AutoTokenizer.from_pretrained(
-            target_model_path,
-            trust_remote_code=trust_remote_code,
-        )
+        try:
+            processor = AutoTokenizer.from_pretrained(
+                target_model_path,
+                trust_remote_code=trust_remote_code,
+            )
+        except Exception:
+            # Bleeding-edge models (e.g. DeepSeek-V4): the model_type isn't registered
+            # AND loading the model config crashes AutoConfig (rope_scaling /
+            # max_position_embeddings). Load the FAST tokenizer straight from
+            # tokenizer.json + tokenizer_config.json, bypassing the model config
+            # entirely (this still picks up the chat_template from tokenizer_config).
+            from transformers import PreTrainedTokenizerFast
+
+            processor = PreTrainedTokenizerFast.from_pretrained(target_model_path)
     _resolve_pad_token(processor)
 
     return processor
