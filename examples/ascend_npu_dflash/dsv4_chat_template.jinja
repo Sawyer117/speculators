@@ -1,0 +1,19 @@
+{#- DeepSeek-V4 chat template (chat / non-thinking mode), reconstructed byte-for-byte from
+    vLLM's encode_messages (vllm/tokenizers/deepseek_v4_encoding.py, thinking_mode="chat",
+    drop_thinking=True) so prep tokenizes IDENTICALLY to the serve that rolled the data.
+    Format:  <｜begin▁of▁sentence｜><｜User｜>{prompt}<｜Assistant｜></think>{response}<｜end▁of▁sentence｜>
+    The `</think>` after <｜Assistant｜> is the generation cue (part of the PROMPT, not loss).
+    {% generation %} wraps the assistant response so return_assistant_tokens_mask gives loss=1
+    on the response tokens only. VERIFY against the serve's /tokenize before a full prep run. -#}
+{{- '<｜begin▁of▁sentence｜>' -}}
+{%- for message in messages -%}
+    {%- if message['role'] == 'system' -%}
+        {{- message['content'] -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- '<｜User｜>' + message['content'] + '<｜Assistant｜></think>' -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {%- generation -%}
+        {{- message['content'] + '<｜end▁of▁sentence｜>' -}}
+        {%- endgeneration -%}
+    {%- endif -%}
+{%- endfor -%}
