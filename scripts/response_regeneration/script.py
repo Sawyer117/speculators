@@ -193,11 +193,17 @@ def load_seen(path: str):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            meta = obj.get("metadata") or {}
+            # FAILED rows are written with the same idx as a placeholder (see the
+            # except-branch in generate). Do NOT count them as seen, so --resume
+            # RETRIES them instead of treating the failure as permanently done.
+            # (A later successful row for the same idx still marks it seen.)
+            if meta.get("error") is not None:
+                continue
             # legacy top-level uuid/idx (older dumps)
             key = obj.get("uuid") or obj.get("idx")
             if key is not None:
                 seen.add(str(key))
-            meta = obj.get("metadata") or {}
             if meta.get("idx") is not None:
                 seen.add(str(meta["idx"]))
             _id = obj.get("id")
