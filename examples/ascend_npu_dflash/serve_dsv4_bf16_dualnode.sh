@@ -160,6 +160,29 @@ if [ "$HS_EXTRACT" = "1" ]; then
   echo ">>> [HS_EXTRACT] aux hidden layers $EAGLE_AUX_LAYERS -> $HS_PATH (hs_*.safetensors)"
 fi
 
+# ---- optional PLAN B HIDDEN-STATE DUMP (DSpark training-data producer, memory-light) ----
+# HS_DUMP=1 turns this PLAIN serve into a HS producer WITHOUT extract_hidden_states'
+# HiddenStateCacheSpec (which OOMs on DSV4 — see docs/deployment/ascend-npu-dsv4-hs-dumper-planB.md).
+# The DSV4 forward already captures the aux target layers into a ~200 MB scratch buffer
+# (gated ONLY on config.dspark_target_layer_ids → a plain serve populates it, no draft
+# ckpt); our runner hook (vllm-ascend feat/dsv4-hs-dumper) copies that + the post-norm
+# final hidden to CPU and writes hs_<id>.safetensors to DSPARK_HS_DIR. No kv_transfer,
+# no PD-disagg. Enable on BOTH head and worker; DSPARK_HS_DIR must be SHARED storage
+# (each node's TP-rank-0 writes its own DP replica's requests). Drive prefill-only
+# (max_tokens=1) — see hs_dump_smoke.py. Mutually exclusive with HS_EXTRACT.
+HS_DUMP_ARGS=()
+if [ "$HS_DUMP" = "1" ]; then
+  [ "$HS_EXTRACT" = "1" ] && { echo "!! set only ONE of HS_EXTRACT / HS_DUMP"; exit 2; }
+  export DSPARK_HS_DUMP=1
+  export DSPARK_HS_DIR="${DSPARK_HS_DIR:-/share/canada_group_folder/dataset/dsv4_hs_dump}"   # A2 real /share shared storage
+  DSPARK_LAYERS="${DSPARK_LAYERS:-[40,41,42]}"   # aux target layers -> hidden_states [seq, 3*hidden_size]
+  mkdir -p "$DSPARK_HS_DIR"
+  # Ensure the target config carries dspark_target_layer_ids so the model allocates + fills
+  # the dspark buffer (spec-method-independent). --hf-overrides merges this key into the config.
+  HS_DUMP_ARGS=( --hf-overrides "{\"dspark_target_layer_ids\":$DSPARK_LAYERS}" )
+  echo ">>> [HS_DUMP] plan B dumper ON: layers $DSPARK_LAYERS -> $DSPARK_HS_DIR (hs_*.safetensors); drive prefill-only (max_tokens=1)"
+fi
+
 # common serve flags (bf16 = NO --quantization; NO --enable-expert-parallel by default)
 COMMON=( "$MODEL"
   --data-parallel-size "$DP" --data-parallel-size-local 1
@@ -170,7 +193,7 @@ COMMON=( "$MODEL"
   --max-num-batched-tokens "$MAXBATCHTOK"
   --gpu-memory-utilization "$GPUUTIL_EFF" --no-enable-prefix-caching
   --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}'
-  "${LOAD_ARGS[@]}" "${HS_ARGS[@]}"
+  "${LOAD_ARGS[@]}" "${HS_ARGS[@]}" "${HS_DUMP_ARGS[@]}"
   $EAGER_FLAG "${GRAPH_ARGS[@]}" )
 # NB: the ckpt FS reports as "DPC" → vLLM disables auto-prefetch (only NFS/Lustre
 # auto-detected), so weight load took ~20 min. --safetensors-load-strategy prefetch
