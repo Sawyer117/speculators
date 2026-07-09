@@ -8,7 +8,11 @@ from transformers import AutoConfig, PretrainedConfig
 def conditional_torch_compile(func=None, *args, **kwargs):
     if func is None:
         return partial(conditional_torch_compile, *args, **kwargs)
-    if torch.cuda.is_available() and hasattr(torch, "compile"):
+    # Only torch.compile on REAL CUDA. On Ascend NPU transfer_to_npu monkeypatches
+    # torch.cuda.is_available() -> True, but torch.compile's dynamo/triton path
+    # breaks there (get_device_capability() is None); torch.version.cuda is None
+    # on the CPU-build+torch_npu stack, so this cleanly runs eager on NPU.
+    if torch.cuda.is_available() and torch.version.cuda is not None and hasattr(torch, "compile"):
         return torch.compile(func, *args, **kwargs)
     return func
 
