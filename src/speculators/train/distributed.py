@@ -7,11 +7,13 @@ maintaining their own distributed state.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 
 import torch
 import torch.distributed as dist
+from torch import nn
 from torch.distributed import ProcessGroup
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
@@ -195,6 +197,41 @@ def maybe_destroy_distributed() -> None:
     _dp_rank = 0
     _sp_group = None
     _dp_group = None
+
+
+@contextlib.contextmanager
+def build_on_meta():
+    """Construct module PARAMETERS on the meta device (no real storage).
+
+    Overrides ``nn.Module.register_parameter`` to move each parameter to ``meta``
+    immediately after it is created, so a large model is built with ~zero resident
+    memory (only one parameter is briefly real before being replaced). Buffers
+    (rope caches, vocab maps) are left real -- they are small and some are
+    non-persistent, so they must keep their computed values.
+
+    Intended for the non-rank0 ranks: their real weights arrive via
+    ``set_model_state_dict(..., broadcast_from_rank0=True)`` in the trainer's FSDP
+    setup, which materializes the sharded meta params in place. This is the
+    torchtitan/torchtune large-model init pattern. Forcing ``.to("meta")``
+    explicitly (rather than a default-device context) is robust to
+    ``transfer_to_npu`` remapping factory ``device=`` args to npu.
+
+    Model init code that touches parameter DATA (weight loading, random init)
+    must no-op when the params are meta -- see the ``is_meta`` guards in
+    ``DSV4DSparkDraftModel.load_verifier_weights`` / ``_init_backbone_params``.
+    """
+    orig = nn.Module.register_parameter
+
+    def _register_on_meta(self, name, param):
+        if param is not None and not param.is_meta:
+            param = nn.Parameter(param.data.to("meta"), requires_grad=param.requires_grad)
+        orig(self, name, param)
+
+    nn.Module.register_parameter = _register_on_meta
+    try:
+        yield
+    finally:
+        nn.Module.register_parameter = orig
 
 
 def apply_fully_sharded(model: torch.nn.Module):

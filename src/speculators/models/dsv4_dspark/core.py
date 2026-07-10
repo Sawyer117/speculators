@@ -188,6 +188,11 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
 
         from speculators.utils.loading import load_model_layers  # noqa: PLC0415
 
+        # Meta build (non-rank0 under --init-on-meta): params carry no data, so
+        # skip file loading entirely; real weights arrive via broadcast_from_rank0.
+        if self.embed_tokens.weight.is_meta:
+            return
+
         sc = getattr(getattr(self, "config", None), "speculators_config", None)
         if sc is None or sc.verifier.name_or_path is None:
             return
@@ -227,6 +232,10 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
     def _init_backbone_params(self) -> None:
         """Initialize the freshly-built backbone params (post_init ran on the old
         Qwen3 layers). Uninitialized ``torch.empty`` params (mHC fn) would NaN."""
+        # Meta build (non-rank0 under --init-on-meta): no data to init; the random
+        # init done on rank 0 is broadcast to every rank in the FSDP setup.
+        if any(p.is_meta for p in self.parameters()):
+            return
         std = 0.02
         for m in [*self.layers, self.hc_head]:
             for name, p in m.named_parameters():

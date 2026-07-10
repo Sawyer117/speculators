@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import gc
 import logging
 import random
@@ -40,6 +41,7 @@ from speculators.models.utils import (
 )
 from speculators.train.dataloader import create_train_val_loaders
 from speculators.train.distributed import (
+    build_on_meta,
     get_rank,
     maybe_destroy_distributed,
     maybe_setup_distributed,
@@ -414,12 +416,22 @@ def build_draft_model(
         )
 
     args.draft_vocab_size = draft_vocab_size
-    return model_class.from_training_args(
-        verifier_config=transformer_layer_config,
-        t2d=t2d,
-        d2t=d2t,
-        **vars(args),
+    # For a large draft, building the full model in host RAM on every rank OOMs
+    # (20B x N ranks). With --init-on-meta, non-rank0 ranks build parameters on
+    # the meta device (no storage) and receive real weights via broadcast_from_rank0
+    # during FSDP setup; only rank 0 constructs real weights.
+    meta_ctx = (
+        build_on_meta()
+        if args.init_on_meta and get_rank() != 0
+        else contextlib.nullcontext()
     )
+    with meta_ctx:
+        return model_class.from_training_args(
+            verifier_config=transformer_layer_config,
+            t2d=t2d,
+            d2t=d2t,
+            **vars(args),
+        )
 
 
 def main(args: argparse.Namespace):  # noqa: C901
@@ -812,6 +824,18 @@ def parse_args():
     parser.add_argument("--log-dir", type=str, default="./logs")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument(
+        "--init-on-meta",
+        action="store_true",
+        help=(
+            "Build the draft on the meta device on all ranks except rank 0, so a "
+            "large model (e.g. the faithful 20B DSV4 DSpark draft) is not "
+            "replicated in host RAM N times during construction. rank 0 builds "
+            "real weights; the other ranks receive them via broadcast_from_rank0 "
+            "in the FSDP setup. Requires the model's data-init methods to no-op on "
+            "meta params (DSV4 DSpark does)."
+        ),
+    )
     parser.add_argument(
         "--draft-arch",
         type=str,
