@@ -703,3 +703,29 @@ def setup_metric_logger(loggers, run_name, output_dir):
         },
     }
     dictConfig(logging_config)
+
+    # Mirror everything to a plain-text file (no ANSI) so a run is captured WITHOUT
+    # an external `tee` -- piping through tee makes stdout a non-tty, which strips
+    # rich's console colors and progress bar. This handler renders the metric dicts
+    # to the same `key=value` lines shown on the console (FormatDictFilter is
+    # idempotent: it no-ops once msg is a str, so the console RichHandler is
+    # unaffected by it running here first). Rank 0 only; best-effort -- file logging
+    # must never break a training launch. Filename carries a timestamp when
+    # --run-name is unset, so runs don't overwrite each other.
+    if os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) == "0":
+        try:
+            name = _substitute_placeholders(run_name, default_template="train_{time}")
+            out_path = Path(output_dir)
+            out_path.mkdir(parents=True, exist_ok=True)
+            log_file = out_path / f"{name}.log"
+            file_handler = logging.FileHandler(log_file)
+            file_handler.addFilter(FormatDictFilter())
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s %(message)s", datefmt="[%X]")
+            )
+            logging.getLogger("speculators").addHandler(file_handler)
+            logging.getLogger(__name__).info("run log mirrored to %s", log_file)
+        except Exception as e:  # noqa: BLE001 - file logging is best-effort
+            logging.getLogger(__name__).warning(
+                "could not set up plain-text file logging: %s", e
+            )
