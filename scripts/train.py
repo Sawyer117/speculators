@@ -545,6 +545,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         on_missing=args.on_missing,
         on_generate=args.on_generate,
         verifier_name_or_path=args.verifier_name_or_path,
+        served_model_name=args.served_model_name,
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,
         hidden_size=hidden_size,
@@ -745,6 +746,18 @@ def parse_args():
             " Note: the vLLM instance must be configured to cache hidden states"
             " to a location that is accessible from the training instance. i.e."
             " on the same node, or a shared network drive. (Default: 'http://localhost:8000/v1')"
+        ),
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help=(
+            "Model name the vLLM instance serves under (the OpenAI `model` field). "
+            "Defaults to --verifier-name-or-path, which matches the common case where "
+            "the serve exposes the verifier by its path. Set this when the serve uses a "
+            "short --served-model-name (e.g. 'dsv4') so the on-demand HS requests target "
+            "the right model id instead of 404ing."
         ),
     )
     parser.add_argument(
