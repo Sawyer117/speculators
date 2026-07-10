@@ -3,6 +3,7 @@ import math
 import os
 import random
 import shutil
+import time
 import warnings
 from collections.abc import Callable
 from os import PathLike
@@ -13,7 +14,7 @@ import openai
 import torch
 import torch.nn.functional as F  # noqa: N812
 from datasets import load_from_disk
-from safetensors.torch import load_file
+from safetensors.torch import load as load_from_bytes, load_file
 from torch.utils.data import Dataset
 
 from speculators.data_generation.offline import check_hidden_states
@@ -215,7 +216,57 @@ class BaseDataset(Dataset):
         return data
 
 
+# --- optional remote hidden-state fetch (no shared filesystem required) ----------
+# When HS_FETCH_BASE is set (e.g. "http://SERVE_HOST:9009"), the trainer pulls each
+# safetensors file from a sidecar on the serve box over HTTP instead of reading it
+# from a shared/local path. The vLLM-returned path string is passed through as an
+# opaque key. The HTTP connection is pooled + kept-alive per dataloader-worker
+# process, so cost is dominated by payload size, not handshakes. Server side:
+# examples/ascend_npu_dflash/hs_sidecar.py
+_HS_FETCH_BASE = os.environ.get("HS_FETCH_BASE")
+_HS_FETCH_TIMEOUT = float(os.environ.get("HS_FETCH_TIMEOUT", "300"))
+_hs_session = None
+
+# --- Plan B: drive our HS_DUMP serve instead of the extract_hidden_states connector ---
+# When DSPARK_HS_DUMP=1, ArrowDataset (on_missing="generate") sends a prefill-only request
+# tagged X-Request-Id=hs_<file_idx> and waits for the serve-side dumper to write
+# hs_<file_idx>.safetensors into hidden_states_path (which MUST equal the serve's
+# DSPARK_HS_DIR). The standard online rolling buffer then applies unchanged — on_generate=
+# "delete" unlinks each file after it is read, so peak disk ≈ dataloader-workers files (no
+# offline explosion). The DSV4 serve has no kv_transfer_params, so the connector path
+# (generate_hidden_states) can't be used; this is its drop-in replacement.
+_HS_DUMP = os.environ.get("DSPARK_HS_DUMP") == "1"
+
+
+def _hs_fetch_session():
+    global _hs_session
+    if _hs_session is None:
+        import requests  # noqa: PLC0415
+        from requests.adapters import HTTPAdapter  # noqa: PLC0415
+
+        session = requests.Session()
+        session.mount(
+            "http://", HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=3)
+        )
+        token = os.environ.get("HS_SIDECAR_TOKEN")
+        if token:
+            session.headers["X-HS-Token"] = token
+        _hs_session = session
+    return _hs_session
+
+
+def _fetch_hs_remote(file_path: Path) -> dict[str, torch.Tensor] | None:
+    resp = _hs_fetch_session().get(
+        _HS_FETCH_BASE + "/hs",
+        params={"path": str(file_path)},
+        timeout=_HS_FETCH_TIMEOUT,
+    )
+    return load_from_bytes(resp.content) if resp.status_code == 200 else None
+
+
 def _maybe_load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
+    if _HS_FETCH_BASE:
+        return _fetch_hs_remote(file_path)
     lock_path = str(file_path) + ".lock"
     if Path(lock_path).exists():
         wait_for_lock(lock_path)
@@ -273,8 +324,6 @@ class ArrowDataset(BaseDataset):
         self.vllm_endpoint = vllm_endpoint
         self.on_missing = on_missing
         self.on_generate = on_generate
-        if self.on_generate == "cache":
-            self.hidden_states_path.mkdir(parents=True, exist_ok=True)
         self.client: openai.OpenAI | None = None
         self.model = model
         self.request_timeout = request_timeout
@@ -308,6 +357,31 @@ class ArrowDataset(BaseDataset):
         """Get lengths of the dataset samples."""
         return list(self.data.with_format(None)["seq_len"])
 
+    def _dump_generate_hs(self, input_ids, file_idx: int) -> str:
+        """DSPARK_HS_DUMP path (Plan B): fire a prefill-only request tagged
+        ``X-Request-Id=hs_<file_idx>`` and wait for the serve-side dumper to write
+        ``hs_<file_idx>.safetensors`` into ``hidden_states_path`` (which MUST equal the
+        serve's ``DSPARK_HS_DIR``). Returns its path. Drop-in for the connector-based
+        ``generate_hidden_states`` (our serve returns no ``kv_transfer_params``)."""
+        self.client.completions.create(
+            model=self.model,
+            prompt=list(input_ids),
+            max_tokens=1,
+            extra_headers={"X-Request-Id": f"hs_{file_idx}"},
+            extra_body={"return_token_ids": True},
+            timeout=self.request_timeout,
+        )
+        path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
+        # The dumper writes synchronously during the prefill (atomic tmp->rename), so the
+        # file should exist the moment the request returns; poll a little for the shared-FS
+        # rename to become visible.
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            if path.exists():
+                return str(path)
+            time.sleep(0.05)
+        raise TimeoutError(f"DSPARK_HS_DUMP: {path} did not appear after the request")
+
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
         if not self.client:
             self._setup_client()
@@ -316,13 +390,18 @@ class ArrowDataset(BaseDataset):
         client_item = build_client_item(dataset_item)
 
         try:
-            hs_filepath = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
-                self.model,  # type:ignore[arg-type]
-                client_item,
-                timeout=self.request_timeout,
-                max_retries=self.max_retries,
-            )
+            if _HS_DUMP:
+                hs_filepath = self._dump_generate_hs(
+                    client_item["input_ids"], self._map_to_file_idx(index)
+                )
+            else:
+                hs_filepath = generate_hidden_states(
+                    self.client,  # type:ignore[arg-type]
+                    self.model,  # type:ignore[arg-type]
+                    client_item,
+                    timeout=self.request_timeout,
+                    max_retries=self.max_retries,
+                )
 
             loaded_hs = _maybe_load_hs_file(Path(hs_filepath))
             if loaded_hs is None:
@@ -330,13 +409,21 @@ class ArrowDataset(BaseDataset):
 
             check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
 
-            match self.on_generate:
-                case "cache":
-                    file_idx = self._map_to_file_idx(index)
-                    target_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-                    shutil.move(hs_filepath, target_path)
-                case "delete":
-                    Path(hs_filepath).unlink()
+            # In remote-fetch mode the file lives on the serve box and the sidecar
+            # already deleted it after sending; nothing local to move/unlink here.
+            if not _HS_FETCH_BASE:
+                match self.on_generate:
+                    case "cache":
+                        file_idx = self._map_to_file_idx(index)
+                        target_path = (
+                            self.hidden_states_path / f"hs_{file_idx}.safetensors"
+                        )
+                        # In DSPARK_HS_DUMP mode the dumper already wrote to target_path;
+                        # a self-move would error, so skip it (file is already cached).
+                        if Path(hs_filepath) != target_path:
+                            shutil.move(hs_filepath, target_path)
+                    case "delete":
+                        Path(hs_filepath).unlink()
         except Exception as e:
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise
