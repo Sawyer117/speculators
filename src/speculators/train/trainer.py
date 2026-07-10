@@ -89,6 +89,29 @@ class _StepTimer:
         }
 
 
+def _gpu_mem_stats() -> dict[str, float] | None:
+    """Per-device memory in GB: current + cumulative peak.
+
+    Uses the ``torch.cuda.*`` memory API, which ``transfer_to_npu`` monkeypatches
+    onto the NPU allocator, so this reports real Ascend device memory on the box.
+    ``max_*`` are cumulative (never reset here), so the last logged step of a run
+    carries the whole-run peak -- the number that answers "does it fit". Returns
+    None on a CPU-only stack.
+    """
+    if not torch.cuda.is_available():
+        return None
+    gb = 1024**3
+    try:
+        return {
+            "alloc_gb": round(torch.cuda.memory_allocated() / gb, 2),
+            "reserved_gb": round(torch.cuda.memory_reserved() / gb, 2),
+            "max_alloc_gb": round(torch.cuda.max_memory_allocated() / gb, 2),
+            "max_reserved_gb": round(torch.cuda.max_memory_reserved() / gb, 2),
+        }
+    except Exception:  # noqa: BLE001 - memory probe must never break training
+        return None
+
+
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 MIN_STEP_PCT = 0.25
 
@@ -433,6 +456,7 @@ class Trainer:
                     {
                         "train": metrics,
                         "profile": profile,
+                        "mem": _gpu_mem_stats(),
                         "epoch": epoch,
                         "lr": lr_info,
                         "global_step": self.global_step,
