@@ -43,7 +43,9 @@ def main() -> None:
     ap.add_argument("--endpoint", required=True)
     ap.add_argument("--model", default="dsv4")
     ap.add_argument("--hs-dir", required=True)
-    ap.add_argument("--tag", default="permcheck")
+    # MUST be digits: the serve dumper names the file from the request id via the
+    # regex hs_\d+, so a non-numeric tag (e.g. "permcheck") is never written.
+    ap.add_argument("--tag", default="77777777")
     ap.add_argument("--wait", type=float, default=60.0)
     args = ap.parse_args()
 
