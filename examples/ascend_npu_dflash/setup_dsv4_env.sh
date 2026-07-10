@@ -42,6 +42,11 @@ done
 
 # ---- conda env (NO conda compilers — they hijack CMake → ABI fail) ----
 source "$(conda info --base)/etc/profile.d/conda.sh"
+# Fresh miniconda: accept the default-channel Terms of Service, else `conda create`
+# aborts non-interactively (CondaToSNonInteractiveError) and the env is never built.
+# `|| true` so older conda without the `tos` subcommand doesn't break the script.
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
 conda env list | grep -qw "$CONDA_ENV" || conda create -n "$CONDA_ENV" python=3.11 -y
 conda activate "$CONDA_ENV"
 conda remove -y gxx_linux-aarch64 gcc_linux-aarch64 clang clangxx lld 2>/dev/null; true
