@@ -372,15 +372,26 @@ class ArrowDataset(BaseDataset):
             timeout=self.request_timeout,
         )
         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        # The dumper writes synchronously during the prefill (atomic tmp->rename), so the
-        # file should exist the moment the request returns; poll a little for the shared-FS
-        # rename to become visible.
+        # Poll until the file is actually LOADABLE, not merely present. On a
+        # cross-node shared FS (trainer and serve on different hosts, /share over
+        # NFS) the dirent can become visible (path.exists() True) BEFORE the
+        # renamed inode's data is readable on this node, so a bare
+        # exists()-then-open races and safetensors raises "No such file". Retrying
+        # the load absorbs that lag (and any partial write) — this is the resilience
+        # the connector-based generate_hidden_states gets from its max_retries.
         deadline = time.monotonic() + 60.0
+        last_err: Exception | None = None
         while time.monotonic() < deadline:
             if path.exists():
-                return str(path)
-            time.sleep(0.05)
-        raise TimeoutError(f"DSPARK_HS_DUMP: {path} did not appear after the request")
+                try:
+                    load_file(str(path))
+                    return str(path)
+                except Exception as e:  # noqa: BLE001 - dirent up, data not yet visible
+                    last_err = e
+            time.sleep(0.1)
+        raise TimeoutError(
+            f"DSPARK_HS_DUMP: {path} not loadable after 60s (last error: {last_err})"
+        )
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
         if not self.client:
