@@ -93,15 +93,17 @@ def _moe_dispatch_torch(
 ) -> torch.Tensor:
     """Route ``x [tokens, dim]`` to its top-k experts and combine (fp32 accum).
 
-    Loops over the experts that received at least one token — the standard
-    reference. The accelerator bridge registers a fused grouped-GEMM under the
-    same op for throughput.
+    Iterates ALL experts in a fixed order and feeds each only its routed tokens
+    (an empty ``[0, dim]`` slice when it got none). Every expert's ``forward`` is
+    therefore called on every rank, which is required when the experts are
+    FSDP2-wrapped per module (see ``DSV4DSparkDraftModel.fsdp_wrap_plan``): the
+    per-expert all-gather fires in the module pre-forward hook, so skipping an
+    idle expert on one rank but not another would desync the collectives and hang
+    HCCL. The empty-slice forwards are near-free in compute; the accelerator
+    bridge registers a fused grouped-GEMM under the same op for throughput.
     """
     y = torch.zeros_like(x, dtype=torch.float32)
-    counts = torch.bincount(indices.flatten(), minlength=n_routed_experts)
     for e in range(n_routed_experts):
-        if counts[e] == 0:
-            continue
         tok, slot = torch.where(indices == e)
         y[tok] += experts[e](x[tok], weights[tok, slot, None])
     return y

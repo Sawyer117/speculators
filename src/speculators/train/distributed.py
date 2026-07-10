@@ -200,7 +200,16 @@ def maybe_destroy_distributed() -> None:
 def apply_fully_sharded(model: torch.nn.Module):
     """Applies torch FSDP fully_shard to the model, wrapping layers in FSDPModule.
 
-    Assumes the model has a `layers` attribute containing the decoder layers.
+    By default shards one FSDP unit per decoder layer (``model.layers``), so the
+    transient all-gather during a layer's fwd/bwd is that whole layer. A model may
+    instead expose ``fsdp_wrap_plan() -> list[nn.Module]`` to declare a finer
+    granularity (children before parents): e.g. a 256-expert MoE backbone shards
+    each expert on its own, shrinking the per-step all-gather from the whole
+    ~6.5B-param layer (~13GB) to a single ~25M-param expert (~50MB), which is what
+    makes the faithful DSV4 draft fit on one node. Nested ``fully_shard`` calls
+    compose: sharding the leaves first, then the containing block, leaves each
+    block group managing only its own (unwrapped) params.
+
     Model should be validated with SpeculatorModel.verify_training_compatible()
     before calling this function.
     """
@@ -209,8 +218,10 @@ def apply_fully_sharded(model: torch.nn.Module):
         reduce_dtype=torch.float32,
     )
 
-    for layer in model.layers:  # type: ignore[union-attr]
-        fully_shard(layer, mp_policy=mp_policy)
+    plan = getattr(model, "fsdp_wrap_plan", None)
+    modules = plan() if callable(plan) else list(model.layers)  # type: ignore[union-attr]
+    for module in modules:
+        fully_shard(module, mp_policy=mp_policy)
 
     fully_shard(model)
 

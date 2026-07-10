@@ -234,6 +234,30 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                     if torch.isnan(p).any() or not p.abs().sum().isfinite() or p.abs().sum() == 0:
                         nn.init.normal_(p, std=std)
 
+    def fsdp_wrap_plan(self) -> list[nn.Module]:
+        """Fine-grained FSDP2 units for :func:`apply_fully_sharded` (children first).
+
+        The whole-layer default all-gathers a full ~6.5B-param faithful layer
+        (~13GB) per fwd/bwd -- OOMs one A2 node. Instead we shard each MoE expert
+        on its own: the torch MoE loops ``experts[e](...)`` per module, so FSDP2
+        gathers/reshards one ~25M-param expert (~50MB) at a time. ``attn`` (MLA)
+        gets its own group too; ``block`` then manages only the small remainder
+        (norms, hyper-connections, router). The root ``fully_shard(model)`` (added
+        by the caller) covers embed/head/heads.
+
+        Note: this composes with the eager per-expert loop. When the fused
+        grouped-GEMM NPU kernel (op ``moe_dispatch``) lands (backbone #5) it wants
+        all expert weights stacked at once, which is incompatible with per-expert
+        sharding -- revisit the granularity then (e.g. shard the stacked tensor).
+        """
+        plan: list[nn.Module] = []
+        for block in self.layers:
+            plan.extend(block.ffn.experts)  # 256 units, ~50MB gathered each
+            plan.append(block.ffn.shared_experts)
+            plan.append(block.attn)
+            plan.append(block)  # remainder: norms, attn_hc/ffn_hc, router
+        return plan
+
     def _rope_at(self, positions: torch.Tensor) -> torch.Tensor:
         """freqs_cis at the given absolute positions -> [len, rope_dim//2]."""
         if positions.numel() and int(positions.max()) >= self.freqs_cis.shape[0]:
