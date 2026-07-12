@@ -113,8 +113,15 @@ def main() -> None:
     else:
         assert embed_is_meta, "non-rank0 must build on meta (--init-on-meta)"
 
-    # rank0 keeps its real weights (CPU) as the reference, exactly like trainer.py.
-    ref_full = model.state_dict() if rank == 0 else {}
+    # Snapshot rank0's real weights as PLAIN cpu clones. fully_shard (below) mutates
+    # the live params into DTensors in place, which would also turn these references
+    # into DTensors and break the plain-vs-DTensor comparison in (3). The clone is
+    # immune to that, and still serves as the broadcast source (like trainer.py).
+    ref_full = (
+        {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if rank == 0
+        else {}
+    )
 
     # == trainer.py:291-305 (shard, then broadcast-materialize from rank0).
     apply_fully_sharded(model)
@@ -140,19 +147,18 @@ def main() -> None:
     #     are DTensors; full_tensor() all-gathers to a plain tensor and is a
     #     collective, so ALL ranks gather (same order) first and only rank0 compares
     #     -- comparing inside the loop would hang the other ranks if an assert trips.
-    def _gather(p: torch.Tensor) -> torch.Tensor:
-        p = p.full_tensor() if hasattr(p, "full_tensor") else p
-        return p.detach().cpu().float()
+    def _plain(t: torch.Tensor) -> torch.Tensor:
+        if hasattr(t, "full_tensor"):  # DTensor -> all-gather to a plain tensor
+            t = t.full_tensor()
+        return t.detach().to("cpu", torch.float32)
 
-    gathered = {name: _gather(p) for name, p in model.named_parameters()}
+    gathered = {name: _plain(p) for name, p in model.named_parameters()}
     dist.barrier()
     if rank == 0:
         bad = [
             name
             for name, got in gathered.items()
-            if not torch.allclose(
-                got, ref_full[name].detach().cpu().float(), rtol=1e-2, atol=1e-3
-            )
+            if not torch.allclose(got, _plain(ref_full[name]), rtol=1e-2, atol=1e-3)
         ]
         assert not bad, f"materialized weights differ from rank0 reference: {bad}"
 
