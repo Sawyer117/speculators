@@ -30,7 +30,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
-    get_model_state_dict,
     set_model_state_dict,
 )
 from transformers import LlamaForCausalLM
@@ -136,22 +135,23 @@ def main() -> None:
         assert not local.is_meta, f"[rank{rank}] {name} still on meta after broadcast"
         assert not torch.isnan(local.float()).any(), f"[rank{rank}] {name} has NaN"
 
-    # (3) the materialized full state (all-gathered from every rank's shard) equals
-    #     rank0's original weights -> non-rank0 got exactly rank0's values.
-    got_full = get_model_state_dict(
-        model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
-    )
+    # (3) each param, gathered from every rank's shard, equals rank0's original
+    #     weights -> non-rank0 materialized exactly rank0's values. Post-FSDP params
+    #     are DTensors; full_tensor() all-gathers to a plain tensor and is a
+    #     collective, so ALL ranks gather (same order) first and only rank0 compares
+    #     -- comparing inside the loop would hang the other ranks if an assert trips.
+    def _gather(p: torch.Tensor) -> torch.Tensor:
+        p = p.full_tensor() if hasattr(p, "full_tensor") else p
+        return p.detach().cpu().float()
+
+    gathered = {name: _gather(p) for name, p in model.named_parameters()}
+    dist.barrier()
     if rank == 0:
-        assert set(got_full) == set(ref_full), (
-            f"key mismatch: only-in-got={set(got_full) - set(ref_full)}, "
-            f"only-in-ref={set(ref_full) - set(got_full)}"
-        )
         bad = [
-            k
-            for k, ref_v in ref_full.items()
-            if ref_v is not None
-            and not torch.allclose(
-                got_full[k].float(), ref_v.float(), rtol=1e-2, atol=1e-3
+            name
+            for name, got in gathered.items()
+            if not torch.allclose(
+                got, ref_full[name].detach().cpu().float(), rtol=1e-2, atol=1e-3
             )
         ]
         assert not bad, f"materialized weights differ from rank0 reference: {bad}"
