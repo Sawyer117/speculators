@@ -1,10 +1,9 @@
 """torchrun worker for the --init-on-meta e2e test (test_init_on_meta.py).
 
-Not a pytest module (not test_*); launched via torch.distributed.run. For EACH
-speculator type (eagle3, dflash, dspark, peagle) it mirrors the trainer's real path
-(rank0 builds real, non-rank0 under build_on_meta, then apply_fully_sharded +
-set_model_state_dict(broadcast_from_rank0=True)) and checks that --init-on-meta
-changes nothing:
+Not a pytest module (not test_*); launched via torch.distributed.run. Mirrors the
+trainer's real path (rank0 builds real, non-rank0 under build_on_meta, then
+apply_fully_sharded + set_model_state_dict(broadcast_from_rank0=True)) and checks that
+--init-on-meta changes nothing:
   1. non-rank0 params are on meta before broadcast (the memory win);
   2. every rank's shard is real + finite after broadcast;
   3. requires_grad matches across ranks (else FSDP2 grad-reduce hangs);
@@ -27,10 +26,7 @@ from torch.distributed.checkpoint.state_dict import (
 from transformers import LlamaForCausalLM
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from speculators.models.dflash.core import DFlashDraftModel
-from speculators.models.dspark.core import DSparkDraftModel
-from speculators.models.eagle3.core import Eagle3DraftModel
-from speculators.models.peagle.core import PEagleDraftModel
+from speculators.models.eagle3 import Eagle3DraftModel
 from speculators.train.distributed import (
     apply_fully_sharded,
     build_on_meta,
@@ -39,14 +35,6 @@ from speculators.train.distributed import (
     maybe_destroy_distributed,
     maybe_setup_distributed,
 )
-
-# All speculator types that route through the base is_meta guard.
-MODELS = [
-    ("eagle3", Eagle3DraftModel),
-    ("dflash", DFlashDraftModel),
-    ("dspark", DSparkDraftModel),
-    ("peagle", PEagleDraftModel),
-]
 
 
 def _tiny_config() -> LlamaConfig:
@@ -64,119 +52,27 @@ def _tiny_config() -> LlamaConfig:
     )
 
 
-def _build(model_cls, verifier_dir: str):
-    # == scripts/train.py: build under build_on_meta on non-rank0 only. Superset of
-    # from_training_args kwargs -- each model uses what it needs and ignores the rest.
+def _build_draft(verifier_dir: str) -> Eagle3DraftModel:
+    # == scripts/train.py: build under build_on_meta on non-rank0 only.
     meta_ctx = build_on_meta() if get_rank() != 0 else contextlib.nullcontext()
     with meta_ctx:
-        return model_cls.from_training_args(
-            _tiny_config(),  # fresh: from_training_args mutates _attn_implementation
+        return Eagle3DraftModel.from_training_args(
+            verifier_config=_tiny_config(),
             t2d=None,
             d2t=None,
             draft_vocab_size=64,
             norm_before_residual=False,
             ttt_steps=1,
-            block_size=4,
-            markov_rank=16,
             draft_attn_impl="eager",
             target_layer_ids=[0, 1],
             verifier_name_or_path=verifier_dir,
         )
 
 
-def _check_one(name, model_cls, verifier_dir, rank, world, tick):
+def main() -> None:
     import numpy as np
     from torch.distributed.tensor import DTensor
 
-    model = _build(model_cls, verifier_dir)
-
-    # rank0 is the source of truth: no nan params (safety net; decouples from
-    # verifier-loading details).
-    if rank == 0:
-        with torch.no_grad():
-            for p in model.parameters():
-                if p.is_meta:
-                    raise AssertionError(f"[{name}] rank0 unexpectedly built on meta")
-                nan = torch.isnan(p)
-                if nan.any():
-                    p[nan] = torch.randn_like(p[nan]) * 0.02
-
-    # (1) the optimization engaged: non-rank0 built on meta, rank0 did not.
-    if rank == 0:
-        assert not model.embed_tokens.weight.is_meta, f"[{name}] rank0 should be real"
-    else:
-        assert model.embed_tokens.weight.is_meta, f"[{name}] non-rank0 must be on meta"
-
-    # Two snapshots: `bcast_src` is the broadcast source (set_model_state_dict mutates
-    # its input dict into DTensors in place); `ref_np` is a frozen numpy copy for the
-    # (3) compare, immune to that mutation.
-    ref_np = (
-        {k: v.detach().cpu().float().numpy().copy() for k, v in model.state_dict().items()}
-        if rank == 0
-        else {}
-    )
-    bcast_src = model.state_dict() if rank == 0 else {}
-
-    apply_fully_sharded(model)
-    set_model_state_dict(
-        model,
-        bcast_src,
-        options=StateDictOptions(
-            full_state_dict=True, broadcast_from_rank0=True, strict=False
-        ),
-    )
-    dist.barrier()
-
-    # (2) every rank's local shard is real and finite after the broadcast.
-    for pname, p in model.named_parameters():
-        local = p.to_local() if isinstance(p, DTensor) else p
-        assert not local.is_meta, f"[{name}][rank{rank}] {pname} still on meta"
-        assert not torch.isnan(local.float()).any(), f"[{name}][rank{rank}] {pname} NaN"
-
-    # (2b) requires_grad must match across ranks, or FSDP2 post_backward collects a
-    #      different trainable-param set per rank and the first backward hangs.
-    #      named_parameters() is identically ordered on every rank -> flags line up.
-    flags = torch.tensor(
-        [1 if p.requires_grad else 0 for _, p in model.named_parameters()],
-        dtype=torch.int32,
-        device="cuda",
-    )
-    gathered_flags = [torch.zeros_like(flags) for _ in range(world)]
-    dist.all_gather(gathered_flags, flags)
-    for other, gf in enumerate(gathered_flags):
-        if not torch.equal(gf, flags):
-            diff = [
-                pn
-                for i, (pn, _) in enumerate(model.named_parameters())
-                if gf[i] != flags[i]
-            ]
-            raise AssertionError(
-                f"[{name}][rank{rank}] requires_grad differs from rank{other} on {diff} "
-                "-> FSDP2 gradient-reduction mismatch (training would hang)"
-            )
-
-    # (3) full weights gathered from every rank's shard == rank0's originals.
-    #     full_tensor() is a collective -> ALL ranks gather first, then rank0-only
-    #     compares numpy (no distributed op inside `if rank == 0`, which would hang).
-    def _gather_np(t: torch.Tensor):
-        if isinstance(t, DTensor):
-            t = t.full_tensor()
-        return t.detach().cpu().float().numpy()
-
-    gathered = {pn: _gather_np(p) for pn, p in model.named_parameters()}
-    dist.barrier()
-    if rank == 0:
-        bad = [
-            pn
-            for pn, got in gathered.items()
-            if not np.allclose(got, ref_np[pn], rtol=1e-2, atol=1e-3)
-        ]
-        assert not bad, f"[{name}] materialized weights differ from rank0: {bad}"
-    dist.barrier()
-    tick(f"{name}: OK (meta -> broadcast, real+finite, requires_grad consistent, == rank0)")
-
-
-def main() -> None:
     t0 = time.perf_counter()
     maybe_setup_distributed()
     world = get_world_size()
@@ -199,15 +95,108 @@ def main() -> None:
         LlamaForCausalLM(_tiny_config()).save_pretrained(verifier_dir)
     dist.barrier()
 
-    for name, model_cls in MODELS:
-        _check_one(name, model_cls, verifier_dir, rank, world, tick)
+    model = _build_draft(verifier_dir)
+    tick("draft model built (rank0 real, non-rank0 on meta)")
+
+    # rank0 is the single source of truth: ensure it has no nan params (safety net
+    # that also decouples this check from verifier-loading details).
+    if rank == 0:
+        with torch.no_grad():
+            for p in model.parameters():
+                if p.is_meta:
+                    raise AssertionError("rank0 unexpectedly built on meta")
+                nan = torch.isnan(p)
+                if nan.any():
+                    p[nan] = torch.randn_like(p[nan]) * 0.02
+
+    # (1) the optimization engaged: non-rank0 built on meta, rank0 did not.
+    embed_is_meta = model.embed_tokens.weight.is_meta
+    if rank == 0:
+        assert not embed_is_meta, "rank0 should hold real weights"
+    else:
+        assert embed_is_meta, "non-rank0 must build on meta (--init-on-meta)"
+
+    # Two snapshots: `bcast_src` is the broadcast source (set_model_state_dict mutates
+    # its input dict into DTensors in place); `ref_np` is a frozen numpy copy for the
+    # (3) compare, immune to that mutation.
+    ref_np = (
+        {
+            k: v.detach().cpu().float().numpy().copy()
+            for k, v in model.state_dict().items()
+        }
+        if rank == 0
+        else {}
+    )
+    bcast_src = model.state_dict() if rank == 0 else {}
+
+    # == trainer.py distributed setup (shard, then broadcast-materialize from rank0).
+    apply_fully_sharded(model)
+    set_model_state_dict(
+        model,
+        bcast_src,
+        options=StateDictOptions(
+            full_state_dict=True,
+            broadcast_from_rank0=True,
+            strict=False,
+        ),
+    )
+    dist.barrier()
+    tick("apply_fully_sharded + broadcast-materialize done")
+
+    # (2) every rank's local shard is real and finite after the broadcast.
+    for name, p in model.named_parameters():
+        local = p.to_local() if isinstance(p, DTensor) else p
+        assert not local.is_meta, f"[rank{rank}] {name} still on meta after broadcast"
+        assert not torch.isnan(local.float()).any(), f"[rank{rank}] {name} has NaN"
+
+    # (2b) requires_grad must match across ranks, or FSDP2 post_backward collects a
+    #      different trainable-param set per rank and the first backward hangs.
+    #      named_parameters() is identically ordered on every rank -> flags line up.
+    flags = torch.tensor(
+        [1 if p.requires_grad else 0 for _, p in model.named_parameters()],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    gathered_flags = [torch.zeros_like(flags) for _ in range(world)]
+    dist.all_gather(gathered_flags, flags)
+    for other, gf in enumerate(gathered_flags):
+        if not torch.equal(gf, flags):
+            mism = [
+                name
+                for i, (name, _) in enumerate(model.named_parameters())
+                if gf[i] != flags[i]
+            ]
+            raise AssertionError(
+                f"[rank{rank}] requires_grad differs from rank{other} on {mism} "
+                "-> FSDP2 gradient-reduction mismatch (training would hang)"
+            )
+    tick("requires_grad is consistent across ranks")
+
+    # (3) full weights gathered from every rank's shard == rank0's originals.
+    #     full_tensor() is a collective -> ALL ranks gather first, then rank0-only
+    #     compares numpy (no distributed op inside `if rank == 0`, which would hang).
+    def _gather_np(t: torch.Tensor):
+        if isinstance(t, DTensor):  # sharded -> all-gather to a plain tensor
+            t = t.full_tensor()
+        return t.detach().cpu().float().numpy()
+
+    gathered = {name: _gather_np(p) for name, p in model.named_parameters()}
+    dist.barrier()
+    tick("full weights gathered")
+
+    if rank == 0:
+        bad = [
+            name
+            for name, got in gathered.items()
+            if not np.allclose(got, ref_np[name], rtol=1e-2, atol=1e-3)
+        ]
+        assert not bad, f"materialized weights differ from rank0 reference: {bad}"
 
     dist.barrier()
     if rank == 0:
-        names = ", ".join(n for n, _ in MODELS)
         print(
-            f"PASS ({world} ranks): --init-on-meta verified for [{names}] -- meta build "
-            "-> broadcast-materialize, real+finite, requires_grad consistent, == rank0.",
+            f"PASS ({world} ranks): non-rank0 built on meta, all ranks materialized "
+            "real+finite weights, and the gathered state matches rank0 exactly.",
             flush=True,
         )
     maybe_destroy_distributed()
