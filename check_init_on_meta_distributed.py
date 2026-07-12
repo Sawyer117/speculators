@@ -177,23 +177,15 @@ def main() -> None:
     tick("full weights gathered (full_tensor all-gather)")
 
     if rank == 0:
-        _k = next(iter(gathered))
-        print(
-            f"  [rank0] compare: got={type(gathered[_k]).__name__} "
-            f"ref={type(ref_np[_k]).__name__}",
-            flush=True,
-        )
         bad = [
             name
             for name, got in gathered.items()
             if not np.allclose(got, ref_np[name], rtol=1e-2, atol=1e-3)
         ]
-        print(f"  [rank0] compare done, bad={bad}", flush=True)
         assert not bad, f"materialized weights differ from rank0 reference: {bad}"
 
-    print(f"  [rank{rank}] before final barrier", flush=True)
     dist.barrier()
-    print(f"  [rank{rank}] after final barrier", flush=True)
+    tick("compared against rank0 reference")
     if rank == 0:
         print(
             f"PASS ({world} ranks): non-rank0 built on meta, all ranks materialized "
