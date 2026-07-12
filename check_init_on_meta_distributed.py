@@ -153,12 +153,16 @@ def main() -> None:
         assert not torch.isnan(local.float()).any(), f"[rank{rank}] {name} has NaN"
 
     # (3) each param, gathered from every rank's shard, equals rank0's original
-    #     weights -> non-rank0 materialized exactly rank0's values. Post-FSDP params
-    #     are DTensors; full_tensor() all-gathers to a plain tensor and is a
-    #     collective, so ALL ranks gather (same order) first and only rank0 compares
-    #     -- comparing inside the loop would hang the other ranks if an assert trips.
+    #     weights -> non-rank0 materialized exactly rank0's values. full_tensor() is a
+    #     COLLECTIVE, so ALL ranks gather (same order) first, then only rank0 compares
+    #     -- with NO distributed op inside `if rank == 0` (that hangs the others).
+    #     Use isinstance(DTensor) as the shard test: hasattr(t, "full_tensor") is True
+    #     for plain tensors too, so it misfires and would call full_tensor() on the
+    #     plain rank0 reference -> a rank0-only collective -> deadlock.
+    from torch.distributed.tensor import DTensor  # noqa: PLC0415
+
     def _plain(t: torch.Tensor) -> torch.Tensor:
-        if hasattr(t, "full_tensor"):  # DTensor -> all-gather to a plain tensor
+        if isinstance(t, DTensor):  # sharded -> all-gather to a plain tensor
             t = t.full_tensor()
         return t.detach().to("cpu", torch.float32)
 
