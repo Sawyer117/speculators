@@ -25,6 +25,7 @@ Exits non-zero on any failure.
 import contextlib
 import os
 import tempfile
+import time
 
 import torch
 import torch.distributed as dist
@@ -79,11 +80,18 @@ def _build_draft(verifier_dir: str) -> Eagle3DraftModel:
 
 
 def main() -> None:
+    t0 = time.perf_counter()
     maybe_setup_distributed()
     world = get_world_size()
     if world < 2:
         raise SystemExit("run with torchrun --nproc_per_node >=2 (need >1 rank)")
     rank = get_rank()
+
+    def tick(msg: str) -> None:
+        if rank == 0:
+            print(f"[+{time.perf_counter() - t0:5.1f}s] {msg}", flush=True)
+
+    tick("distributed initialized (torch/transformers import + CUDA + NCCL done)")
 
     # rank0 writes a tiny verifier WITH weights so rank0's load_verifier_weights
     # succeeds (torchrun ranks share the node filesystem).
@@ -93,6 +101,7 @@ def main() -> None:
     dist.barrier()
 
     model = _build_draft(verifier_dir)
+    tick("draft model built (rank0 real, non-rank0 on meta)")
 
     # rank0 is the single source of truth: make sure it has NO nan params (embed/
     # lm_head come from the verifier; this is a safety net that also decouples the
@@ -135,6 +144,7 @@ def main() -> None:
         ),
     )
     dist.barrier()
+    tick("apply_fully_sharded + broadcast-materialize done")
 
     # (2) every rank's local shard is real and finite after the broadcast.
     for name, p in model.named_parameters():
@@ -154,6 +164,7 @@ def main() -> None:
 
     gathered = {name: _plain(p) for name, p in model.named_parameters()}
     dist.barrier()
+    tick("full weights gathered (full_tensor all-gather)")
     if rank == 0:
         bad = [
             name
