@@ -1,20 +1,15 @@
 #!/bin/bash
 # E2E smoke test for --init-on-meta: a REAL 2-GPU FSDP training run.
 #
-# Trains a tiny Eagle3 draft on Qwen3-0.6B for 1 epoch over a handful of ShareGPT
-# samples, WITH --init-on-meta and NUM_TRAIN_GPUS=2. The goal is not model quality
-# but to exercise the real training loop (forward -> loss -> backward ->
-# optimizer.step) under FSDP2 with meta-init on the non-rank0 rank.
+# Trains a tiny Eagle3 draft on Qwen3-0.6B for 1 epoch on a handful of ShareGPT
+# samples, WITH --init-on-meta and 2 training GPUs -- exercising the real training
+# loop (forward -> backward -> optimizer.step) under FSDP2. 2 GPUs are required:
+# if the meta path leaves verifier weights requires_grad=True on non-rank0 while
+# rank0 froze them, FSDP2's post_backward collects a different param set per rank and
+# the first backward HANGS (a single GPU can't reproduce it). A clean run validates
+# the fix.
 #
-# Why 2 training GPUs matter: the failure mode is a cross-rank inconsistency --
-# if the frozen verifier weights (lm_head / verifier_lm_head / verifier_norm) end
-# up requires_grad=True on non-rank0 (because the meta path skipped the freeze)
-# while rank0 has them frozen, FSDP2's post_backward reduce_scatter collects a
-# different param set per rank and the FIRST backward HANGS. A single GPU never
-# shards across ranks, so it cannot reproduce this. A clean run to completion here
-# validates that --init-on-meta keeps the trainable-param set rank-consistent.
-#
-# Requirements: >=3 GPUs (1 for vLLM, 2 for training), vLLM installed, HF access.
+# Requirements: >=3 GPUs (1 vLLM, 2 training), vLLM installed, HF access.
 # Usage: bash examples/train/eagle3_qwen3_0_6b_init_on_meta_smoke.sh
 set -euo pipefail
 
