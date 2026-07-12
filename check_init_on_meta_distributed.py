@@ -122,21 +122,29 @@ def main() -> None:
     else:
         assert embed_is_meta, "non-rank0 must build on meta (--init-on-meta)"
 
-    # Snapshot rank0's real weights as PLAIN cpu clones. fully_shard (below) mutates
-    # the live params into DTensors in place, which would also turn these references
-    # into DTensors and break the plain-vs-DTensor comparison in (3). The clone is
-    # immune to that, and still serves as the broadcast source (like trainer.py).
-    ref_full = (
-        {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    # Snapshot rank0's real weights TWICE. `bcast_src` is the broadcast source handed
+    # to set_model_state_dict below -- which MUTATES its input dict into DTensors in
+    # place (it shards the full tensors to hand out to each rank). `ref_np` is a
+    # SEPARATE, frozen NUMPY copy used only for the comparison in (3); numpy so nothing
+    # torch/DTensor can retroactively touch it. (Reusing one dict for both is what hung
+    # earlier: the compare then called full_tensor() on a now-DTensor ref on rank0.)
+    import numpy as np  # noqa: PLC0415
+
+    ref_np = (
+        {
+            k: v.detach().cpu().float().numpy().copy()
+            for k, v in model.state_dict().items()
+        }
         if rank == 0
         else {}
     )
+    bcast_src = model.state_dict() if rank == 0 else {}
 
     # == trainer.py:291-305 (shard, then broadcast-materialize from rank0).
     apply_fully_sharded(model)
     set_model_state_dict(
         model,
-        ref_full,
+        bcast_src,
         options=StateDictOptions(
             full_state_dict=True,
             broadcast_from_rank0=True,
@@ -154,30 +162,38 @@ def main() -> None:
 
     # (3) each param, gathered from every rank's shard, equals rank0's original
     #     weights -> non-rank0 materialized exactly rank0's values. full_tensor() is a
-    #     COLLECTIVE, so ALL ranks gather (same order) first, then only rank0 compares
-    #     -- with NO distributed op inside `if rank == 0` (that hangs the others).
-    #     Use isinstance(DTensor) as the shard test: hasattr(t, "full_tensor") is True
-    #     for plain tensors too, so it misfires and would call full_tensor() on the
-    #     plain rank0 reference -> a rank0-only collective -> deadlock.
+    #     COLLECTIVE, so ALL ranks gather (same order) FIRST; only rank0 then compares,
+    #     against the frozen numpy reference, so there is NO distributed op inside
+    #     `if rank == 0` (a collective there would hang the other ranks).
     from torch.distributed.tensor import DTensor  # noqa: PLC0415
 
-    def _plain(t: torch.Tensor) -> torch.Tensor:
+    def _gather_np(t: torch.Tensor):
         if isinstance(t, DTensor):  # sharded -> all-gather to a plain tensor
             t = t.full_tensor()
-        return t.detach().to("cpu", torch.float32)
+        return t.detach().cpu().float().numpy()
 
-    gathered = {name: _plain(p) for name, p in model.named_parameters()}
+    gathered = {name: _gather_np(p) for name, p in model.named_parameters()}
     dist.barrier()
     tick("full weights gathered (full_tensor all-gather)")
+
     if rank == 0:
+        _k = next(iter(gathered))
+        print(
+            f"  [rank0] compare: got={type(gathered[_k]).__name__} "
+            f"ref={type(ref_np[_k]).__name__}",
+            flush=True,
+        )
         bad = [
             name
             for name, got in gathered.items()
-            if not torch.allclose(got, _plain(ref_full[name]), rtol=1e-2, atol=1e-3)
+            if not np.allclose(got, ref_np[name], rtol=1e-2, atol=1e-3)
         ]
+        print(f"  [rank0] compare done, bad={bad}", flush=True)
         assert not bad, f"materialized weights differ from rank0 reference: {bad}"
 
+    print(f"  [rank{rank}] before final barrier", flush=True)
     dist.barrier()
+    print(f"  [rank{rank}] after final barrier", flush=True)
     if rank == 0:
         print(
             f"PASS ({world} ranks): non-rank0 built on meta, all ranks materialized "
