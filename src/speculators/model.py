@@ -129,10 +129,18 @@ class DraftVocabMixin(nn.Module):
         tokenizer) by calling super().load_verifier_weights() first.
         """
         # Meta-device init (--init-on-meta): params carry no data, so skip the
-        # verifier load; real weights arrive via set_model_state_dict(
-        # broadcast_from_rank0=True) in the trainer's FSDP setup. (isnan() below
-        # would raise on a meta tensor.)
+        # data-dependent verifier load (isnan()/load_state_dict below need real
+        # storage); real weights arrive via set_model_state_dict(
+        # broadcast_from_rank0=True) in the trainer's FSDP setup. Still apply the
+        # requires_grad_(False) freeze below -- it works on meta (only sets a flag),
+        # and the trainable-param set MUST be identical on every rank or FSDP2's
+        # post_backward reduce_scatter builds different-sized buffers and hangs.
         if self.embed_tokens.weight.is_meta:
+            self.embed_tokens.weight.requires_grad_(False)
+            self.lm_head.weight.requires_grad_(False)
+            self.verifier_lm_head.weight.requires_grad_(False)
+            if hasattr(self, "verifier_norm"):
+                self.verifier_norm.weight.requires_grad_(False)  # type: ignore[union-attr]
             return
 
         import warnings  # noqa: PLC0415

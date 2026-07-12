@@ -163,6 +163,33 @@ def main() -> None:
         assert not local.is_meta, f"[rank{rank}] {name} still on meta after broadcast"
         assert not torch.isnan(local.float()).any(), f"[rank{rank}] {name} has NaN"
 
+    # (2b) requires_grad must be IDENTICAL across ranks. The meta path builds params
+    #      without running the verifier load, so it must still apply the same
+    #      requires_grad_(False) freeze as rank0 -- otherwise FSDP2's post_backward
+    #      collects a different trainable-param set per rank, the reduce_scatter
+    #      buffers mismatch, and the first backward hangs. named_parameters() is
+    #      deterministic and identically ordered on every rank, so the flag vectors
+    #      line up 1:1.
+    flags = torch.tensor(
+        [1 if p.requires_grad else 0 for _, p in model.named_parameters()],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    gathered_flags = [torch.zeros_like(flags) for _ in range(world)]
+    dist.all_gather(gathered_flags, flags)
+    for other, gf in enumerate(gathered_flags):
+        if not torch.equal(gf, flags):
+            mism = [
+                name
+                for i, (name, _) in enumerate(model.named_parameters())
+                if gf[i] != flags[i]
+            ]
+            raise AssertionError(
+                f"[rank{rank}] requires_grad differs from rank{other} on {mism} "
+                "-> FSDP2 gradient-reduction mismatch (training would hang)"
+            )
+    tick("requires_grad is consistent across ranks")
+
     # (3) each param, gathered from every rank's shard, equals rank0's original
     #     weights. full_tensor() is a COLLECTIVE, so ALL ranks gather (same order)
     #     FIRST; only rank0 then compares, against the frozen numpy reference, so there
