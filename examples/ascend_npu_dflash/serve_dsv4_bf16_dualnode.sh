@@ -59,9 +59,16 @@ MAXBATCHTOK="${MAXBATCHTOK:-8192}"        # per-forward token budget. Token SIZE
                                           # two-node hang — the AtomGit A2 two-node V4-Flash report runs 8192
                                           # fine. The real cause was --enable-expert-parallel (now default-off,
                                           # see ENABLE_EP). 8192 = the report's value.
-MAXSEQS="${MAXSEQS:-16}"
+MAXSEQS="${MAXSEQS:-32}"                   # concurrency. 32/replica x DP2 = 64 = the rollout-optimal /
+                                          # KV-safe max for 2-node bf16 (memory: >64 client concurrency
+                                          # overflows KV -> HTTP-200 garbage). HS_DUMP is prefill-only
+                                          # (max_tokens=1) so KV pressure is low -> 32 is comfortable; drop
+                                          # to 16 for generation/eval if you see garbage.
 GPUUTIL="${GPUUTIL:-0.9}"
-EAGER="${EAGER:-1}"                       # 1 = --enforce-eager (reliable first bring-up); 0 = graph mode (faster)
+EAGER="${EAGER:-0}"                       # 0 = graph mode (compilation pipeline ON -> fuses prefill kernels
+                                          # too, not just the FULL_DECODE_ONLY cudagraph; rollout-optimal).
+                                          # Set EAGER=1 (--enforce-eager, no compile) only for a conservative
+                                          # first bring-up if graph mode fails to come up.
 QUANT="${QUANT:-}"                        # empty = bf16; set QUANT=ascend (+ MODEL=<w8a8 ckpt>) to serve w8a8.
 ENABLE_EP="${ENABLE_EP:-}"                # ★ empty = NO expert-parallel (DEFAULT). --enable-expert-parallel on
                                           # two-node A2 triggers a cross-node EP16 HcclAllGather deadlock (the
@@ -191,7 +198,7 @@ COMMON=( "$MODEL"
   --tokenizer-mode deepseek_v4
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --block-size 128
   --max-num-batched-tokens "$MAXBATCHTOK"
-  --gpu-memory-utilization "$GPUUTIL_EFF" --no-enable-prefix-caching
+  --gpu-memory-utilization "$GPUUTIL_EFF" --no-enable-prefix-caching --async-scheduling
   --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}'
   "${LOAD_ARGS[@]}" "${HS_ARGS[@]}" "${HS_DUMP_ARGS[@]}"
   $EAGER_FLAG "${GRAPH_ARGS[@]}" )
