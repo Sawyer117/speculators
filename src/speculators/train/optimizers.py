@@ -29,12 +29,6 @@ _ADAMW_NAME_HINTS = ("embed_tokens", "lm_head")
 _MATRIX_NDIM = 2
 
 
-def _ep_local_keys(model: Module) -> set:
-    """Expert-parallel rank-local param names (plain tensors), or empty set if not EP."""
-    fn = getattr(model, "ep_local_param_keys", None)
-    return fn() if callable(fn) else set()
-
-
 def split_named_params_for_muon(
     model: Module,
 ) -> tuple[list[tuple[str, Tensor]], list[tuple[str, Tensor]]]:
@@ -69,25 +63,14 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         "adamw" returns a single optimizer; "muon" returns ``[Muon, AdamW]``.
     """
     if config.optimizer == "adamw":
-        ep_local = _ep_local_keys(model)
-        if not ep_local:
-            return [
-                torch.optim.AdamW(
-                    model.named_parameters(),
-                    lr=config.lr,
-                    weight_decay=config.weight_decay,
-                )
-            ]
-        # Expert-parallel: the routed experts are plain (rank-local) tensors while the
-        # rest are FSDP DTensors. A single foreach AdamW would batch them into one
-        # ``_foreach_mul_`` and crash ("mixed torch.Tensor and DTensor"), so split into
-        # two same-type AdamW optimizers (each group is uniform -> foreach stays fast).
-        # The trainer already drives a list of optimizers + one scheduler each.
-        fsdp = [(n, p) for n, p in model.named_parameters() if p.requires_grad and n not in ep_local]
-        experts = [(n, p) for n, p in model.named_parameters() if p.requires_grad and n in ep_local]
+        # Under EP the routed experts are Shard(0) DTensors on the same mesh as the
+        # FSDP-sharded rest, so a single AdamW over all (uniform DTensor) params is fine.
         return [
-            torch.optim.AdamW(fsdp, lr=config.lr, weight_decay=config.weight_decay),
-            torch.optim.AdamW(experts, lr=config.lr, weight_decay=config.weight_decay),
+            torch.optim.AdamW(
+                model.named_parameters(),
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+            )
         ]
 
     if config.optimizer == "muon":

@@ -11,6 +11,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     set_model_state_dict,
 )
+from torch.distributed.device_mesh import init_device_mesh
 from torch.utils.data import DataLoader
 from tqdm import TqdmExperimentalWarning
 from tqdm.rich import tqdm
@@ -30,6 +31,7 @@ from speculators.train.distributed import (
     get_local_rank,
     get_rank,
     is_distributed,
+    shard_experts_as_dtensor,
 )
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
@@ -254,11 +256,6 @@ class Trainer:
         # Verify model is compatible with training infrastructure
         SpeculatorModel.verify_training_compatible(self.model)
 
-        # EP grad-clip groups (populated post-FSDP below): routed experts are plain
-        # local tensors, everything else is an FSDP DTensor -> clipped separately.
-        self._ep_expert_params: list = []
-        self._ep_fsdp_params: list = []
-
         self.model.to(self.config.hidden_states_dtype)  # type: ignore[arg-type]
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
@@ -276,25 +273,29 @@ class Trainer:
         full_state_dict = {}
         if not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
-            # EP: routed experts are rank-local (each rank owns a disjoint, per-rank-
-            # initialized slice) -> drop them so rank0's slice is NOT broadcast over the
-            # others'. Non-expert params still broadcast (keeps them consistent).
+            # EP: routed experts are rank-local Shard(0) slices (each rank owns a disjoint,
+            # per-rank-initialized set) -> drop them from the rank0 broadcast, since rank0
+            # doesn't hold the global expert set. Non-expert params still broadcast.
             ep_local = getattr(self.model, "ep_local_param_keys", None)
             if callable(ep_local):
                 for k in ep_local():
                     full_state_dict.pop(k, None)
 
-        # EP: the routed experts are FSDP-ignored, so fully_shard won't relocate them to
-        # the device (it only moves the params it shards). Move the whole model -- which
-        # under EP is already just this rank's 1/EP slice -- to the device up front, so no
-        # param is left on CPU (else state-dict load hits "Multiple devices found").
+        # EP: build the expert-parallel DeviceMesh, move the model to the device, and wrap
+        # each GroupedExperts' stacked weights as Shard(0) DTensors on that mesh BEFORE FSDP.
+        # Experts and the FSDP-sharded rest are then uniform DTensors on ONE mesh -> the
+        # optimizer / clip / DCP checkpoint need no plain-vs-DTensor special casing.
         ep_active = callable(getattr(self.model, "ep_local_param_keys", None)) and bool(
             self.model.ep_local_param_keys()
         )
+        mesh = None
         if ep_active:
             self.model.to(self.local_rank)  # type: ignore[arg-type]
+            dev = next(self.model.parameters()).device.type
+            mesh = init_device_mesh(dev, (dist.get_world_size(),))
+            shard_experts_as_dtensor(self.model, mesh)
 
-        apply_fully_sharded(self.model)
+        apply_fully_sharded(self.model, mesh=mesh)
 
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)
@@ -311,14 +312,6 @@ class Trainer:
             )
             del full_state_dict
             dist.barrier()
-
-        # EP: cache the plain (rank-local expert) vs FSDP-DTensor param split for the
-        # separate-group grad clipping in the training step (see clip_grad_norm_ above).
-        ep_local = getattr(self.model, "ep_local_param_keys", None)
-        if callable(ep_local) and ep_local():
-            local = ep_local()
-            self._ep_expert_params = [p for n, p in self.model.named_parameters() if n in local]
-            self._ep_fsdp_params = [p for n, p in self.model.named_parameters() if n not in local]
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
@@ -457,15 +450,9 @@ class Trainer:
             # pre-clip total grad norm (FSDP2-global reduce) -- watch it climb toward
             # the lr peak (lr-driven blow-up) vs spike on one batch (dirty data); a
             # non-finite value pinpoints the step where NaN enters via the gradients.
-            # Under EP the routed experts are plain (rank-local) tensors while the rest
-            # are FSDP DTensors; a single clip_grad_norm_ would torch.stack DTensor and
-            # plain norms together and crash, so clip the two groups separately (reported
-            # grad_norm is the DTensor group's mesh-reduced norm, the consistent signal).
-            if self._ep_expert_params:
-                grad_norm = torch.nn.utils.clip_grad_norm_(self._ep_fsdp_params, 1.0)
-                torch.nn.utils.clip_grad_norm_(self._ep_expert_params, 1.0)
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            # (Under EP the routed experts are Shard(0) DTensors on the same mesh as the
+            # FSDP-sharded rest, so a single clip over all params is uniform -- no split.)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             timer.mark("bwd")
             self._optimizers_step()
@@ -561,17 +548,6 @@ class Trainer:
         return val_metrics
 
     def maybe_save_checkpoint(self, epoch: int | str, local_step: int = 0):
-        # EP: routed experts are rank-local plain tensors under disjoint local names; a
-        # naive state_dict save mixes them with FSDP DTensors AND collides names across
-        # ranks. Skip ALL saves (mid-epoch / interrupted / epoch-end) until the EP-aware
-        # expert-gather (local slice -> global 256, per rank) is wired -- otherwise a save
-        # (incl. the graceful-shutdown "interrupted" one) would crash or emit a broken ckpt.
-        if self._ep_expert_params:
-            root_logger.warning(
-                "EP: checkpoint save skipped (epoch=%s) — EP-aware expert-gather not wired yet.",
-                epoch,
-            )
-            return
         if epoch != "interrupted" and (
             self.config.save_best
             or (

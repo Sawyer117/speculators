@@ -38,12 +38,11 @@ if [ "$MODE" = "faithful" ]; then
   NPROC="${NPROC:-8}"; LAYERS=3; EXPERTS=256
   PORTS="HCCL_NPU_SOCKET_PORT_RANGE=61000-62000 HCCL_HOST_SOCKET_PORT_RANGE=60000-61000"
   if [ "$EP" = "1" ]; then
-    # EP: routed experts partitioned (256/NPROC WHOLE experts per card) -> grouped-GEMM
-    # runs on the local experts. NO --init-on-meta (each rank builds only its 1/EP slice;
-    # EP is incompatible with meta-build+broadcast). EP checkpoint-gather isn't wired yet,
-    # so disable mid-epoch checkpoints (freq>=1 => step_interval=None => epoch-boundary
-    # only, which a mid-epoch-killed perf gate never reaches). NOTE: kill before epoch 0
-    # completes; a real EP checkpoint needs the expert-gather (follow-up).
+    # EP: routed experts are Shard(0) DTensors (256/NPROC per card); grouped-GEMM runs on
+    # the local slice. NO --init-on-meta (each rank builds only its 1/EP slice per-rank).
+    # Checkpoints now work under EP (DCP gathers the Shard(0) expert DTensors), but default
+    # to OFF (freq>=1 => no mid-epoch save) for the first perf/validation run; set
+    # CKPT_FREQ=0.1 to enable real checkpointing once a run is confirmed healthy.
     EXTRA="--checkpoint-freq ${CKPT_FREQ:-1}"
   else
     EXTRA="--init-on-meta --checkpoint-freq ${CKPT_FREQ:-0.1}"

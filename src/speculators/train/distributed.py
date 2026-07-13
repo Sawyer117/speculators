@@ -234,18 +234,38 @@ def build_on_meta():
         nn.Module.register_parameter = orig
 
 
-def apply_fully_sharded(model: torch.nn.Module):
+def shard_experts_as_dtensor(model: torch.nn.Module, mesh) -> None:
+    """Convert each GroupedExperts' stacked weights to ``Shard(0)`` DTensors on ``mesh``.
+
+    Under EP each rank already holds only its local ``[n_local, ...]`` slice; wrap it as
+    ``DTensor.from_local(..., [Shard(0)])`` so the global param is ``[E, ...]`` sharded on
+    the expert dim. The experts are then uniform DTensors (like the FSDP-sharded rest, on
+    the SAME mesh) -> the optimizer / clip / DCP checkpoint need no plain-vs-DTensor special
+    casing. FSDP is told to ignore them (see fsdp_ignored_params); the MoE reads ``.to_local()``
+    and moves tokens with all-to-all instead of an FSDP all-gather.
+    """
+    from torch.distributed.tensor import DTensor, Shard  # noqa: PLC0415
+
+    for module in model.modules():
+        if type(module).__name__ != "GroupedExperts":
+            continue
+        for name in ("w1", "w2", "w3"):
+            p = getattr(module, name)
+            if isinstance(p.data, DTensor):
+                continue
+            dt = DTensor.from_local(p.data, mesh, [Shard(0)], run_check=False)
+            setattr(module, name, torch.nn.Parameter(dt, requires_grad=p.requires_grad))
+
+
+def apply_fully_sharded(model: torch.nn.Module, mesh=None):
     """Applies torch FSDP fully_shard to the model, wrapping layers in FSDPModule.
 
-    By default shards one FSDP unit per decoder layer (``model.layers``), so the
-    transient all-gather during a layer's fwd/bwd is that whole layer. A model may
-    instead expose ``fsdp_wrap_plan() -> list[nn.Module]`` to declare a finer
-    granularity (children before parents): e.g. a 256-expert MoE backbone shards
-    each expert on its own, shrinking the per-step all-gather from the whole
-    ~6.5B-param layer (~13GB) to a single ~25M-param expert (~50MB), which is what
-    makes the faithful DSV4 draft fit on one node. Nested ``fully_shard`` calls
-    compose: sharding the leaves first, then the containing block, leaves each
-    block group managing only its own (unwrapped) params.
+    A model may expose ``fsdp_wrap_plan() -> list[nn.Module]`` to declare the FSDP unit
+    granularity (children before parents), and ``fsdp_ignored_params()`` to keep some
+    params OUT of FSDP entirely (expert-parallel routed experts: rank-local Shard(0)
+    DTensors moved by the MoE all-to-all, not FSDP all-gather). ``mesh`` (when given) is
+    the DeviceMesh every fully_shard uses -- pass the SAME mesh the experts were sharded on
+    (:func:`shard_experts_as_dtensor`) so expert and non-expert DTensors live on one mesh.
 
     Model should be validated with SpeculatorModel.verify_training_compatible()
     before calling this function.
@@ -258,16 +278,16 @@ def apply_fully_sharded(model: torch.nn.Module):
     plan = getattr(model, "fsdp_wrap_plan", None)
     modules = plan() if callable(plan) else list(model.layers)  # type: ignore[union-attr]
 
-    # A model may expose fsdp_ignored_params() to keep some params OUT of FSDP entirely
-    # (e.g. expert-parallel routed experts: rank-local whole weights, sharded via the
-    # MoE all-to-all instead of FSDP). Passed to every fully_shard so no ancestor group
-    # (block / root) reshards them. Requires torch FSDP2 with ignored_params (>=2.5).
     ig = getattr(model, "fsdp_ignored_params", None)
     ignored_params = (ig() if callable(ig) else None) or None
-    extra = {"ignored_params": ignored_params} if ignored_params else {}
+    extra = {"mp_policy": mp_policy}
+    if ignored_params:
+        extra["ignored_params"] = ignored_params  # torch FSDP2 >=2.5
+    if mesh is not None:
+        extra["mesh"] = mesh
 
     for module in modules:
-        fully_shard(module, mp_policy=mp_policy, **extra)
+        fully_shard(module, **extra)
 
     fully_shard(model, **extra)
 
