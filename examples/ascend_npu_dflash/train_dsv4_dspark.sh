@@ -30,6 +30,9 @@ RUN="${RUN:-/home/a00652497/dspark_austin/run}"
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"
 LR="${LR:-2e-4}"
 MAX_ANCHORS="${MAX_ANCHORS:-64}"
+SEQLEN="${SEQLEN:-8192}"                # --total-seq-len. Shorter (e.g. 3072) cuts draft-forward
+                                       # activation memory (room for more anchors) + shortens the
+                                       # HS prefill; anchor utilization = MAX_ANCHORS/SEQLEN.
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
 EP="${DSPARK_EP:-0}"
 
@@ -90,6 +93,7 @@ SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
 echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED"
+echo " seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS  (anchor utilization = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
 echo " data=$DATA"
 echo " 📋 log -> $LOG   (rank0 mirror also in $RUN/train_*.log)"
@@ -103,6 +107,7 @@ nohup env \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
     --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
     --block-size 5 --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
+    --total-seq-len "$SEQLEN" \
     --draft-attn-impl sdpa --loss-fn '{"ce":0.1,"tv":0.9}' \
     --optimizer adamw --lr "$LR" $EXTRA \
     --on-missing generate --on-generate delete \
