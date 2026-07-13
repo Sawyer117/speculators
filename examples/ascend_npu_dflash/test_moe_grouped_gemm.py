@@ -4,10 +4,17 @@
 Validates that `moe_dispatch_grouped` reproduces `_moe_dispatch_torch` (same experts, same
 routing) in BOTH forward and backward. Run in the austin env (speculators editable installed):
     python examples/ascend_npu_dflash/test_moe_grouped_gemm.py
-On NPU the same call routes through torch_npu.npu_grouped_matmul; here it uses the pure-torch
-grouped fallback, so this pins the routing / permute / swiglu / accumulate math.
+CPU (default) uses the pure-torch grouped fallback -> pins the routing / permute / swiglu /
+accumulate math. `DEVICE=npu python ...` routes through torch_npu.npu_grouped_matmul (fwd) and
+the self-written backward -> validates the REAL op + backward before hooking into training.
 """
+import os
+
 import torch
+
+_DEV = os.environ.get("DEVICE", "cpu")
+if _DEV == "npu":
+    import torch_npu  # noqa: F401
 
 from speculators.models.dsv4_dspark.backbone.moe import Expert, _moe_dispatch_torch
 from speculators.models.dsv4_dspark.backbone.moe_grouped_gemm import moe_dispatch_grouped
@@ -15,11 +22,11 @@ from speculators.models.dsv4_dspark.backbone.moe_grouped_gemm import moe_dispatc
 
 def _build(seed=0, T=17, dim=16, inter=32, E=8, topk=3, limit=10.0):
     torch.manual_seed(seed)
-    experts = torch.nn.ModuleList([Expert(dim, inter, limit) for _ in range(E)])
-    x = torch.randn(T, dim, dtype=torch.float32)
+    experts = torch.nn.ModuleList([Expert(dim, inter, limit) for _ in range(E)]).to(_DEV)
+    x = torch.randn(T, dim, dtype=torch.float32, device=_DEV)
     # synthetic routing: topk distinct experts per token + normalized positive weights
-    indices = torch.stack([torch.randperm(E)[:topk] for _ in range(T)])
-    w = torch.rand(T, topk, dtype=torch.float32) + 0.1
+    indices = torch.stack([torch.randperm(E)[:topk] for _ in range(T)]).to(_DEV)
+    w = torch.rand(T, topk, dtype=torch.float32, device=_DEV) + 0.1
     weights = w / w.sum(-1, keepdim=True)
     return experts, x, weights, indices, E
 
@@ -37,6 +44,7 @@ def _run(fn, experts, x, weights, indices, E):
 
 
 def main():
+    print(f">>> device={_DEV}  ({'real npu_grouped_matmul + backward' if _DEV == 'npu' else 'torch grouped fallback'})")
     experts, x, weights, indices, E = _build()
     y_e, gx_e, gw_e = _run(_moe_dispatch_torch, experts, x, weights, indices, E)
     y_g, gx_g, gw_g = _run(moe_dispatch_grouped, experts, x, weights, indices, E)
