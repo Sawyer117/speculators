@@ -561,6 +561,17 @@ class Trainer:
         return val_metrics
 
     def maybe_save_checkpoint(self, epoch: int | str, local_step: int = 0):
+        # EP: routed experts are rank-local plain tensors under disjoint local names; a
+        # naive state_dict save mixes them with FSDP DTensors AND collides names across
+        # ranks. Skip ALL saves (mid-epoch / interrupted / epoch-end) until the EP-aware
+        # expert-gather (local slice -> global 256, per rank) is wired -- otherwise a save
+        # (incl. the graceful-shutdown "interrupted" one) would crash or emit a broken ckpt.
+        if self._ep_expert_params:
+            root_logger.warning(
+                "EP: checkpoint save skipped (epoch=%s) — EP-aware expert-gather not wired yet.",
+                epoch,
+            )
+            return
         if epoch != "interrupted" and (
             self.config.save_best
             or (
