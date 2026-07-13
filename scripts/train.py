@@ -447,6 +447,19 @@ def main(args: argparse.Namespace):  # noqa: C901
     # Setup distributed training
     maybe_setup_distributed()
 
+    # Opt-in fused grouped-GEMM MoE (DSV4-DSpark, NPU): replaces the 256-way eager
+    # expert loop with grouped matmuls -> kills the per-shape MoE recompile spikes.
+    # Off by default; set DSPARK_GROUPED_MOE=1 to enable. Needs experts LOCAL
+    # (single-card / replicated / EP), NOT per-expert-FSDP -- see moe_grouped_gemm.py.
+    import os  # noqa: PLC0415
+
+    if os.environ.get("DSPARK_GROUPED_MOE") and args.speculator_type == "dsv4_dspark":
+        from speculators.models.dsv4_dspark.backbone import moe_grouped_gemm  # noqa: PLC0415
+
+        moe_grouped_gemm.enable()
+        if get_rank() == 0:
+            print(">>> [DSPARK_GROUPED_MOE] fused grouped-GEMM MoE dispatch ENABLED", flush=True)
+
     if get_rank() == 0:
         save_train_command(args.save_path)
 
