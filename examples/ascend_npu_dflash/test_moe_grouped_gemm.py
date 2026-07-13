@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Parity test: fused grouped-GEMM MoE dispatch vs the eager per-expert loop (CPU).
 
-Validates that `moe_dispatch_grouped` reproduces `_moe_dispatch_torch` (same experts, same
-routing) in BOTH forward and backward. Run in the austin env (speculators editable installed):
+Validates that `moe_dispatch_grouped` reproduces `_moe_dispatch_torch` (same GroupedExperts,
+same routing) in BOTH forward and backward. Run in the austin env (speculators editable):
     python examples/ascend_npu_dflash/test_moe_grouped_gemm.py
 CPU (default) uses the pure-torch grouped fallback -> pins the routing / permute / swiglu /
 accumulate math. `DEVICE=npu python ...` routes through torch_npu.npu_grouped_matmul (fwd) and
@@ -16,13 +16,13 @@ _DEV = os.environ.get("DEVICE", "cpu")
 if _DEV == "npu":
     import torch_npu  # noqa: F401
 
-from speculators.models.dsv4_dspark.backbone.moe import Expert, _moe_dispatch_torch
+from speculators.models.dsv4_dspark.backbone.moe import GroupedExperts, _moe_dispatch_torch
 from speculators.models.dsv4_dspark.backbone.moe_grouped_gemm import moe_dispatch_grouped
 
 
 def _build(seed=0, T=17, dim=16, inter=32, E=8, topk=3, limit=10.0):
     torch.manual_seed(seed)
-    experts = torch.nn.ModuleList([Expert(dim, inter, limit) for _ in range(E)]).to(_DEV)
+    experts = GroupedExperts(dim, inter, E, limit).to(_DEV)  # stacked routed-expert weights
     x = torch.randn(T, dim, dtype=torch.float32, device=_DEV)
     # synthetic routing: topk distinct experts per token + normalized positive weights
     indices = torch.stack([torch.randperm(E)[:topk] for _ in range(T)]).to(_DEV)
@@ -37,9 +37,7 @@ def _run(fn, experts, x, weights, indices, E):
     xg = x.clone().requires_grad_(True)
     y = fn(xg, weights, indices, experts, E)
     y.sum().backward()
-    wgrads = [e.w1.weight.grad.clone() for e in experts] + \
-             [e.w2.weight.grad.clone() for e in experts] + \
-             [e.w3.weight.grad.clone() for e in experts]
+    wgrads = [experts.w1.grad.clone(), experts.w2.grad.clone(), experts.w3.grad.clone()]
     return y.detach(), xg.grad.detach(), wgrads
 
 

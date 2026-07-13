@@ -19,10 +19,9 @@ gather-before-group. The MATH here is layout-independent and is what the unit te
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
-from torch import nn
 
 from .kernels import register_kernel
+from .moe import GroupedExperts, swiglu_grouped
 
 _MOE_OP = "moe_dispatch"
 
@@ -82,16 +81,15 @@ def _grouped_matmul(x, weight, counts):
 
 
 def moe_dispatch_grouped(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,
-                         experts: nn.ModuleList, n_routed_experts: int) -> torch.Tensor:
-    """Grouped-GEMM equivalent of moe._moe_dispatch_torch. Returns y[T, dim] (fp32)."""
+                         experts: GroupedExperts, n_routed_experts: int) -> torch.Tensor:
+    """Grouped-GEMM equivalent of moe._moe_dispatch_torch. Returns y[T, dim] (fp32).
+
+    ``experts`` holds stacked weights (``w1/w3 [E, inter, dim]``, ``w2 [E, dim, inter]``);
+    no per-forward restacking. Reads ``.to_local()`` when they are Shard(0) DTensors.
+    """
     T, dim = x.shape
     device = x.device
-    swiglu_limit = experts[0].swiglu_limit
-
-    # stack expert weights (nn.Linear weight is [out, in]); want [E, in, out] for x @ W
-    W1 = torch.stack([e.w1.weight for e in experts]).transpose(1, 2)  # gate [E, dim, inter]
-    W3 = torch.stack([e.w3.weight for e in experts]).transpose(1, 2)  # up   [E, dim, inter]
-    W2 = torch.stack([e.w2.weight for e in experts]).transpose(1, 2)  # down [E, inter, dim]
+    w1, w3, w2 = experts.local_weights()
 
     # flatten routing: each token -> topk (token, expert, weight); sort by expert
     topk = indices.shape[1]
@@ -103,14 +101,8 @@ def moe_dispatch_grouped(x: torch.Tensor, weights: torch.Tensor, indices: torch.
     counts = torch.bincount(exp_ids, minlength=n_routed_experts)           # [E]
 
     xg = x[tok_ids].float()                                                # [T*topk, dim]
-    gate = _grouped_matmul(xg, W1.float(), counts)                         # [T*topk, inter]
-    up = _grouped_matmul(xg, W3.float(), counts)
-    if swiglu_limit > 0:
-        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
-        gate = torch.clamp(gate, max=swiglu_limit)
-    h = F.silu(gate) * up
-    h = w_flat[:, None] * h                                                # router weight (pre-down, matches Expert)
-    out = _grouped_matmul(h, W2.float(), counts)                          # [T*topk, dim]
+    out = swiglu_grouped(xg, w1.float(), w3.float(), w2.float(), counts, w_flat,
+                         experts.swiglu_limit, _grouped_matmul)            # [T*topk, dim]
 
     y = torch.zeros(T, dim, dtype=torch.float32, device=device)
     y.index_add_(0, tok_ids, out)                                         # sum a token's topk contributions

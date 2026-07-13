@@ -28,12 +28,22 @@ if _DEV == "npu":
     import torch_npu  # noqa: F401
 
 from speculators.models.dsv4_dspark.backbone import moe_ep
-from speculators.models.dsv4_dspark.backbone.moe import Expert, _moe_dispatch_torch
+from speculators.models.dsv4_dspark.backbone.moe import GroupedExperts, _moe_dispatch_torch
 
 
 def _build_experts(seed, E, dim, inter, limit):
     torch.manual_seed(seed)  # SAME seed on every rank -> identical full expert set
-    return torch.nn.ModuleList([Expert(dim, inter, limit) for _ in range(E)]).to(_DEV)
+    return GroupedExperts(dim, inter, E, limit).to(_DEV)
+
+
+def _slice_experts(full, rank, L, dim, inter, limit):
+    """A GroupedExperts holding full's [rank*L:(rank+1)*L] slice (this rank's EP shard)."""
+    local = GroupedExperts(dim, inter, L, limit).to(_DEV)
+    with torch.no_grad():
+        local.w1.copy_(full.w1[rank * L:(rank + 1) * L])
+        local.w3.copy_(full.w3[rank * L:(rank + 1) * L])
+        local.w2.copy_(full.w2[rank * L:(rank + 1) * L])
+    return local
 
 
 def _batch(seed, T, dim, E, topk):
@@ -57,7 +67,7 @@ def _degenerate():
         xg = x.clone().requires_grad_(True)
         y = fn(xg, weights, indices, exps, E)
         y.sum().backward()
-        gw = [e.w1.weight.grad.clone() for e in exps] + [e.w2.weight.grad.clone() for e in exps]
+        gw = [exps.w1.grad.clone(), exps.w2.grad.clone(), exps.w3.grad.clone()]
         return y.detach(), xg.grad.detach(), gw
 
     y_e, gx_e, gw_e = run(_moe_dispatch_torch, experts)
@@ -84,7 +94,7 @@ def _distributed():
     assert E % world == 0, f"E={E} not divisible by world={world}"
     L = E // world
     full = _build_experts(0, E, dim, inter, limit)              # identical on all ranks
-    local = torch.nn.ModuleList([full[rank * L + i] for i in range(L)])  # this rank's slice
+    local = _slice_experts(full, rank, L, dim, inter, limit)    # this rank's EP shard
     x, weights, indices = _batch(100 + rank, 17, dim, E, topk)  # per-rank distinct batch
 
     moe_ep.configure(group=dist.group.WORLD, rank=rank, size=world, experts_per_rank=L)

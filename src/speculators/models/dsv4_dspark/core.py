@@ -253,26 +253,21 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
     def fsdp_wrap_plan(self) -> list[nn.Module]:
         """Fine-grained FSDP2 units for :func:`apply_fully_sharded` (children first).
 
-        The whole-layer default all-gathers a full ~6.5B-param faithful layer
-        (~13GB) per fwd/bwd -- OOMs one A2 node. Instead we shard each MoE expert
-        on its own: the torch MoE loops ``experts[e](...)`` per module, so FSDP2
-        gathers/reshards one ~25M-param expert (~50MB) at a time. ``attn`` (MLA)
-        gets its own group too; ``block`` then manages only the small remainder
-        (norms, hyper-connections, router). The root ``fully_shard(model)`` (added
-        by the caller) covers embed/head/heads.
+        ``ffn.experts`` (a :class:`GroupedExperts` with stacked ``[E, ...]`` weights) is
+        one FSDP unit; ``attn`` (MLA) gets its own group; ``block`` then manages only the
+        small remainder (norms, hyper-connections, router). The root ``fully_shard(model)``
+        (added by the caller) covers embed/head/heads.
 
-        Note: this composes with the eager per-expert loop. When the fused
-        grouped-GEMM NPU kernel (op ``moe_dispatch``) lands (backbone #5) it wants
-        all expert weights stacked at once, which is incompatible with per-expert
-        sharding -- revisit the granularity then (e.g. shard the stacked tensor).
+        Under EP the routed experts are NOT FSDP-wrapped (see fsdp_ignored_params): they
+        are rank-local Shard(0) slices, dispatched via all-to-all, not FSDP all-gather.
+        The non-EP path shards the stacked experts over the DP mesh (fine for the small
+        reduced config; the 256-expert faithful run uses EP, not non-EP per-layer FSDP).
         """
         ep = self._ep_active()
         plan: list[nn.Module] = []
         for block in self.layers:
             if not ep:
-                plan.extend(block.ffn.experts)  # per-expert FSDP: 256 units, ~50MB each
-            # Under EP the routed experts are rank-local whole modules -> NOT FSDP-wrapped
-            # (see fsdp_ignored_params); tokens are all-to-all'd to their owner instead.
+                plan.append(block.ffn.experts)  # GroupedExperts: one FSDP unit
             plan.append(block.ffn.shared_experts)
             plan.append(block.attn)
             plan.append(block)  # remainder: norms, attn_hc/ffn_hc, router
@@ -284,15 +279,14 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         return moe_ep._EP is not None and moe_ep._EP.size > 1
 
     def fsdp_ignored_params(self) -> set:
-        """Params FSDP must leave alone. Under EP the routed experts are rank-local whole
-        weights (each rank owns a disjoint slice) -> exclude from sharding entirely so
-        grouped-GEMM sees full local weights and grads stay local (no cross-rank sync)."""
+        """Params FSDP must leave alone. Under EP the routed experts are rank-local Shard(0)
+        slices (each rank owns a disjoint set) -> exclude from FSDP sharding so grouped-GEMM
+        sees the local slice and tokens are moved by all-to-all instead of all-gather."""
         if not self._ep_active():
             return set()
         params: set = set()
         for block in self.layers:
-            for expert in block.ffn.experts:
-                params.update(expert.parameters())
+            params.update(block.ffn.experts.parameters())  # stacked w1/w2/w3
         return params
 
     def ep_local_param_keys(self) -> set:

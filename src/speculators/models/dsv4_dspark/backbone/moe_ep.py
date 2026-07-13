@@ -30,10 +30,9 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
-from torch import nn
 
 from .kernels import register_kernel
+from .moe import GroupedExperts, swiglu_grouped
 from .moe_grouped_gemm import _grouped_matmul
 
 _MOE_OP = "moe_dispatch"
@@ -54,11 +53,6 @@ def configure(group, rank: int, size: int, experts_per_rank: int) -> None:
     """Install the process-wide EP context (call once at NPU/EP training startup)."""
     global _EP
     _EP = _EPCtx(group=group, rank=rank, size=size, experts_per_rank=experts_per_rank)
-
-
-def _full(p: torch.Tensor) -> torch.Tensor:
-    """Materialize a possibly-DTensor param to a plain local tensor (size-1 mesh -> whole)."""
-    return p.to_local() if hasattr(p, "to_local") else p
 
 
 class _AllToAll(torch.autograd.Function):
@@ -90,34 +84,23 @@ def _a2a_ints(x: torch.Tensor, out_splits, in_splits, group) -> torch.Tensor:
 
 
 def _local_grouped_ffn(x: torch.Tensor, local_eid: torch.Tensor, w: torch.Tensor,
-                       experts: nn.ModuleList, n_local: int) -> torch.Tensor:
+                       experts: GroupedExperts, n_local: int) -> torch.Tensor:
     """Grouped-GEMM SwiGLU over the LOCAL experts, per-unit output (no token combine).
 
     ``x[N, dim]`` units each tagged with ``local_eid[N]`` (0..n_local-1) and router weight
-    ``w[N]``. Sorts by local expert, runs 3 grouped GEMMs (gate/up/down), returns outputs
-    re-ordered back to the input order. Same math as ``moe_grouped_gemm.moe_dispatch_grouped``
-    minus the flatten/scatter (which EP does around the all-to-all).
+    ``w[N]``. Sorts by local expert, runs the grouped SwiGLU, returns outputs re-ordered
+    back to the input order. Same math as ``moe_grouped_gemm.moe_dispatch_grouped`` minus
+    the flatten/scatter (which EP does around the all-to-all). ``experts`` holds stacked
+    weights (``.to_local()`` when Shard(0) DTensors).
     """
-    dim = x.shape[1]
-    swiglu_limit = experts[0].swiglu_limit
-    W1 = torch.stack([_full(e.w1.weight) for e in experts]).transpose(1, 2)  # [L, dim, inter]
-    W3 = torch.stack([_full(e.w3.weight) for e in experts]).transpose(1, 2)
-    W2 = torch.stack([_full(e.w2.weight) for e in experts]).transpose(1, 2)  # [L, inter, dim]
-
+    w1, w3, w2 = experts.local_weights()
     order = torch.argsort(local_eid, stable=True)
     inv = torch.argsort(order, stable=True)
     xs, ws = x[order].float(), w[order].float()
     counts = torch.bincount(local_eid, minlength=n_local)
-
-    gate = _grouped_matmul(xs, W1.float(), counts)
-    up = _grouped_matmul(xs, W3.float(), counts)
-    if swiglu_limit > 0:
-        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
-        gate = torch.clamp(gate, max=swiglu_limit)
-    h = F.silu(gate) * up
-    h = ws[:, None] * h                                     # router weight (pre-down, matches Expert)
-    out = _grouped_matmul(h, W2.float(), counts)            # [N, dim]
-    return out[inv]                                         # back to input order
+    out = swiglu_grouped(xs, w1.float(), w3.float(), w2.float(), counts, ws,
+                         experts.swiglu_limit, _grouped_matmul)            # [N, dim]
+    return out[inv]                                                        # back to input order
 
 
 def _flatten_route(x, weights, indices):
@@ -131,7 +114,7 @@ def _flatten_route(x, weights, indices):
 
 
 def moe_dispatch_ep(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,
-                    experts: nn.ModuleList, n_routed_experts: int) -> torch.Tensor:
+                    experts: GroupedExperts, n_routed_experts: int) -> torch.Tensor:
     """EP grouped-GEMM MoE dispatch. ``experts`` is the LOCAL slice; returns y[T, dim] fp32."""
     ep = _EP
     T, dim = x.shape
