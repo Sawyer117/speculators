@@ -80,7 +80,11 @@ if ! curl -sf --noproxy '*' "$ENDPOINT/models" >/dev/null 2>&1; then
 fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
-TAG="${MODE}$([ "$EP" = 1 ] && echo _ep)$([ "$GROUPED" = 1 ] && echo _grouped)"
+# NB: build TAG with if-blocks, NOT `TAG="...$([ ] && echo ...)"` — under set -e a
+# command substitution whose test fails returns nonzero and silently kills the script.
+TAG="$MODE"
+if [ "$EP" = "1" ]; then TAG="${TAG}_ep"; fi
+if [ "$GROUPED" = "1" ]; then TAG="${TAG}_grouped"; fi
 LOG="$RUN/${TAG}_${TS}.log"
 
 echo "==================================================================="
