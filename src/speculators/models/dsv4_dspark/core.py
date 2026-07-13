@@ -190,7 +190,14 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
 
         # Meta build (non-rank0 under --init-on-meta): params carry no data, so
         # skip file loading entirely; real weights arrive via broadcast_from_rank0.
+        # Still freeze here (requires_grad_() works on meta) -- the trainable-param
+        # set must match rank0's or FSDP2's grad reduce_scatter hangs (mirrors #776).
         if self.embed_tokens.weight.is_meta:
+            self.embed_tokens.weight.requires_grad_(False)
+            self.lm_head.weight.requires_grad_(False)
+            self.verifier_lm_head.weight.requires_grad_(False)
+            if hasattr(self, "verifier_norm"):
+                self.verifier_norm.weight.requires_grad_(False)
             return
 
         sc = getattr(getattr(self, "config", None), "speculators_config", None)
