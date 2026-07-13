@@ -284,6 +284,16 @@ class Trainer:
                 for k in ep_local():
                     full_state_dict.pop(k, None)
 
+        # EP: the routed experts are FSDP-ignored, so fully_shard won't relocate them to
+        # the device (it only moves the params it shards). Move the whole model -- which
+        # under EP is already just this rank's 1/EP slice -- to the device up front, so no
+        # param is left on CPU (else state-dict load hits "Multiple devices found").
+        ep_active = callable(getattr(self.model, "ep_local_param_keys", None)) and bool(
+            self.model.ep_local_param_keys()
+        )
+        if ep_active:
+            self.model.to(self.local_rank)  # type: ignore[arg-type]
+
         apply_fully_sharded(self.model)
 
         if load_checkpoint:

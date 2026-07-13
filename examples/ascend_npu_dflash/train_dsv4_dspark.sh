@@ -86,12 +86,16 @@ TAG="$MODE"
 if [ "$EP" = "1" ]; then TAG="${TAG}_ep"; fi
 if [ "$GROUPED" = "1" ]; then TAG="${TAG}_grouped"; fi
 LOG="$RUN/${TAG}_${TS}.log"
+# Fresh per-run save-path so we DON'T auto-resume a stale (possibly non-EP) checkpoint
+# from ./output. Override SAVE_PATH=<dir> to resume a specific run.
+SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
 echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED"
 echo " verifier=$VERIFIER"
 echo " data=$DATA"
 echo " 📋 log -> $LOG   (rank0 mirror also in $RUN/train_*.log)"
+echo " 💾 save -> $SAVE_PATH"
 echo "==================================================================="
 
 nohup env \
@@ -106,7 +110,7 @@ nohup env \
     --on-missing generate --on-generate delete \
     --hidden-states-path "$HS_DIR" --vllm-endpoint "$ENDPOINT" \
     --verifier-name-or-path "$VERIFIER" --data-path "$DATA" \
-    --log-dir "$RUN" \
+    --save-path "$SAVE_PATH" --log-dir "$RUN" \
   > "$LOG" 2>&1 &
 
 echo ">>> started PID $!  |  tail -f $LOG"
