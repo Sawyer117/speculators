@@ -14,7 +14,8 @@
 #
 # OVERRIDES (env, validated defaults baked in):
 #   RUN VERIFIER DATA HS_DIR ENDPOINT LR MAX_ANCHORS NPROC CKPT_FREQ CANN_ENV
-set -euo pipefail
+# NB: no `set -u` — CANN's 900env / conda activate reference unbound vars (matches serve).
+set -eo pipefail
 
 MODE="${1:-reduced}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +27,7 @@ DATA="${DATA:-/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/
 HS_DIR="${HS_DIR:-/share/canada_group_folder/dataset/dsv4_hs_dump}"
 ENDPOINT="${ENDPOINT:-http://80.5.5.115:7000/v1}"
 RUN="${RUN:-/home/a00652497/dspark_austin/run}"
-CANN_ENV="${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
+CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"
 LR="${LR:-2e-4}"
 MAX_ANCHORS="${MAX_ANCHORS:-64}"
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
@@ -66,8 +67,12 @@ if [ "$EP" = "1" ]; then
 fi
 
 # ---- preflight ----
-[ -f "$CANN_ENV" ] && source "$CANN_ENV" || echo "WARN: CANN set_env not at $CANN_ENV"
-mkdir -p "$RUN"
+if [ -f "$CANN_ENV" ]; then
+  set +e; source "$CANN_ENV"; set -e         # env scripts return nonzero benignly
+else
+  echo "WARN: CANN env not found at $CANN_ENV — pass CANN_ENV=/path/to/900env_npu.sh"
+fi
+mkdir -p "$RUN" 2>/dev/null || { echo "!! cannot create RUN=$RUN (different box user?) — override e.g. RUN=\$HOME/dspark_austin/run"; exit 1; }
 rm -f "$HS_DIR"/hs_*.safetensors*                     # stale dumps collide with data row idx
 export no_proxy=127.0.0.1,localhost,80.5.5.115,80.5.5.116 NO_PROXY=127.0.0.1,localhost,80.5.5.115,80.5.5.116
 if ! curl -sf --noproxy '*' "$ENDPOINT/models" >/dev/null 2>&1; then
