@@ -424,7 +424,10 @@ class Trainer:
             timer.mark("fwd")
             self._optimizers_zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            # pre-clip total grad norm (FSDP2-global reduce) -- watch it climb toward
+            # the lr peak (lr-driven blow-up) vs spike on one batch (dirty data); a
+            # non-finite value pinpoints the step where NaN enters via the gradients.
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             timer.mark("bwd")
             self._optimizers_step()
@@ -440,6 +443,8 @@ class Trainer:
             if timer.enabled:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
+                if profile is not None:
+                    profile["grad_norm"] = float(grad_norm)
                 if self.is_distributed:
                     for v in metrics.values():
                         dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
