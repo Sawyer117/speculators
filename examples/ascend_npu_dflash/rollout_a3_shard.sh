@@ -22,7 +22,7 @@
 set -o pipefail
 
 SHARD_ID="${1:?usage: bash rollout_a3_shard.sh <SHARD_ID 0..N-1>}"
-SID=$(printf "%02d" "$SHARD_ID")
+SID=$(printf "%02d" "$((10#$SHARD_ID))")
 
 MODEL="${MODEL:-/home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"   # A3 convention: /home/canada_group_folder (symlink-faked per box)
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"     # CANN 9.0.0

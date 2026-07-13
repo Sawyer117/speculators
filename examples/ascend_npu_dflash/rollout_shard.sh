@@ -25,7 +25,7 @@
 set -o pipefail
 
 SHARD_ID="${1:?usage: bash rollout_shard.sh <SHARD_ID 0..N-1>}"
-SID=$(printf "%02d" "$SHARD_ID")
+SID=$(printf "%02d" "$((10#$SHARD_ID))")
 
 MODEL="${MODEL:-/share/canada_group_folder/ckpt/DeepSeek-V4-Flash-w8a8-mtp}"
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"
