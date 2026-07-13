@@ -1,0 +1,60 @@
+# Shared config for the Ascend-NPU Qwen3-4B DFlash run scripts.
+# Edit values here, or override via the environment. Safe to source.
+#
+# 4B differs from 8B only by: verifier weights (hidden_size 2560, auto-derived),
+# and a TP=1 device split (4B fits one card -> more cards for training).
+# The tokenized dataset is tokenizer-only, so it is the SAME Arrow as 8B
+# (the whole Qwen3 family shares the tokenizer) -> DATA_DIR points at the shared set.
+
+export TARGET_MODEL="${TARGET_MODEL:-/share/canada_group_folder/ckpt/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c}"
+export DATA_DIR="${DATA_DIR:-/share/canada_group_folder/dataset/perfectblend_train_regen.half50.qwen3.seq3072}"
+export OUTPUT_DIR="${OUTPUT_DIR:-./outputs/qwen3-4b-dflash-npu}"
+
+# resolve OUTPUT_DIR to an absolute path so serve & train agree on HS_DIR
+mkdir -p "$OUTPUT_DIR"
+export OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+
+export HS_DIR="${HS_DIR:-$OUTPUT_DIR/hidden_states}"   # 4B hidden states ([tokens,6,2560]); separate from 8B
+export SAVE_DIR="${SAVE_DIR:-$OUTPUT_DIR/checkpoints}"
+
+export PORT="${PORT:-8001}"            # distinct from 8B (8000) in case both ever run
+export SEQ_LEN="${SEQ_LEN:-3072}"
+# vLLM serve knobs. MAX_MODEL_LEN caps the served context to ~SEQ_LEN: leaving it
+# at the model default (~40960) makes vLLM reserve KV cache / capture ACL graphs
+# for huge sequences we never serve (data is tokenized at SEQ_LEN), wasting memory
+# and serve throughput. Must be >= SEQ_LEN. GPU_MEM_UTIL: fraction of NPU HBM for
+# weights+KV (raise toward 0.95 for more KV cache / concurrency if it fits).
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((SEQ_LEN + 256))}"
+export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
+export SERVE_CARDS="${SERVE_CARDS:-0}"           # 4B fits TP=1 on one card
+export TRAIN_CARDS="${TRAIN_CARDS:-1,2,3,4,5,6,7}"   # 7-way FSDP
+export TP="${TP:-1}"
+# vLLM data-parallel replicas for serving (throughput lever for serve-bound runs).
+# DP=2 + SERVE_CARDS=0,1 runs two full Qwen3-4B replicas (one per card) → ~2x
+# hidden-state gen; then give the trainer the rest (TRAIN_CARDS=2,3,4,5,6,7, NPROC=6).
+export VLLM_DP="${VLLM_DP:-1}"
+export NPROC="${NPROC:-7}"
+export MASTER_PORT="${MASTER_PORT:-29534}"
+
+# Training knobs (env-overridable). Defaults match the existing regen-half50 run.
+export EPOCHS="${EPOCHS:-6}"
+# NOTE: --use-off-policy-tokens is EAGLE3-ONLY. DFlash IGNORES it — DFlash's
+# get_trainer_kwargs passes only {loss_fn, gamma} to the model, so this knob has
+# NO effect on DFlash training (set anything). Kept only because train.py accepts
+# the flag. (It only matters for EAGLE3's TTT autoregressive chain.)
+export USE_OFF_POLICY="${USE_OFF_POLICY:-0}"
+# Draft vocab. Default = full (151,936). The trainer RAISES if you pass
+# --draft-vocab-size == full vocab (with a token_freq.pt present), so "full" is requested
+# by OMITTING the flag — the train scripts do that automatically when DRAFT_VOCAB_SIZE ==
+# VERIFIER_VOCAB. So DRAFT_VOCAB_SIZE=151936 → full; =32000 → reduced (needs token_freq.pt).
+export VERIFIER_VOCAB="${VERIFIER_VOCAB:-151936}"   # Qwen3 family full vocab
+export DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-151936}"
+# DFlash loss. Default "ce": that was DFlash's validated/hardcoded default before
+# PR #542, which (per issue #541) was only meant to make the loss configurable but
+# accidentally flipped DFlash's default to kl_div (never validated for DFlash).
+# Override with LOSS_FN=kl_div if desired. choices: ce | kl_div | tv | nla.
+# nla = negative log-acceptance (LK): directly optimizes acceptance overlap alpha
+# (= -log alpha); reduces to CE on point-mass targets. For the CE vs KL vs LK study,
+# run three identical trainings with LOSS_FN=ce / kl_div / nla and compare EVAL
+# acceptance length (NOT training loss — the three have different scales).
+export LOSS_FN="${LOSS_FN:-ce}"
