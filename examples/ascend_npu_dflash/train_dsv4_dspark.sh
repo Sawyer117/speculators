@@ -40,10 +40,9 @@ if [ "$MODE" = "faithful" ]; then
   if [ "$EP" = "1" ]; then
     # EP: routed experts are Shard(0) DTensors (256/NPROC per card); grouped-GEMM runs on
     # the local slice. NO --init-on-meta (each rank builds only its 1/EP slice per-rank).
-    # Checkpoints now work under EP (DCP gathers the Shard(0) expert DTensors), but default
-    # to OFF (freq>=1 => no mid-epoch save) for the first perf/validation run; set
-    # CKPT_FREQ=0.1 to enable real checkpointing once a run is confirmed healthy.
-    EXTRA="--checkpoint-freq ${CKPT_FREQ:-1}"
+    # Checkpoints work under EP (DCP gathers the Shard(0) expert DTensors) -> save every
+    # ~10% of an epoch, same as non-EP faithful (CKPT_FREQ<1 => every round(N*freq) steps).
+    EXTRA="--checkpoint-freq ${CKPT_FREQ:-0.1}"
   else
     EXTRA="--init-on-meta --checkpoint-freq ${CKPT_FREQ:-0.1}"
     if [ "$GROUPED" = "1" ]; then
