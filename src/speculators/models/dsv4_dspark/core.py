@@ -266,13 +266,42 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         all expert weights stacked at once, which is incompatible with per-expert
         sharding -- revisit the granularity then (e.g. shard the stacked tensor).
         """
+        ep = self._ep_active()
         plan: list[nn.Module] = []
         for block in self.layers:
-            plan.extend(block.ffn.experts)  # 256 units, ~50MB gathered each
+            if not ep:
+                plan.extend(block.ffn.experts)  # per-expert FSDP: 256 units, ~50MB each
+            # Under EP the routed experts are rank-local whole modules -> NOT FSDP-wrapped
+            # (see fsdp_ignored_params); tokens are all-to-all'd to their owner instead.
             plan.append(block.ffn.shared_experts)
             plan.append(block.attn)
             plan.append(block)  # remainder: norms, attn_hc/ffn_hc, router
         return plan
+
+    def _ep_active(self) -> bool:
+        """True when expert-parallelism is configured (routed experts are partitioned)."""
+        from .backbone import moe_ep  # noqa: PLC0415
+        return moe_ep._EP is not None and moe_ep._EP.size > 1
+
+    def fsdp_ignored_params(self) -> set:
+        """Params FSDP must leave alone. Under EP the routed experts are rank-local whole
+        weights (each rank owns a disjoint slice) -> exclude from sharding entirely so
+        grouped-GEMM sees full local weights and grads stay local (no cross-rank sync)."""
+        if not self._ep_active():
+            return set()
+        params: set = set()
+        for block in self.layers:
+            for expert in block.ffn.experts:
+                params.update(expert.parameters())
+        return params
+
+    def ep_local_param_keys(self) -> set:
+        """state_dict names of EP rank-local params (routed experts) to drop from the
+        rank0 broadcast -- each rank keeps its own per-rank-initialized slice."""
+        if not self._ep_active():
+            return set()
+        ignored_ids = {id(p) for p in self.fsdp_ignored_params()}
+        return {name for name, p in self.named_parameters() if id(p) in ignored_ids}
 
     def _rope_at(self, positions: torch.Tensor) -> torch.Tensor:
         """freqs_cis at the given absolute positions -> [len, rope_dim//2]."""

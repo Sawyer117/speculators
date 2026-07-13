@@ -254,6 +254,11 @@ class Trainer:
         # Verify model is compatible with training infrastructure
         SpeculatorModel.verify_training_compatible(self.model)
 
+        # EP grad-clip groups (populated post-FSDP below): routed experts are plain
+        # local tensors, everything else is an FSDP DTensor -> clipped separately.
+        self._ep_expert_params: list = []
+        self._ep_fsdp_params: list = []
+
         self.model.to(self.config.hidden_states_dtype)  # type: ignore[arg-type]
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
@@ -271,6 +276,13 @@ class Trainer:
         full_state_dict = {}
         if not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
+            # EP: routed experts are rank-local (each rank owns a disjoint, per-rank-
+            # initialized slice) -> drop them so rank0's slice is NOT broadcast over the
+            # others'. Non-expert params still broadcast (keeps them consistent).
+            ep_local = getattr(self.model, "ep_local_param_keys", None)
+            if callable(ep_local):
+                for k in ep_local():
+                    full_state_dict.pop(k, None)
 
         apply_fully_sharded(self.model)
 
@@ -289,6 +301,14 @@ class Trainer:
             )
             del full_state_dict
             dist.barrier()
+
+        # EP: cache the plain (rank-local expert) vs FSDP-DTensor param split for the
+        # separate-group grad clipping in the training step (see clip_grad_norm_ above).
+        ep_local = getattr(self.model, "ep_local_param_keys", None)
+        if callable(ep_local) and ep_local():
+            local = ep_local()
+            self._ep_expert_params = [p for n, p in self.model.named_parameters() if n in local]
+            self._ep_fsdp_params = [p for n, p in self.model.named_parameters() if n not in local]
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
@@ -427,7 +447,15 @@ class Trainer:
             # pre-clip total grad norm (FSDP2-global reduce) -- watch it climb toward
             # the lr peak (lr-driven blow-up) vs spike on one batch (dirty data); a
             # non-finite value pinpoints the step where NaN enters via the gradients.
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            # Under EP the routed experts are plain (rank-local) tensors while the rest
+            # are FSDP DTensors; a single clip_grad_norm_ would torch.stack DTensor and
+            # plain norms together and crash, so clip the two groups separately (reported
+            # grad_norm is the DTensor group's mesh-reduced norm, the consistent signal).
+            if self._ep_expert_params:
+                grad_norm = torch.nn.utils.clip_grad_norm_(self._ep_fsdp_params, 1.0)
+                torch.nn.utils.clip_grad_norm_(self._ep_expert_params, 1.0)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             timer.mark("bwd")
             self._optimizers_step()

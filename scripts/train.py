@@ -460,6 +460,38 @@ def main(args: argparse.Namespace):  # noqa: C901
         if get_rank() == 0:
             print(">>> [DSPARK_GROUPED_MOE] fused grouped-GEMM MoE dispatch ENABLED", flush=True)
 
+    # Opt-in expert parallelism (DSV4-DSpark, NPU, multi-card): partition the routed
+    # experts across ranks (n_routed_experts // world, WHOLE experts per rank) and
+    # all-to-all tokens to their owner. Each owner runs grouped-GEMM over its LOCAL
+    # experts -> the faithful 256-expert draft gets the grouped-GEMM win that per-expert
+    # FSDP blocks. MUST be configured BEFORE the model is built (MoE.__init__ reads the
+    # EP context to build only its local slice). Supersedes DSPARK_GROUPED_MOE.
+    if os.environ.get("DSPARK_EP") and args.speculator_type == "dsv4_dspark":
+        import torch.distributed as dist  # noqa: PLC0415
+
+        from speculators.models.dsv4_dspark.backbone import moe_ep  # noqa: PLC0415
+
+        if not dist.is_initialized():
+            raise RuntimeError("DSPARK_EP needs distributed training (torchrun --nproc_per_node > 1).")
+        world, ep_rank = dist.get_world_size(), dist.get_rank()
+        n_exp = args.n_routed_experts
+        if n_exp % world != 0:
+            raise ValueError(f"DSPARK_EP: n_routed_experts ({n_exp}) must be divisible by world_size ({world}).")
+        if args.init_on_meta:
+            raise ValueError(
+                "DSPARK_EP is incompatible with --init-on-meta: experts are built "
+                "per-rank (not broadcast), and EP already caps per-rank build to 1/EP "
+                "of the experts. Drop --init-on-meta."
+            )
+        moe_ep.configure(group=dist.group.WORLD, rank=ep_rank, size=world, experts_per_rank=n_exp // world)
+        moe_ep.enable()
+        if ep_rank == 0:
+            print(
+                f">>> [DSPARK_EP] expert-parallel MoE ENABLED: EP={world}, "
+                f"{n_exp // world} experts/rank (all-to-all dispatch + local grouped-GEMM)",
+                flush=True,
+            )
+
     if get_rank() == 0:
         save_train_command(args.save_path)
 

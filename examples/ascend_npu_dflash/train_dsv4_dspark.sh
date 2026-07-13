@@ -30,21 +30,39 @@ CANN_ENV="${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
 LR="${LR:-2e-4}"
 MAX_ANCHORS="${MAX_ANCHORS:-64}"
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
+EP="${DSPARK_EP:-0}"
 
 # ---- per-mode config ----
 if [ "$MODE" = "faithful" ]; then
   NPROC="${NPROC:-8}"; LAYERS=3; EXPERTS=256
-  EXTRA="--init-on-meta --checkpoint-freq ${CKPT_FREQ:-0.1}"
   PORTS="HCCL_NPU_SOCKET_PORT_RANGE=61000-62000 HCCL_HOST_SOCKET_PORT_RANGE=60000-61000"
-  if [ "$GROUPED" = "1" ]; then
-    echo "!! faithful uses per-expert FSDP; grouped-GEMM needs experts LOCAL -> it will get"
-    echo "   sharded weights and be WRONG. Use reduced/single-card for grouped, or add EP first."
-    echo "   Refusing to enable grouped-GEMM on faithful. Unset DSPARK_GROUPED_MOE."; exit 2
+  if [ "$EP" = "1" ]; then
+    # EP: routed experts partitioned (256/NPROC WHOLE experts per card) -> grouped-GEMM
+    # runs on the local experts. NO --init-on-meta (each rank builds only its 1/EP slice;
+    # EP is incompatible with meta-build+broadcast). EP checkpoint-gather isn't wired yet,
+    # so disable mid-epoch checkpoints (freq>=1 => step_interval=None => epoch-boundary
+    # only, which a mid-epoch-killed perf gate never reaches). NOTE: kill before epoch 0
+    # completes; a real EP checkpoint needs the expert-gather (follow-up).
+    EXTRA="--checkpoint-freq ${CKPT_FREQ:-1}"
+  else
+    EXTRA="--init-on-meta --checkpoint-freq ${CKPT_FREQ:-0.1}"
+    if [ "$GROUPED" = "1" ]; then
+      echo "!! faithful uses per-expert FSDP; grouped-GEMM needs experts LOCAL. Turn on EP"
+      echo "   instead:  DSPARK_EP=1 bash $0 faithful  (partitions experts + all-to-all)."
+      echo "   Refusing grouped-GEMM on per-expert-FSDP faithful."; exit 2
+    fi
   fi
 elif [ "$MODE" = "reduced" ]; then
   NPROC="${NPROC:-1}"; LAYERS=1; EXPERTS=32; EXTRA=""; PORTS=""
+  [ "$EP" = "1" ] && PORTS="HCCL_NPU_SOCKET_PORT_RANGE=61000-62000 HCCL_HOST_SOCKET_PORT_RANGE=60000-61000"
 else
   echo "usage: $0 [reduced|faithful]"; exit 1
+fi
+
+# EP preconditions: >=2 cards and experts divisible by cards.
+if [ "$EP" = "1" ]; then
+  [ "$NPROC" -ge 2 ] || { echo "!! DSPARK_EP=1 needs NPROC>=2 (got $NPROC). e.g. DSPARK_EP=1 NPROC=2 bash $0 reduced"; exit 2; }
+  [ $((EXPERTS % NPROC)) -eq 0 ] || { echo "!! EXPERTS=$EXPERTS not divisible by NPROC=$NPROC"; exit 2; }
 fi
 
 # ---- preflight ----
@@ -57,18 +75,18 @@ if ! curl -sf --noproxy '*' "$ENDPOINT/models" >/dev/null 2>&1; then
 fi
 
 TS="$(date +%Y%m%d_%H%M%S)"
-TAG="${MODE}$([ "$GROUPED" = 1 ] && echo _grouped)"
+TAG="${MODE}$([ "$EP" = 1 ] && echo _ep)$([ "$GROUPED" = 1 ] && echo _grouped)"
 LOG="$RUN/${TAG}_${TS}.log"
 
 echo "==================================================================="
-echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  grouped_moe=$GROUPED"
+echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED"
 echo " verifier=$VERIFIER"
 echo " data=$DATA"
 echo " 📋 log -> $LOG   (rank0 mirror also in $RUN/train_*.log)"
 echo "==================================================================="
 
 nohup env \
-  DSPARK_HS_DUMP=1 DSPARK_GROUPED_MOE="$GROUPED" \
+  DSPARK_HS_DUMP=1 DSPARK_GROUPED_MOE="$GROUPED" DSPARK_EP="$EP" \
   HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 $PORTS \
   torchrun --nproc_per_node "$NPROC" "$REPO_ROOT/scripts/train.py" \
     --speculator-type dsv4_dspark --served-model-name dsv4 \

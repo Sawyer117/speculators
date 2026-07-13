@@ -257,9 +257,18 @@ def apply_fully_sharded(model: torch.nn.Module):
 
     plan = getattr(model, "fsdp_wrap_plan", None)
     modules = plan() if callable(plan) else list(model.layers)  # type: ignore[union-attr]
-    for module in modules:
-        fully_shard(module, mp_policy=mp_policy)
 
-    fully_shard(model)
+    # A model may expose fsdp_ignored_params() to keep some params OUT of FSDP entirely
+    # (e.g. expert-parallel routed experts: rank-local whole weights, sharded via the
+    # MoE all-to-all instead of FSDP). Passed to every fully_shard so no ancestor group
+    # (block / root) reshards them. Requires torch FSDP2 with ignored_params (>=2.5).
+    ig = getattr(model, "fsdp_ignored_params", None)
+    ignored_params = (ig() if callable(ig) else None) or None
+    extra = {"ignored_params": ignored_params} if ignored_params else {}
+
+    for module in modules:
+        fully_shard(module, mp_policy=mp_policy, **extra)
+
+    fully_shard(model, **extra)
 
     return model

@@ -115,12 +115,31 @@ class MoE(nn.Module):
     def __init__(self, cfg) -> None:
         super().__init__()
         self.dim = cfg.hidden_size
-        self.n_routed_experts = cfg.n_routed_experts
+        self.n_routed_experts = cfg.n_routed_experts  # GLOBAL count (router + dispatch use it)
         self.router = Router(cfg)
-        self.experts = nn.ModuleList(
-            Expert(cfg.hidden_size, cfg.moe_inter_dim, cfg.swiglu_limit)
-            for _ in range(cfg.n_routed_experts)
-        )
+        # Expert-parallel: when EP is configured, build only THIS rank's slice of whole
+        # experts (n_routed_experts // EP), seeded per-rank so shards don't init
+        # identically; the MoE all-to-all's tokens to each expert's owner rank. Non-EP
+        # builds all n_routed_experts (per-expert FSDP shards them). ``self.experts`` is
+        # always the LOCAL list; ``ep_expert_offset`` maps local idx -> global expert id.
+        from . import moe_ep  # noqa: PLC0415  (function-local: reads the live EP context)
+
+        ep = moe_ep._EP
+        if ep is not None and ep.size > 1:
+            n_local = cfg.n_routed_experts // ep.size
+            self.ep_expert_offset = ep.rank * n_local
+            with torch.random.fork_rng(devices=[]):  # CPU rng only; don't perturb the rest
+                torch.manual_seed(0xE9E9 + ep.rank)   # diverse init per EP shard
+                self.experts = nn.ModuleList(
+                    Expert(cfg.hidden_size, cfg.moe_inter_dim, cfg.swiglu_limit)
+                    for _ in range(n_local)
+                )
+        else:
+            self.ep_expert_offset = 0
+            self.experts = nn.ModuleList(
+                Expert(cfg.hidden_size, cfg.moe_inter_dim, cfg.swiglu_limit)
+                for _ in range(cfg.n_routed_experts)
+            )
         # The released config carries exactly one shared expert; the checkpoint
         # key is ``ffn.shared_experts.{w1,w2,w3}`` (a single expert), so this is
         # a single module, not a list.
