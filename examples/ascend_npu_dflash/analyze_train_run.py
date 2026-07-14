@@ -35,6 +35,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from statistics import median, mean, pstdev
 
 # where train_dsv4_dspark.sh writes logs (RUN=... in that script); override via env.
@@ -75,7 +76,7 @@ def resolve_log(path: str) -> str:
 _PAIR = re.compile(r"([A-Za-z0-9_/]+)=(-?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|nan|inf))")
 
 
-def load(path: str) -> list[dict]:
+def load(path: str) -> tuple[list[dict], str]:
     text = sys.stdin.read() if path == "-" else open(path, errors="ignore").read()
     recs, cur = [], {}
     for k, v in _PAIR.findall(text):
@@ -83,7 +84,21 @@ def load(path: str) -> list[dict]:
         if k == "global_step":  # always the last field of a record → flush
             recs.append(cur)
             cur = {}
-    return recs
+    return recs, text
+
+
+def checkpoint_steps(text: str) -> set[int]:
+    """Steps where a checkpoint SAVE happened (the save cost gets misread as a fetch/step spike).
+
+    The 'Saving checkpoint' log line has no global_step of its own, so attribute it to the last
+    step logged before it; the save shows up on that step or the next one."""
+    steps: set[int] = set()
+    for m in re.finditer(r"Saving checkpoint|Checkpoint saved", text):
+        gs = re.findall(r"global_step=(\d+)", text[: m.start()])
+        if gs:
+            s = int(gs[-1])
+            steps |= {s, s + 1}
+    return steps
 
 
 def isnan(x) -> bool:
@@ -162,7 +177,8 @@ def main() -> None:
     ap.add_argument("--recent", type=int, default=500, help="window (steps) for the recent-dynamics trend")
     args = ap.parse_args()
 
-    recs = load(resolve_log(args.logfile))
+    recs, raw_text = load(resolve_log(args.logfile))
+    ckpt_steps = checkpoint_steps(raw_text)
     if not recs:
         print("!! no metric records parsed — is this a trainer.py rich-logger log?")
         return
@@ -296,17 +312,26 @@ def main() -> None:
             fwd_spk = {s for s, _ in (fwd_r["spikes"] if fwd_r else [])}
             bwd_spk = {s for s, _ in (bwd_r["spikes"] if bwd_r else [])}
             fetch_spk = {s for s, _ in (fetch_r["spikes"] if fetch_r else [])}
-            # attribute each spike: HS-stall (fetch) takes precedence (it's the dominant cost that step)
-            n_fetch = sum(1 for s, _ in spikes if s in fetch_spk)
-            n_fwd = sum(1 for s, _ in spikes if s in fwd_spk and s not in fetch_spk)
-            n_bwd = sum(1 for s, _ in spikes if s in bwd_spk and s not in fetch_spk and s not in fwd_spk)
+            # attribution priority: checkpoint-save (known, periodic) > HS-stall > recompile > bwd.
+            # The save cost gets misread as fetch/step, so identify it FIRST from the log markers.
+            def _cause(s):
+                if s in ckpt_steps:  return "ckpt"
+                if s in fetch_spk:   return "fetch"
+                if s in fwd_spk:     return "fwd"
+                if s in bwd_spk:     return "bwd"
+                return "other"
+            by = Counter(_cause(s) for s, _ in spikes)
+            ov_ckpt = sum(v - smed for s, v in spikes if s in ckpt_steps)
             overhead = sum(v - smed for _, v in spikes)
             total = sum(col(recs, "profile/step_ms"))
             ints = [spikes[i][0] - spikes[i-1][0] for i in range(1, len(spikes))]
             print(f"step_ms spikes : {len(spikes)} steps > {args.spike_k}× steady ({smed:.0f} ms)")
             print(f"  magnitude    : max {max(mags):.0f} ms ({max(mags)/smed:.0f}×) | median spike {median(mags):.0f} ms")
-            print(f"  cause        : {n_fwd} MoE recompile (fwd), {n_fetch} HS-stall (fetch), {n_bwd} bwd"
-                  + ("   ⚠️ HS stalls present — see HS FETCH below" if n_fetch else ""))
+            print(f"  cause        : {by['fwd']} MoE recompile (fwd), {by['ckpt']} checkpoint-save (EP-DCP gather), "
+                  f"{by['fetch']} HS-stall (fetch), {by['bwd']} bwd")
+            if by["ckpt"]:
+                print(f"  ↳ checkpoints: {by['ckpt']} saves cost {ov_ckpt/1000:.0f} s ({100*ov_ckpt/total:.0f}% of wall-clock)"
+                      f"  → raise --checkpoint-freq (save less often) to cut this")
             print(f"  frequency    : every ~{median(ints):.0f} steps (min {min(ints)}, max {max(ints)})" if ints
                   else "  frequency    : (single spike)")
             print(f"  overhead     : {overhead/1000:.1f} s total = {100*overhead/total:.0f}% of wall-clock"
@@ -320,11 +345,17 @@ def main() -> None:
     if ff:
         print("\n-- HS FETCH " + "-" * 66)
         print(f"fetch_frac : median {median(ff):.3f} → {'HS NOT the typical bottleneck ✅' if median(ff) < 0.1 else '⚠️ HS stalling most steps'}")
-        n_stall = sum(1 for x in ff if x > 0.5)
-        if max(ff) > 0.5:
-            print(f"           : ⚠️ but {n_stall} step(s) waited >50% on HS (worst {max(ff):.2f} = {max(fm)/1000:.0f}s fetch)")
-            print(f"             → occasional serve/HS starvation (rolling buffer empty): serve produced HS slower than train")
-            print(f"               consumed it, OR a serve hiccup. These are the giant spikes, NOT recompiles.")
+        hi = [(step_of(r), f(r, "profile/fetch_frac")) for r in recs
+              if f(r, "profile/fetch_frac") is not None and f(r, "profile/fetch_frac") > 0.5]
+        if hi:
+            ckpt_hi = [s for s, _ in hi if s in ckpt_steps]
+            real = [s for s, _ in hi if s not in ckpt_steps]
+            print(f"           : {len(hi)} step(s) with fetch>50% → {len(ckpt_hi)} are CHECKPOINT-SAVE steps "
+                  f"(save cost misread as fetch), {len(real)} are real HS starvation.")
+            if real:
+                print(f"             real HS stalls at steps {real[:6]} — serve produced HS slower than train consumed (rolling buffer empty).")
+            else:
+                print(f"             → so there is NO real HS starvation; the giant 'fetch' spikes are all checkpoint saves.")
         mx = max(fm)
         print(f"fetch_ms   : median {median(fm):.0f} ms | max {(mx/1000):.1f} s" if mx >= 1000 else
               f"fetch_ms   : median {median(fm):.0f} ms | max {mx:.0f} ms")
