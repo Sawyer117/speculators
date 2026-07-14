@@ -195,35 +195,40 @@ bullets(s, [
 footer(s, 7)
 
 # 8 — training results
-s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Training results (in progress — block6 @ 196 anchors, EP8)", "results")
-table(s, ["metric", "@ step ~1.1k", "@ step ~3.9k", "target"],
-      [["loss", "0.46", "0.29", "↓"],
-       ["accept_len", "1.19", "2.5 ↑", "3.94 (released)"],
-       ["position_1_acc", "0.41", "0.70", "—"],
-       ["position_5_acc", "—", "0.28", "—"],
-       ["confidence_loss", "0.28", "0.30", "calibrated"]],
-      colw=[3.0, 3.0, 3.0, 3.1], top=1.55)
+s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Training results — epoch 0 complete (block6 @ 196 anchors, EP8)", "results")
+table(s, ["metric", "start", "end of epoch 0", "target"],
+      [["loss", "2.26", "0.29", "↓"],
+       ["accept_len", "1.0", "2.32 ↑ (max 2.71)", "3.94 (released)"],
+       ["position_1..5 acc", "—", "0.65 / 0.49 / 0.37 / 0.31 / 0.27", "—"],
+       ["confidence pred vs obs", "—", "0.20 vs 0.38", "calibrate"]],
+      colw=[3.3, 1.9, 4.8, 2.1], top=1.55)
 bullets(s, [
-    ("Draft is learning steadily; accept_len climbing toward the 3.94 released-draft bar.", 0, GOOD),
-    ("Memory: 59 GB reserved / 64 (92%) — fits with the block-6, 196-anchor config on 8×A2.", 0),
-    ("Converged per-benchmark numbers pending a full train→eval pass (needs the stacked→per-expert converter).", 0),
-], top=4.3)
+    ("Still learning at epoch end — recent-500 vs prior-500: loss↓, accept_len↑, full_acc↑ (not plateaued).", 0, GOOD),
+    ("accept_len 2.32 after 1 epoch (of 20); climbing toward the released-draft 3.94 — needs more epochs.", 0),
+    ("Memory 59 GB / 64 (92%). Two crash bugs fixed this run: --block-size 6 (off-by-one) and the val", 0),
+    ("dataloader fork-at-epoch-boundary (num_workers=0); training now survives epoch boundaries + resumes.", 1),
+    ("Converged per-benchmark numbers pending train→eval (needs the stacked→per-expert converter).", 0),
+], top=4.15)
 footer(s, 8)
 
 # 9 — timing
-s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Throughput & timing", "performance")
-table(s, ["stage (steady)", "time", "note"],
-      [["forward", "~375 ms", "MoE + sink attention"],
-       ["backward", "~620 ms", "dominates steady state"],
-       ["optimizer", "~100 ms", "single AdamW over DTensors"],
-       ["HS fetch", "~27 ms", "fetch_frac 0.02 — NOT a bottleneck"],
-       ["step", "~1.13 s", "≈ 2.6k tokens/s"]],
-      colw=[3.2, 2.2, 6.7], top=1.55)
+s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Throughput — steady is a lie; spikes eat 75% of wall-clock", "performance")
+table(s, ["", "steady (spikes excluded)", "EFFECTIVE (real, incl spikes)"],
+      [["step time", "~1.17 s", "~4.8 s  (4.1×)"],
+       ["throughput", "~2.6k tok/s", "~630 tok/s"],
+       ["1 epoch (4416 steps)", "(would be ~1.4 h)", "5.8 h"]],
+      colw=[3.4, 4.3, 4.4], top=1.5)
+tf = _tb(s, 0.6, 3.05, 12.1, 0.4)
+p = tf.paragraphs[0]; _run(p, "Spike overhead ≈ 15,700 s / epoch (75% of wall-clock) breaks down as:", 15, INK, bold=True)
+table(s, ["cause", "count × each", "cost", "fix"],
+      [["MoE recompile (new token-count shapes)", "~623 × ~18 s", "~11.2k s (71%)", "fixed-shape MoE padding"],
+       ["checkpoint save (EP-DCP gather)", "~10 × ~300 s", "~3.0k s (19%)", "raise --checkpoint-freq (→1/epoch)"],
+       ["real HS starvation", "~2 × ~300 s", "~0.6k s (4%)", "serve throughput (minor)"]],
+      colw=[5.0, 2.4, 2.4, 3.0], top=3.5, fs=12)
 bullets(s, [
-    ("Recompile spikes remain: forward 15–20 s on new MoE token-count shapes — FWD-only (backward is stable).", 0, WARN),
-    ("In bursts these spikes dominate wall-clock (measured ~80% in one window) — the #1 throughput lever.", 0, WARN),
-    ("Fix: fixed-shape MoE padding (pad per-expert counts to buckets → static grouped-GEMM shapes → no recompile).", 0, GOOD),
-], top=4.35)
+    ("Two levers → ~3× (5.8 h → ~2 h/epoch): fixed-shape MoE padding (recompiles) + save once/epoch (checkpoints).", 0, GOOD),
+    ("Backward (~620 ms) dominates the steady step; HS fetch (~27 ms) is NOT the bottleneck (giant 'fetch' spikes were checkpoints).", 0),
+], top=5.55)
 footer(s, 9)
 
 # 10 — attention op
@@ -255,10 +260,10 @@ footer(s, 11)
 # 12 — roadmap
 s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Remaining work / roadmap", "next")
 bullets(s, [
+    ("Throughput (biggest single win, ~3×): fixed-shape MoE padding (kills recompiles) + save once/epoch (done, one-liner).", 0, ACCENT),
     ("Critical path: stacked→per-expert weight converter (unblocks serve/eval) → full train→eval → fill converged numbers.", 0, ACCENT),
     ("Validation gates (cheap, CPU): structural parity · EP-invariance · overfit-one-batch · config guard.", 0),
-    ("Performance: fixed-shape MoE padding (kill recompile spikes) · argsort AiCore fix · gradient checkpointing (→512 anchors).", 0),
-    ("Kernel: integrate the SWA Triton kernel into the training path (einsum → fused).", 0),
+    ("Perf follow-ups: argsort AiCore fix · gradient checkpointing (→512 anchors) · SWA Triton kernel into training.", 0),
     ("Upstream: carve the DTensor-native EP refactor into a clean GPU-safe PR.", 0),
     ("Deferred: native extract HS path (needs vLLM 0.24 + the DP0/head memory pathology solved).", 0, MUTE),
 ])
