@@ -220,22 +220,29 @@ work, no patches. See §6.
   `core.py` that broke transformers' `custom_object_save` at save time (`a855bfb` → absolute
   import).
 
-**Acceptance-length targets (baseline, NOT yet the converged draft).** The last run was still
-LR-warming (accept_len ≈ 1.19); a converged draft has not yet been trained-to-eval on this EP
-stack. The bar to clear is the **standard num_spec=7 baseline** (mean accepted length per step):
+**Acceptance-length target (baseline, NOT yet the converged draft).** The DSV4 DSpark draft is
+**`block_size = 5` → `num_speculative_tokens = 5`** (not 7 — that's the Qwen3 line; see note
+below). The last training run was still LR-warming (accept_len ≈ 1.19, out of a block-5 ceiling
+of ~6); a converged draft has not yet been trained-to-eval on this EP stack.
 
-| benchmark | num_spec=7 baseline accept_len |
+The bar to match/beat is the **released DeepSeek DSV4-Flash DSpark draft**, measured on NPU in
+**vllm-ascend PR #11196** (QwertyJack) at `num_spec=5`:
+
+| metric | released DSV4-Flash DSpark (PR #11196) |
 |---|---|
-| gsm8k | 6.189 |
-| math500 | 6.095 |
-| humaneval | 5.524 |
-| mbpp | 5.191 |
-| mt-bench | 3.747 |
+| acceptance rate (AR) | **58.79%** |
+| **accept length (AL)** | **3.94** (GPU reference: 3.86) |
+| per-position accept | `[0.81, 0.68, 0.58, 0.48, 0.39]` (AL = 1 + Σ = 3.94) |
 
-(no-spec base throughput reference: gsm8k ≈ 302.69 tok/s.) Fill the converged draft's numbers
-here after a full train→eval pass; **eval /metrics counter resets mid-run** on vllm-ascend
-spec_decode — use the reset-aware poller (`Evaluator.py @ a3c41a6`), or non-first-dataset accept
-lengths read low.
+Fill our trained draft's per-dataset numbers here after a full train→eval pass at `num_spec=5`.
+**eval /metrics counter resets mid-run** on vllm-ascend spec_decode — use the reset-aware poller
+(`Evaluator.py @ a3c41a6`), or non-first-dataset accept lengths read low.
+
+> **⚠ Do NOT conflate models.** The `dspark_qwen3_4b_block7` accept lengths (gsm8k 6.189 /
+> math500 6.095 / humaneval 5.524 / mbpp 5.191 / mt-bench 3.747) are **Qwen3-4B, block7,
+> num_spec=7, full-attention** — a *different* speculator. DSV4 is block5 / num_spec=5 /
+> sliding-window+sink, and its released-draft AL is **3.94**, not ~6. (The two live side by
+> side in our notes; the block/attention/model all differ.)
 
 ## 7. Environment build & run (linked, not duplicated)
 
