@@ -159,13 +159,14 @@ def main() -> None:
                     help=f"log file, or a directory to auto-pick its newest *.log (default: {DEFAULT_RUN_DIR})")
     ap.add_argument("--out", default=None, help="folder for PNG plots (created if missing)")
     ap.add_argument("--spike-k", type=float, default=3.0, help="spike = stage > k*steady-median")
+    ap.add_argument("--recent", type=int, default=500, help="window (steps) for the recent-dynamics trend")
     args = ap.parse_args()
 
     recs = load(resolve_log(args.logfile))
     if not recs:
         print("!! no metric records parsed — is this a trainer.py rich-logger log?")
         return
-    steps = [step_of(r) for r in recs]
+    steps = [s for s in (step_of(r) for r in recs) if s >= 0]  # skip a leading partial record
     print("=" * 78)
     print(f" TRAINING RUN ANALYSIS   {len(recs)} steps   (global_step {min(steps)}..{max(steps)})")
     print("=" * 78)
@@ -222,6 +223,38 @@ def main() -> None:
               f" vs accept_rate {fmt(last_n_med('train/accept_rate'))}"
               f" | cumprod_bias {fmt(last_n_med('train/confidence_cumprod_bias'))}")
 
+    # ---------------- recent dynamics (is it STILL learning?) ----------------
+    N = args.recent
+    def wtrend(key, higher_better):
+        s = [(step_of(r), f(r, key)) for r in good if f(r, key) is not None and step_of(r) >= 0]
+        if len(s) < 40:
+            return None
+        n = N if len(s) >= 2 * N else max(15, len(s) // 3)
+        recent = [v for _, v in s[-n:]]
+        prior = [v for _, v in s[-2 * n:-n]] or [v for _, v in s[:-n]] or recent
+        pr, rc, d = median(prior), median(recent), median([v for _, v in s[-n:]]) - median(prior)
+        noise = 2 * (pstdev(recent) / max(1, len(recent) ** 0.5)) if len(recent) > 1 else 0
+        if higher_better:
+            verdict = "↑ improving" if d > noise else ("↓ WORSENING" if d < -noise else "→ plateaued")
+        else:
+            verdict = "↓ improving" if d < -noise else ("↑ WORSENING" if d > noise else "→ plateaued")
+        return pr, rc, d, verdict, (s[-n][0], s[-1][0]), n
+    print(f"\n-- RECENT DYNAMICS (last ~{N} steps vs the {N} before) " + "-" * 20)
+    verdicts = {}
+    for key, lab, hb in [("train/loss", "loss", False), ("train/accept_len", "accept_len", True),
+                         ("train/full_acc", "full_acc", True)]:
+        t = wtrend(key, hb)
+        if t:
+            pr, rc, d, verdict, span, n = t
+            verdicts[lab] = verdict
+            flag = "⚠️ " if "WORSENING" in verdict else ""
+            print(f"{lab:11}: prior {fmt(pr)} → recent {fmt(rc)}  (Δ{d:+.3f})  {flag}{verdict}"
+                  f"   [steps {span[0]}..{span[1]}]")
+    if verdicts.get("loss") == "↑ WORSENING" and verdicts.get("accept_len") == "↓ WORSENING":
+        print("  ⚠️ BOTH loss↑ and accept_len↓ over the recent window → possible divergence / overfit / lr too high.")
+    elif all("plateaued" in v for v in verdicts.values()) and verdicts:
+        print("  → plateaued on all metrics — near-converged, or stuck (try lr schedule / more data if far from 3.94).")
+
     # ---------------- timing (steady-state) ----------------
     print("\n-- TIMING (steady-state medians, spikes excluded) " + "-" * 28)
     stages = ["profile/fetch_ms", "profile/fwd_ms", "profile/bwd_ms", "profile/opt_ms", "profile/step_ms"]
@@ -232,9 +265,20 @@ def main() -> None:
             print(f"{s.split('/')[1]:10}: {r['steady_med']:8.1f} ms   (steady)")
     tp = col(recs, "profile/tokens_per_s")
     if tp:
-        # steady tokens/s excludes spike steps (very low tps)
         steady_tp = [v for v in tp if v > 0.5 * median(sorted(tp)[len(tp)//2:])]
-        print(f"tokens/s   : {median(tp):8.0f} (median incl spikes) | {median(steady_tp):.0f} (steady)")
+        print(f"tokens/s   : {median(steady_tp):8.0f} (steady)")
+    # EFFECTIVE (incl spikes) — the REAL average the run actually achieves.
+    pairs = [(f(r, "profile/tokens_per_s"), f(r, "profile/step_ms")) for r in recs
+             if f(r, "profile/tokens_per_s") and f(r, "profile/step_ms")]
+    if pairs:
+        tot_ms = sum(s for _, s in pairs)
+        tot_tok = sum(t * s / 1000 for t, s in pairs)
+        eff = tot_ms / len(pairs)
+        steady = reps["profile/step_ms"]["steady_med"]
+        real_tps = tot_tok / (tot_ms / 1000)
+        print(f"EFFECTIVE  : {eff:8.0f} ms/step incl spikes ({eff/steady:.1f}× the steady {steady:.0f} ms)")
+        print(f"             → REAL throughput ~{real_tps:.0f} tok/s (vs {median(steady_tp):.0f} steady)"
+              f"  |  {tot_ms/1000/3600:.1f} h wall-clock so far")
 
     # ---------------- spikes ----------------
     print("\n-- SPIKES (recompile / stalls) " + "-" * 47)
@@ -248,17 +292,21 @@ def main() -> None:
         else:
             mags = [v for _, v in spikes]
             # attribute each spike to the stage that blew up
+            fetch_r = reps["profile/fetch_ms"]
             fwd_spk = {s for s, _ in (fwd_r["spikes"] if fwd_r else [])}
             bwd_spk = {s for s, _ in (bwd_r["spikes"] if bwd_r else [])}
-            n_fwd = sum(1 for s, _ in spikes if s in fwd_spk)
-            n_bwd = sum(1 for s, _ in spikes if s in bwd_spk)
+            fetch_spk = {s for s, _ in (fetch_r["spikes"] if fetch_r else [])}
+            # attribute each spike: HS-stall (fetch) takes precedence (it's the dominant cost that step)
+            n_fetch = sum(1 for s, _ in spikes if s in fetch_spk)
+            n_fwd = sum(1 for s, _ in spikes if s in fwd_spk and s not in fetch_spk)
+            n_bwd = sum(1 for s, _ in spikes if s in bwd_spk and s not in fetch_spk and s not in fwd_spk)
             overhead = sum(v - smed for _, v in spikes)
             total = sum(col(recs, "profile/step_ms"))
             ints = [spikes[i][0] - spikes[i-1][0] for i in range(1, len(spikes))]
             print(f"step_ms spikes : {len(spikes)} steps > {args.spike_k}× steady ({smed:.0f} ms)")
             print(f"  magnitude    : max {max(mags):.0f} ms ({max(mags)/smed:.0f}×) | median spike {median(mags):.0f} ms")
-            print(f"  stage        : {n_fwd} fwd-side, {n_bwd} bwd-side  "
-                  f"→ {'FWD-only (MoE new-shape recompile)' if n_bwd == 0 else 'mixed'}")
+            print(f"  cause        : {n_fwd} MoE recompile (fwd), {n_fetch} HS-stall (fetch), {n_bwd} bwd"
+                  + ("   ⚠️ HS stalls present — see HS FETCH below" if n_fetch else ""))
             print(f"  frequency    : every ~{median(ints):.0f} steps (min {min(ints)}, max {max(ints)})" if ints
                   else "  frequency    : (single spike)")
             print(f"  overhead     : {overhead/1000:.1f} s total = {100*overhead/total:.0f}% of wall-clock"
@@ -271,9 +319,15 @@ def main() -> None:
     fm = col(recs, "profile/fetch_ms")
     if ff:
         print("\n-- HS FETCH " + "-" * 66)
-        print(f"fetch_frac : median {median(ff):.3f} | max {max(ff):.3f}   "
-              f"→ {'HS NOT a bottleneck ✅' if median(ff) < 0.1 else '⚠️ HS is stalling — raise max_anchors or check serve'}")
-        print(f"fetch_ms   : median {median(fm):.0f} | max {max(fm):.0f} ms")
+        print(f"fetch_frac : median {median(ff):.3f} → {'HS NOT the typical bottleneck ✅' if median(ff) < 0.1 else '⚠️ HS stalling most steps'}")
+        n_stall = sum(1 for x in ff if x > 0.5)
+        if max(ff) > 0.5:
+            print(f"           : ⚠️ but {n_stall} step(s) waited >50% on HS (worst {max(ff):.2f} = {max(fm)/1000:.0f}s fetch)")
+            print(f"             → occasional serve/HS starvation (rolling buffer empty): serve produced HS slower than train")
+            print(f"               consumed it, OR a serve hiccup. These are the giant spikes, NOT recompiles.")
+        mx = max(fm)
+        print(f"fetch_ms   : median {median(fm):.0f} ms | max {(mx/1000):.1f} s" if mx >= 1000 else
+              f"fetch_ms   : median {median(fm):.0f} ms | max {mx:.0f} ms")
     mr, ma = col(recs, "mem/max_reserved_gb"), col(recs, "mem/max_alloc_gb")
     if mr:
         print("\n-- MEMORY " + "-" * 68)
