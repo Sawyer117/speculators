@@ -301,3 +301,100 @@ These pin the EP + grouped-GEMM math independent of the NPU, so an NPU regressio
   is low; drop `MAXSEQS` to 16 for generation/eval if you see garbage.
 - Rollout-optimal serve config: `MAXSEQS=32`, graph mode (`EAGER=0`, cudagraph
   `FULL_DECODE_ONLY`), `--async-scheduling`.
+
+## 9. Validation matrix & green-check checklist
+
+> **The point of this section.** "It runs" ≠ "it's correct." Every module needs a **correctness
+> oracle** (a trusted thing to compare against), not just a smoke test. Below: what each module is
+> validated against today, where we only check "runs / shapes" (🟡) or have nothing (🔴), and the
+> plan to close each gap. Status legend: **✅** has a correctness oracle · **🟡** only runs /
+> shape-checked (not proven correct) · **🔴** missing. Tier = where it can run: **CPU** (CI-able,
+> no NPU), **NPU** (one card), **SERVE** (needs the live verifier).
+
+### 9.1 Current status (what has a real oracle vs what doesn't)
+
+| Module | Oracle (what it's compared against) | Tier | Status | Script |
+|---|---|---|---|---|
+| RMSNorm / mHC / sink-softmax / MoE block | HF `deepseek_v4`, per-component weight-copy, fp32 ≈ 0 | CPU | ✅ | `dsv4_dspark_hf_parity.py` |
+| MLA attention | clean-room ref from official `inference/model.py` | CPU | ✅ | `dsv4_mla_ref.py` |
+| Draft SWA + sink attention | vllm-ascend gold `_dspark_attention_reference` | NPU | ✅ | `dspark_attn_ref_bench.py` |
+| mHC Sinkhorn | official tilelang kernel transcription | CPU | ✅ | `dsv4_dspark_parity.py` (A) |
+| grouped-GEMM fwd/bwd | eager reference (fwd 0.00 / bwd 2.98e-8) | CPU | ✅ | `test_moe_grouped_gemm.py` |
+| all-to-all dispatch | degenerate + 2-proc gloo parity | CPU | ✅ | `test_moe_ep.py` |
+| Markov / Confidence heads + loss terms | formula-aligned to DeepSpec (BCE vs 1−TV, CE, L1) | NPU | 🟡 runs + formula, no numeric parity | `dspark_confidence_test.py`, `dspark_npu_op_check.py` |
+| main_proj / block-γ | none in HF → fwd/bwd smoke only | CPU | 🟡 | `dsv4_dspark_parity.py` (B) |
+| Full-draft numeric parity (load released weights → fwd) | planned "part C" | CPU/NPU | 🔴 **missing** | — (`dsv4_dspark_parity.py` C TODO) |
+| **HS extraction — value correctness** | only layout/shape/seq today | SERVE | 🔴 **"can dump" ≠ "dumps right"** | `hs_dump_smoke.py` (format only) |
+| Train loop actually learns / ckpt round-trip / serve↔train config match | — | CPU/NPU | 🔴 missing | — |
+
+**Reading it:** the *components* almost all have a gold-standard oracle → high confidence in the
+building blocks. The gaps are (a) the **assembled** draft's end-to-end numeric parity, and (b)
+a handful of **silently-wrong** failure modes a smoke test can't catch (§9.3).
+
+### 9.2 The two hard ones — how to give them a real correctness oracle
+
+**HS extraction (the "怎么知道抽得对" question) — three oracles, cheap→gold:**
+1. **Self-consistency via `lm_head` (single-machine, strong).** Extraction is teacher-forced
+   prefill over known (prompt+response). So the **verifier-last** hidden (last slot of
+   `hidden_states`), pushed through the target's `lm_head`, must give logits whose `argmax` hits
+   the **next** teacher-forced token on the response region — matching at the model's own greedy
+   rate. Near-zero / off-by-one match ⇒ we captured the wrong layer or slot (e.g. residual mixed
+   in, off-by-one). This proves verifier-last end-to-end with no second machine.
+2. **Cross-impl (gold).** Run the same token string through a trusted HF/CPU DSV4 forward and
+   compare `[40,41,42]` + final hidden per-token (bf16 tol). Expensive; do it on a small slice.
+   This also pins the aux-capture convention (post-layer, residual-folded — see
+   `dsv4-aux-capture-convention`).
+3. **Alignment (free).** Promote the `token_ids == rollout input_ids` check (already asserted in
+   `train/data.py`) to a standalone assertion.
+
+**Draft build correctness — two layers, do the cheap one first:**
+- **Structural weight-key parity (no NPU, no forward — cheapest, must-have).** Our
+  `named_parameters()` (name + shape) must match the **released DeepSeek DSV4-Flash-DSpark draft**
+  keys (index at `/workspace/dspark_extract/{draft,index}.json`): every `mtp.N.attn.{wq_a,wq_b,
+  wkv,wo_a,wo_b,q_norm,kv_norm,attn_sink}`, `experts.N.{w1,w2,w3}`, `shared_experts`, `gate`,
+  `hc_{attn,ffn,head_*}`, `markov_head.markov_w{1,2}`, `confidence_head.proj`, `main_proj/norm`.
+  A missing/extra/wrong-shape param = wrong build. **Also validates the stacked↔per-expert
+  conversion (§A.2 follow-up).**
+- **Numeric parity (part C).** Load the released weights into our module and compare a forward
+  against the vllm-ascend inference op / an assembled reference (built from the component oracles
+  above — don't wait for a nonexistent HF DSV4-DSpark forward).
+
+### 9.3 Gates to add (silently-wrong modes a smoke test misses)
+
+| # | Gate | Why it matters (the silent bug) | Tier |
+|---|---|---|---|
+| 1 | **EP-invariance** — EP=1 vs EP=2 vs EP=8, same input+seed, outputs/loss **bitwise-close** | all-to-all is data movement only; math must be invariant. Single most decisive test of the whole EP path (dispatch+grouped+combine). | CPU |
+| 2 | **gradcheck on hand-written backward** — `_NpuGroupedMatmul`, `_AllToAll` (double, tiny shapes) | a wrong backward still lets loss go down — but to the wrong place. Only fwd-parity today. | CPU |
+| 3 | **Overfit-one-batch** — same batch repeated, loss must drop to ≈0 | cheapest "the whole loop actually learns" signal; catches detached grad / wrong target / wrong loss. | NPU |
+| 4 | **Checkpoint round-trip** — save→reload→fwd reproduces pre-save fwd; stacked↔per-expert round-trips | `check_ckpt.py` only checks integrity, not equivalence. | CPU/NPU |
+| 5 | **serve↔train config guard** — assert `mask_token_id=128799`, `target_layer_ids=[40,41,42]`, `block_size=5`, vocab match between serve `--hf-overrides` and train args | a mismatch silently corrupts training — **we hit this twice** (mask fell back to pad=1). | CPU |
+| 6 | **Data pipeline** — collator packing to `total_seq_len`, anchor-sample positions, `loss_mask`↔response alignment | speculators `test_data.py` only partially covers the DSV4 anchor/packing path. | CPU |
+
+### 9.4 Green-check mechanism (three tiers)
+
+A single `run_all_checks.sh` + pytest markers, printing a ✅/❌/⏭ table, split by run-tier
+(most gates need NPU/serve, so tier the runner, don't assume one box does all):
+- **CPU tier (CI-able):** structural parity · grouped/EP parity · EP-invariance · gradcheck ·
+  `hf_parity` · overfit-one-batch (tiny) · config guard · data-pipeline.
+- **Single-NPU tier:** `dspark_npu_op_check` · `dspark_attn_ref_bench` · `dspark_confidence_test`
+  · overfit-one-batch (real).
+- **Needs-serve tier:** HS self-consistency + cross-impl · `hs_dump_smoke` (format).
+
+Status is recorded from **box runs** (the sandbox has no torch/NPU) — tick the checklist below as
+each is confirmed on the box.
+
+### 9.5 Checklist (tick as confirmed on box)
+
+Priority order = cheap + catches big bugs first.
+
+- [ ] **Structural weight-key parity** vs released DSpark draft (CPU) — also covers per-expert conversion
+- [ ] **EP-invariance** EP=1 vs EP=N bitwise-close (CPU)
+- [ ] **Overfit-one-batch** loss→≈0 (NPU)
+- [ ] **HS self-consistency** verifier-last `@lm_head` argmax → next token (SERVE)
+- [ ] **serve↔train config guard** (CPU)
+- [ ] **gradcheck** grouped-GEMM + all-to-all backward (CPU)
+- [ ] **Checkpoint round-trip** equivalence + stacked↔per-expert (CPU/NPU)
+- [ ] **HS cross-impl** vs trusted HF/CPU DSV4 forward on a slice (SERVE)
+- [ ] **Full-draft numeric parity** (`dsv4_dspark_parity.py` part C) (CPU/NPU)
+- [ ] Data-pipeline packing / anchor / loss_mask alignment (CPU)
+- [x] grouped-GEMM fwd/bwd parity · all-to-all parity · HF component parity · MLA ref · draft-attn gold · mHC Sinkhorn *(already green — §9.1)*
