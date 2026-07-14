@@ -41,6 +41,68 @@ Ascend/vLLM stack. For the step-by-step recipe, follow the linked scripts.
   hidden states to shared storage; the trainer reads them per sample (rolling buffer, produce-
   one / consume-one).
 
+## 1.5 Architecture — verified from the weights & paper (NOT analogy)
+
+> Every claim here is from a **reproducible primary source** (released checkpoint keys, released
+> `config.json` fields, the DSpark/V4 papers, or vllm-ascend code) — cited inline `[like this]`
+> and consolidated in **§10**. Reasoning-by-analogy burned this project repeatedly (the
+> attention-sink flip-flops); the rule is *check the weight keys / the paper, not a sibling model*.
+
+**Target — DeepSeek-V4-Flash** (43 layers, hidden 4096, vocab 129280, 64 heads). Each layer:
+- **MLA** (Multi-head Latent Attention): q low-rank (`q_lora_rank=1024`: `wq_a→q_norm→wq_b`),
+  single shared KV latent (`wkv→kv_norm`), grouped low-rank output (`wo_a→wo_b`).
+  `[released config.json; weight keys layers.N.attn.{wq_a,wq_b,q_norm,wkv,kv_norm,wo_a,wo_b}]`
+- **Per-head learnable attention sink** (all 43 layers). `[weight key layers.N.attn.attn_sink ×43]`
+- **Hybrid long-context attention = SWA + CSA + HCA**, assigned per-layer by `compress_ratios`
+  (44 entries, tiers `{0:3, 4:21, 128:20}`): ratio **0** = dense/SWA-only; ratio **4** = **CSA**
+  (Compressed Sparse Attention, vLLM "c4a": KV ÷4, top-512); ratio **128** = **HCA** (Heavily
+  Compressed Attention, vLLM "c128a": KV ÷128). Every layer also runs **SWA** (`sliding_window=128`)
+  on uncompressed tokens. `[config compress_ratios / sliding_window=128 / index_topk=512;
+  dsa_v1.py:1108 "vLLM-Ascend only support SWA-layer for Deepseek-V4"; vLLM blog c4a/c128a;
+  arXiv:2606.19348]`
+- **MoE**: 256 routed experts, top-6 (`num_experts_per_tok=6`), 1 shared, `moe_intermediate=2048`.
+  `[config; weight keys layers.N.ffn.experts.{0..255} + shared_experts + gate]`
+- **mHC** (Manifold-Constrained Hyper-Connections, Sinkhorn 20 iters) — replaces the residual.
+  `[config hc_sinkhorn_iters=20; weight keys layers.N.hc_{attn,ffn}_{base,fn,scale}]`
+
+**Draft — DSV4-Flash DSpark** (3 mtp layers, block γ=5). Each mtp layer is a DSV4 decoder layer
+**minus DSA**:
+- **MLA + per-head sink + MoE(256, top-6, shared) + mHC** — **NO compressor, NO indexer → NO
+  DSA/CSA/HCA.** The draft attention is **dense sliding-window (128), bidirectional within the
+  block.** `[released draft weight keys: mtp.N.attn.{wq_a,wq_b,q_norm,wkv,kv_norm,wo_a,wo_b,
+  attn_sink} + ffn.experts.{0..255} + hc_{attn,ffn}, and NO compressor/indexer keys; DSpark paper
+  arXiv:2607.05147 "the parallel backbone comprises three MoE layers with mHC and a sliding window
+  attention of 128" + "All positions within a block attend bidirectionally"]`
+- **Block heads**: `main_proj`+`main_norm` on **mtp.0** (block entry, injects the target context);
+  `markov_head`(w1/w2, rank 256) + `confidence_head`(proj) + `hc_head` + `norm` on **mtp.2** (exit).
+  `[released draft weight keys — heads appear once, on mtp.0 / mtp.2 respectively]`
+- Target context = verifier hidden at `[40,41,42]`, projected (`main_proj`) and concatenated into
+  every draft layer's K/V. Draft input = anchor token + γ mask embeddings (noise `128799`).
+  `[config dspark_target_layer_ids=[40,41,42] / dspark_noise_token_id=128799; paper Eq. 2–3]`
+
+⚠️ **"draft = MLA + DSA + SWA" is WRONG** (a natural guess, but false): the draft has **no DSA** —
+no compressor/indexer weight keys, and the paper never gives the draft DSA. Correct = **MLA + sink
++ SWA**. DSA/CSA/HCA is **target-only** (long-context KV compression); the draft is tiny (3 layers,
+γ=5), a 128 sliding window is already cheap.
+
+```
+ Draft forward (one block, γ=5) — from the weight keys + paper:
+
+ TARGET(frozen) ─ hidden @ [40,41,42] ─────────────┐
+                                                    ▼
+ anchor + mask×5(=128799) ─embed─►  main_proj+main_norm (mtp.0)  → inject into every layer K/V
+                                          │
+              ┌── mtp.0 ──┐  each layer = mHC[ MLA + sink + SWA-128, bidir-in-block ]
+              │   mtp.1   │              + mHC[ MoE 256 (top-6) + shared ]
+              └── mtp.2 ──┘
+                    │
+              hc_head+norm (mtp.2)
+             ┌──────┼──────────┐
+             ▼      ▼          ▼
+        lm_head  markov_head  confidence_head
+        (5 tok)  (block dep)  (5× accept prob)
+```
+
 ## 2. HS extraction: two schemes, and why we chose the PR-based dumper (`HS_DUMP`)
 
 The draft trains on the verifier's hidden states at target layers `[40,41,42]` **plus** the
@@ -229,6 +291,21 @@ loss-masked; drafts `block_size − 1`, like DFlash `block16 → 15`). So **trai
 num_spec), i.e. `block_size − 1`. Passing `--block-size 5` silently drafts only 4 (logs show
 `position_1..4`, accept_len ceiling 5) — a wrong, one-short draft. A converged draft has not yet
 been trained-to-eval on this EP stack.
+> **Provenance (this bit the project — full chain in §10.C):**
+> - **DSpark's own forward masks the anchor slot** → trains/drafts `block_size − 1`:
+>   `src/speculators/models/dsv4_dspark/core.py:343` (`mask_token_ids[:, ::block_size] = anchor token`)
+>   and `:397` (`aligned_loss_mask[:, ::block_size] = 0`), plus `src/speculators/models/dspark/metrics.py:85,88,152`
+>   (comment *"slot 0 is the anchor"*; `[:, 1:]`; `for pos in range(1, block_size)`).
+> - **Shipped proposal config** `speculative_tokens = block_size − 1` (inherited: `DSV4DSparkDraftModel`
+>   ← `DSparkDraftModel` ← `DFlashDraftModel`, not overridden) — `src/speculators/models/dflash/core.py:186-188`,
+>   `# First block position is the anchor, not emitted during gen.`
+> - **Inference sets `n_predict = dspark_block_size`, NO −1**: vllm-ascend (dspark path)
+>   `patch/platform/patch_speculative_config.py:21`; test `tests/ut/spec_decode/test_dspark_config.py:36`
+>   asserts `n_predict == 5`; `spec_decode/dspark_proposer.py:421` `block_size = num_speculative_tokens`.
+> - **Qwen3 cross-check**: upstream trains `BLOCK_SIZE=8` (`examples/train/dspark_qwen3_0_6b_sharegpt_online.sh:36`)
+>   ⇔ released `deepseek-ai/dspark_qwen3_4b_block7/config.json` `block_size=7` (Δ=1=anchor).
+> - **accept_len ceiling = num_spec + 1 = 6**: `examples/ascend_npu_dflash/Evaluator.py:599`
+>   `accept_length = 1.0 + d_acc/d_drafts`.
 
 The bar to match/beat is the **released DeepSeek DSV4-Flash DSpark draft**, measured on NPU in
 **vllm-ascend PR #11196** (QwertyJack) at `num_spec=5`:
@@ -403,3 +480,85 @@ Priority order = cheap + catches big bugs first.
 - [ ] **Full-draft numeric parity** (`dsv4_dspark_parity.py` part C) (CPU/NPU)
 - [ ] Data-pipeline packing / anchor / loss_mask alignment (CPU)
 - [x] grouped-GEMM fwd/bwd parity · all-to-all parity · HF component parity · MLA ref · draft-attn gold · mHC Sinkhorn *(already green — §9.1)*
+
+## 10. Evidence & provenance (every load-bearing claim → reproducible source)
+
+> So a reviewer can check us, not take our word. Source tags: **[repo]** = this repo
+> (`Sawyer117/speculators @ feat/dsv4-dspark`); **[va]** = `Sawyer117/vllm-ascend` (branch noted);
+> **[HF]** = a released HuggingFace checkpoint's `config.json` / `model.safetensors.index.json`;
+> **[paper]** = arXiv; **[blog]** = the vLLM V4 blog. DSpark claims cite DSpark/DSV4 code directly
+> (not the DFlash base) except where a behavior is genuinely inherited (noted as such).
+
+**A. Draft architecture (3 mtp layers = MLA + sink + MoE + mHC; NO DSA).**
+- Draft = MLA + sink + MoE(256) + mHC, no compressor/indexer: **[HF]** released
+  `deepseek-ai/DeepSeek-V4-Flash-DSpark` `model.safetensors.index.json` draft-shard keys —
+  present: `mtp.N.attn.{wq_a,wq_b,q_norm,wkv,kv_norm,wo_a,wo_b,attn_sink}`, `mtp.N.ffn.experts.{0..255}`,
+  `shared_experts`, `gate`, `mtp.N.hc_{attn,ffn}_{base,fn,scale}`; **absent**: any `compressor`/`indexer`
+  key (those exist only under target `layers.N.attn.*`). **[paper]** arXiv:2607.05147: *"the parallel
+  backbone comprises three MoE layers with mHC and a sliding window attention of 128"*, *"All positions
+  within a block attend bidirectionally to each other and to the injected target context"* — no DSA
+  mentioned for the draft.
+- Head placement — `main_proj`/`main_norm` on **mtp.0**, `markov_head`(w1/w2)/`confidence_head`/`hc_head`/`norm`
+  on **mtp.2**: **[HF]** draft keys (each head appears exactly once, at that mtp index).
+- Draft input = anchor + γ mask embeddings; target context injected via K/V: **[paper]** arXiv:2607.05147
+  Eq. 2–3; **[HF]** `dspark_noise_token_id=128799`, `dspark_target_layer_ids=[40,41,42]`.
+
+**B. Target architecture (DeepSeek-V4-Flash: MLA + sink + SWA + CSA/HCA + MoE + mHC).**
+- 43 layers, hidden 4096, 256 experts top-6, sliding_window 128, index_topk 512, mHC Sinkhorn 20:
+  **[HF]** `deepseek-ai/DeepSeek-V4-Flash/config.json` (`num_hidden_layers=43`, `hidden_size=4096`,
+  `n_routed_experts=256`, `num_experts_per_tok=6`, `sliding_window=128`, `index_topk=512`,
+  `hc_sinkhorn_iters=20`, `vocab_size=129280`).
+- Per-layer attention tier via `compress_ratios` (`{0:3, 4:21, 128:20}`): **[HF]** config
+  `compress_ratios`. Ratio 4 = CSA/"c4a", 128 = HCA/"c128a", 0 = dense/SWA: **[blog]**
+  vllm.ai/blog/2026-04-24-deepseek-v4 (c4a = ÷4 top-512, c128a = ÷128); **[paper]** arXiv:2606.19348.
+- "SWA-only layer for V4" + lightning indexer: **[va]** `dspark-dsv4 dsa_v1.py:1108`
+  (`"vLLM-Ascend only support SWA-layer for Deepseek-V4 now."`), `:1440-1458` (indexer/compressor).
+
+**C. block_size / num_spec / accept_len (the off-by-one that cost a run).**
+- Training block includes the anchor; drafts `block_size − 1` (DSpark's own code): **[repo]**
+  `models/dsv4_dspark/core.py:135` (*"position 0 is the anchor"*), `:343` (`mask_token_ids[:, ::block_size] = anchor`),
+  `:397` (`aligned_loss_mask[:, ::block_size] = 0`); `models/dspark/metrics.py:85,88` (`[:, 1:]`), `:152`
+  (`for pos in range(1, block_size)`).
+- Shipped proposal config `speculative_tokens = block_size − 1` (inherited, `DSV4DSparkDraftModel ←
+  DSparkDraftModel ← DFlashDraftModel`, not overridden): **[repo]** `models/dflash/core.py:186-188`.
+- Inference `n_predict = dspark_block_size`, **no −1**: **[va]** `patch/platform/patch_speculative_config.py:21`;
+  test `tests/ut/spec_decode/test_dspark_config.py:36` (`assert patched.n_predict == 5`);
+  `spec_decode/dspark_proposer.py:421` (`block_size = self.num_speculative_tokens`).
+- DSV4 draft counts: **[HF]** `deepseek-ai/DeepSeek-V4-Flash-DSpark/config.json` `dspark_block_size=5`.
+- Qwen3 cross-check (train 8 ⇔ release 7): **[repo]** `examples/train/dspark_qwen3_0_6b_sharegpt_online.sh:36`
+  (`BLOCK_SIZE=8`); **[HF]** `deepseek-ai/dspark_qwen3_4b_block7/config.json` `block_size=7`.
+- accept_len = `1 + accepted/drafts`, ceiling `num_spec + 1 = 6`: **[repo]**
+  `examples/ascend_npu_dflash/Evaluator.py:599`, `scripts/evaluate/perf_utils.py:344`.
+
+**D. HS extraction (why Plan B over native extract).**
+- Native extract KV pathology (CacheOnly cache co-sized with real KV): **[repo]**
+  `docs/deployment/ascend-npu-dsv4-hs-dumper-planB.md` §1; upstream vLLM `extract_hidden_states.py:132,363-365`.
+- 0.23.0 crash `'list' has no attribute 'device'`: `extract_hidden_states.py:72` (planB doc §0).
+- PD-disagg vs Ascend balance-scheduling: **[repo]** `serve_dsv4_bf16_dualnode.sh:159-162`.
+- Plan-B buffer already captured by the DSV4 forward (gated on `dspark_target_layer_ids`): **[va]**
+  `dspark-dsv4 models/deepseek_v4.py:1190,1236-1242` (`_dspark_hidden_buffer`), `get_mtp_target_hidden_states()`.
+- Dumper hook: **[va]** `feat/dsv4-hs-dumper vllm_ascend/dspark_hs_dumper.py` + `worker/model_runner_v1.py`;
+  perm fix `@ 4677f0b`.
+
+**E. Serve EP OFF (2-node A2) + KV-safety.**
+- Cross-node EP16 `HcclAllGather` deadlock → EP OFF: **[repo]** `serve_dsv4_bf16_dualnode.sh:11-15,73-79`
+  (+ AtomGit A2 two-node V4-Flash report cited there).
+- KV holds 29,795 tok, garbage beyond concurrency 64: our serve plog / benchmark doc
+  `docs/deployment/ascend-npu-dsv4-bf16-dualnode-benchmark.md`.
+
+**F. Accept-length baseline (the bar to beat).**
+- Released DSV4 draft AR 58.79% / AL 3.94 / per-pos `[0.81,0.68,0.58,0.48,0.39]`, GPU ref 3.86:
+  **[va]** vllm-ascend **PR #11196** (QwertyJack) measurements.
+- ⚠ Qwen3-4B `6.189/…` are a **different** model (block7/num_spec7/full-attn): **[HF]**
+  `dspark_qwen3_4b_block7` (do not conflate — memory `dsv4-dspark-accept-baseline`).
+
+**G. Key config values (must match serve).**
+- `dspark_target_layer_ids=[40,41,42]`, `dspark_noise_token_id=128799`, `dspark_block_size=5`,
+  `dspark_markov_rank=256`, `vocab=129280`: **[HF]** `DeepSeek-V4-Flash-DSpark/config.json`; mirrored in
+  **[repo]** `models/dsv4_dspark/config.py:37,43-46`.
+
+**H. EP internals (measured / code).**
+- Grouped-GEMM + all-to-all parity numbers: **[repo]** `examples/ascend_npu_dflash/test_moe_grouped_gemm.py`,
+  `test_moe_ep.py` (§8). `Shard(0)` DTensor conversion: `src/speculators/train/distributed.py:237`.
+- Memory scaling (`max_anchors × block`): measured, memory `dsv4-dspark-fsdp2-memory-estimate`
+  (block5@256=1280tok=59.82 GB; block6@256 OOM; block6@196 runs).
