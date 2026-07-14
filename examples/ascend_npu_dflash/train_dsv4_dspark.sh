@@ -37,6 +37,16 @@ MASK_TOKEN="${MASK_TOKEN:-128799}"     # DSpark noise token (config.py noise_tok
                                        # positions embed as embed_tokens[MASK_TOKEN]; MUST match serve.
                                        # Without it, resolve_mask_token_id falls back to pad_token_id=1
                                        # (wrong: collides with real pad + mismatches the official 128799).
+BLOCK="${BLOCK:-6}"                     # ★ BLOCK WIDTH = anchor(slot 0) + gamma draft masks. The trainer
+                                       # drafts BLOCK-1 tokens (slot 0 is the GIVEN anchor, loss-masked;
+                                       # same convention as DFlash block16 -> 15 drafted). DSV4 DSpark
+                                       # gamma=5 (released num_spec=5; the released draft has 5 per-position
+                                       # accepts) => BLOCK=6. Passing 5 (the released config's dspark_block_size,
+                                       # which is GAMMA, not width) drafts only 4 -> logs show position_1..4,
+                                       # accept_len ceiling 5. DO NOT set 5. (Serve still gets dspark_block_size
+                                       # = BLOCK-1 = 5; verify at save/convert.) NB: BLOCK scales draft-forward
+                                       # tokens = MAX_ANCHORS*BLOCK -> raising it costs memory; drop MAX_ANCHORS
+                                       # to keep MAX_ANCHORS*BLOCK ~constant (256*5=1280 -> ~213*6).
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
 EP="${DSPARK_EP:-0}"
 
@@ -97,7 +107,8 @@ SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
 echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED"
-echo " seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS  (anchor utilization = $MAX_ANCHORS/$SEQLEN)"
+echo " block=$BLOCK (drafts $((BLOCK-1)) tokens = gamma; slot 0 anchor)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS"
+echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
 echo " data=$DATA"
 echo " 📋 log -> $LOG   (rank0 mirror also in $RUN/train_*.log)"
@@ -110,7 +121,7 @@ nohup env \
   torchrun --nproc_per_node "$NPROC" "$REPO_ROOT/scripts/train.py" \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
     --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
-    --block-size 5 --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
+    --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
     --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" \
     --draft-attn-impl sdpa --loss-fn '{"ce":0.1,"tv":0.9}' \
     --optimizer adamw --lr "$LR" $EXTRA \

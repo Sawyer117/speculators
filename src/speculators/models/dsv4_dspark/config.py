@@ -40,8 +40,15 @@ class DSparkDraftConfig:
 
     # ---- draft stack --------------------------------------------------------
     n_draft_layers: int = 3  # official n_mtp_layers
-    block_size: int = 5  # gamma; one draft forward emits this many tokens
-    noise_token_id: int = 128799  # fills draft_input_ids[:, 1:]
+    # block_size = BLOCK WIDTH = anchor(slot 0) + gamma draft masks. The draft
+    # trains/emits block_size-1 tokens (slot 0 is the GIVEN anchor, loss-masked in
+    # the forward; same as DFlash block16 -> 15 drafted). The released config's
+    # `dspark_block_size` is GAMMA (=5, num_spec=5) -> our block_size = gamma+1 = 6.
+    # ⚠ Setting 5 here drafts only 4 (position_1..4). The trainer overrides via
+    # --block-size (default 6 in train_dsv4_dspark.sh). At save, dspark_block_size
+    # for the serve = block_size-1.
+    block_size: int = 6  # anchor + gamma(5) masks; drafts block_size-1 = 5
+    noise_token_id: int = 128799  # fills draft_input_ids[:, 1:] (the gamma mask slots)
     target_layer_ids: tuple[int, ...] = (40, 41, 42)  # verifier layers -> main_proj
     markov_rank: int = 256
 

@@ -220,10 +220,15 @@ work, no patches. See §6.
   `core.py` that broke transformers' `custom_object_save` at save time (`a855bfb` → absolute
   import).
 
-**Acceptance-length target (baseline, NOT yet the converged draft).** The DSV4 DSpark draft is
-**`block_size = 5` → `num_speculative_tokens = 5`** (not 7 — that's the Qwen3 line; see note
-below). The last training run was still LR-warming (accept_len ≈ 1.19, out of a block-5 ceiling
-of ~6); a converged draft has not yet been trained-to-eval on this EP stack.
+**Acceptance-length target (baseline, NOT yet the converged draft).** The DSV4 DSpark draft
+drafts **γ = 5** tokens per block → served `num_speculative_tokens = 5` (not 7 — that's the
+Qwen3 line; see note below). ⚠️ **Block-size convention gotcha (cost us a run):** the trainer's
+`--block-size` is the **block width including the anchor** (slot 0 is the given anchor,
+loss-masked; drafts `block_size − 1`, like DFlash `block16 → 15`). So **train with
+`--block-size 6`** to draft 5; the released config's `dspark_block_size = 5` is **γ** (= served
+num_spec), i.e. `block_size − 1`. Passing `--block-size 5` silently drafts only 4 (logs show
+`position_1..4`, accept_len ceiling 5) — a wrong, one-short draft. A converged draft has not yet
+been trained-to-eval on this EP stack.
 
 The bar to match/beat is the **released DeepSeek DSV4-Flash DSpark draft**, measured on NPU in
 **vllm-ascend PR #11196** (QwertyJack) at `num_spec=5`:
@@ -367,7 +372,7 @@ a handful of **silently-wrong** failure modes a smoke test can't catch (§9.3).
 | 2 | **gradcheck on hand-written backward** — `_NpuGroupedMatmul`, `_AllToAll` (double, tiny shapes) | a wrong backward still lets loss go down — but to the wrong place. Only fwd-parity today. | CPU |
 | 3 | **Overfit-one-batch** — same batch repeated, loss must drop to ≈0 | cheapest "the whole loop actually learns" signal; catches detached grad / wrong target / wrong loss. | NPU |
 | 4 | **Checkpoint round-trip** — save→reload→fwd reproduces pre-save fwd; stacked↔per-expert round-trips | `check_ckpt.py` only checks integrity, not equivalence. | CPU/NPU |
-| 5 | **serve↔train config guard** — assert `mask_token_id=128799`, `target_layer_ids=[40,41,42]`, `block_size=5`, vocab match between serve `--hf-overrides` and train args | a mismatch silently corrupts training — **we hit this twice** (mask fell back to pad=1). | CPU |
+| 5 | **serve↔train config guard** — assert `mask_token_id=128799`, `target_layer_ids=[40,41,42]`, `vocab`, and the **block convention** (train `--block-size 6` ⇔ served `dspark_block_size=5=γ`; drafts `block_size−1`) match between serve `--hf-overrides` and train args | a mismatch silently corrupts training — **we hit this** (mask fell back to pad=1; `--block-size 5` drafted 4 not 5). | CPU |
 | 6 | **Data pipeline** — collator packing to `total_seq_len`, anchor-sample positions, `loss_mask`↔response alignment | speculators `test_data.py` only partially covers the DSV4 anchor/packing path. | CPU |
 
 ### 9.4 Green-check mechanism (three tiers)
