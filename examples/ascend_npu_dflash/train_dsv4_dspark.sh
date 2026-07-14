@@ -33,6 +33,10 @@ MAX_ANCHORS="${MAX_ANCHORS:-64}"
 SEQLEN="${SEQLEN:-8192}"                # --total-seq-len. Shorter (e.g. 3072) cuts draft-forward
                                        # activation memory (room for more anchors) + shortens the
                                        # HS prefill; anchor utilization = MAX_ANCHORS/SEQLEN.
+MASK_TOKEN="${MASK_TOKEN:-128799}"     # DSpark noise token (config.py noise_token_id). Draft's masked
+                                       # positions embed as embed_tokens[MASK_TOKEN]; MUST match serve.
+                                       # Without it, resolve_mask_token_id falls back to pad_token_id=1
+                                       # (wrong: collides with real pad + mismatches the official 128799).
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
 EP="${DSPARK_EP:-0}"
 
@@ -107,7 +111,7 @@ nohup env \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
     --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
     --block-size 5 --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
-    --total-seq-len "$SEQLEN" \
+    --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" \
     --draft-attn-impl sdpa --loss-fn '{"ce":0.1,"tv":0.9}' \
     --optimizer adamw --lr "$LR" $EXTRA \
     --on-missing generate --on-generate delete \
