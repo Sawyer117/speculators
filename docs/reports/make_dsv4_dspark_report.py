@@ -233,6 +233,24 @@ bullets(s, [
 ], top=5.55)
 footer(s, 9)
 
+# 9b — full-dataset cost extrapolation
+s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Full-dataset cost extrapolation — Open-PerfectBlend", "scaling")
+bullets(s, [
+    ("Current run: 4416 steps/epoch, 5.8 h/epoch (effective), ≈108 M tokens ≈ ~100k samples — a SUBSET.", 0),
+    ("Full Open-PerfectBlend ≈ 1.3 M samples, 10 epochs (paper) ≈ ~12× the current dataset.", 0),
+], top=1.4)
+table(s, ["scenario", "per full-epoch (~12×)", "× 10 epochs (paper)"],
+      [["current (recompile + checkpoint spikes)", "~70 h", "~29 days"],
+       ["+ fixed-shape MoE padding + save 1×/epoch", "~25 h", "~10–11 days"],
+       ["pure steady (spikes eliminated — lower bound)", "~17 h", "~7 days"]],
+      colw=[5.7, 3.3, 3.1], top=2.7)
+bullets(s, [
+    ("HF-native FSDP full run = WEEKS → it validates method-correctness + memory, NOT full-scale throughput.", 0, WARN),
+    ("Production-scale plan = MindSpeed-EP (whole expert per card + all-to-all) — removes the 768 per-expert collectives + the spikes.", 0, GOOD),
+    ("Practical path: train the subset a few more epochs to prove the method (accept_len → ~3.9), then MindSpeed-EP for full scale.", 0, ACCENT),
+], top=4.55)
+footer(s, 10)
+
 # 10 — attention op
 s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Draft attention op — SWA + non-causal + sink", "kernel")
 table(s, ["op", "SWA", "non-causal", "sink", "backward", "use"],
@@ -246,7 +264,7 @@ bullets(s, [
     ("Triton kernel is done and validated (matches the gold reference at fp32 5.96e-7); needs integration into training.", 0, GOOD),
     ("Real inference dispatches to the SAS op (source verified non-causal; #11196 relaxed the causal asserts).", 0),
 ], top=4.5)
-footer(s, 10)
+footer(s, 11)
 
 # 11 — validation
 s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Correctness validation — \"it runs\" ≠ \"it's correct\"", "validation")
@@ -257,7 +275,7 @@ bullets(s, [
     ("Silently-wrong gates to add: EP-invariance (EP=1 vs 8), gradcheck on hand-written backward, overfit-one-batch, serve↔train config guard.", 0, WARN),
     ("Green-check runner tiered CPU / single-NPU / needs-serve; the block-size bug is exactly the kind the config guard catches.", 0),
 ])
-footer(s, 11)
+footer(s, 12)
 
 # 12 — roadmap
 s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Remaining work / roadmap", "next")
@@ -269,7 +287,7 @@ bullets(s, [
     ("Upstream: carve the DTensor-native EP refactor into a clean GPU-safe PR.", 0),
     ("Deferred: native extract HS path (needs vLLM 0.24 + the DP0/head memory pathology solved).", 0, MUTE),
 ])
-footer(s, 12)
+footer(s, 13)
 
 # 13 — provenance
 s = prs.slides.add_slide(BLANK); _bg(s); header(s, "Reproducibility & provenance", "sources")
@@ -281,7 +299,7 @@ bullets(s, [
     ("Repos: Sawyer117/speculators (trainer) · Sawyer117/vllm-ascend @ feat/dsv4-hs-dumper (serve+HS) · non-causal-swa-triton-ascend (kernel).", 0),
     ("Log analysis: examples/ascend_npu_dflash/analyze_train_run.py (loss / accept / confidence / timing / spikes + plots).", 0),
 ])
-footer(s, 13)
+footer(s, 14)
 
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsv4_dspark_npu_report.pptx")
 prs.save(out)
