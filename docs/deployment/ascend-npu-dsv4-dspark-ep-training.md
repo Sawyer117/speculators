@@ -103,6 +103,42 @@ no compressor/indexer weight keys, and the paper never gives the draft DSA. Corr
         (5 tok)  (block dep)  (5× accept prob)
 ```
 
+### Draft attention — the op landscape + train/infer windows
+
+The draft attention is **SWA(128) + non-causal(bidirectional in block) + per-head sink**. The window
+is asymmetric: `win_left = window + block_size − 1`, `win_right = block_size − 1`
+`[va] dspark_attention.py:32-36`. Because training's `block_size` includes the anchor (6) but
+inference's is the drafted count (5), the two sides use different but **equivalent** windows (the
+anchor is a visible key either way — it's block-slot-0 in training, last-context-token at inference):
+
+| side | block | `win_left / win_right` | KV = window+block |
+|---|---|---|---|
+| **training** (speculators, our forward) | **6** (anchor + 5 drafts) | **133 / 5** | 134 |
+| **inference** (vllm-ascend SAS op) | **5** (γ) | **132 / 4** | 133 |
+
+(NB: `134/6` is the **block7** Qwen3 case — `128+7−1`; not DSV4.) `[va] _dspark_sas_window`,
+`[repo] models/dsv4_dspark/config.py block_size=6`.
+
+**Why we can't reuse a fused op — no single op has all four properties:**
+
+| op | SWA | non-causal | sink | backward | usable for… |
+|---|---|---|---|---|---|
+| vllm-ascend **SAS** (inference) | ✅ | ✅ (mask mode 4) | ✅ (`sinks=sinks`) | **❌ forward-only** | inference / the gold **reference** |
+| SDPA / `npu_fusion_attention` | ✅ | ❌ causal | ❌ | ✅ | nothing here (missing sink + non-causal) |
+| our **einsum** (`backbone/attention.py::sink_block_attention`) | ✅ | ✅ | ✅ | ✅ **but slow** | training **now** (correct, unfused) |
+| **Triton** kernel (in dev) | ✅ | ✅ | ✅ | ✅ (goal) | training **target** (fused) |
+
+**Does the operator need updating?**
+- **Inference SAS op — code is fine, no update.** It already does SWA+non-causal+sink; the fork's
+  `win_right>0` patch is in `dspark-dsv4` (PR #11196, AL 3.94). *If* a node's compiled `.so` computes
+  causal-127 (upstream, missing the patch — its AscendC tiling asserts `oriWinRight==0`), that's a
+  **build** issue on that node → rebuild vllm-ascend from the patched commit; verify with
+  `diag_sas_window.py` (run at `BS=5` for DSV4). Not a code change.
+- **Training op — the update-in-progress is the Triton kernel** (SWA+non-causal+sink **+ backward**;
+  no existing fused op has all four). Until it lands, training uses the correct-but-slow einsum. SWA
+  handoff repo: `Sawyer117/non-causal-swa-triton-ascend` (kernel matches the gold ref at fp32
+  5.96e-7). See §5, §7.
+
 ## 2. HS extraction: two schemes, and why we chose the PR-based dumper (`HS_DUMP`)
 
 The draft trains on the verifier's hidden states at target layers `[40,41,42]` **plus** the
