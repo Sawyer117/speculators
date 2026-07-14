@@ -275,7 +275,11 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
 
     def _ep_active(self) -> bool:
         """True when expert-parallelism is configured (routed experts are partitioned)."""
-        from .backbone import moe_ep  # noqa: PLC0415
+        # ABSOLUTE import (see the module-header note): transformers' custom_object_save
+        # statically parses this file's RELATIVE imports to bundle them for trust_remote_code
+        # and mishandles ``from .backbone ...`` (looks for backbone.py) -> save_pretrained
+        # crashes at checkpoint time. Keep backbone imports absolute.
+        from speculators.models.dsv4_dspark.backbone import moe_ep  # noqa: PLC0415
         return moe_ep._EP is not None and moe_ep._EP.size > 1
 
     def fsdp_ignored_params(self) -> set:
