@@ -272,13 +272,24 @@ def main() -> None:
         print("  → plateaued on all metrics — near-converged, or stuck (try lr schedule / more data if far from 3.94).")
 
     # ---------------- timing (steady-state) ----------------
-    print("\n-- TIMING (steady-state medians, spikes excluded) " + "-" * 28)
+    print("\n-- TIMING (per stage: STEADY vs EFFECTIVE-avg incl spikes) " + "-" * 16)
     stages = ["profile/fetch_ms", "profile/fwd_ms", "profile/bwd_ms", "profile/opt_ms", "profile/step_ms"]
+    _labels = {"profile/fetch_ms": "HS fetch", "profile/fwd_ms": "fwd", "profile/bwd_ms": "bwd",
+               "profile/opt_ms": "opt", "profile/step_ms": "step"}
     reps = {s: spike_report(recs, s, args.spike_k) for s in stages}
+    def stage_avg(key):
+        vv = [(step_of(r), f(r, key)) for r in recs if f(r, key) is not None]
+        if key == "profile/fetch_ms":  # exclude checkpoint-save steps (their cost is misread as fetch)
+            vv = [(st, v) for st, v in vv if st not in ckpt_steps]
+        return mean([v for _, v in vv]) if vv else None
+    print(f"  {'stage':10} {'steady':>10}   {'effective avg':>14}   {'×':>5}")
     for s in stages:
         r = reps[s]
-        if r:
-            print(f"{s.split('/')[1]:10}: {r['steady_med']:8.1f} ms   (steady)")
+        if not r:
+            continue
+        avg = stage_avg(s) or r["steady_med"]
+        note = "  (fetch: ckpt-misreads excluded)" if s == "profile/fetch_ms" else ""
+        print(f"  {_labels[s]:10} {r['steady_med']:8.0f}ms   {avg:12.0f}ms   {avg/r['steady_med']:4.1f}×{note}")
     tp = col(recs, "profile/tokens_per_s")
     if tp:
         steady_tp = [v for v in tp if v > 0.5 * median(sorted(tp)[len(tp)//2:])]
@@ -390,11 +401,11 @@ def main() -> None:
 
     # ---------------- plots ----------------
     if args.out:
-        _plots(recs, good, pos_keys, reps, args.out)
+        _plots(recs, good, pos_keys, reps, ckpt_steps, args.out)
     print("=" * 78)
 
 
-def _plots(recs, good, pos_keys, reps, out):
+def _plots(recs, good, pos_keys, reps, ckpt_steps, out):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -504,17 +515,39 @@ def _plots(recs, good, pos_keys, reps, out):
     plt.title("Per-stage time (log-y — spikes are the recompiles)"); plt.grid(alpha=.3, which="both")
     plt.tight_layout(); plt.savefig(f"{out}/timing.png", dpi=120); plt.close()
 
-    # 5) steady-state fwd/bwd distribution (spikes clipped)
-    plt.figure(figsize=(9, 4))
-    for k, lab in [("profile/fwd_ms", "fwd"), ("profile/bwd_ms", "bwd")]:
-        r = reps[k]
-        vals = [v for v in col(recs, k) if v <= 3 * r["steady_med"]]
-        if vals:
-            plt.hist(vals, bins=40, alpha=.6, label=f"{lab} (med {r['steady_med']:.0f}ms)")
-    plt.xlabel("ms"); plt.ylabel("count"); plt.legend(); plt.title("Steady-state fwd/bwd distribution")
-    plt.grid(alpha=.3); plt.tight_layout(); plt.savefig(f"{out}/steady_hist.png", dpi=120); plt.close()
+    # 5) per-stage timing BARS: steady (solid) vs effective-avg incl spikes (hollow/hatched), log-y
+    import numpy as np
+    stage_defs = [("profile/fetch_ms", "HS fetch"), ("profile/fwd_ms", "fwd"),
+                  ("profile/bwd_ms", "bwd"), ("profile/opt_ms", "opt"), ("profile/step_ms", "step")]
+    labels, sv, av = [], [], []
+    for key, lab in stage_defs:
+        r = reps.get(key)
+        if not r:
+            continue
+        vv = [(step_of(rec), f(rec, key)) for rec in recs if f(rec, key) is not None]
+        if key == "profile/fetch_ms":  # exclude checkpoint-save steps (misread as fetch)
+            vv = [(st, v) for st, v in vv if st not in ckpt_steps]
+        labels.append(lab)
+        sv.append(r["steady_med"])
+        av.append(mean([v for _, v in vv]) if vv else r["steady_med"])
+    if labels:
+        x = np.arange(len(labels)); w = 0.38
+        plt.figure(figsize=(9.8, 5.0))
+        b1 = plt.bar(x - w / 2, sv, w, color="#2E6CF6", zorder=3, label="steady (spikes excluded)")
+        b2 = plt.bar(x + w / 2, av, w, facecolor="none", edgecolor="#D62828", lw=1.8,
+                     hatch="////", zorder=3, label="effective avg (incl spikes)")
+        for bars in (b1, b2):
+            for b in bars:
+                h = b.get_height()
+                plt.text(b.get_x() + b.get_width() / 2, h * 1.06,
+                         f"{h:.0f}" if h >= 10 else f"{h:.1f}", ha="center", va="bottom", fontsize=9)
+        plt.yscale("log"); plt.xticks(x, labels); plt.ylabel("ms (log)")
+        plt.title("Per-stage time — steady (solid) vs effective-avg incl spikes (hatched)")
+        plt.legend(loc="upper left"); plt.grid(axis="y", alpha=.3, which="both", zorder=0)
+        plt.tight_layout(); plt.savefig(f"{out}/timing_bars.png", dpi=120); plt.close()
 
-    print(f"\n📊 plots → {out}/  (loss, acceptance, accept_len[raw+smoothed+target], position_acc, confidence, timing, steady_hist)")
+    print(f"\n📊 plots → {out}/  (loss, acceptance, accept_len[raw+smoothed+target], position_acc[bars],\n"
+          f"                    confidence, timing[lines], timing_bars[steady-vs-avg])")
 
 
 if __name__ == "__main__":
