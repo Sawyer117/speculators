@@ -18,17 +18,58 @@ Prints a structured report AND (if matplotlib is present) writes PNGs to an outp
 Console-only works anywhere (no torch/matplotlib needed). Plots need matplotlib.
 
 Usage:
+    python analyze_train_run.py                       # DEFAULT: newest *.log in $RUN (the run dir)
+    python analyze_train_run.py <dir>                 # newest *.log with metrics in <dir>
     python analyze_train_run.py <logfile> [--out plots_dir]
     <cmd> 2>&1 | tee run.log ; python analyze_train_run.py run.log --out ./analysis
     python analyze_train_run.py -                     # read stdin, console only
+
+The run dir defaults to $RUN or /home/a00652497/dspark_austin/run (matches train_dsv4_dspark.sh,
+which writes $RUN/faithful_ep_<ts>.log + a rank0 mirror train_*.log). Override with RUN=... .
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import re
 import sys
+import time
 from statistics import median, mean, pstdev
+
+# where train_dsv4_dspark.sh writes logs (RUN=... in that script); override via env.
+DEFAULT_RUN_DIR = os.environ.get("RUN", "/home/a00652497/dspark_austin/run")
+
+
+def _has_metrics(path, tail_bytes=500_000) -> bool:
+    """True if the file's tail contains trainer metric records (a real run, not startup/crash)."""
+    try:
+        with open(path, "rb") as fh:
+            if os.path.getsize(path) > tail_bytes:
+                fh.seek(-tail_bytes, os.SEEK_END)
+            return b"global_step=" in fh.read()
+    except OSError:
+        return False
+
+
+def resolve_log(path: str) -> str:
+    """A file → itself; '-' → stdin; a directory (default) → newest *.log with metrics."""
+    if path == "-":
+        return "-"
+    if os.path.isdir(path):
+        cands = sorted(glob.glob(os.path.join(path, "*.log")), key=os.path.getmtime, reverse=True)
+        if not cands:
+            raise SystemExit(f"!! no *.log files in {path}  (set RUN=<dir> or pass a file)")
+        for c in cands:
+            if _has_metrics(c):
+                age = (time.time() - os.path.getmtime(c)) / 60
+                extra = "" if len(cands) == 1 else f"  (newest with metrics of {len(cands)} logs)"
+                print(f">>> latest log in {path}:\n    {c}   [modified {age:.0f} min ago]{extra}\n")
+                return c
+        raise SystemExit(f"!! {len(cands)} *.log in {path} but none contain training metrics (global_step)")
+    if not os.path.exists(path):
+        raise SystemExit(f"!! not found: {path}  (default run dir is {DEFAULT_RUN_DIR}; set RUN= or pass a path)")
+    return path
 
 # key=value with NO space around '=' (so env dumps like "LOCAL_RANK = 0" are skipped)
 _PAIR = re.compile(r"([A-Za-z0-9_/]+)=(-?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|nan|inf))")
@@ -114,12 +155,13 @@ def spike_report(recs, key, k_thresh=3.0):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("logfile")
+    ap.add_argument("logfile", nargs="?", default=DEFAULT_RUN_DIR,
+                    help=f"log file, or a directory to auto-pick its newest *.log (default: {DEFAULT_RUN_DIR})")
     ap.add_argument("--out", default=None, help="folder for PNG plots (created if missing)")
     ap.add_argument("--spike-k", type=float, default=3.0, help="spike = stage > k*steady-median")
     args = ap.parse_args()
 
-    recs = load(args.logfile)
+    recs = load(resolve_log(args.logfile))
     if not recs:
         print("!! no metric records parsed — is this a trainer.py rich-logger log?")
         return
