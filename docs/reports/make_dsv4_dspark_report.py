@@ -164,9 +164,11 @@ bullets(s, [
     ("KV memory pathology — a CacheOnly cache co-sized with the real KV; DSV4's KV is hyper-compressed so it OOMs.", 1, WARN),
     ("vLLM version lock — crashes on our pinned 0.23.0; only fixed on 0.24 (which flips the v1→v2 runner).", 1, WARN),
     ("PD-disaggregation clash — kv_producer mode is incompatible with Ascend balance-scheduling.", 1, WARN),
-    ("Chosen: Plan-B dumper — rides the DSV4 model's existing target-hidden buffer (vllm-ascend #11571).", 0, GOOD),
-    ("A runner post-forward hook copies the buffer + post-norm hidden to CPU; writes the standard ArrowDataset format.", 1),
+    ("Chosen: Plan-B dumper — rides vllm-ascend PR #11571 (the DSV4 forward already fills a target-hidden", 0, GOOD),
+    ("buffer _dspark_hidden_buffer at [40,41,42], gated on dspark_target_layer_ids → a plain serve produces HS, no draft ckpt).", 1, GOOD),
+    ("Our hook (fork branch feat/dsv4-hs-dumper) copies that buffer + post-norm hidden to CPU → standard ArrowDataset format.", 1),
     ("Zero extra NPU KV, runs on the validated 0.23.0 serve, no PD-disagg. Validated end-to-end (3436 tok/s).", 1, GOOD),
+    ("(NB: #11571 = the buffer the dumper rides; the separate inference runtime is PR #11196 — don't conflate.)", 1, MUTE),
 ])
 footer(s, 5)
 
