@@ -362,7 +362,8 @@ def main() -> None:
     mr, ma = col(recs, "mem/max_reserved_gb"), col(recs, "mem/max_alloc_gb")
     if mr:
         print("\n-- MEMORY " + "-" * 68)
-        print(f"reserved   : max {max(mr):.1f} GB   | alloc max {max(ma):.1f} GB"
+        alloc = f"{max(ma):.1f} GB" if ma else "—"
+        print(f"reserved   : max {max(mr):.1f} GB   | alloc max {alloc}"
               f"   ({100*max(mr)/64:.0f}% of a 64 GB A2 card)")
 
     # ---------------- auto notes ----------------
@@ -417,7 +418,7 @@ def _plots(recs, good, pos_keys, reps, out):
     plt.xlabel("step"); plt.ylabel("loss"); plt.legend(); plt.title("Loss"); plt.grid(alpha=.3)
     plt.tight_layout(); plt.savefig(f"{out}/loss.png", dpi=120); plt.close()
 
-    # 2) acceptance + per-position
+    # 2) acceptance + per-position (overview)
     plt.figure(figsize=(9, 4))
     for k, lab in [("train/accept_len", "accept_len"), ("train/accept_rate", "accept_rate"),
                    ("train/full_acc", "full_acc")]:
@@ -427,6 +428,33 @@ def _plots(recs, good, pos_keys, reps, out):
     plt.axhline(3.94, ls="--", c="grey", lw=.8, label="released AL 3.94")
     plt.xlabel("step"); plt.ylabel("accept"); plt.legend(); plt.title("Acceptance"); plt.grid(alpha=.3)
     plt.tight_layout(); plt.savefig(f"{out}/acceptance.png", dpi=120); plt.close()
+
+    # 2b) accept_len DEDICATED: raw + smoothed + HIGHLIGHTED paper baseline
+    x, y = xy("train/accept_len", good)
+    if x:
+        import numpy as np
+        plt.figure(figsize=(9.5, 4.8))
+        plt.plot(x, y, lw=0.5, alpha=0.30, color="#7A8AA8", label="raw (per step)")
+        w = max(11, len(y) // 60)  # smoothing window
+        if len(y) >= w:
+            ys = np.convolve(np.asarray(y, float), np.ones(w) / w, mode="valid")
+            off = (w - 1) // 2
+            plt.plot(x[off:off + len(ys)], ys, lw=2.4, color="#2E6CF6",
+                     label=f"smoothed ({w}-step moving avg)")
+        # HIGHLIGHTED paper / released-draft target
+        plt.axhline(3.94, ls="--", lw=2.4, color="#D62828",
+                    label="released draft AL = 3.94 (paper / vllm-ascend PR #11196)")
+        plt.annotate("target 3.94", xy=(x[0], 3.94), xytext=(x[0], 3.99),
+                     color="#D62828", fontsize=11, weight="bold")
+        cur = median(y[-min(50, len(y)):])
+        plt.axhline(cur, ls=":", lw=1.2, color="#1B8A4E")
+        plt.annotate(f"current ~{cur:.2f}", xy=(x[-1], cur), xytext=(x[-1], cur - 0.18),
+                     color="#1B8A4E", fontsize=10, ha="right", weight="bold")
+        plt.ylim(1.0, max(4.2, (max(y) if y else 4) + 0.2))
+        plt.xlabel("step"); plt.ylabel("acceptance length")
+        plt.title("Acceptance length — raw vs smoothed (target = released-draft 3.94)")
+        plt.legend(loc="lower right"); plt.grid(alpha=.3)
+        plt.tight_layout(); plt.savefig(f"{out}/accept_len.png", dpi=120); plt.close()
 
     if pos_keys:
         plt.figure(figsize=(9, 4))
@@ -468,7 +496,7 @@ def _plots(recs, good, pos_keys, reps, out):
     plt.xlabel("ms"); plt.ylabel("count"); plt.legend(); plt.title("Steady-state fwd/bwd distribution")
     plt.grid(alpha=.3); plt.tight_layout(); plt.savefig(f"{out}/steady_hist.png", dpi=120); plt.close()
 
-    print(f"\n📊 plots → {out}/  (loss, acceptance, position_acc, confidence, timing, steady_hist)")
+    print(f"\n📊 plots → {out}/  (loss, acceptance, accept_len[raw+smoothed+target], position_acc, confidence, timing, steady_hist)")
 
 
 if __name__ == "__main__":
