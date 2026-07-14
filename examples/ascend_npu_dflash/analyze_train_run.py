@@ -457,13 +457,31 @@ def _plots(recs, good, pos_keys, reps, out):
         plt.tight_layout(); plt.savefig(f"{out}/accept_len.png", dpi=120); plt.close()
 
     if pos_keys:
-        plt.figure(figsize=(9, 4))
-        for i, k in enumerate(pos_keys):
-            x, y = xy(k, good)
-            if x:
-                plt.plot(x, y, lw=0.8, label=f"pos{i+1}")
-        plt.xlabel("step"); plt.ylabel("per-position acc"); plt.legend(); plt.title("Per-position draft accuracy")
-        plt.grid(alpha=.3); plt.tight_layout(); plt.savefig(f"{out}/position_acc.png", dpi=120); plt.close()
+        # BAR chart of the CURRENT (last-N-step median) per-position accuracy, value-labeled.
+        n = min(50, len(good))
+        vals = []
+        for k in pos_keys:
+            v = col(good[-n:], k)
+            vals.append(median(v) if v else 0.0)
+        labels = [f"pos{i+1}" for i in range(len(pos_keys))]
+        plt.figure(figsize=(8.5, 4.8))
+        bars = plt.bar(labels, vals, width=0.62, color="#2E6CF6", zorder=3)
+        for b, v in zip(bars, vals):
+            plt.text(b.get_x() + b.get_width() / 2, v + 0.012, f"{v:.3f}",
+                     ha="center", va="bottom", fontsize=11, weight="bold", color="#1B2538")
+        # released-draft per-position ACCEPT marginals (a related-but-different metric) as a shape ref
+        rel = [0.81, 0.68, 0.58, 0.48, 0.39]
+        if len(pos_keys) == len(rel):
+            plt.plot(labels, rel, "o--", color="#D62828", lw=1.6, ms=6, zorder=4,
+                     label="released draft accept marginal (ref)")
+            for i, r in enumerate(rel):
+                plt.text(i, r + 0.02, f"{r:.2f}", ha="center", color="#D62828", fontsize=9)
+            plt.legend(loc="upper right")
+        plt.ylim(0, 1.0)
+        plt.ylabel("greedy accuracy  (argmax == target)")
+        plt.title(f"Per-position draft accuracy — last {n} steps (decays p1→p{len(pos_keys)})")
+        plt.grid(axis="y", alpha=.3, zorder=0)
+        plt.tight_layout(); plt.savefig(f"{out}/position_acc.png", dpi=120); plt.close()
 
     # 3) confidence calibration
     plt.figure(figsize=(9, 4))
