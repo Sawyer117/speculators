@@ -151,13 +151,20 @@ def create_train_val_loaders(
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
     )
+    # NB: the VAL loader forces num_workers=0 (no forked workers). Unlike the train loader —
+    # whose persistent workers fork ONCE at start, when the NPU/HCCL context is fresh — the val
+    # loader's first iteration is at the epoch BOUNDARY, i.e. after a full epoch of NPU use + the
+    # (EP-)DCP checkpoint gather. Forking dataloader workers from that live native state corrupts
+    # the child heap → "free(): invalid pointer" + "DataLoader worker killed by signal: Aborted",
+    # and the run dies right after epoch 0's checkpoint save. Validation is a small held-out pass,
+    # so in-process loading costs ~nothing (the trainer is HS-fetch-bound anyway; fetch_frac≈0.02).
     val_loader = _setup_dataloader(
         val_dataset,
         total_seq_len,
         hidden_size,
         num_target_layers=num_target_layers,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
+        num_workers=0,
+        prefetch_factor=None,
         preprocess=preprocess,
     )
 
