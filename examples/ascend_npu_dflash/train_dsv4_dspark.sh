@@ -32,7 +32,7 @@ CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"
 LR="${LR:-6e-4}"
 EPOCHS="${EPOCHS:-5}"                   # number of training epochs (--epochs). Override e.g. EPOCHS=20.
 MAX_ANCHORS="${MAX_ANCHORS:-64}"
-SEQLEN="${SEQLEN:-8192}"                # --total-seq-len. Shorter (e.g. 3072) cuts draft-forward
+SEQLEN="${SEQLEN:-3072}"                # --total-seq-len (default 3072; was 8192). Shorter cuts draft-forward
                                        # activation memory (room for more anchors) + shortens the
                                        # HS prefill; anchor utilization = MAX_ANCHORS/SEQLEN.
 MASK_TOKEN="${MASK_TOKEN:-128799}"     # DSpark noise token (config.py noise_token_id). Draft's masked
