@@ -453,7 +453,7 @@ def main(args: argparse.Namespace):  # noqa: C901
     # (single-card / replicated / EP), NOT per-expert-FSDP -- see moe_grouped_gemm.py.
     import os  # noqa: PLC0415
 
-    if os.environ.get("DSPARK_GROUPED_MOE") and args.speculator_type == "dsv4_dspark":
+    if os.environ.get("DSPARK_GROUPED_MOE") == "1" and args.speculator_type == "dsv4_dspark":
         from speculators.models.dsv4_dspark.backbone import moe_grouped_gemm  # noqa: PLC0415
 
         moe_grouped_gemm.enable()
@@ -466,7 +466,7 @@ def main(args: argparse.Namespace):  # noqa: C901
     # experts -> the faithful 256-expert draft gets the grouped-GEMM win that per-expert
     # FSDP blocks. MUST be configured BEFORE the model is built (MoE.__init__ reads the
     # EP context to build only its local slice). Supersedes DSPARK_GROUPED_MOE.
-    if os.environ.get("DSPARK_EP") and args.speculator_type == "dsv4_dspark":
+    if os.environ.get("DSPARK_EP") == "1" and args.speculator_type == "dsv4_dspark":
         import torch.distributed as dist  # noqa: PLC0415
 
         from speculators.models.dsv4_dspark.backbone import moe_ep  # noqa: PLC0415
@@ -496,7 +496,7 @@ def main(args: argparse.Namespace):  # noqa: C901
     # Compiles the experts forward once with a symbolic token dim -> kills the per-shape recompile (~42%
     # of wall-clock, validated ~1.74x). REQUIRES torch 2.12.0+cpu + torch_npu 2.12.0rc1 + inductor_npu_ext
     # + triton-ascend; MUST NOT be set on the 2.10 main stack (would desync train vs the 2.10 serve).
-    if os.environ.get("DSPARK_COMPILE") and args.speculator_type == "dsv4_dspark":
+    if os.environ.get("DSPARK_COMPILE") == "1" and args.speculator_type == "dsv4_dspark":
         from speculators.models.dsv4_dspark.backbone import moe_compile  # noqa: PLC0415
 
         moe_compile.enable()
