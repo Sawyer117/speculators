@@ -104,10 +104,11 @@ def make_inputs(m):
 M_LIST = [500, 1024, 1500, 2048, 3000, 777]
 
 print("=== EAGER baseline (reference outputs) ===")
+# generate inputs ONCE and reuse for eager AND compiled — else parity compares different random data.
+INPUTS = {m: make_inputs(m) for m in M_LIST}
 ref = {}
 for m in M_LIST:
-    x, counts = make_inputs(m)
-    ref[m] = experts_fn(x, counts).float()
+    ref[m] = experts_fn(*INPUTS[m]).float()
     print(f"  M={m:5}: out {tuple(ref[m].shape)}")
 
 print("\n=== COMPILED (backend='inductor' + maybe_mark_dynamic on token dim) ===")
@@ -116,7 +117,7 @@ torch.compiler.reset()
 compiled = torch.compile(experts_fn, backend="inductor")
 
 for i, m in enumerate(M_LIST):
-    x, counts = make_inputs(m)
+    x, counts = INPUTS[m]                       # SAME inputs the eager reference used (real parity)
     torch._dynamo.maybe_mark_dynamic(x, 0)     # token dim symbolic -> one kernel for every M
     torch.npu.synchronize()
     t0 = time.perf_counter()

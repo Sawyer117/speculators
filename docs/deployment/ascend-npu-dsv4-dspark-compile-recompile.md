@@ -105,8 +105,14 @@ Test: `python examples/ascend_npu_dflash/test_compile_grouped_mm.py`
    → `RuntimeError: 0 active drivers` (only CUDA-triton 3.7.1 is installed; no Ascend-Triton driver).
    **Fix**: `import inductor_npu_ext` (torchtitan-npu `entry.py:92` does exactly this) engages the
    AutoFuse/AscendC codegen and bypasses the Triton path — we'd installed inductor_npu_ext but never
-   *imported* it. Retest. ⟵ *we are here.* If it STILL wants Triton → install `triton-ascend` (the
-   Ascend Triton; note `~/non-causal-swa-triton-ascend`).
+   *imported* it. Also needed **`triton-ascend`** (CANN 9.0.0 → 3.2.x) — the CUDA-triton pulled earlier
+   gave "0 active drivers".
+7. **triton-ascend + `import inductor_npu_ext` in → compile WORKS shape-generically** ✅:
+   `dynamo stats {unique_graphs: 1}`, first token count compiles (~1.6s), **all other counts ~3.8ms
+   (no per-shape recompile)** — the 42% recompile IS killable by compile, `maybe_mark_dynamic` works on
+   NPU. Initial parity looked wrong (rel~1.3) but that was a **test bug** (inputs regenerated per loop →
+   eager vs compiled ran on *different* random data); fixed to reuse the same inputs. Re-verifying
+   parity. ⟵ *we are here.*
 
 ## 7. Risks / open questions
 
