@@ -57,11 +57,13 @@ if [ "$MODE" = "faithful" ]; then
   if [ "$EP" = "1" ]; then
     # EP: routed experts are Shard(0) DTensors (256/NPROC per card); grouped-GEMM runs on
     # the local slice. NO --init-on-meta (each rank builds only its 1/EP slice per-rank).
-    # Checkpoints work under EP (DCP gathers the Shard(0) expert DTensors) -> save every
-    # ~10% of an epoch, same as non-EP faithful (CKPT_FREQ<1 => every round(N*freq) steps).
-    EXTRA="--checkpoint-freq ${CKPT_FREQ:-0.1}"
+    # Checkpoints work under EP (DCP gathers the Shard(0) expert DTensors). DEFAULT = once per
+    # epoch (CKPT_FREQ=1.0): EP save is DTensor-native (fast, no 768 per-expert gather), and
+    # per-epoch keeps overhead minimal on the multi-day run. While DEBUGGING save/resume, set a
+    # small CKPT_FREQ (e.g. 0.1 => every round(N*freq) steps) to hit the save/resume path fast.
+    EXTRA="--checkpoint-freq ${CKPT_FREQ:-1.0}"
   else
-    EXTRA="--init-on-meta --checkpoint-freq ${CKPT_FREQ:-0.1}"
+    EXTRA="--init-on-meta --checkpoint-freq ${CKPT_FREQ:-1.0}"
     if [ "$GROUPED" = "1" ]; then
       echo "!! faithful uses per-expert FSDP; grouped-GEMM needs experts LOCAL. Turn on EP"
       echo "   instead:  DSPARK_EP=1 bash $0 faithful  (partitions experts + all-to-all)."
