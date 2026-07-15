@@ -80,6 +80,37 @@ def _grouped_matmul(x, weight, counts):
     return _grouped_matmul_torch(x, weight, counts)
 
 
+def _fused_permute_dispatch_npu(x: torch.Tensor, indices: torch.Tensor, w_flat: torch.Tensor,
+                                experts: GroupedExperts, n_experts: int) -> torch.Tensor:
+    """NPU fused dispatch: ``npu_moe_token_permute`` -> grouped-GEMM SwiGLU -> ``npu_moe_token_unpermute``.
+
+    Same math as the ``argsort`` + gather + ``index_add`` path, but the sort/scatter run on the
+    fused Ascend routing ops instead of an int64 ``argsort`` (which falls back to AiCPU). Mirrors
+    torchtitan-npu ``_run_local_experts``:
+      * ``x[N, dim]``   -- the (UN-replicated) input tokens;
+      * ``indices[N, k]`` -- per-token expert ids (k = topk for the routed path, or 1 for the
+        already-flattened EP per-unit path);
+      * ``w_flat[N*k]`` -- the matching router weights (row-major over (token, slot)).
+    Returns the UNPERMUTED per-unit output ``[N*k, dim]`` in original (row-major) order -- the
+    caller sums the k slots (routed topk) or uses it as-is (k == 1). The grouped GEMM is still
+    the validated ``_grouped_matmul`` (Graft A swaps only the permute; Graft B swaps the GEMM).
+    """
+    import torch_npu  # noqa: PLC0415  (NPU-only; every caller gates on device.type == "npu")
+
+    w1, w3, w2 = experts.local_weights()
+    # Ascend routing ops take int32 expert ids (ids < n_experts fit); ids are non-differentiable.
+    idx = indices.to(torch.int32)
+    routed_input, sorted_idx = torch_npu.npu_moe_token_permute(x, idx)            # [N*k, dim]
+    routed_scores, _ = torch_npu.npu_moe_token_permute(
+        w_flat.reshape(-1, 1), idx.reshape(-1, 1)
+    )                                                                             # [N*k, 1]
+    counts = torch.bincount(indices.reshape(-1), minlength=n_experts)            # [E]
+    out = swiglu_grouped(routed_input.float(), w1.float(), w3.float(), w2.float(),
+                         counts, routed_scores.reshape(-1).float(),
+                         experts.swiglu_limit, _grouped_matmul)                   # [N*k, dim]
+    return torch_npu.npu_moe_token_unpermute(out.to(routed_input.dtype), sorted_idx, None)
+
+
 def moe_dispatch_grouped(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,
                          experts: GroupedExperts, n_routed_experts: int) -> torch.Tensor:
     """Grouped-GEMM equivalent of moe._moe_dispatch_torch. Returns y[T, dim] (fp32).
@@ -89,10 +120,17 @@ def moe_dispatch_grouped(x: torch.Tensor, weights: torch.Tensor, indices: torch.
     """
     T, dim = x.shape
     device = x.device
+    topk = indices.shape[1]
+
+    if device.type == "npu":
+        # Fused Ascend routing (no int64-argsort AiCPU fallback); same math as the CPU path below.
+        unpermuted = _fused_permute_dispatch_npu(x, indices, weights.reshape(-1),
+                                                 experts, n_routed_experts)        # [T*topk, dim]
+        return unpermuted.view(T, topk, dim).float().sum(dim=1)                    # sum the topk slots
+
     w1, w3, w2 = experts.local_weights()
 
     # flatten routing: each token -> topk (token, expert, weight); sort by expert
-    topk = indices.shape[1]
     tok_ids = torch.arange(T, device=device).repeat_interleave(topk)      # [T*topk]
     exp_ids = indices.reshape(-1)                                          # [T*topk]
     w_flat = weights.reshape(-1).float()                                   # [T*topk]

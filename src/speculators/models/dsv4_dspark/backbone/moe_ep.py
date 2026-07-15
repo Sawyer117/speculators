@@ -33,7 +33,7 @@ import torch.distributed as dist
 
 from .kernels import register_kernel
 from .moe import GroupedExperts, swiglu_grouped
-from .moe_grouped_gemm import _grouped_matmul
+from .moe_grouped_gemm import _fused_permute_dispatch_npu, _grouped_matmul
 
 _MOE_OP = "moe_dispatch"
 
@@ -93,6 +93,11 @@ def _local_grouped_ffn(x: torch.Tensor, local_eid: torch.Tensor, w: torch.Tensor
     the flatten/scatter (which EP does around the all-to-all). ``experts`` holds stacked
     weights (``.to_local()`` when Shard(0) DTensors).
     """
+    if x.device.type == "npu":
+        # Fused Ascend routing: units are already flattened (k=1), so permute/unpermute over
+        # local_eid replaces the int64 argsort. Returns [N, dim] in input order (== out[inv]).
+        return _fused_permute_dispatch_npu(x, local_eid.reshape(-1, 1), w, experts, n_local)
+
     w1, w3, w2 = experts.local_weights()
     order = torch.argsort(local_eid, stable=True)
     inv = torch.argsort(order, stable=True)
