@@ -25,7 +25,10 @@ import time
 
 import torch
 import torch_npu  # noqa: F401
-from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+# NB: do NOT `from torch_npu.contrib import transfer_to_npu` — torchtitan-npu does not use it, and on
+# torch 2.12 + torch_npu 2.12.0rc1 its _patch_cuda() crashes (_apply_patches signature mismatch). We
+# only need `import torch_npu`, which registers the "npu" device + torch.npu.* (no CUDA remap needed).
 
 
 # --- NPU compile shim: torch 2.10's Triton/TMA capability probes call get_device_capability() /

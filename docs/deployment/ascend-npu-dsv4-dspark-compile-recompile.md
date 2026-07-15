@@ -58,8 +58,12 @@ on 2.10 the Inductor internals differ → CUDA-centric passes run unpatched → 
 ```bash
 conda create -n dspark-dsv4-compile --clone dspark-dsv4-austin
 conda activate dspark-dsv4-compile
-pip install torch==2.12.0+cpu                 # CPU torch (NOT the default aarch64 wheel = torch 2.13 + CUDA!)
+pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu   # ★ MUST be +cpu — torch_npu
+                                              # 2.12.0rc1 is built for +cpu; the default aarch64 wheel is
+                                              # +cu130 and breaks transfer_to_npu (_apply_patches ABI mismatch)
 pip install torch_npu==2.12.0rc1              # from the Ascend pip source
+# do NOT use transfer_to_npu (torchtitan-npu doesn't; it crashes on this stack). Plain `import torch_npu`
+# registers the "npu" device + torch.npu.* — that's all we need.
 cd ~/torchair && git checkout 3c9418c2
 pip install -e experimental/_inductor_npu_ext/python/ --no-deps   # ★ --no-deps: else it drags torch 2.13 + cuda-toolkit + nvidia-*
 cd -
@@ -83,8 +87,16 @@ Test: `python examples/ascend_npu_dflash/test_compile_grouped_mm.py`
    inductor_npu_ext on torch 2.10.)
 3. **Root cause = version mismatch** (2.10 vs required 2.12). `inductor_npu_ext --force-reinstall`
    tried to pull **torch 2.13.0 + CUDA** (its `torch>=2.8.0` dep) → must use `--no-deps`.
-4. **Next**: install torch 2.12.0+cpu + torch_npu 2.12.0rc1 in the clone, `inductor_npu_ext --no-deps`,
-   retest. ⟵ *we are here.*
+4. **torch 2.12 + torch_npu 2.12.0rc1 installed** (`inductor_npu_ext --no-deps`). `import torch_npu;
+   torch.npu.is_available()` → **True** ⇒ **CANN gate PASSED** (2.12.0rc1 runs on the box CANN). BUT
+   `pip install torch==2.12.0+cpu` resolved to **`2.12.0+cu130`** (no aarch64 `+cpu` wheel on the default
+   index) → `from torch_npu.contrib import transfer_to_npu` crashes at import:
+   `_apply_patches() takes 0 positional arguments but 1 was given` (torch_npu 2.12.0rc1 is built for the
+   **+cpu** torch, not +cu130; [web](https://github.com/BrightXiaoHan/pytorch-npu/)).
+5. **Fixes** (⟵ *we are here*): (a) **torchtitan-npu does NOT use `transfer_to_npu`** (grep: 0 hits) —
+   removed it from the test; plain `import torch_npu` registers the `npu` device + `torch.npu.*`.
+   (b) install torch **2.12.0+cpu** (the build torch_npu 2.12.0rc1 expects), not `+cu130`, via the CPU
+   index. Then retest.
 
 ## 7. Risks / open questions
 
