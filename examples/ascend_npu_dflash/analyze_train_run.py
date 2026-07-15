@@ -17,12 +17,17 @@ Prints a structured report AND (if matplotlib is present) writes PNGs to an outp
 
 Console-only works anywhere (no torch/matplotlib needed). Plots need matplotlib.
 
-Usage:
+Usage (see --help for the full list + examples):
     python analyze_train_run.py                       # DEFAULT: newest *.log in $RUN (the run dir)
     python analyze_train_run.py <dir>                 # newest *.log with metrics in <dir>
     python analyze_train_run.py <logfile> [--out plots_dir]
+    python analyze_train_run.py CURRENT --baseline OLD --out ./cmp   # COMPARE two runs
     <cmd> 2>&1 | tee run.log ; python analyze_train_run.py run.log --out ./analysis
     python analyze_train_run.py -                     # read stdin, console only
+
+COMPARE MODE: pass --baseline <log> to overlay an older reference run on every plot
+(CURRENT = solid, BASELINE = dashed / grouped bars). The text report stays CURRENT-only,
+plus a compact 'VS BASELINE' headline delta table (accept_len / loss / tok_s / recompile% / HS%).
 
 The run dir defaults to $RUN or /home/a00652497/dspark_austin/run (matches train_dsv4_dspark.sh,
 which writes $RUN/faithful_ep_<ts>.log + a rank0 mirror train_*.log). Override with RUN=... .
@@ -168,31 +173,174 @@ def spike_report(recs, key, k_thresh=3.0):
     return {"median": med, "steady_med": med, "spikes": spikes, "n": len(vals)}
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
+def _default_label(path: str) -> str:
+    """A short display name for a run — the log's filename without extension."""
+    if path in ("-", None):
+        return "current"
+    base = os.path.basename(os.path.normpath(path))
+    return os.path.splitext(base)[0] or base
+
+
+def _load_and_skip(path: str, skip: int, quiet: bool = False):
+    """resolve → load → drop steps < skip. Returns (recs, ckpt_steps) or (None, None) if no metrics."""
+    recs, raw_text = load(resolve_log(path))
+    if not recs:
+        return None, None
+    if skip > 0:
+        kept = [r for r in recs if step_of(r) >= skip]
+        if kept:
+            if not quiet:
+                print(f"(--skip {skip}: dropped {len(recs) - len(kept)} warmup/regen steps; analyzing {len(kept)})")
+            recs = kept
+    return recs, checkpoint_steps(raw_text)
+
+
+def _headline(recs, ckpt_steps, spike_k=3.0) -> dict:
+    """The handful of numbers we compare between two runs (cheap; recomputed per run)."""
+    good = [r for r in recs if f(r, "train/loss") is not None and not isnan(f(r, "train/loss"))]
+    al = [f(r, "train/accept_len") for r in good if f(r, "train/accept_len") is not None]
+    loss = col(good[-20:], "train/loss")
+
+    def _steady(key):
+        rr = spike_report(recs, key, spike_k)
+        return rr["steady_med"] if rr else None
+
+    fwd_s, fetch_s, step_s = _steady("profile/fwd_ms"), _steady("profile/fetch_ms"), _steady("profile/step_ms")
+    total = sum(col(recs, "profile/step_ms")) or 1.0
+
+    def _excess(key, steady, only_nonckpt=False):
+        if steady is None:
+            return 0.0
+        t = 0.0
+        for r in recs:
+            if only_nonckpt and step_of(r) in ckpt_steps:
+                continue
+            v = f(r, key)
+            if v is not None and v > steady:
+                t += v - steady
+        return t
+
+    tp = col(recs, "profile/tokens_per_s")
+    tps = None
+    if tp:
+        thr = 0.5 * median(sorted(tp)[len(tp) // 2:])
+        st = [v for v in tp if v > thr]
+        tps = median(st) if st else median(tp)
+    steps = [s for s in (step_of(r) for r in recs) if s >= 0]
+    return {
+        "accept_len": median(al[-20:]) if al else None,
+        "accept_len_max": max(al) if al else None,
+        "loss": median(loss) if loss else None,
+        "step_ms": step_s,
+        "tokens_s": tps,
+        "recompile_pct": 100 * _excess("profile/fwd_ms", fwd_s) / total,
+        "hs_pct": 100 * _excess("profile/fetch_ms", fetch_s, only_nonckpt=True) / total,
+        "span": (min(steps) if steps else 0, max(steps) if steps else 0),
+    }
+
+
+def _print_vs_baseline(recs, ckpt_steps, base_recs, base_ckpt, cur_label, base_label, spike_k):
+    """A compact headline delta table: CURRENT vs BASELINE (the plots carry the full comparison)."""
+    hc = _headline(recs, ckpt_steps, spike_k)
+    hb = _headline(base_recs, base_ckpt, spike_k)
+    bl, cl = (base_label or "baseline")[:13], (cur_label or "current")[:13]
+    print("\n-- VS BASELINE (headline; the full report below is CURRENT only) " + "-" * 13)
+    print(f"  steps: {bl}={hb['span'][0]}..{hb['span'][1]}   {cl}={hc['span'][0]}..{hc['span'][1]}")
+    print(f"  {'metric':16} {bl:>13} {cl:>13} {'Δ (cur−base)':>16}")
+
+    def _row(label, key, higher_better, fmt_="{:.3f}", unit=""):
+        vb, vc = hb.get(key), hc.get(key)
+        if vb is None or vc is None:
+            print(f"  {label:16} {'—':>13} {'—':>13}")
+            return
+        d = vc - vb
+        if abs(d) / max(abs(vb), 1e-9) < 0.005:   # within 0.5% → noise, not a real change
+            mark = "→ ~same"
+        elif (d > 0) == higher_better:
+            mark = "✅ better"
+        else:
+            mark = "⚠️  worse"
+        dfmt = fmt_.replace("{:", "{:+")
+        print(f"  {label:16} {(fmt_.format(vb) + unit):>13} {(fmt_.format(vc) + unit):>13}"
+              f" {(dfmt.format(d) + unit):>12}  {mark}")
+
+    _row("accept_len",    "accept_len",     True)
+    _row("accept_len max","accept_len_max", True)
+    _row("loss",          "loss",           False)
+    _row("tokens/s",      "tokens_s",       True,  "{:.0f}")
+    _row("step_ms steady","step_ms",        False, "{:.0f}", "ms")
+    _row("recompile %",   "recompile_pct",  False, "{:.1f}", "%")
+    _row("HS fetch %",    "hs_pct",         False, "{:.1f}", "%")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="analyze_train_run.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Analyze a DSV4-DSpark training run: quality + timing + spikes + bottleneck breakdown,\n"
+            "printed as a console report and (with --out) PNG plots.\n\n"
+            "COMPARE MODE: pass --baseline <log> to overlay a second, older run on every plot\n"
+            "(CURRENT = solid, BASELINE = dashed). The text report stays CURRENT-only; a compact\n"
+            "'VS BASELINE' headline table (accept_len / loss / tok_s / recompile% / HS%) is added."
+        ),
+        epilog=(
+            "TERMS:\n"
+            "  CURRENT  = the run you're evaluating now (positional; gets the full text report)\n"
+            "  BASELINE = the older reference run to compare against (--baseline; overlaid on plots)\n\n"
+            "EXAMPLES:\n"
+            "  # newest *.log in $RUN, console only\n"
+            "  python analyze_train_run.py\n\n"
+            "  # one run + plots\n"
+            "  python analyze_train_run.py run.log --out ./analysis\n\n"
+            "  # compare anchor=384 (current) against anchor=196 (baseline)\n"
+            "  python analyze_train_run.py new.log --baseline old.log --out ./cmp\n"
+            "  python analyze_train_run.py new.log --baseline old.log \\\n"
+            "         --label anchor384 --baseline-label anchor196 --out ./cmp --skip 500\n"
+        ),
+    )
     ap.add_argument("logfile", nargs="?", default=DEFAULT_RUN_DIR,
-                    help=f"log file, or a directory to auto-pick its newest *.log (default: {DEFAULT_RUN_DIR})")
-    ap.add_argument("--out", default=None, help="folder for PNG plots (created if missing)")
-    ap.add_argument("--spike-k", type=float, default=3.0, help="spike = stage > k*steady-median")
+                    help=f"CURRENT run: a log file, or a dir to auto-pick its newest *.log (default: {DEFAULT_RUN_DIR})")
+    ap.add_argument("--baseline", default=None, metavar="LOG",
+                    help="BASELINE run to compare against: overlaid (dashed) on every plot + a headline delta table")
+    ap.add_argument("--label", default=None, metavar="NAME",
+                    help="display name for the CURRENT run (default: log filename)")
+    ap.add_argument("--baseline-label", default=None, metavar="NAME",
+                    help="display name for the BASELINE run (default: its filename)")
+    ap.add_argument("--out", default=None, metavar="DIR", help="folder for PNG plots (created if missing)")
+    ap.add_argument("--spike-k", type=float, default=3.0, help="spike = stage > k*steady-median (default 3.0)")
     ap.add_argument("--recent", type=int, default=500, help="window (steps) for the recent-dynamics trend")
     ap.add_argument("--skip", type=int, default=0,
-                    help="drop global_steps < N (exclude shape-warmup / resume HS-regeneration) for a clean steady verdict")
-    args = ap.parse_args()
+                    help="drop global_steps < N (exclude shape-warmup / resume HS-regen); applied to BOTH runs")
+    return ap
 
-    recs, raw_text = load(resolve_log(args.logfile))
-    ckpt_steps = checkpoint_steps(raw_text)
-    if not recs:
+
+def main() -> None:
+    args = _build_parser().parse_args()
+
+    recs, ckpt_steps = _load_and_skip(args.logfile, args.skip)
+    if recs is None:
         print("!! no metric records parsed — is this a trainer.py rich-logger log?")
         return
-    if args.skip > 0:
-        kept = [r for r in recs if step_of(r) >= args.skip]
-        if kept:
-            print(f"(--skip {args.skip}: dropped {len(recs) - len(kept)} warmup/regen steps; analyzing {len(kept)})")
-            recs = kept
+    cur_label = args.label or _default_label(args.logfile)
+
+    # optional BASELINE run to compare against (overlaid on plots + a headline delta table)
+    base_recs = base_ckpt = base_label = None
+    if args.baseline:
+        base_label = args.baseline_label or _default_label(args.baseline)
+        print(f">>> baseline overlay = {args.baseline}   (label '{base_label}', dashed on all plots)\n")
+        base_recs, base_ckpt = _load_and_skip(args.baseline, args.skip, quiet=True)
+        if base_recs is None:
+            print("!! baseline log had no metrics — ignoring --baseline")
+            base_recs = base_label = None
+
     steps = [s for s in (step_of(r) for r in recs) if s >= 0]  # skip a leading partial record
     print("=" * 78)
-    print(f" TRAINING RUN ANALYSIS   {len(recs)} steps   (global_step {min(steps)}..{max(steps)})")
+    print(f" TRAINING RUN ANALYSIS   {len(recs)} steps   (global_step {min(steps)}..{max(steps)})"
+          + (f"   [CURRENT '{cur_label}' vs BASELINE '{base_label}']" if base_recs is not None else ""))
     print("=" * 78)
+    if base_recs is not None:
+        _print_vs_baseline(recs, ckpt_steps, base_recs, base_ckpt, cur_label, base_label, args.spike_k)
 
     # ---------------- NaN ----------------
     # Only a REAL nan counts — a missing train/loss just means a truncated/partial record
@@ -450,153 +598,252 @@ def main() -> None:
 
     # ---------------- plots ----------------
     if args.out:
-        _plots(recs, good, pos_keys, reps, ckpt_steps, args.out)
+        base = None
+        if base_recs is not None:
+            base = {
+                "recs": base_recs,
+                "good": [r for r in base_recs if f(r, "train/loss") is not None and not isnan(f(r, "train/loss"))],
+                "pos_keys": detect_positions(base_recs),
+                "reps": {s: spike_report(base_recs, s, args.spike_k) for s in
+                         ["profile/fetch_ms", "profile/fwd_ms", "profile/bwd_ms", "profile/opt_ms", "profile/step_ms"]},
+                "ckpt_steps": base_ckpt, "label": base_label,
+            }
+        _plots(recs, good, pos_keys, reps, ckpt_steps, args.out, cur_label, base)
     print("=" * 78)
 
 
-def _plots(recs, good, pos_keys, reps, ckpt_steps, out):
+def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=None):
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import numpy as np
+        from matplotlib.lines import Line2D
     except ImportError:
         print(f"\n(plots skipped: matplotlib not installed — `pip install matplotlib`; console report above is complete)")
         return
     os.makedirs(out, exist_ok=True)
 
+    # optional BASELINE overlay (dashed / grouped). have_base gates every comparison branch.
+    have_base = base is not None
+    bgood = base["good"] if have_base else None
+    brecs = base["recs"] if have_base else None
+    breps = base["reps"] if have_base else None
+    blabel = base["label"] if have_base else None
+
     def xy(key, recs_=recs):
         s = series(recs_, key)
         return [a for a, _ in s], [b for _, b in s]
 
+    def _overlay(key, color, lab, cur_src, base_src):
+        """current solid + (if comparing) baseline dashed, SAME color per metric."""
+        x, y = xy(key, cur_src)
+        if x:
+            plt.plot(x, y, lw=1.0, color=color, label=lab)
+        if have_base:
+            xb, yb = xy(key, base_src)
+            if xb:
+                plt.plot(xb, yb, lw=1.0, color=color, ls="--", alpha=0.55)
+
+    def _legend(**kw):
+        """Set the legend; when comparing, append two proxy entries (solid=current / dashed=baseline)."""
+        ax = plt.gca()
+        h, l = ax.get_legend_handles_labels()
+        if have_base:
+            h = h + [Line2D([0], [0], color="0.25", ls="-", lw=2),
+                     Line2D([0], [0], color="0.25", ls="--", lw=2)]
+            l = l + [f"{label} (solid)", f"{blabel} (dashed)"]
+        ax.legend(h, l, **kw)
+
+    ttl_suffix = f"  ({label} solid vs {blabel} dashed)" if have_base else ""
+
     # 1) loss
     plt.figure(figsize=(9, 4))
-    for k, lab in [("train/loss", "total"), ("train/ce_loss", "ce"),
-                   ("train/tv_loss", "tv"), ("train/confidence_loss", "confidence")]:
-        x, y = xy(k, good)
-        if x:
-            plt.plot(x, y, lw=0.8, label=lab)
-    plt.xlabel("step"); plt.ylabel("loss"); plt.legend(); plt.title("Loss"); plt.grid(alpha=.3)
+    for k, lab, c in [("train/loss", "total", "#222222"), ("train/ce_loss", "ce", "#2E6CF6"),
+                      ("train/tv_loss", "tv", "#1B8A4E"), ("train/confidence_loss", "confidence", "#D62828")]:
+        _overlay(k, c, lab, good, bgood)
+    plt.xlabel("step"); plt.ylabel("loss"); plt.title("Loss" + ttl_suffix); plt.grid(alpha=.3); _legend()
     plt.tight_layout(); plt.savefig(f"{out}/loss.png", dpi=120); plt.close()
 
     # 2) acceptance + per-position (overview)
     plt.figure(figsize=(9, 4))
-    for k, lab in [("train/accept_len", "accept_len"), ("train/accept_rate", "accept_rate"),
-                   ("train/full_acc", "full_acc")]:
-        x, y = xy(k, good)
-        if x:
-            plt.plot(x, y, lw=0.9, label=lab)
+    for k, lab, c in [("train/accept_len", "accept_len", "#2E6CF6"),
+                      ("train/accept_rate", "accept_rate", "#1B8A4E"),
+                      ("train/full_acc", "full_acc", "#D62828")]:
+        _overlay(k, c, lab, good, bgood)
     plt.axhline(3.94, ls="--", c="grey", lw=.8, label="released AL 3.94")
-    plt.xlabel("step"); plt.ylabel("accept"); plt.legend(); plt.title("Acceptance"); plt.grid(alpha=.3)
+    plt.xlabel("step"); plt.ylabel("accept"); plt.title("Acceptance" + ttl_suffix); plt.grid(alpha=.3); _legend()
     plt.tight_layout(); plt.savefig(f"{out}/acceptance.png", dpi=120); plt.close()
 
-    # 2b) accept_len DEDICATED: raw + smoothed + HIGHLIGHTED paper baseline
+    # 2b) accept_len DEDICATED (the hero comparison): raw + smoothed, both runs, + released target
     x, y = xy("train/accept_len", good)
     if x:
-        import numpy as np
         plt.figure(figsize=(9.5, 4.8))
-        plt.plot(x, y, lw=0.5, alpha=0.30, color="#7A8AA8", label="raw (per step)")
-        w = max(11, len(y) // 60)  # smoothing window
-        if len(y) >= w:
-            ys = np.convolve(np.asarray(y, float), np.ones(w) / w, mode="valid")
-            off = (w - 1) // 2
-            plt.plot(x[off:off + len(ys)], ys, lw=2.4, color="#2E6CF6",
-                     label=f"smoothed ({w}-step moving avg)")
+
+        def _smoothed(xx, yy, color, raw_color, name):
+            plt.plot(xx, yy, lw=0.5, alpha=0.28, color=raw_color)
+            w = max(11, len(yy) // 60)
+            if len(yy) >= w:
+                ys = np.convolve(np.asarray(yy, float), np.ones(w) / w, mode="valid")
+                off = (w - 1) // 2
+                plt.plot(xx[off:off + len(ys)], ys, lw=2.4, color=color, label=f"{name} (smoothed)")
+            return median(yy[-min(50, len(yy)):])
+
+        cur = _smoothed(x, y, "#2E6CF6", "#7A8AA8", label)
+        base_y = []
+        if have_base:
+            xb, yb = xy("train/accept_len", bgood)
+            if xb:
+                base_y = yb
+                bcur = _smoothed(xb, yb, "#E08A1E", "#C9A27A", blabel)
+                plt.annotate(f"{blabel} ~{bcur:.2f}", xy=(xb[-1], bcur), xytext=(xb[-1], bcur + 0.06),
+                             color="#E08A1E", fontsize=10, ha="right", weight="bold")
         # HIGHLIGHTED paper / released-draft target
         plt.axhline(3.94, ls="--", lw=2.4, color="#D62828",
                     label="released draft AL = 3.94 (paper / vllm-ascend PR #11196)")
         plt.annotate("target 3.94", xy=(x[0], 3.94), xytext=(x[0], 3.99),
                      color="#D62828", fontsize=11, weight="bold")
-        cur = median(y[-min(50, len(y)):])
-        plt.axhline(cur, ls=":", lw=1.2, color="#1B8A4E")
-        plt.annotate(f"current ~{cur:.2f}", xy=(x[-1], cur), xytext=(x[-1], cur - 0.18),
+        plt.annotate(f"{label} ~{cur:.2f}", xy=(x[-1], cur), xytext=(x[-1], cur - 0.18),
                      color="#1B8A4E", fontsize=10, ha="right", weight="bold")
-        plt.ylim(1.0, max(4.2, (max(y) if y else 4) + 0.2))
+        ally = y + base_y
+        plt.ylim(1.0, max(4.2, (max(ally) if ally else 4) + 0.2))
         plt.xlabel("step"); plt.ylabel("acceptance length")
-        plt.title("Acceptance length — raw vs smoothed (target = released-draft 3.94)")
+        plt.title((f"Acceptance length — {label} vs {blabel}" if have_base
+                   else "Acceptance length — raw vs smoothed") + " (target = released-draft 3.94)")
         plt.legend(loc="lower right"); plt.grid(alpha=.3)
         plt.tight_layout(); plt.savefig(f"{out}/accept_len.png", dpi=120); plt.close()
 
     if pos_keys:
-        # BAR chart of the CURRENT (last-N-step median) per-position accuracy, value-labeled.
         n = min(50, len(good))
-        vals = []
-        for k in pos_keys:
-            v = col(good[-n:], k)
-            vals.append(median(v) if v else 0.0)
+
+        def _posvals(pk, g):
+            gg = g[-min(50, len(g)):]
+            return [(median(col(gg, k)) if col(gg, k) else 0.0) for k in pk]
+
         labels = [f"pos{i+1}" for i in range(len(pos_keys))]
-        plt.figure(figsize=(8.5, 4.8))
-        bars = plt.bar(labels, vals, width=0.62, color="#2E6CF6", zorder=3)
-        for b, v in zip(bars, vals):
-            plt.text(b.get_x() + b.get_width() / 2, v + 0.012, f"{v:.3f}",
-                     ha="center", va="bottom", fontsize=11, weight="bold", color="#1B2538")
-        # released-draft per-position ACCEPT marginals (a related-but-different metric) as a shape ref
-        rel = [0.81, 0.68, 0.58, 0.48, 0.39]
-        if len(pos_keys) == len(rel):
-            plt.plot(labels, rel, "o--", color="#D62828", lw=1.6, ms=6, zorder=4,
-                     label="released draft accept marginal (ref)")
-            for i, r in enumerate(rel):
-                plt.text(i, r + 0.02, f"{r:.2f}", ha="center", color="#D62828", fontsize=9)
-            plt.legend(loc="upper right")
-        plt.ylim(0, 1.0)
-        plt.ylabel("greedy accuracy  (argmax == target)")
-        plt.title(f"Per-position draft accuracy — last {n} steps (decays p1→p{len(pos_keys)})")
-        plt.grid(axis="y", alpha=.3, zorder=0)
-        plt.tight_layout(); plt.savefig(f"{out}/position_acc.png", dpi=120); plt.close()
+        if have_base and base["pos_keys"]:
+            # GROUPED bars: current vs baseline, side by side per position.
+            cur_vals = _posvals(pos_keys, good)
+            bvals_raw = _posvals(base["pos_keys"], bgood)
+            bvals = (bvals_raw + [0.0] * len(labels))[:len(labels)]  # align to current's position count
+            xx = np.arange(len(labels)); w = 0.4
+            plt.figure(figsize=(9, 4.8))
+            b1 = plt.bar(xx - w / 2, cur_vals, w, color="#2E6CF6", zorder=3, label=label)
+            b2 = plt.bar(xx + w / 2, bvals, w, color="#E08A1E", zorder=3, label=blabel)
+            for bars in (b1, b2):
+                for b in bars:
+                    h = b.get_height()
+                    if h > 0:
+                        plt.text(b.get_x() + b.get_width() / 2, h + 0.012, f"{h:.2f}",
+                                 ha="center", va="bottom", fontsize=8, weight="bold")
+            plt.ylim(0, 1.0); plt.xticks(xx, labels); plt.legend(loc="upper right")
+            plt.ylabel("greedy accuracy  (argmax == target)")
+            plt.title(f"Per-position draft accuracy — {label} vs {blabel} (last {n} steps)")
+            plt.grid(axis="y", alpha=.3, zorder=0)
+            plt.tight_layout(); plt.savefig(f"{out}/position_acc.png", dpi=120); plt.close()
+        else:
+            # BAR chart of the CURRENT (last-N-step median) per-position accuracy, value-labeled.
+            vals = _posvals(pos_keys, good)
+            plt.figure(figsize=(8.5, 4.8))
+            bars = plt.bar(labels, vals, width=0.62, color="#2E6CF6", zorder=3)
+            for b, v in zip(bars, vals):
+                plt.text(b.get_x() + b.get_width() / 2, v + 0.012, f"{v:.3f}",
+                         ha="center", va="bottom", fontsize=11, weight="bold", color="#1B2538")
+            # released-draft per-position ACCEPT marginals (a related-but-different metric) as a shape ref
+            rel = [0.81, 0.68, 0.58, 0.48, 0.39]
+            if len(pos_keys) == len(rel):
+                plt.plot(labels, rel, "o--", color="#D62828", lw=1.6, ms=6, zorder=4,
+                         label="released draft accept marginal (ref)")
+                for i, r in enumerate(rel):
+                    plt.text(i, r + 0.02, f"{r:.2f}", ha="center", color="#D62828", fontsize=9)
+                plt.legend(loc="upper right")
+            plt.ylim(0, 1.0)
+            plt.ylabel("greedy accuracy  (argmax == target)")
+            plt.title(f"Per-position draft accuracy — last {n} steps (decays p1→p{len(pos_keys)})")
+            plt.grid(axis="y", alpha=.3, zorder=0)
+            plt.tight_layout(); plt.savefig(f"{out}/position_acc.png", dpi=120); plt.close()
 
     # 3) confidence calibration
     plt.figure(figsize=(9, 4))
-    for k, lab in [("train/confidence_pred_mean", "pred_mean"), ("train/accept_rate", "observed accept_rate"),
-                   ("train/confidence_abs_error", "abs_error"), ("train/confidence_cumprod_bias", "cumprod_bias")]:
-        x, y = xy(k, good)
-        if x:
-            plt.plot(x, y, lw=0.8, label=lab)
-    plt.xlabel("step"); plt.ylabel("confidence"); plt.legend(); plt.title("Confidence calibration"); plt.grid(alpha=.3)
+    for k, lab, c in [("train/confidence_pred_mean", "pred_mean", "#2E6CF6"),
+                      ("train/accept_rate", "observed accept_rate", "#1B8A4E"),
+                      ("train/confidence_abs_error", "abs_error", "#D62828"),
+                      ("train/confidence_cumprod_bias", "cumprod_bias", "#8A2BE2")]:
+        _overlay(k, c, lab, good, bgood)
+    plt.xlabel("step"); plt.ylabel("confidence"); plt.title("Confidence calibration" + ttl_suffix)
+    plt.grid(alpha=.3); _legend()
     plt.tight_layout(); plt.savefig(f"{out}/confidence.png", dpi=120); plt.close()
 
     # 4) timing (log-y so spikes + steady both visible)
     plt.figure(figsize=(9, 4))
-    for k, lab in [("profile/fetch_ms", "fetch/HS"), ("profile/fwd_ms", "fwd"),
-                   ("profile/bwd_ms", "bwd"), ("profile/opt_ms", "opt"), ("profile/step_ms", "step")]:
-        x, y = xy(k)
-        if x:
-            plt.plot(x, y, lw=0.7, label=lab)
-    plt.yscale("log"); plt.xlabel("step"); plt.ylabel("ms (log)"); plt.legend(ncol=5, fontsize=8)
-    plt.title("Per-stage time (log-y — spikes are the recompiles)"); plt.grid(alpha=.3, which="both")
+    for k, lab, c in [("profile/fetch_ms", "fetch/HS", "#D62828"), ("profile/fwd_ms", "fwd", "#2E6CF6"),
+                      ("profile/bwd_ms", "bwd", "#1B8A4E"), ("profile/opt_ms", "opt", "#8A2BE2"),
+                      ("profile/step_ms", "step", "#222222")]:
+        _overlay(k, c, lab, recs, brecs)
+    plt.yscale("log"); plt.xlabel("step"); plt.ylabel("ms (log)"); _legend(ncol=5, fontsize=8)
+    plt.title("Per-stage time (log-y — spikes are the recompiles)" + ttl_suffix); plt.grid(alpha=.3, which="both")
     plt.tight_layout(); plt.savefig(f"{out}/timing.png", dpi=120); plt.close()
 
-    # 5) per-stage timing BARS: steady (solid) vs effective-avg incl spikes (hollow/hatched), log-y
-    import numpy as np
+    # 5) per-stage timing BARS
     stage_defs = [("profile/fetch_ms", "HS fetch"), ("profile/fwd_ms", "fwd"),
                   ("profile/bwd_ms", "bwd"), ("profile/opt_ms", "opt"), ("profile/step_ms", "step")]
-    labels, sv, av = [], [], []
-    for key, lab in stage_defs:
-        r = reps.get(key)
-        if not r:
-            continue
-        vv = [(step_of(rec), f(rec, key)) for rec in recs if f(rec, key) is not None]
-        if key == "profile/fetch_ms":  # exclude checkpoint-save steps (misread as fetch)
-            vv = [(st, v) for st, v in vv if st not in ckpt_steps]
-        labels.append(lab)
-        sv.append(r["steady_med"])
-        av.append(mean([v for _, v in vv]) if vv else r["steady_med"])
-    if labels:
-        x = np.arange(len(labels)); w = 0.38
-        plt.figure(figsize=(9.8, 5.0))
-        b1 = plt.bar(x - w / 2, sv, w, color="#2E6CF6", zorder=3, label="steady (spikes excluded)")
-        b2 = plt.bar(x + w / 2, av, w, facecolor="none", edgecolor="#D62828", lw=1.8,
-                     hatch="////", zorder=3, label="effective avg (incl spikes)")
-        for bars in (b1, b2):
-            for b in bars:
-                h = b.get_height()
-                plt.text(b.get_x() + b.get_width() / 2, h * 1.06,
-                         f"{h:.0f}" if h >= 10 else f"{h:.1f}", ha="center", va="bottom", fontsize=9)
-        plt.yscale("log"); plt.xticks(x, labels); plt.ylabel("ms (log)")
-        plt.title("Per-stage time — steady (solid) vs effective-avg incl spikes (hatched)")
-        plt.legend(loc="upper left"); plt.grid(axis="y", alpha=.3, which="both", zorder=0)
-        plt.tight_layout(); plt.savefig(f"{out}/timing_bars.png", dpi=120); plt.close()
+    if have_base:
+        # COMPARE: current STEADY vs baseline STEADY, grouped (did steady compute change?), log-y.
+        labels, cs, bs = [], [], []
+        for key, lab in stage_defs:
+            r, rb = reps.get(key), (breps.get(key) if breps else None)
+            if not r:
+                continue
+            labels.append(lab)
+            cs.append(r["steady_med"])
+            bs.append(rb["steady_med"] if rb else 0.0)
+        if labels:
+            x = np.arange(len(labels)); w = 0.38
+            plt.figure(figsize=(9.8, 5.0))
+            b1 = plt.bar(x - w / 2, cs, w, color="#2E6CF6", zorder=3, label=f"{label} steady")
+            b2 = plt.bar(x + w / 2, bs, w, color="#E08A1E", zorder=3, label=f"{blabel} steady")
+            for bars in (b1, b2):
+                for b in bars:
+                    h = b.get_height()
+                    if h > 0:
+                        plt.text(b.get_x() + b.get_width() / 2, h * 1.06,
+                                 f"{h:.0f}" if h >= 10 else f"{h:.1f}", ha="center", va="bottom", fontsize=9)
+            plt.yscale("log"); plt.xticks(x, labels); plt.ylabel("ms (log)")
+            plt.title(f"Per-stage STEADY time — {label} vs {blabel}")
+            plt.legend(loc="upper left"); plt.grid(axis="y", alpha=.3, which="both", zorder=0)
+            plt.tight_layout(); plt.savefig(f"{out}/timing_bars.png", dpi=120); plt.close()
+    else:
+        # SINGLE run: steady (solid) vs effective-avg incl spikes (hollow/hatched), log-y.
+        labels, sv, av = [], [], []
+        for key, lab in stage_defs:
+            r = reps.get(key)
+            if not r:
+                continue
+            vv = [(step_of(rec), f(rec, key)) for rec in recs if f(rec, key) is not None]
+            if key == "profile/fetch_ms":  # exclude checkpoint-save steps (misread as fetch)
+                vv = [(st, v) for st, v in vv if st not in ckpt_steps]
+            labels.append(lab)
+            sv.append(r["steady_med"])
+            av.append(mean([v for _, v in vv]) if vv else r["steady_med"])
+        if labels:
+            x = np.arange(len(labels)); w = 0.38
+            plt.figure(figsize=(9.8, 5.0))
+            b1 = plt.bar(x - w / 2, sv, w, color="#2E6CF6", zorder=3, label="steady (spikes excluded)")
+            b2 = plt.bar(x + w / 2, av, w, facecolor="none", edgecolor="#D62828", lw=1.8,
+                         hatch="////", zorder=3, label="effective avg (incl spikes)")
+            for bars in (b1, b2):
+                for b in bars:
+                    h = b.get_height()
+                    plt.text(b.get_x() + b.get_width() / 2, h * 1.06,
+                             f"{h:.0f}" if h >= 10 else f"{h:.1f}", ha="center", va="bottom", fontsize=9)
+            plt.yscale("log"); plt.xticks(x, labels); plt.ylabel("ms (log)")
+            plt.title("Per-stage time — steady (solid) vs effective-avg incl spikes (hatched)")
+            plt.legend(loc="upper left"); plt.grid(axis="y", alpha=.3, which="both", zorder=0)
+            plt.tight_layout(); plt.savefig(f"{out}/timing_bars.png", dpi=120); plt.close()
 
+    tail = f"   [baseline '{blabel}' overlaid: dashed lines / grouped bars]" if have_base else ""
     print(f"\n📊 plots → {out}/  (loss, acceptance, accept_len[raw+smoothed+target], position_acc[bars],\n"
-          f"                    confidence, timing[lines], timing_bars[steady-vs-avg])")
+          f"                    confidence, timing[lines], timing_bars){tail}")
 
 
 if __name__ == "__main__":
