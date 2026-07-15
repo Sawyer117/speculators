@@ -28,6 +28,32 @@ import torch_npu  # noqa: F401
 from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
 
+# --- NPU compile shim: torch 2.10's Triton/TMA capability probes call get_device_capability() /
+# get_device_properties().major, which are None on NPU -> "'>=' NoneType vs tuple" crash DURING
+# torch.compile (before it ever reaches the grouped_mm). inductor_npu_ext codegens AscendC (NOT
+# Triton), so forcing benign no-Triton values is correct. torchtitan-npu also sets capture_scalar
+# _outputs for the data-dependent offs path. ---
+def _install_npu_compile_shim():
+    def _safe_cap(_f):
+        def inner(*a, **k):
+            try:
+                c = _f(*a, **k)
+            except Exception:  # noqa: BLE001
+                c = None
+            return c if c is not None else (0, 0)
+        return inner
+
+    for _name in ("cuda", "npu"):
+        mod = getattr(torch, _name, None)
+        gc = getattr(mod, "get_device_capability", None) if mod is not None else None
+        if gc is not None:
+            mod.get_device_capability = _safe_cap(gc)
+    torch._dynamo.config.capture_scalar_outputs = True
+
+
+_install_npu_compile_shim()
+
+
 # --- register aten::_grouped_mm -> npu_grouped_matmul (verbatim from torchtitan-npu ops/_grouped_mm.py) ---
 @torch.library.impl("aten::_grouped_mm", "PrivateUse1")
 def _grouped_mm_npu(self, mat2, offs, bias=None, out_dtype=None):
