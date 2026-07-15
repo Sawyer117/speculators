@@ -273,6 +273,31 @@ def _print_vs_baseline(recs, ckpt_steps, base_recs, base_ckpt, cur_label, base_l
     _row("HS fetch %",    "hs_pct",         False, "{:.1f}", "%")
 
 
+def _print_multi_table(runs, spike_k):
+    """One row per run (CURRENT = row 1) + Δ accept_len vs CURRENT. Any number of runs."""
+    hs = [(r["label"], _headline(r["recs"], r["ckpt"], spike_k)) for r in runs]
+    cols = [("accept_len", "accept_len", "{:.3f}"), ("acc_len_max", "accept_len_max", "{:.3f}"),
+            ("loss", "loss", "{:.3f}"), ("tok/s", "tokens_s", "{:.0f}"),
+            ("step_ms", "step_ms", "{:.0f}"), ("recompile%", "recompile_pct", "{:.1f}"),
+            ("HS%", "hs_pct", "{:.1f}")]
+    print("\n-- MULTI-RUN COMPARE (row 1 = CURRENT) " + "-" * 38)
+    print(f"  {'run':18} {'steps':>11} " + " ".join(f"{c[0]:>11}" for c in cols))
+    for lbl, h in hs:
+        span = f"{h['span'][0]}..{h['span'][1]}"
+        cells = [(fmt.format(h[key]) if h.get(key) is not None else "—") for _, key, fmt in cols]
+        print(f"  {lbl[:18]:18} {span:>11} " + " ".join(f"{c:>11}" for c in cells))
+    cur = hs[0][1]
+    if cur.get("accept_len") is not None:
+        deltas = []
+        for lbl, h in hs[1:]:
+            v = h.get("accept_len")
+            if v is not None:
+                d = cur["accept_len"] - v
+                deltas.append(f"{lbl[:14]} {d:+.3f}{'✅' if d > 0 else ('⚠️' if d < 0 else '→')}")
+        if deltas:
+            print("  Δ accept_len (CURRENT − each): " + " | ".join(deltas))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="analyze_train_run.py",
@@ -301,12 +326,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("logfile", nargs="?", default=DEFAULT_RUN_DIR,
                     help=f"CURRENT run: a log file, or a dir to auto-pick its newest *.log (default: {DEFAULT_RUN_DIR})")
-    ap.add_argument("--baseline", default=None, metavar="LOG",
-                    help="BASELINE run to compare against: overlaid (dashed) on every plot + a headline delta table")
+    ap.add_argument("--baseline", default=None, metavar="LOG", nargs="+",
+                    help="one or more BASELINE runs to compare against. ONE -> head-to-head (delta table + "
+                         "dashed overlays). MULTIPLE -> multi-run overlay (each run its own colour + a compare table).")
     ap.add_argument("--label", default=None, metavar="NAME",
                     help="display name for the CURRENT run (default: log filename)")
-    ap.add_argument("--baseline-label", default=None, metavar="NAME",
-                    help="display name for the BASELINE run (default: its filename)")
+    ap.add_argument("--baseline-label", default=None, metavar="NAME", nargs="+",
+                    help="display name(s) for the BASELINE run(s), positionally matched (default: filenames)")
     ap.add_argument("--full-baseline", action="store_true",
                     help="show the BASELINE's ENTIRE curve; default ALIGNS it to the CURRENT run's "
                          "step range (a short current run isn't buried under a long baseline)")
@@ -327,39 +353,51 @@ def main() -> None:
         return
     cur_label = args.label or _default_label(args.logfile)
 
-    # optional BASELINE run to compare against (overlaid on plots + a headline delta table)
-    base_recs = base_ckpt = base_label = None
+    # optional BASELINE run(s) to compare against. ONE -> head-to-head (delta table + dashed
+    # overlays). MULTIPLE -> multi-run overlay (each run its own colour + a compare table). Each
+    # baseline is aligned to the CURRENT run's step range by default (--full-baseline = full curves).
+    baselines: list[dict] = []
     if args.baseline:
-        base_label = args.baseline_label or _default_label(args.baseline)
-        print(f">>> baseline overlay = {args.baseline}   (label '{base_label}', dashed on all plots)\n")
-        base_recs, base_ckpt = _load_and_skip(args.baseline, args.skip, quiet=True)
-        if base_recs is None:
-            print("!! baseline log had no metrics — ignoring --baseline")
-            base_recs = base_label = None
-        elif not args.full_baseline:
-            # Align the baseline to the CURRENT run's step range so a short current run isn't
-            # buried under a long baseline (plots, y-autoscale, smoothing and the delta table all
-            # follow). Clip to steps <= current's max; keep a one-line reference to where the
-            # baseline's FULL run ended. --full-baseline shows the whole curve instead.
-            cur_steps = [s for s in (step_of(r) for r in recs) if s >= 0]
-            cur_max = max(cur_steps) if cur_steps else 0
-            clipped = [r for r in base_recs if 0 <= step_of(r) <= cur_max]
-            if clipped and len(clipped) < len(base_recs):
-                bfa = [f(r, "train/accept_len") for r in base_recs
-                       if f(r, "train/accept_len") is not None]
-                bref = f"; its full run reached accept_len ~{median(bfa[-20:]):.2f}" if bfa else ""
-                print(f">>> baseline aligned to current's step range (≤{cur_max}): "
-                      f"{len(clipped)}/{len(base_recs)} baseline steps shown{bref} "
-                      f"(--full-baseline to show all).\n")
-                base_recs = clipped
+        cur_steps0 = [s for s in (step_of(r) for r in recs) if s >= 0]
+        cur_max = max(cur_steps0) if cur_steps0 else 0
+        blabels = args.baseline_label or []
+        for i, bpath in enumerate(args.baseline):
+            blabel = blabels[i] if i < len(blabels) else _default_label(bpath)
+            brecs, bckpt = _load_and_skip(bpath, args.skip, quiet=True)
+            if brecs is None:
+                print(f"!! baseline '{bpath}' had no metrics — skipping")
+                continue
+            if not args.full_baseline:
+                clipped = [r for r in brecs if 0 <= step_of(r) <= cur_max]
+                if clipped and len(clipped) < len(brecs):
+                    bfa = [f(r, "train/accept_len") for r in brecs
+                           if f(r, "train/accept_len") is not None]
+                    bref = f"; full run reached accept_len ~{median(bfa[-20:]):.2f}" if bfa else ""
+                    print(f">>> baseline '{blabel}' aligned to current's step range (≤{cur_max}): "
+                          f"{len(clipped)}/{len(brecs)} steps shown{bref}.")
+                    brecs = clipped
+            baselines.append({
+                "label": blabel, "recs": brecs, "ckpt": bckpt,
+                "good": [r for r in brecs
+                         if f(r, "train/loss") is not None and not isnan(f(r, "train/loss"))],
+            })
+        if baselines:
+            print()
 
     steps = [s for s in (step_of(r) for r in recs) if s >= 0]  # skip a leading partial record
+    cmp_tag = f"   [CURRENT '{cur_label}' vs {len(baselines)} baseline(s)]" if baselines else ""
     print("=" * 78)
-    print(f" TRAINING RUN ANALYSIS   {len(recs)} steps   (global_step {min(steps)}..{max(steps)})"
-          + (f"   [CURRENT '{cur_label}' vs BASELINE '{base_label}']" if base_recs is not None else ""))
+    print(f" TRAINING RUN ANALYSIS   {len(recs)} steps   (global_step {min(steps)}..{max(steps)}){cmp_tag}")
     print("=" * 78)
-    if base_recs is not None:
-        _print_vs_baseline(recs, ckpt_steps, base_recs, base_ckpt, cur_label, base_label, args.spike_k)
+    if len(baselines) == 1:
+        b = baselines[0]
+        _print_vs_baseline(recs, ckpt_steps, b["recs"], b["ckpt"], cur_label, b["label"], args.spike_k)
+    elif len(baselines) >= 2:
+        _print_multi_table(
+            [{"label": cur_label, "recs": recs, "ckpt": ckpt_steps}]
+            + [{"label": b["label"], "recs": b["recs"], "ckpt": b["ckpt"]} for b in baselines],
+            args.spike_k,
+        )
 
     # ---------------- NaN ----------------
     # Only a REAL nan counts — a missing train/loss just means a truncated/partial record
@@ -617,17 +655,25 @@ def main() -> None:
 
     # ---------------- plots ----------------
     if args.out:
-        base = None
-        if base_recs is not None:
-            base = {
-                "recs": base_recs,
-                "good": [r for r in base_recs if f(r, "train/loss") is not None and not isnan(f(r, "train/loss"))],
-                "pos_keys": detect_positions(base_recs),
-                "reps": {s: spike_report(base_recs, s, args.spike_k) for s in
-                         ["profile/fetch_ms", "profile/fwd_ms", "profile/bwd_ms", "profile/opt_ms", "profile/step_ms"]},
-                "ckpt_steps": base_ckpt, "label": base_label,
-            }
-        _plots(recs, good, pos_keys, reps, ckpt_steps, args.out, cur_label, base)
+        if len(baselines) >= 2:
+            # multi-run overlay (each run its own colour) — one metric per plot
+            _plots_multi(
+                [{"label": cur_label, "recs": recs, "good": good}]
+                + [{"label": b["label"], "recs": b["recs"], "good": b["good"]} for b in baselines],
+                args.out,
+            )
+        else:
+            base = None
+            if len(baselines) == 1:
+                b = baselines[0]
+                base = {
+                    "recs": b["recs"], "good": b["good"],
+                    "pos_keys": detect_positions(b["recs"]),
+                    "reps": {s: spike_report(b["recs"], s, args.spike_k) for s in
+                             ["profile/fetch_ms", "profile/fwd_ms", "profile/bwd_ms", "profile/opt_ms", "profile/step_ms"]},
+                    "ckpt_steps": b["ckpt"], "label": b["label"],
+                }
+            _plots(recs, good, pos_keys, reps, ckpt_steps, args.out, cur_label, base)
     print("=" * 78)
 
 
@@ -879,6 +925,92 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
     tail = f"   [baseline '{blabel}' overlaid: dashed lines / grouped bars]" if have_base else ""
     print(f"\n📊 plots → {out}/  (loss, acceptance, accept_len[raw+smoothed+target], position_acc[bars],\n"
           f"                    confidence, timing[lines], timing_bars){tail}")
+
+
+def _plots_multi(runs, out):
+    """Overlay N runs (CURRENT first) on the key comparison metrics — one metric per plot,
+    each run its own colour + smoothed curve (raw faded behind). Used for >=2 baselines."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("\n(plots skipped: matplotlib not installed — console report above is complete)")
+        return
+    os.makedirs(out, exist_ok=True)
+    colors = ["#2E6CF6", "#E08A1E", "#1B8A4E", "#8A2BE2", "#D62828",
+              "#00A3A3", "#B4661E", "#555555", "#C71585", "#2F6B2F"]
+    for i, r in enumerate(runs):
+        r["color"] = colors[i % len(colors)]
+
+    def _xy(recs_, key):
+        s = series(recs_, key)
+        return [a for a, _ in s], [b for _, b in s]
+
+    def _overlay(key, fname, title, ylabel, *, train=True, logy=False, target=None):
+        plt.figure(figsize=(9.5, 4.8))
+        allv, drew = [], False
+        for r in runs:
+            x, y = _xy(r["good"] if train else r["recs"], key)
+            if not x:
+                continue
+            drew = True
+            allv += y
+            c = r["color"]
+            plt.plot(x, y, lw=0.5, alpha=0.18, color=c)
+            w = max(11, len(y) // 60)
+            if len(y) >= w:
+                ys = np.convolve(np.asarray(y, float), np.ones(w) / w, mode="valid")
+                off = (w - 1) // 2
+                plt.plot(x[off:off + len(ys)], ys, lw=2.2, color=c,
+                         label=f"{r['label']} ~{median(y[-min(50, len(y)):]):.3g}")
+            else:
+                plt.plot(x, y, lw=1.6, color=c, label=r["label"])
+        if not drew:
+            plt.close()
+            return
+        if logy:
+            plt.yscale("log")
+        if target is not None:
+            top = (max(allv) if allv else 1.5) + 0.15
+            if top < target - 0.34:
+                plt.ylim(1.0, top)
+                plt.annotate(f"↑ target = {target} (off-scale — early training)",
+                             xy=(0.5, 0.97), xycoords="axes fraction", ha="center", va="top",
+                             color="#D62828", fontsize=10, weight="bold")
+            else:
+                plt.axhline(target, ls="--", lw=2.0, color="#D62828", label=f"target {target}")
+                plt.ylim(1.0, max(target + 0.2, top))
+        plt.xlabel("step"); plt.ylabel(ylabel); plt.title(title)
+        plt.grid(alpha=.3, which="both" if logy else "major"); plt.legend(loc="best", fontsize=9)
+        plt.tight_layout(); plt.savefig(f"{out}/{fname}", dpi=120); plt.close()
+
+    _overlay("train/accept_len", "accept_len.png", "Acceptance length — all runs", "acceptance length", target=3.94)
+    _overlay("train/loss", "loss.png", "Total loss — all runs", "loss")
+    _overlay("train/accept_rate", "accept_rate.png", "Accept rate — all runs", "accept_rate")
+    _overlay("train/full_acc", "full_acc.png", "Full-block accuracy — all runs", "full_acc")
+    _overlay("profile/grad_norm", "grad_norm.png", "grad_norm — all runs (log-y)", "grad_norm",
+             train=False, logy=True)
+
+    # per-position accuracy: grouped bars, all runs (last-50-step medians)
+    pos_keys = detect_positions(runs[0]["recs"])
+    if pos_keys:
+        labels = [f"pos{i+1}" for i in range(len(pos_keys))]
+        xx = np.arange(len(labels)); n = len(runs); w = 0.8 / n
+        plt.figure(figsize=(10, 4.8))
+        for j, r in enumerate(runs):
+            g = r["good"][-50:]
+            vals = [(median(col(g, k)) if col(g, k) else 0.0) for k in pos_keys]
+            plt.bar(xx + (j - (n - 1) / 2) * w, vals, w, color=r["color"], zorder=3, label=r["label"])
+        plt.ylim(0, 1.0); plt.xticks(xx, labels); plt.legend(loc="upper right", fontsize=9)
+        plt.ylabel("greedy accuracy  (argmax == target)")
+        plt.title("Per-position draft accuracy — all runs (last 50 steps)")
+        plt.grid(axis="y", alpha=.3, zorder=0)
+        plt.tight_layout(); plt.savefig(f"{out}/position_acc.png", dpi=120); plt.close()
+
+    print(f"\n📊 multi-run plots → {out}/  ({len(runs)} runs overlaid: accept_len, loss, accept_rate, "
+          "full_acc, grad_norm[log], position_acc)")
 
 
 if __name__ == "__main__":
