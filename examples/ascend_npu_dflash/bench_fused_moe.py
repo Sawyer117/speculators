@@ -124,7 +124,25 @@ def bench():
     print(f"(2) fused  + grouped (A)  : {t2:8.3f} ms   ({t1 / t2:.2f}x vs argsort, {t0 / t2:.2f}x vs eager)")
 
 
+def empty_rank():
+    """EP edge case that crashed real training at step 89: a rank receives 0 tokens -> the fused
+    ``npu_moe_token_unpermute`` backward died with 'input shape has 0' (error 561002). The empty
+    step must run (fwd + bwd) via the empty-pad floor and return ``[0, dim]`` with ~0 expert grad."""
+    from speculators.models.dsv4_dspark.backbone.moe_grouped_gemm import _fused_permute_dispatch_npu
+    print("\n=== EMPTY-RANK EDGE (n=0, the step-89 crash) ===")
+    experts = GroupedExperts(DIM, INTER, n_local=E, swiglu_limit=SWIGLU_LIMIT, seed=0).to(DEV)
+    x = torch.zeros(0, DIM, device=DEV, requires_grad=True)
+    eid = torch.zeros(0, dtype=torch.int64, device=DEV)          # local expert ids (empty)
+    w = torch.zeros(0, device=DEV)
+    out = _fused_permute_dispatch_npu(x, eid.reshape(-1, 1), w, experts, E)   # must NOT crash
+    print(f"    fwd out shape = {tuple(out.shape)}  (expect (0, {DIM}))")
+    out.sum().backward()                                          # backward must NOT crash
+    g = experts.w1.grad
+    print(f"    bwd ok; experts.w1.grad max|.| = {(g.abs().max().item() if g is not None else 'None')} (expect ~0)")
+
+
 if __name__ == "__main__":
     parity()
+    empty_rank()
     bench()
-    print("\nDONE. Green = [fwd]/[bwd] rel small (~1e-2 bf16-grouped ok) AND (2) faster than (1).")
+    print("\nDONE. Green = parity rel small + empty-rank no crash + (2) faster than (1).")

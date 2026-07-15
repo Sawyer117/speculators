@@ -34,9 +34,18 @@ _MOE_OP = "moe_dispatch"
 # to few shapes (recompiles amortize after the first few). Padding is a few % of the TOKEN dim
 # (NOT per-expert capacity), so the memory/compute waste is small. 0/1 disables bucketing.
 _MOE_BUCKET = int(os.environ.get("DSPARK_MOE_BUCKET", "512"))
+# Fused Ascend routing ops (npu_moe_token_permute/unpermute AND npu_moe_token_unpermute_grad) FAIL
+# on a 0-row input ("input shape has 0", error 561002). Under EP a rank can receive 0 tokens in a
+# step (all top-k picks miss its 32 experts) -> the local grouped path gets [0, dim] and the unpermute
+# backward crashes. Pad an empty step to a non-zero floor so the ops run and the experts stay in the
+# autograd graph (dummy tokens carry zero router weight -> zero grad, which is the correct grad for a
+# rank that processed no tokens). Non-empty steps are unaffected.
+_MOE_EMPTY_MIN = 16
 
 
 def _bucket_count(n: int) -> int:
+    if n == 0:
+        return _MOE_BUCKET if _MOE_BUCKET > 1 else _MOE_EMPTY_MIN
     if _MOE_BUCKET <= 1:
         return n
     return ((n + _MOE_BUCKET - 1) // _MOE_BUCKET) * _MOE_BUCKET
