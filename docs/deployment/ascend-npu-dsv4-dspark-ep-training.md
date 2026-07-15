@@ -285,6 +285,8 @@ work, no patches. See §6.
 | Grouped-GEMM op | `torch_npu.npu_grouped_matmul` | Extracted from MindSpeed; one grouped matmul per projection replaces the 256-way expert loop + kills per-shape recompiles. Self-written autograd backward, CPU + NPU parity-tested (§8). |
 | Draft attention | **SDPA** (`--draft-attn-impl sdpa`) | Ascend has no `simple_flex_attention`. The non-causal-sink SWA fused kernel is a separate in-progress optimization (see §5, §7 handoff repo). |
 | Rollout sampling | **greedy, temp=0 end-to-end** | Gen / train / eval all temp=0 → self-consistent (user's call). DeepSpec uses 0.7/top-p0.8; DSV4 official rec 1.0. Tripwire if ever benchmarked sampled. |
+| Per-epoch validation | **off-able** (`--no-validation` / `NO_VAL=1`) | The 10% held-out val split has **no pre-dumped HS**, so `on_missing=generate` re-generates it **serially via the serve every epoch** (the val loader is `num_workers=0` — forked val workers corrupt the child heap right after the epoch-boundary DCP checkpoint: `free(): invalid pointer`). That dominates the epoch and *looks* hung (only the tqdm bar creeps). `--no-validation` skips the val pass **and** trains on the **FULL** dataset (`split_ratio=1.0`); `train_data_ratio` (default 0.9) only applies when val is **on**, so nothing is silently wasted. |
+| MoE warm-start from target | **opt-in** (`--init-moe-from-target` / `INIT_MOE=1`) | A draft layer **is** a DSV4 target layer, so init each draft layer's MoE (routed experts + router + shared) from verifier layer `target_layer_ids[n]` (`[40,41,42]→[0,1,2]`) instead of random — a strong basin for the draft's job (predict next-token from the layer-40/41/42 hidden states). **1:1 copy** (verifier uses the official DeepSeek names; only rename `ffn.gate`→`router`; `w1`=gate/`w3`=up/`w2`=down). **Trainable** (not frozen, unlike the shared embed/lm_head). EP-aware: runs at build time when `GroupedExperts` are still plain per-rank tensors (before the `Shard(0)` wrap), so each rank copies only its `[ep_expert_offset : +n_local]` slice; no-op on meta params. **Faithful (256×2048) only** — fast-fails at startup on any dim/key mismatch. Verified on box: 256 experts, `moe_intermediate_size 2048`, `layers.{40,41,42}.ffn.{experts.{e}.w{1,2,3},gate.{weight,bias},shared_experts.w{1,2,3}}`. A/B vs from-scratch (early accept_len should start higher). Open (measurable): whether the **official** DSpark recipe warm-starts — `dspark_method.py` shows only loss+heads. |
 
 ## 5. Known follow-ups / not-yet-optimized
 
@@ -294,8 +296,13 @@ work, no patches. See §6.
 - **Fused MoE permute** (`npu_moe_init_routing`) — fuses sort+permute around the all-to-all,
   supersedes the argsort fix.
 - **Fixed-shape MoE padding** — pad per-expert token counts to fixed buckets → static
-  grouped-GEMM shapes → eliminates the residual ~7–14 s new-shape recompile spikes.
-- **Gradient checkpointing** — needed to reach the paper's 512 anchors (memory-bound at 256).
+  grouped-GEMM shapes → eliminates the residual ~7–14 s new-shape recompile spikes
+  (`DSPARK_MOE_BUCKET`). The **shape-generic** alternative — `torch.compile`'d experts
+  (`DSPARK_COMPILE=1`) — is validated (~1.74×, bit-exact) but **banked** (needs the torch-2.12
+  stack); default off. See [`ascend-npu-dsv4-dspark-compile-recompile.md`](ascend-npu-dsv4-dspark-compile-recompile.md).
+- **Gradient checkpointing (activation recompute)** — **DONE** (`DSPARK_RECOMPUTE=1`; `core.py`
+  recomputes each draft layer in backward). Frees activation to run **384 @ 3072** (was
+  memory-capped ~256); the paper's 512 still OOMs even with recompute, so 384 is the settled point.
 - **SWA non-causal sink fused Triton kernel** — in development (replaces SDPA draft attention);
   handoff repo in §7.
 - **Serve HS throughput** — `HS_DUMP` serve tuned to rollout-optimal (`MAXSEQS=32`, graph mode
@@ -384,10 +391,14 @@ group). A3 single-node variant: `serve_dsv4_a3_singlenode.sh` (DP2/TP8/EP16, int
 
 **Train:**
 [`examples/ascend_npu_dflash/train_dsv4_dspark.sh`](../../examples/ascend_npu_dflash/train_dsv4_dspark.sh)
-— `SEQLEN=3072 MAX_ANCHORS=256 LR=6e-4 DSPARK_EP=1 bash ... faithful`. Modes: `reduced`
-(1L×32E smoke) / `faithful` (3L×256E, EP8). Env knobs: `SEQLEN MAX_ANCHORS LR MASK_TOKEN
-CKPT_FREQ DSPARK_EP NPROC RUN SAVE_PATH VERIFIER DATA HS_DIR ENDPOINT CANN_ENV`. Backgrounds a
-torchrun run; prints the tail command.
+— baked defaults now `LR=6e-4 EPOCHS=5 SEQLEN=3072 BLOCK=6`. Typical faithful run:
+`INIT_MOE=1 NO_VAL=1 MAX_ANCHORS=384 RECOMPUTE=1 DSPARK_EP=1 DATA=<arrow_dir> bash ... faithful`.
+Modes: `reduced` (1L×32E smoke) / `faithful` (3L×256E, EP8). Env knobs:
+`SEQLEN MAX_ANCHORS LR EPOCHS BLOCK MASK_TOKEN CKPT_FREQ DSPARK_EP RECOMPUTE COMPILE NO_VAL
+INIT_MOE DSPARK_GROUPED_MOE NPROC RUN SAVE_PATH VERIFIER DATA HS_DIR ENDPOINT CANN_ENV`
+(the banner echoes their resolved values). Backgrounds a torchrun run; prints the tail command.
+`NO_VAL=1` → no per-epoch val + train on full data; `INIT_MOE=1` → warm-start MoE from the
+verifier; `RECOMPUTE=1` → activation recompute (needed past ~256 anchors). See §4 for each.
 
 **Rollout (data gen):** `rollout_a3_shard.sh` / `rollout_shard.sh` (greedy, temp=0; prep →
 Arrow). **HS-dump smoke:** `hs_dump_smoke.py`. **Eval:** `run_eval.sh` (background serve +
@@ -395,7 +406,8 @@ curl-wait + eval in ONE terminal).
 
 **Repos / external:**
 - Draft trainer fork: `https://github.com/Sawyer117/speculators` (branch `feat/dsv4-dspark`,
-  HEAD `a855bfb`).
+  HEAD `3953bc1`: `--init-moe-from-target`, `--no-validation`, `EPOCHS`/`SEQLEN 3072`/`LR 6e-4`
+  knobs, `prepare_data --chat-template` port, `analyze_train_run --baseline` compare).
 - HS-dumper serve fork: `https://github.com/Sawyer117/vllm-ascend` (branch `feat/dsv4-hs-dumper`,
   `@ 4677f0b`; rides `dspark-dsv4`/#11571's `_dspark_hidden_buffer`).
 - SWA fused kernel handoff: `https://github.com/Sawyer117/non-causal-swa-triton-ascend`.

@@ -34,6 +34,10 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
 - **Pipeline: run end-to-end** (env → rollout → HS-producing serve → EP training → checkpoint
   save all validated on the box). Converged draft accept-length numbers pending a full train→eval
   pass (see EP-training doc §6).
+- **Training levers** (`feat/dsv4-dspark @ 3953bc1`): MoE warm-start from the target
+  (`INIT_MOE=1`), skip-validation + train-on-full-data (`NO_VAL=1`), activation recompute
+  (`RECOMPUTE=1`, 384@3072), defaults `EPOCHS=5 / SEQLEN=3072 / LR=6e-4`; A/B two runs with
+  `analyze_train_run.py --baseline`. Rationale in EP-training §4, run knobs in §7.
 - **Correctness validation:** see the **validation matrix + green-check checklist** in
   [`ascend-npu-dsv4-dspark-ep-training.md`](./ascend-npu-dsv4-dspark-ep-training.md) §9 — component
   oracles mostly green; assembled-draft numeric parity + a few silently-wrong-mode gates still to

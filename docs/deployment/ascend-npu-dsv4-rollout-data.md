@@ -109,13 +109,22 @@ Applies the DSV4 chat template → `input_ids` + `loss_mask` (loss on the assist
 ```bash
 python scripts/prepare_data.py \
   --model /share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16 --trust-remote-code \
+  --chat-template examples/ascend_npu_dflash/dsv4_chat_template.jinja \
   --data out_bf16/rollout_00.clean.jsonl --data out_bf16/rollout_01.clean.jsonl \
   --seq-length 8192 --num-preprocessing-workers 8 --minimum-valid-tokens 1 \
-  --output /share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow
+  --output /share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow --overwrite
 ```
 
 - `--data` takes local `.jsonl` (ShareGPT `conversations`) and can repeat for multiple shards.
 - `--minimum-valid-tokens 1` drops zero-trainable-token samples (backstop; garbage already gone).
+- **`--chat-template` is required and now lives on `feat/dsv4-dspark`** (ported at `594714c`; DSV4
+  ships no Jinja template — see the gotcha below). Older prep commands that omit it fail with
+  *"does not support chat templates"*.
+- **`--overwrite`** rebuilds in place; to a **NEW** dir (e.g. `…/arrow_0715`) if a run is still
+  mmap'ing the old `…/arrow` (overwriting under a live run corrupts its reads).
+- **Sub-sample by count**: `--max-samples N` (shuffles then keeps N — random subset), or
+  deterministic head `head -n N clean.jsonl > sub.jsonl` then prep `sub.jsonl`. The `rollout0715`
+  build was `head -n 450000` (49W→45W) → `…/arrow_0715` (450000 rows, `frac` non-zero on all).
 
 **⚠️ DSV4 chat-template gotcha (resolved).** DeepSeek-V4 ships **NO Jinja `chat_template`** — the
 serve renders chat via vLLM's custom Python encoder `vllm/tokenizers/deepseek_v4_encoding.py`
