@@ -105,6 +105,16 @@ def parse_args():
             "per conversation for data augmentation."
         ),
     )
+    parser.add_argument(
+        "--chat-template",
+        type=str,
+        default=None,
+        help=(
+            "Path to a .jinja chat template (or an inline template string) to use when "
+            "the model ships none (e.g. DeepSeek-V4). MUST match the template the serve "
+            "used to roll the data — verify with the serve's /tokenize before a full run."
+        ),
+    )
 
     # Output arguments
     parser.add_argument(
@@ -190,6 +200,7 @@ def main():
         turn_dropout=args.turn_dropout,
         minimum_valid_tokens=args.minimum_valid_tokens,
         trust_remote_code=args.trust_remote_code,
+        chat_template=args.chat_template,
     )
 
     log.info("Done preparing data")
