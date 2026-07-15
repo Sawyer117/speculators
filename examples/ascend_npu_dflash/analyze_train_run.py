@@ -1003,6 +1003,13 @@ def _plots_multi(runs, out):
             g = r["good"][-50:]
             vals = [(median(col(g, k)) if col(g, k) else 0.0) for k in pos_keys]
             plt.bar(xx + (j - (n - 1) / 2) * w, vals, w, color=r["color"], zorder=3, label=r["label"])
+        # released-draft per-position ACCEPT marginals (shape ref), same as the single-run plot
+        rel = [0.81, 0.68, 0.58, 0.48, 0.39]
+        if len(pos_keys) == len(rel):
+            plt.plot(xx, rel, "o--", color="#D62828", lw=1.6, ms=6, zorder=4,
+                     label="released draft accept marginal (ref)")
+            for i, rv in enumerate(rel):
+                plt.text(xx[i], rv + 0.02, f"{rv:.2f}", ha="center", color="#D62828", fontsize=9)
         plt.ylim(0, 1.0); plt.xticks(xx, labels); plt.legend(loc="upper right", fontsize=9)
         plt.ylabel("greedy accuracy  (argmax == target)")
         plt.title("Per-position draft accuracy — all runs (last 50 steps)")
