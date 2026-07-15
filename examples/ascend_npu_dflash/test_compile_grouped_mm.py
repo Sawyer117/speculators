@@ -161,7 +161,7 @@ def experts_g(x, counts, w13, w2):  # weights as args -> grad-enabled (globals a
 
 
 print("\n=== BACKWARD parity (compiled bwd via aot_autograd vs eager) ===")
-w13g = torch.cat([w13, w13], dim=1).detach().clone().requires_grad_()   # [E, 2*INTER, DIM]
+w13g = w13.detach().clone().requires_grad_()   # global w13 is ALREADY [E, 2*INTER, DIM] (fused gate;up)
 w2g = w2.detach().clone().requires_grad_()
 xb, cb = INPUTS[1500]
 xb = xb.detach().clone().requires_grad_()
