@@ -67,6 +67,10 @@ pip install torch_npu==2.12.0rc1              # from the Ascend pip source
 cd ~/torchair && git checkout 3c9418c2
 pip install -e experimental/_inductor_npu_ext/python/ --no-deps   # ★ --no-deps: else it drags torch 2.13 + cuda-toolkit + nvidia-*
 cd -
+# ★ torch_npu's _inductor is Triton-based -> needs the ASCEND Triton, not the CUDA triton that
+# --force-reinstall pulled ("0 active drivers"). CANN 9.0.0 -> triton-ascend 3.2.x. Match your base env.
+pip uninstall triton -y && pip install triton-ascend
+import inductor_npu_ext  # (in code) engages AscendC codegen — see the test; torchtitan-npu entry.py:92
 python -c "import torch, torch_npu; print(torch.__version__, torch_npu.__version__, torch.npu.is_available())"
 ```
 **★ `--no-deps` is mandatory** — inductor_npu_ext declares `torch>=2.8.0`, so plain install pulls
