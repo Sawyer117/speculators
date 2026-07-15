@@ -93,10 +93,16 @@ Test: `python examples/ascend_npu_dflash/test_compile_grouped_mm.py`
    index) → `from torch_npu.contrib import transfer_to_npu` crashes at import:
    `_apply_patches() takes 0 positional arguments but 1 was given` (torch_npu 2.12.0rc1 is built for the
    **+cpu** torch, not +cu130; [web](https://github.com/BrightXiaoHan/pytorch-npu/)).
-5. **Fixes** (⟵ *we are here*): (a) **torchtitan-npu does NOT use `transfer_to_npu`** (grep: 0 hits) —
-   removed it from the test; plain `import torch_npu` registers the `npu` device + `torch.npu.*`.
-   (b) install torch **2.12.0+cpu** (the build torch_npu 2.12.0rc1 expects), not `+cu130`, via the CPU
-   index. Then retest.
+5. **Fixes**: (a) **torchtitan-npu does NOT use `transfer_to_npu`** (grep: 0 hits) — removed it from the
+   test; plain `import torch_npu` registers the `npu` device + `torch.npu.*`. (b) install torch
+   **2.12.0+cpu** (the build torch_npu 2.12.0rc1 expects), not `+cu130`, via the CPU index.
+6. **torch 2.12.0+cpu in** → eager baseline runs, transfer_to_npu gone. But `torch.compile` crashed:
+   `torch_npu.utils._dynamo.register_inductor_npu` → torch_npu's **built-in `_inductor` (Triton backend)**
+   → `RuntimeError: 0 active drivers` (only CUDA-triton 3.7.1 is installed; no Ascend-Triton driver).
+   **Fix**: `import inductor_npu_ext` (torchtitan-npu `entry.py:92` does exactly this) engages the
+   AutoFuse/AscendC codegen and bypasses the Triton path — we'd installed inductor_npu_ext but never
+   *imported* it. Retest. ⟵ *we are here.* If it STILL wants Triton → install `triton-ascend` (the
+   Ascend Triton; note `~/non-causal-swa-triton-ascend`).
 
 ## 7. Risks / open questions
 

@@ -26,6 +26,12 @@ import time
 import torch
 import torch_npu  # noqa: F401
 
+# ★ engage inductor_npu_ext's AutoFuse/AscendC codegen (torchtitan-npu entry.py:92 does exactly this).
+# Without this import, torch.compile falls through to torch_npu's BUILT-IN _inductor (Triton backend),
+# which needs an active Ascend-Triton driver and dies with "0 active drivers" if only CUDA-triton is
+# installed. Importing inductor_npu_ext registers the AscendC codegen path instead.
+import inductor_npu_ext  # noqa: F401
+
 # NB: do NOT `from torch_npu.contrib import transfer_to_npu` — torchtitan-npu does not use it, and on
 # torch 2.12 + torch_npu 2.12.0rc1 its _patch_cuda() crashes (_apply_patches signature mismatch). We
 # only need `import torch_npu`, which registers the "npu" device + torch.npu.* (no CUDA remap needed).
