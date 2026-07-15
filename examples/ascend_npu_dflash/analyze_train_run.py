@@ -175,6 +175,8 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="folder for PNG plots (created if missing)")
     ap.add_argument("--spike-k", type=float, default=3.0, help="spike = stage > k*steady-median")
     ap.add_argument("--recent", type=int, default=500, help="window (steps) for the recent-dynamics trend")
+    ap.add_argument("--skip", type=int, default=0,
+                    help="drop global_steps < N (exclude shape-warmup / resume HS-regeneration) for a clean steady verdict")
     args = ap.parse_args()
 
     recs, raw_text = load(resolve_log(args.logfile))
@@ -182,6 +184,11 @@ def main() -> None:
     if not recs:
         print("!! no metric records parsed — is this a trainer.py rich-logger log?")
         return
+    if args.skip > 0:
+        kept = [r for r in recs if step_of(r) >= args.skip]
+        if kept:
+            print(f"(--skip {args.skip}: dropped {len(recs) - len(kept)} warmup/regen steps; analyzing {len(kept)})")
+            recs = kept
     steps = [s for s in (step_of(r) for r in recs) if s >= 0]  # skip a leading partial record
     print("=" * 78)
     print(f" TRAINING RUN ANALYSIS   {len(recs)} steps   (global_step {min(steps)}..{max(steps)})")
@@ -346,9 +353,51 @@ def main() -> None:
             print(f"  frequency    : every ~{median(ints):.0f} steps (min {min(ints)}, max {max(ints)})" if ints
                   else "  frequency    : (single spike)")
             print(f"  overhead     : {overhead/1000:.1f} s total = {100*overhead/total:.0f}% of wall-clock"
-                  f"  → the #1 throughput lever (see §5 fixed-shape MoE padding)")
+                  f"  → see BOTTLENECK BREAKDOWN below for the recompile-vs-HS split")
             worst = sorted(spikes, key=lambda t: -t[1])[:5]
             print("  worst steps  : " + ", ".join(f"{s}({v/1000:.1f}s)" for s, v in worst))
+
+    # ---------------- bottleneck breakdown: recompile vs HS vs ckpt (compile-worth-it verdict) ----------------
+    print("\n-- BOTTLENECK BREAKDOWN (where wall-clock goes; is the compile fix worth it?) " + "-" * 1)
+    total = sum(col(recs, "profile/step_ms")) or 1.0
+    fwd_steady = reps["profile/fwd_ms"]["steady_med"] or 0.0
+    fetch_steady = reps["profile/fetch_ms"]["steady_med"] or 0.0
+    step_steady = reps["profile/step_ms"]["steady_med"] or 0.0
+
+    def _excess(key, steady, only_nonckpt=False):
+        tot = 0.0
+        for r in recs:
+            if only_nonckpt and step_of(r) in ckpt_steps:
+                continue
+            v = f(r, key)
+            if v is not None and v > steady:
+                tot += v - steady
+        return tot
+
+    recompile_ov = _excess("profile/fwd_ms", fwd_steady)                     # excess fwd time = grouped-GEMM recompile
+    hs_ov = _excess("profile/fetch_ms", fetch_steady, only_nonckpt=True)     # excess HS-fetch = serve stall (ckpt saves excluded)
+    ckpt_ov = sum(max(0.0, f(r, "profile/step_ms") - step_steady) for r in recs
+                  if step_of(r) in ckpt_steps and f(r, "profile/step_ms") is not None)
+    floor = max(0.0, total - recompile_ov - hs_ov - ckpt_ov)
+    print(f"  {'component':26} {'time':>9}   {'% wall-clock':>12}")
+    for label, v in [("steady compute (floor)", floor), ("recompile (fwd excess)", recompile_ov),
+                     ("HS fetch stall (excess)", hs_ov), ("checkpoint saves", ckpt_ov)]:
+        print(f"  {label:26} {v/1000:7.1f}s   {100*v/total:11.1f}%")
+    rc, hs = 100 * recompile_ov / total, 100 * hs_ov / total
+    print("  ── verdict ──")
+    if recompile_ov >= 2 * hs_ov and rc >= 10:
+        print(f"    RECOMPILE-bound (fwd {rc:.0f}% vs HS {hs:.0f}%): compile + maybe_mark_dynamic is the permanent")
+        print(f"    fix and IS worth the inductor_npu_ext setup — ~{rc:.0f}% of wall-clock is recoverable.")
+    elif hs_ov >= 2 * recompile_ov and hs >= 10:
+        print(f"    HS/SERVING-bound (HS {hs:.0f}% vs fwd {rc:.0f}%): compile WON'T help — the serve can't dump HS")
+        print(f"    fast enough. Fix the HS pipeline (serve throughput / prefetch), NOT the MoE kernel.")
+    elif max(rc, hs) < 10:
+        print(f"    NEITHER dominates (fwd {rc:.0f}%, HS {hs:.0f}% — both <10%): steady compute is the floor.")
+        print(f"    compile's inductor_npu_ext setup is NOT worth it; bucketing already suffices.")
+    else:
+        print(f"    MIXED (fwd {rc:.0f}%, HS {hs:.0f}%): both matter. Try a bigger DSPARK_MOE_BUCKET (cheap) +")
+        print(f"    check the serve; reach for compile only if recompile stays high AFTER the shape-warmup.")
+    print("  ⚠ run with --skip <N> to drop the first epoch (shape-warmup + resume HS-regen inflate BOTH bars).")
 
     # ---------------- HS / memory ----------------
     ff = col(recs, "profile/fetch_frac")
