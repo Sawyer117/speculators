@@ -30,6 +30,7 @@ ENDPOINT="${ENDPOINT:-http://80.5.5.115:7000/v1}"
 RUN="${RUN:-/home/a00652497/dspark_austin/run}"
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"
 LR="${LR:-2e-4}"
+EPOCHS="${EPOCHS:-20}"                  # number of training epochs (--epochs). Set e.g. EPOCHS=5.
 MAX_ANCHORS="${MAX_ANCHORS:-64}"
 SEQLEN="${SEQLEN:-8192}"                # --total-seq-len. Shorter (e.g. 3072) cuts draft-forward
                                        # activation memory (room for more anchors) + shortens the
@@ -122,7 +123,7 @@ LOG="$RUN/${TAG}_${TS}.log"
 SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
-echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL"
+echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL"
 echo " block=$BLOCK (drafts $((BLOCK-1)) tokens = gamma; slot 0 anchor)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
@@ -141,7 +142,7 @@ nohup env \
     --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
     --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" \
     --draft-attn-impl sdpa --loss-fn '{"ce":0.1,"tv":0.9}' \
-    --optimizer adamw --lr "$LR" $EXTRA \
+    --optimizer adamw --lr "$LR" --epochs "$EPOCHS" $EXTRA \
     --on-missing generate --on-generate delete \
     --hidden-states-path "$HS_DIR" --vllm-endpoint "$ENDPOINT" \
     --verifier-name-or-path "$VERIFIER" --data-path "$DATA" \
