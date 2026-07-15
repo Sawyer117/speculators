@@ -57,6 +57,9 @@ COMPILE="${COMPILE:-0}"                # ★ SEED TECH: torch.compile'd experts 
                                        # recompile, ~1.74x). REQUIRES the torch-2.12 stack (torch 2.12+cpu /
                                        # torch_npu 2.12rc1 / inductor_npu_ext / triton-ascend) — do NOT set
                                        # on the 2.10 main stack (desyncs train vs the 2.10 serve).
+NOVAL="${NO_VAL:-0}"                    # NO_VAL=1 -> cancel the per-epoch validation pass. Val does SERIAL
+                                       # online HS generation for the 10% held-out split (num_workers=0),
+                                       # which dominates the epoch; --no-validation trains on the FULL data.
 
 # ---- per-mode config ----
 if [ "$MODE" = "faithful" ]; then
@@ -91,6 +94,9 @@ if [ "$EP" = "1" ]; then
   [ $((EXPERTS % NPROC)) -eq 0 ] || { echo "!! EXPERTS=$EXPERTS not divisible by NPROC=$NPROC"; exit 2; }
 fi
 
+# NO_VAL=1 -> append --no-validation (skip the slow per-epoch val pass, train on full data).
+if [ "$NOVAL" = "1" ]; then EXTRA="$EXTRA --no-validation"; fi
+
 # ---- preflight ----
 if [ -f "$CANN_ENV" ]; then
   set +e; source "$CANN_ENV"; set -e         # env scripts return nonzero benignly
@@ -116,7 +122,7 @@ LOG="$RUN/${TAG}_${TS}.log"
 SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
-echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE"
+echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL"
 echo " block=$BLOCK (drafts $((BLOCK-1)) tokens = gamma; slot 0 anchor)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"

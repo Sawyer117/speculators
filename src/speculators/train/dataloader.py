@@ -82,7 +82,8 @@ def create_train_val_loaders(
     num_workers: int,
     prefetch_factor: int,
     preprocess: Callable[[BatchType], BatchType] | None,
-) -> tuple[DataLoader, DataLoader]:
+    no_validation: bool = False,
+) -> tuple[DataLoader, DataLoader | None]:
     """Create training and validation DataLoaders.
 
     Handles dataset construction (legacy vs Arrow) and dataloader wiring.
@@ -92,8 +93,13 @@ def create_train_val_loaders(
     """
     noise_transform = AddUniformNoise(std=noise_std)
 
-    if not (0.0 < train_data_ratio < 1.0):
+    # --no-validation: skip the per-epoch val pass and train on the FULL dataset
+    # (split_ratio 1.0). The Trainer already skips validation when val_loader is None;
+    # reclaiming the held-out slice avoids silently wasting 1 - train_data_ratio of the data.
+    if not no_validation and not (0.0 < train_data_ratio < 1.0):
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
+    train_split_ratio = 1.0 if no_validation else train_data_ratio
+    val_dataset: BaseDataset | None = None
 
     if legacy_data:
         warnings.warn(
@@ -108,11 +114,12 @@ def create_train_val_loaders(
             transform=noise_transform,
             hidden_states_dtype=hidden_states_dtype,
         )
-        val_dataset: BaseDataset = SampleFileDataset(
-            file_list=val_files,
-            max_len=total_seq_len,
-            hidden_states_dtype=hidden_states_dtype,
-        )
+        if not no_validation:
+            val_dataset = SampleFileDataset(
+                file_list=val_files,
+                max_len=total_seq_len,
+                hidden_states_dtype=hidden_states_dtype,
+            )
     else:
         train_dataset = ArrowDataset(
             datapath=data_path,
@@ -122,25 +129,26 @@ def create_train_val_loaders(
             on_missing=on_missing,
             on_generate=on_generate,
             transform=noise_transform,
-            split_ratio=train_data_ratio,
+            split_ratio=train_split_ratio,
             model=served_model_name or verifier_name_or_path,
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
         )
-        val_dataset = ArrowDataset(
-            datapath=data_path,
-            max_len=total_seq_len,
-            hidden_states_path=hidden_states_path,
-            vllm_endpoint=vllm_endpoint,
-            on_missing=on_missing,
-            on_generate=on_generate,
-            split_ratio=train_data_ratio - 1.0,
-            model=served_model_name or verifier_name_or_path,
-            hidden_states_dtype=hidden_states_dtype,
-            request_timeout=request_timeout,
-            max_retries=max_retries,
-        )
+        if not no_validation:
+            val_dataset = ArrowDataset(
+                datapath=data_path,
+                max_len=total_seq_len,
+                hidden_states_path=hidden_states_path,
+                vllm_endpoint=vllm_endpoint,
+                on_missing=on_missing,
+                on_generate=on_generate,
+                split_ratio=train_data_ratio - 1.0,
+                model=served_model_name or verifier_name_or_path,
+                hidden_states_dtype=hidden_states_dtype,
+                request_timeout=request_timeout,
+                max_retries=max_retries,
+            )
 
     train_loader = _setup_dataloader(
         train_dataset,
@@ -158,14 +166,16 @@ def create_train_val_loaders(
     # the child heap → "free(): invalid pointer" + "DataLoader worker killed by signal: Aborted",
     # and the run dies right after epoch 0's checkpoint save. Validation is a small held-out pass,
     # so in-process loading costs ~nothing (the trainer is HS-fetch-bound anyway; fetch_frac≈0.02).
-    val_loader = _setup_dataloader(
-        val_dataset,
-        total_seq_len,
-        hidden_size,
-        num_target_layers=num_target_layers,
-        num_workers=0,
-        prefetch_factor=None,
-        preprocess=preprocess,
-    )
+    val_loader = None
+    if not no_validation:
+        val_loader = _setup_dataloader(
+            val_dataset,
+            total_seq_len,
+            hidden_size,
+            num_target_layers=num_target_layers,
+            num_workers=0,
+            prefetch_factor=None,
+            preprocess=preprocess,
+        )
 
     return train_loader, val_loader

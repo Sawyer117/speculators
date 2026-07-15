@@ -609,6 +609,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        no_validation=args.no_validation,
     )
 
     # Get trainer kwargs from model class
@@ -873,6 +874,15 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--train-data-ratio", type=float, default=0.9)
+    parser.add_argument(
+        "--no-validation",
+        action="store_true",
+        help=(
+            "Skip the per-epoch validation pass entirely and train on the FULL dataset "
+            "(no held-out split). Use when validation is expensive — e.g. online HS "
+            "generation for the held-out split runs serially and dominates the epoch."
+        ),
+    )
     parser.add_argument("--no-resume-from-checkpoint", action="store_true")
     parser.add_argument(
         "--logger",
