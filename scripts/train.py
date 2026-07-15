@@ -875,6 +875,16 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--train-data-ratio", type=float, default=0.9)
     parser.add_argument(
+        "--init-moe-from-target",
+        action="store_true",
+        help=(
+            "Warm-start each draft layer's MoE (routed experts + router + shared expert) "
+            "from the matching verifier layer (draft layer n <- target_layer_ids[n]). "
+            "Trainable init; requires the faithful draft MoE dims to match the verifier "
+            "(dsv4_dspark only). EP-aware: each rank copies its local expert slice."
+        ),
+    )
+    parser.add_argument(
         "--no-validation",
         action="store_true",
         help=(

@@ -61,6 +61,9 @@ COMPILE="${COMPILE:-0}"                # ★ SEED TECH: torch.compile'd experts 
 NOVAL="${NO_VAL:-0}"                    # NO_VAL=1 -> cancel the per-epoch validation pass. Val does SERIAL
                                        # online HS generation for the 10% held-out split (num_workers=0),
                                        # which dominates the epoch; --no-validation trains on the FULL data.
+INITMOE="${INIT_MOE:-0}"               # INIT_MOE=1 -> warm-start the draft MoE (experts+router+shared) from
+                                       # the verifier's target layers (draft n <- target_layer_ids[n]).
+                                       # Trainable init; faithful (256x2048) only. A/B vs from-scratch.
 
 # ---- per-mode config ----
 if [ "$MODE" = "faithful" ]; then
@@ -97,6 +100,8 @@ fi
 
 # NO_VAL=1 -> append --no-validation (skip the slow per-epoch val pass, train on full data).
 if [ "$NOVAL" = "1" ]; then EXTRA="$EXTRA --no-validation"; fi
+# INIT_MOE=1 -> append --init-moe-from-target (warm-start draft MoE from verifier layers).
+if [ "$INITMOE" = "1" ]; then EXTRA="$EXTRA --init-moe-from-target"; fi
 
 # ---- preflight ----
 if [ -f "$CANN_ENV" ]; then
@@ -123,7 +128,7 @@ LOG="$RUN/${TAG}_${TS}.log"
 SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
-echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL"
+echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL  init_moe=$INITMOE"
 echo " block=$BLOCK (drafts $((BLOCK-1)) tokens = gamma; slot 0 anchor)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
