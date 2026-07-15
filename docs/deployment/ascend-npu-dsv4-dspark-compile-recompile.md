@@ -130,13 +130,23 @@ Test: `python examples/ascend_npu_dflash/test_compile_grouped_mm.py`
    `python examples/ascend_npu_dflash/test_compile_grouped_mm.py` → the **GRAFT B+C INTEGRATION** section
    checks **fwd + backward** parity (training needs gradients).
 
-## Decision: SEED TECH, not deployed (2026-07-15)
+## Decision: BANKED for now — but the TRAINING stack can upgrade independently (corrected 2026-07-15)
 
-Compile is **validated + ready but intentionally NOT enabled**. Enabling it requires migrating the whole
-stack to torch 2.12 — and if *training* moves to 2.12 while the *serve* stays on 2.10, train vs inference
-desync and all the rolled HS/rollout data is invalidated. So: keep `DSPARK_COMPILE=0` (bucketing manages
-recompile on the 2.10 main line); bank compile as a **seed capability** and turn it on later in a single
-coordinated **train + serve** upgrade to the latest stack. The ~1.74× is realizable then.
+Compile is **validated + ready**; `DSPARK_COMPILE=0` by default (not urgent — the 384 run is producing).
+
+⚠️ **Correction.** An earlier draft said enabling 2.12 training "desyncs vs the 2.10 serve and invalidates
+rolled data" — **wrong**. Training and serve are **decoupled by torch-version-portable interfaces**: HS
+(safetensors) + rollout (Arrow) flow serve→train; the draft checkpoint (safetensors + JSON) flows
+train→serve. The compiled forward is **bit-exact**, so a 2.12-compiled-trained draft ≡ an eager-trained
+one and runs correctly on the 2.10 serve (and spec-decode tolerates any tiny draft-numerics shift anyway —
+the target verifies). Only a **serve** stack change invalidates rolled data; a **training-only** upgrade
+does not touch it.
+
+So the ~1.74× has **two viable paths, both leaving the serve + rolled data untouched**:
+- **(a) 2.10 bucketing** (§8) — zero migration; cost = padding memory; amortization unconfirmed.
+- **(b) training-only migration to torch 2.12** — clean, no padding; real cost = re-validate the training
+  stack (EP all-to-all, DCP save/load, recompute, **checkpoint→serve conversion**) on torch 2.12 +
+  torch_npu 2.12rc1 (an RC). This is a *training-only* upgrade, NOT a coordinated train+serve one.
 
 ## 7. Risks / open questions
 
