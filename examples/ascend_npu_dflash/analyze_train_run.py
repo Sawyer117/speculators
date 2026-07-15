@@ -307,6 +307,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="display name for the CURRENT run (default: log filename)")
     ap.add_argument("--baseline-label", default=None, metavar="NAME",
                     help="display name for the BASELINE run (default: its filename)")
+    ap.add_argument("--full-baseline", action="store_true",
+                    help="show the BASELINE's ENTIRE curve; default ALIGNS it to the CURRENT run's "
+                         "step range (a short current run isn't buried under a long baseline)")
     ap.add_argument("--out", default=None, metavar="DIR", help="folder for PNG plots (created if missing)")
     ap.add_argument("--spike-k", type=float, default=3.0, help="spike = stage > k*steady-median (default 3.0)")
     ap.add_argument("--recent", type=int, default=500, help="window (steps) for the recent-dynamics trend")
@@ -333,6 +336,22 @@ def main() -> None:
         if base_recs is None:
             print("!! baseline log had no metrics — ignoring --baseline")
             base_recs = base_label = None
+        elif not args.full_baseline:
+            # Align the baseline to the CURRENT run's step range so a short current run isn't
+            # buried under a long baseline (plots, y-autoscale, smoothing and the delta table all
+            # follow). Clip to steps <= current's max; keep a one-line reference to where the
+            # baseline's FULL run ended. --full-baseline shows the whole curve instead.
+            cur_steps = [s for s in (step_of(r) for r in recs) if s >= 0]
+            cur_max = max(cur_steps) if cur_steps else 0
+            clipped = [r for r in base_recs if 0 <= step_of(r) <= cur_max]
+            if clipped and len(clipped) < len(base_recs):
+                bfa = [f(r, "train/accept_len") for r in base_recs
+                       if f(r, "train/accept_len") is not None]
+                bref = f"; its full run reached accept_len ~{median(bfa[-20:]):.2f}" if bfa else ""
+                print(f">>> baseline aligned to current's step range (≤{cur_max}): "
+                      f"{len(clipped)}/{len(base_recs)} baseline steps shown{bref} "
+                      f"(--full-baseline to show all).\n")
+                base_recs = clipped
 
     steps = [s for s in (step_of(r) for r in recs) if s >= 0]  # skip a leading partial record
     print("=" * 78)
@@ -698,15 +717,24 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
                 bcur = _smoothed(xb, yb, "#E08A1E", "#C9A27A", blabel)
                 plt.annotate(f"{blabel} ~{bcur:.2f}", xy=(xb[-1], bcur), xytext=(xb[-1], bcur + 0.06),
                              color="#E08A1E", fontsize=10, ha="right", weight="bold")
-        # HIGHLIGHTED paper / released-draft target
-        plt.axhline(3.94, ls="--", lw=2.4, color="#D62828",
-                    label="released draft AL = 3.94 (paper / vllm-ascend PR #11196)")
-        plt.annotate("target 3.94", xy=(x[0], 3.94), xytext=(x[0], 3.99),
-                     color="#D62828", fontsize=11, weight="bold")
-        plt.annotate(f"{label} ~{cur:.2f}", xy=(x[-1], cur), xytext=(x[-1], cur - 0.18),
-                     color="#1B8A4E", fontsize=10, ha="right", weight="bold")
+        # y-axis: when the data is far below the 3.94 target (early training), ZOOM to the data
+        # so the two runs are legible/separable; show the target as an off-scale note. Once
+        # accept_len climbs near the target, show the full axis + the highlighted target line.
         ally = y + base_y
-        plt.ylim(1.0, max(4.2, (max(ally) if ally else 4) + 0.2))
+        data_top = (max(ally) if ally else 1.5) + 0.15
+        if data_top < 3.6:
+            plt.ylim(1.0, data_top)
+            plt.annotate("↑ released-draft target = 3.94 (off-scale — early training)",
+                         xy=(0.5, 0.97), xycoords="axes fraction", ha="center", va="top",
+                         color="#D62828", fontsize=10, weight="bold")
+        else:
+            plt.axhline(3.94, ls="--", lw=2.4, color="#D62828",
+                        label="released draft AL = 3.94 (paper / vllm-ascend PR #11196)")
+            plt.annotate("target 3.94", xy=(x[0], 3.94), xytext=(x[0], 3.99),
+                         color="#D62828", fontsize=11, weight="bold")
+            plt.ylim(1.0, max(4.2, data_top))
+        plt.annotate(f"{label} ~{cur:.2f}", xy=(x[-1], cur), xytext=(x[-1], cur - 0.06),
+                     color="#2E6CF6", fontsize=10, ha="right", weight="bold")
         plt.xlabel("step"); plt.ylabel("acceptance length")
         plt.title((f"Acceptance length — {label} vs {blabel}" if have_base
                    else "Acceptance length — raw vs smoothed") + " (target = released-draft 3.94)")
