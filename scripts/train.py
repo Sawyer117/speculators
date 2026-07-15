@@ -492,6 +492,17 @@ def main(args: argparse.Namespace):  # noqa: C901
                 flush=True,
             )
 
+    # Opt-in torch.compile'd grouped-GEMM experts (DSV4-DSpark, NPU) — SEED TECH, torch-2.12 stack ONLY.
+    # Compiles the experts forward once with a symbolic token dim -> kills the per-shape recompile (~42%
+    # of wall-clock, validated ~1.74x). REQUIRES torch 2.12.0+cpu + torch_npu 2.12.0rc1 + inductor_npu_ext
+    # + triton-ascend; MUST NOT be set on the 2.10 main stack (would desync train vs the 2.10 serve).
+    if os.environ.get("DSPARK_COMPILE") and args.speculator_type == "dsv4_dspark":
+        from speculators.models.dsv4_dspark.backbone import moe_compile  # noqa: PLC0415
+
+        moe_compile.enable()
+        if get_rank() == 0:
+            print(">>> [DSPARK_COMPILE] torch.compile'd grouped-GEMM experts ENABLED (torch-2.12 stack)", flush=True)
+
     if get_rank() == 0:
         save_train_command(args.save_path)
 

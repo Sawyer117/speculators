@@ -53,6 +53,10 @@ EP="${DSPARK_EP:-0}"
 RECOMPUTE="${RECOMPUTE:-0}"             # activation checkpointing: recompute each draft layer in backward
                                        # -> frees activation so MAX_ANCHORS scales past the memory wall
                                        # (the lever to slow an HS-bound step to the serve's HS rate).
+COMPILE="${COMPILE:-0}"                # ★ SEED TECH: torch.compile'd experts (kills the ~42% grouped-GEMM
+                                       # recompile, ~1.74x). REQUIRES the torch-2.12 stack (torch 2.12+cpu /
+                                       # torch_npu 2.12rc1 / inductor_npu_ext / triton-ascend) — do NOT set
+                                       # on the 2.10 main stack (desyncs train vs the 2.10 serve).
 
 # ---- per-mode config ----
 if [ "$MODE" = "faithful" ]; then
@@ -112,7 +116,7 @@ LOG="$RUN/${TAG}_${TS}.log"
 SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
-echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE"
+echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE"
 echo " block=$BLOCK (drafts $((BLOCK-1)) tokens = gamma; slot 0 anchor)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
@@ -122,7 +126,7 @@ echo " 💾 save -> $SAVE_PATH"
 echo "==================================================================="
 
 nohup env \
-  DSPARK_HS_DUMP=1 DSPARK_GROUPED_MOE="$GROUPED" DSPARK_EP="$EP" DSPARK_RECOMPUTE="$RECOMPUTE" \
+  DSPARK_HS_DUMP=1 DSPARK_GROUPED_MOE="$GROUPED" DSPARK_EP="$EP" DSPARK_RECOMPUTE="$RECOMPUTE" DSPARK_COMPILE="$COMPILE" \
   PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}" \
   HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 $PORTS \
   torchrun --nproc_per_node "$NPROC" "$REPO_ROOT/scripts/train.py" \

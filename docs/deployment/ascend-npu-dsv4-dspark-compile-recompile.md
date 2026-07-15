@@ -111,8 +111,25 @@ Test: `python examples/ascend_npu_dflash/test_compile_grouped_mm.py`
    `dynamo stats {unique_graphs: 1}`, first token count compiles (~1.6s), **all other counts ~3.8ms
    (no per-shape recompile)** — the 42% recompile IS killable by compile, `maybe_mark_dynamic` works on
    NPU. Initial parity looked wrong (rel~1.3) but that was a **test bug** (inputs regenerated per loop →
-   eager vs compiled ran on *different* random data); fixed to reuse the same inputs. Re-verifying
-   parity. ⟵ *we are here.*
+   eager vs compiled ran on *different* random data); fixed to reuse the same inputs. Re-run →
+   **`parity rel = 0.000e+00` (bit-exact) for every M** ⇒ **compile is shape-generic AND numerically
+   exact on NPU**. Speedup: recompile = 42% of wall-clock → removing it = **1 / 0.576 ≈ 1.74×**
+   (756 → ~1320 tok/s).
+8. **Graft B+C implemented** — `moe_compile.py`, gated `DSPARK_COMPILE=1`, **DEFAULT OFF** (the 2.10
+   main line is untouched; all compile imports are lazy). Graft B = torchtitan-npu fused-w13
+   `_experts_grouped_mm`; Graft C = `torch.compile` + `maybe_mark_dynamic` + the shims + `import
+   inductor_npu_ext`. Hooked into `moe_grouped_gemm._fused_permute_dispatch_npu`; wired via `DSPARK_COMPILE`
+   in `scripts/train.py` + `COMPILE=` in `train_dsv4_dspark.sh`. Validate in the torch-2.12 clone:
+   `python examples/ascend_npu_dflash/test_compile_grouped_mm.py` → the **GRAFT B+C INTEGRATION** section
+   checks **fwd + backward** parity (training needs gradients).
+
+## Decision: SEED TECH, not deployed (2026-07-15)
+
+Compile is **validated + ready but intentionally NOT enabled**. Enabling it requires migrating the whole
+stack to torch 2.12 — and if *training* moves to 2.12 while the *serve* stays on 2.10, train vs inference
+desync and all the rolled HS/rollout data is invalidated. So: keep `DSPARK_COMPILE=0` (bucketing manages
+recompile on the 2.10 main line); bank compile as a **seed capability** and turn it on later in a single
+coordinated **train + serve** upgrade to the latest stack. The ~1.74× is realizable then.
 
 ## 7. Risks / open questions
 

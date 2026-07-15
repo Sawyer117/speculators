@@ -145,9 +145,16 @@ def _fused_permute_dispatch_npu(x: torch.Tensor, indices: torch.Tensor, w_flat: 
         w_flat.reshape(-1, 1), idx.reshape(-1, 1)
     )                                                                             # [nb*k, 1]
     counts = torch.bincount(indices.reshape(-1), minlength=n_experts)            # [E], sum = nb*k
-    out = swiglu_grouped(routed_input.float(), w1.float(), w3.float(), w2.float(),
-                         counts, routed_scores.reshape(-1).float(),
-                         experts.swiglu_limit, _grouped_matmul)                   # [nb*k, dim]
+    from . import moe_compile  # noqa: PLC0415  (Graft B+C; _ENABLED only on the torch-2.12 stack)
+
+    if moe_compile._ENABLED:
+        # Compiled (shape-generic, no per-shape recompile) fused-w13 experts — kills the 42% recompile.
+        out = moe_compile.run(w1, w3, w2, routed_input, counts,
+                              experts.swiglu_limit, routed_scores.reshape(-1))    # [nb*k, dim]
+    else:
+        out = swiglu_grouped(routed_input.float(), w1.float(), w3.float(), w2.float(),
+                             counts, routed_scores.reshape(-1).float(),
+                             experts.swiglu_limit, _grouped_matmul)               # [nb*k, dim]
     unpermuted = torch_npu.npu_moe_token_unpermute(out.to(routed_input.dtype), sorted_idx, None)
     if nb > n:
         unpermuted = unpermuted.view(nb, k, dim)[:n].reshape(n * k, dim)         # drop pad tokens

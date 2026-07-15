@@ -143,3 +143,36 @@ except Exception as e:  # noqa: BLE001
 
 print("\nVERDICT: GREEN if parity rel small AND only the 1st M compiles (rest 'fast'). Then I write Graft B+C.")
 print("         RED  if every new M is slow (recompiles per shape) or a codegen error above.")
+
+
+# =====================================================================================================
+# Graft B+C INTEGRATION — validate moe_compile.run() exactly as training calls it: fused w13 + compiled,
+# forward AND BACKWARD (training needs gradients; torch.compile compiles the backward via aot_autograd).
+# =====================================================================================================
+print("\n=== GRAFT B+C INTEGRATION (moe_compile.run — fwd + backward parity) ===")
+from speculators.models.dsv4_dspark.backbone import moe_compile  # noqa: E402
+
+moe_compile.enable()
+m = 1500
+w1 = (torch.randn(E, INTER, DIM, device=DEV, dtype=torch.bfloat16) * 0.02).requires_grad_()
+w3 = (torch.randn(E, INTER, DIM, device=DEV, dtype=torch.bfloat16) * 0.02).requires_grad_()
+w2b = (torch.randn(E, DIM, INTER, device=DEV, dtype=torch.bfloat16) * 0.02).requires_grad_()
+xg = torch.randn(m, DIM, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+_idx = torch.randint(0, E, (m,), device=DEV)
+cnts = torch.zeros(E, dtype=torch.int64, device=DEV).scatter_add_(
+    0, _idx, torch.ones(m, dtype=torch.int64, device=DEV))
+scr = torch.rand(m, device=DEV)
+LIM = float(os.environ.get("SWIGLU_LIMIT_INT", "0"))
+
+# eager reference = the SAME fn run eagerly (not compiled); compiled = moe_compile.run
+y_ref = moe_compile._experts_grouped_mm(torch.cat([w1, w3], dim=1), w2b, xg, cnts, LIM, scr)
+y_cmp = moe_compile.run(w1, w3, w2b, xg, cnts, LIM, scr)
+_fw = (y_ref - y_cmp).abs().max().item()
+print(f"[fwd] max|Δ|={_fw:.3e}  rel={_fw / y_ref.abs().max().clamp_min(1e-6).item():.3e}")
+_g = torch.randn_like(y_ref)
+_gr = torch.autograd.grad(y_ref, [xg, w1, w3, w2b], _g, retain_graph=False)
+_gc = torch.autograd.grad(y_cmp, [xg, w1, w3, w2b], _g, retain_graph=False)
+for _n, _a, _b in zip(["dx ", "dw1", "dw3", "dw2"], _gr, _gc):
+    _d = (_a - _b).abs().max().item()
+    print(f"[bwd] {_n}: max|Δ|={_d:.3e}  rel={_d / _a.abs().max().clamp_min(1e-6).item():.3e}")
+print("GREEN if [fwd]/[bwd] rel small — Graft B+C (fwd+bwd) is correct; the compiled backward matches eager.")
