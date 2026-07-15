@@ -1,9 +1,16 @@
 # DSV4-DSpark: killing the grouped-GEMM recompile (torch.compile on NPU) — **WIP**
 
-> **Status: WIP / investigating.** The training run is healthy and producing on `torch 2.10`
-> (`dspark-dsv4-austin`); this doc tracks the *optional* compile optimization that would recover
-> ~42% of wall-clock. It is being validated in an **isolated cloned env** (`dspark-dsv4-compile`)
-> and does NOT block the main run.
+> **Status: compile VALIDATED (fwd+bwd bit-exact, ~1.74×) — BANKED as seed tech, NOT deployed.**
+> The 2.10 main run is healthy and producing. Compile requires a torch-2.12 full-stack upgrade
+> (train **and** serve together) so it is OFF by default (`DSPARK_COMPILE=0`); on the 2.10 line the
+> recompile is managed by **bucketing** (§8). Validated in the isolated clone `dspark-dsv4-compile`.
+>
+> **Final validation** (`test_compile_grouped_mm.py`, torch-2.12 clone):
+> - forward: `parity rel = 0.000e+00` (bit-exact), `unique_graphs = 1` (one kernel for all token counts)
+> - backward: `dx/dw13/dw2 rel = 0.000e+00` (compiled bwd via aot_autograd == eager)
+> - speed: steady per-call **1.00×** (eager 3.34ms vs compiled 3.35ms) → **the entire 1.74× is
+>   recompile-avoidance**, not a faster steady kernel (matches the analyzer: recompile = 42% of wall-clock)
+> - memory: 27.4 GB peak (dynamic-shape → **no bucketing-padding memory**, unlike the 2.10 path)
 
 ## 1. The problem — RECOMPILE-bound after HS was solved
 
@@ -139,14 +146,27 @@ coordinated **train + serve** upgrade to the latest stack. The ~1.74× is realiz
   torch 2.12 + torch_npu 2.12rc1 to benefit (the whole EP/fused/recompute stack was validated on 2.10).
   Separate migration + re-validation effort. Prove compile viability FIRST (cheap, in the clone).
 
-## 8. Fallback (if compile proves non-viable on this box)
+## 8. Recompile management on the 2.10 main line (bucketing) — the practical path today
 
-Bucketing at a lower anchor to fit memory:
+Because the steady per-call is **1.00×** (see status box), the full 1.74× is *only* recompile-avoidance
+— so on 2.10 we don't strictly need compile: a big-enough bucket makes the grouped-GEMM shapes finite,
+and they EXHAUST within the first epoch (→ zero recompile after warmup). The only cost is padding memory,
+which a small anchor trim offsets:
 ```bash
+# bigger bucket (fewer distinct shapes → amortize fast) + a small anchor trim to fund the padding memory
 RECOMPUTE=1 MAX_ANCHORS=320 SEQLEN=3072 DSPARK_MOE_BUCKET=2048 DSPARK_EP=1 bash examples/ascend_npu_dflash/train_dsv4_dspark.sh faithful
 ```
-Bigger bucket → fewer shapes → recompiles amortize; drop anchor to 320 so the extra padding fits.
-Partial (est. 42% → ~15%), no dependency. Or accept the 42% (run is producing).
+Memory intuition (why the trim likely covers it): anchor 384→320 (~17% fewer draft tokens) frees per-layer
+activation ≈ the extra grouped-GEMM padding a 2048 bucket adds, so it should still fit ~59 GB. `bucket=512`
+at `anchor=384` was too fine (42% recompile, still not amortizing at step 733); `2048` gives ~4× fewer
+shapes → exhausts in epoch 0 → recompile ~0 after warmup — **no stack migration**. MEASURE `max_reserved`
++ the BOTTLENECK recompile% to confirm.
+
+**The two families** to avoid the per-shape `npu_grouped_matmul` recompile (there is no third — either the
+shape is constant, or the kernel ignores it):
+- **① fix the shape** — bucketing / per-expert capacity. 2.10-compatible; cost = padding memory/compute.
+- **② shape-generic kernel** — `torch.compile` + `maybe_mark_dynamic` (this doc; AscendC codegen, no
+  padding) or a hand-written dynamic Triton-Ascend/AscendC kernel. Cost = the 2.12 stack (or hand-effort).
 
 ## Related
 - Test: `examples/ascend_npu_dflash/test_compile_grouped_mm.py`
