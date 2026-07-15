@@ -14,6 +14,7 @@
 #
 # OVERRIDES (env, validated defaults baked in):
 #   RUN VERIFIER DATA HS_DIR ENDPOINT LR MAX_ANCHORS NPROC CKPT_FREQ CANN_ENV
+#   RECOMPUTE=1 (activation checkpointing: recompute draft layers in bwd -> raise MAX_ANCHORS past OOM)
 # NB: no `set -u` — CANN's 900env / conda activate reference unbound vars (matches serve).
 set -eo pipefail
 
@@ -49,6 +50,9 @@ BLOCK="${BLOCK:-6}"                     # ★ BLOCK WIDTH = anchor(slot 0) + gam
                                        # to keep MAX_ANCHORS*BLOCK ~constant (256*5=1280 -> ~213*6).
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
 EP="${DSPARK_EP:-0}"
+RECOMPUTE="${RECOMPUTE:-0}"             # activation checkpointing: recompute each draft layer in backward
+                                       # -> frees activation so MAX_ANCHORS scales past the memory wall
+                                       # (the lever to slow an HS-bound step to the serve's HS rate).
 
 # ---- per-mode config ----
 if [ "$MODE" = "faithful" ]; then
@@ -108,7 +112,7 @@ LOG="$RUN/${TAG}_${TS}.log"
 SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
-echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED"
+echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE"
 echo " block=$BLOCK (drafts $((BLOCK-1)) tokens = gamma; slot 0 anchor)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
@@ -118,7 +122,7 @@ echo " 💾 save -> $SAVE_PATH"
 echo "==================================================================="
 
 nohup env \
-  DSPARK_HS_DUMP=1 DSPARK_GROUPED_MOE="$GROUPED" DSPARK_EP="$EP" \
+  DSPARK_HS_DUMP=1 DSPARK_GROUPED_MOE="$GROUPED" DSPARK_EP="$EP" DSPARK_RECOMPUTE="$RECOMPUTE" \
   HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 $PORTS \
   torchrun --nproc_per_node "$NPROC" "$REPO_ROOT/scripts/train.py" \
     --speculator-type dsv4_dspark --served-model-name dsv4 \

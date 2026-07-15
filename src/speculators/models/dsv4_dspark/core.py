@@ -18,6 +18,7 @@ stack (expand once, collapse with the HyperHead at the end).
 """
 from __future__ import annotations
 
+import os
 from typing import ClassVar, Literal
 
 import torch
@@ -130,6 +131,12 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         super().__init__(config=config)
         bb = config.backbone_config()
         self.backbone_cfg = bb
+
+        # Activation checkpointing (recompute): DSPARK_RECOMPUTE=1 recomputes each draft layer's
+        # forward in backward instead of storing its activations -> frees per-layer activation so
+        # MAX_ANCHORS can scale past the memory wall (the anchor lever that rebalances an HS-bound
+        # run by slowing the step to the serve's HS-production rate). See _backbone_forward.
+        self.grad_checkpoint = bool(int(os.environ.get("DSPARK_RECOMPUTE", "0")))
 
         # Swap the decoder stack for our DSV4-native blocks + the mHC head.
         self.layers = nn.ModuleList(MhcDecoderBlock(bb) for _ in range(bb.n_draft_layers))
@@ -377,13 +384,17 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 if layer_idx in self.sliding_window_indices
                 else full_attn_mask
             )
-            streams = layer(
-                streams,
-                fc_output,
-                block_freqs,
-                ctx_freqs,
-                self._mask_to_bias(attn_bias),
-            )
+            layer_args = (streams, fc_output, block_freqs, ctx_freqs,
+                          self._mask_to_bias(attn_bias))
+            if self.grad_checkpoint and self.training:
+                # Recompute this layer (attn + EP-MoE all-to-all + mHC) in backward to free its
+                # activation. use_reentrant=False so the collective inside the MoE recomputes
+                # correctly under the saved-tensor hooks (standard AC+EP; the a2a re-runs in bwd).
+                from torch.utils.checkpoint import checkpoint  # noqa: PLC0415
+
+                streams = checkpoint(layer, *layer_args, use_reentrant=False)
+            else:
+                streams = layer(*layer_args)
 
         hidden = self.norm(self.hc_head(streams))  # [1, TB, H]
         logits = self.lm_head(hidden)
