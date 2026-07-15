@@ -18,12 +18,28 @@ gather-before-group. The MATH here is layout-independent and is what the unit te
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .kernels import register_kernel
 from .moe import GroupedExperts, swiglu_grouped
 
 _MOE_OP = "moe_dispatch"
+
+# Bucket the routed-token count so the grouped-GEMM sees only a handful of distinct row-counts.
+# npu_grouped_matmul recompiles per unique #rows; under EP the per-rank routed-token count varies
+# every step with routing imbalance -> a recompile spike each time a new count appears (observed
+# fwd_ms jumping 300ms -> 16s). Rounding the count up to a DSPARK_MOE_BUCKET multiple collapses it
+# to few shapes (recompiles amortize after the first few). Padding is a few % of the TOKEN dim
+# (NOT per-expert capacity), so the memory/compute waste is small. 0/1 disables bucketing.
+_MOE_BUCKET = int(os.environ.get("DSPARK_MOE_BUCKET", "512"))
+
+
+def _bucket_count(n: int) -> int:
+    if _MOE_BUCKET <= 1:
+        return n
+    return ((n + _MOE_BUCKET - 1) // _MOE_BUCKET) * _MOE_BUCKET
 
 
 def _grouped_matmul_torch(x: torch.Tensor, weight: torch.Tensor,
@@ -94,21 +110,39 @@ def _fused_permute_dispatch_npu(x: torch.Tensor, indices: torch.Tensor, w_flat: 
     Returns the UNPERMUTED per-unit output ``[N*k, dim]`` in original (row-major) order -- the
     caller sums the k slots (routed topk) or uses it as-is (k == 1). The grouped GEMM is still
     the validated ``_grouped_matmul`` (Graft A swaps only the permute; Graft B swaps the GEMM).
+
+    The token count ``N`` is BUCKETED (:func:`_bucket_count`) so the whole permute/grouped/unpermute
+    chain sees a recompile-stable shape: pad rows are zero tokens routed to expert 0 with zero
+    router weight (zero contribution) and are sliced off after unpermute -- mathematically identical
+    to the un-bucketed path (the CPU parity reference has no padding), just fewer distinct shapes.
     """
+    import torch.nn.functional as F  # noqa: PLC0415
     import torch_npu  # noqa: PLC0415  (NPU-only; every caller gates on device.type == "npu")
 
     w1, w3, w2 = experts.local_weights()
+    n, dim = x.shape
+    k = indices.shape[1]
+    nb = _bucket_count(n)
+    if nb > n:
+        pad = nb - n
+        x = F.pad(x, (0, 0, 0, pad))                                    # [nb, dim] zero tokens
+        indices = F.pad(indices, (0, 0, 0, pad))                        # [nb, k] -> expert 0
+        w_flat = F.pad(w_flat.reshape(n, k), (0, 0, 0, pad)).reshape(-1)  # [nb*k] zero weight
+
     # Ascend routing ops take int32 expert ids (ids < n_experts fit); ids are non-differentiable.
     idx = indices.to(torch.int32)
-    routed_input, sorted_idx = torch_npu.npu_moe_token_permute(x, idx)            # [N*k, dim]
+    routed_input, sorted_idx = torch_npu.npu_moe_token_permute(x, idx)            # [nb*k, dim]
     routed_scores, _ = torch_npu.npu_moe_token_permute(
         w_flat.reshape(-1, 1), idx.reshape(-1, 1)
-    )                                                                             # [N*k, 1]
-    counts = torch.bincount(indices.reshape(-1), minlength=n_experts)            # [E]
+    )                                                                             # [nb*k, 1]
+    counts = torch.bincount(indices.reshape(-1), minlength=n_experts)            # [E], sum = nb*k
     out = swiglu_grouped(routed_input.float(), w1.float(), w3.float(), w2.float(),
                          counts, routed_scores.reshape(-1).float(),
-                         experts.swiglu_limit, _grouped_matmul)                   # [N*k, dim]
-    return torch_npu.npu_moe_token_unpermute(out.to(routed_input.dtype), sorted_idx, None)
+                         experts.swiglu_limit, _grouped_matmul)                   # [nb*k, dim]
+    unpermuted = torch_npu.npu_moe_token_unpermute(out.to(routed_input.dtype), sorted_idx, None)
+    if nb > n:
+        unpermuted = unpermuted.view(nb, k, dim)[:n].reshape(n * k, dim)         # drop pad tokens
+    return unpermuted
 
 
 def moe_dispatch_grouped(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,

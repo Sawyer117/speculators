@@ -43,7 +43,7 @@ from speculators.models.dsv4_dspark.backbone.moe_grouped_gemm import (
 torch.manual_seed(0)
 
 DEV = "npu"
-T = int(os.environ.get("T", 2048))
+T = int(os.environ.get("T", 2000))     # non-multiple of the bucket -> exercises bucket padding
 DIM = int(os.environ.get("DIM", 1024))
 INTER = int(os.environ.get("INTER", 704))
 E = int(os.environ.get("E", 64))
@@ -78,7 +78,10 @@ def argsort_grouped(x, weights, indices, experts, n):
 
 
 def parity():
+    from speculators.models.dsv4_dspark.backbone.moe_grouped_gemm import _MOE_BUCKET, _bucket_count
     print(f"\n=== PARITY (shape T={T} DIM={DIM} INTER={INTER} E={E} TOPK={TOPK}) ===")
+    print(f"    DSPARK_MOE_BUCKET={_MOE_BUCKET}  ->  routed-token count {T} bucketed to {_bucket_count(T)}"
+          f"  (pad {_bucket_count(T) - T}); parity below must still hold with padding.")
     experts, x, weights, indices = make_inputs(requires_grad=True)
     leaves = [x, experts.w1, experts.w2, experts.w3]
 
