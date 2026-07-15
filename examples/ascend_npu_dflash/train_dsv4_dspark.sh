@@ -30,7 +30,7 @@ ENDPOINT="${ENDPOINT:-http://80.5.5.115:7000/v1}"
 RUN="${RUN:-/home/a00652497/dspark_austin/run}"
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"
 LR="${LR:-6e-4}"
-EPOCHS="${EPOCHS:-20}"                  # number of training epochs (--epochs). Set e.g. EPOCHS=5.
+EPOCHS="${EPOCHS:-5}"                   # number of training epochs (--epochs). Override e.g. EPOCHS=20.
 MAX_ANCHORS="${MAX_ANCHORS:-64}"
 SEQLEN="${SEQLEN:-8192}"                # --total-seq-len. Shorter (e.g. 3072) cuts draft-forward
                                        # activation memory (room for more anchors) + shortens the
