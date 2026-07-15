@@ -184,8 +184,14 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         model = cls(config=config)
         model.load_vocab_mappings(t2d, d2t)
         model.load_verifier_weights()
-        if kwargs.get("init_moe_from_target"):
-            model.load_verifier_moe()
+        parts = {p for p, flag in (
+            ("attn", "init_attn_from_target"), ("hc", "init_hc_from_target"),
+            ("norm", "init_norm_from_target"), ("moe", "init_moe_from_target"),
+        ) if kwargs.get(flag)}
+        if kwargs.get("init_layer_from_target"):
+            parts |= {"attn", "hc", "norm", "moe"}
+        if parts:
+            model.load_verifier_layer(parts)
         return model
 
     def load_verifier_weights(self) -> None:
@@ -246,28 +252,38 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             self.verifier_norm.weight.requires_grad_(False)
 
     def load_verifier_moe(self) -> None:
-        """Warm-start each draft layer's MoE (routed experts + router + shared expert)
-        from the matching verifier layer: draft layer ``n`` <- verifier layer
-        ``target_layer_ids[n]`` (the layers ``main_proj`` conditions on). A draft layer
-        is architecturally a DSV4 target layer, so this is a strong TRAINABLE init (not
-        frozen), unlike the shared embed/lm_head that ``load_verifier_weights`` freezes.
+        """Back-compat shim: warm-start only the MoE. See :meth:`load_verifier_layer`."""
+        self.load_verifier_layer({"moe"})
 
-        EP-aware: the stacked ``GroupedExperts`` weights are still plain per-rank tensors
-        at build time (before the ``Shard(0)`` DTensor wrap), so each rank copies only its
-        local ``[ep_expert_offset : +n_local]`` slice. No-op on meta params (non-rank0
-        under ``--init-on-meta``; real weights arrive via ``broadcast_from_rank0``).
+    def load_verifier_layer(self, parts) -> None:
+        """Warm-start the requested PARTS of each draft layer from the matching verifier
+        layer: draft layer ``n`` <- verifier layer ``target_layer_ids[n]`` (the layers
+        ``main_proj`` conditions on). A draft layer is architecturally a DSV4 target layer,
+        so this is a strong TRAINABLE init (not frozen), unlike the shared embed/lm_head.
 
-        Requires the draft MoE dims to match the verifier's (the faithful 256 x
-        ``moe_inter`` config); raises with a clear message on a reduced/mismatched draft.
-        The verifier uses the official DeepSeek names -- ``layers.{L}.ffn.experts.{e}.w
-        {1,2,3}.weight`` (w1=gate, w3=up, w2=down), ``ffn.gate.{weight,bias}`` (our
-        router), ``ffn.shared_experts.w{1,2,3}.weight`` -- so the copy is 1:1."""
+        ``parts`` is any subset of:
+          * ``"attn"`` — the MLA **core** projections (wq_a/q_norm/wq_b/wkv/kv_norm/wo_a/
+            wo_b/attn_sink). The verifier's sparse-attn ``compressor``/``indexer`` submodules
+            are skipped — the draft does dense sliding-window sink attention (no such parts).
+          * ``"hc"``   — the two hyper-connections (``attn_hc`` <- ``hc_attn_*``,
+            ``ffn_hc`` <- ``hc_ffn_*``; the sole flat->dotted rename).
+          * ``"norm"`` — the two RMSNorms (``attn_norm``, ``ffn_norm``).
+          * ``"moe"``  — routed experts (EP-local slice) + router (<- ``ffn.gate``) + shared.
+
+        EP-aware for experts (the stacked ``GroupedExperts`` weights are still plain per-rank
+        tensors at build time — before the ``Shard(0)`` wrap — so each rank copies only its
+        ``[ep_expert_offset : +n_local]`` slice); the rest are replicated (full copy per rank).
+        No-op on meta params (non-rank0 under ``--init-on-meta``; broadcast fills). Requires
+        the draft dims to match the verifier's (the faithful config); raises on any missing
+        key / shape mismatch. Verifier uses official DeepSeek names, so copies are 1:1."""
         import logging  # noqa: PLC0415
 
         from speculators.utils.loading import load_model_layers  # noqa: PLC0415
 
+        parts = set(parts)
+        if not parts:
+            return
         # meta build (non-rank0 under --init-on-meta): weights arrive via broadcast.
-        # EP forbids --init-on-meta, so under EP every rank has real params and loads.
         if self.layers[0].ffn.router.weight.is_meta:
             return
         sc = getattr(getattr(self, "config", None), "speculators_config", None)
@@ -278,67 +294,100 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         tids = bb.target_layer_ids
         if len(tids) < bb.n_draft_layers:
             raise ValueError(
-                f"init-moe-from-target needs >= n_draft_layers ({bb.n_draft_layers}) "
+                f"init-from-target needs >= n_draft_layers ({bb.n_draft_layers}) "
                 f"target_layer_ids, got {tids}."
             )
 
+        # replicated (non-EP) parts: (verifier-key suffix, draft attribute path). For attn
+        # and norm the two are identical; hc renames the flat hc_{attn,ffn}_* -> attn_hc/ffn_hc.
+        PART_MAP = {
+            "attn": [
+                ("attn.wq_a.weight", "attn.wq_a.weight"), ("attn.q_norm.weight", "attn.q_norm.weight"),
+                ("attn.wq_b.weight", "attn.wq_b.weight"), ("attn.wkv.weight", "attn.wkv.weight"),
+                ("attn.kv_norm.weight", "attn.kv_norm.weight"), ("attn.wo_a.weight", "attn.wo_a.weight"),
+                ("attn.wo_b.weight", "attn.wo_b.weight"), ("attn.attn_sink", "attn.attn_sink"),
+            ],
+            "hc": [
+                ("hc_attn_fn", "attn_hc.fn"), ("hc_attn_base", "attn_hc.base"),
+                ("hc_attn_scale", "attn_hc.scale"), ("hc_ffn_fn", "ffn_hc.fn"),
+                ("hc_ffn_base", "ffn_hc.base"), ("hc_ffn_scale", "ffn_hc.scale"),
+            ],
+            "norm": [
+                ("attn_norm.weight", "attn_norm.weight"), ("ffn_norm.weight", "ffn_norm.weight"),
+            ],
+        }
+
         def _need(dct: dict, k: str):
             if k not in dct:
-                raise KeyError(f"init-moe-from-target: '{k}' not found in verifier {path}")
+                raise KeyError(f"init-from-target: '{k}' not found in verifier {path}")
             return dct[k]
 
         def _copy(param, src) -> None:
             src = src.to(device=param.device, dtype=param.dtype)
             if tuple(src.shape) != tuple(param.shape):
                 raise ValueError(
-                    f"init-moe-from-target: source shape {tuple(src.shape)} != draft "
-                    f"{tuple(param.shape)} -- needs the faithful MoE config "
-                    f"(256 x {bb.moe_inter_dim}) matching the verifier."
+                    f"init-from-target: source shape {tuple(src.shape)} != draft "
+                    f"{tuple(param.shape)} -- needs the faithful config matching the verifier."
                 )
             param.data.copy_(src)
 
-        for n in range(bb.n_draft_layers):
-            layer_id = tids[n]
-            ffn = self.layers[n].ffn
-            off = int(getattr(ffn, "ep_expert_offset", 0))
-            n_local = ffn.experts.w1.shape[0]
-            eids = [off + i for i in range(n_local)]
-            pre = f"layers.{layer_id}.ffn."
-            keys = [pre + "gate.weight", pre + "gate.bias",
-                    pre + "shared_experts.w1.weight", pre + "shared_experts.w2.weight",
-                    pre + "shared_experts.w3.weight"]
-            for e in eids:
-                keys += [f"{pre}experts.{e}.w1.weight", f"{pre}experts.{e}.w2.weight",
-                         f"{pre}experts.{e}.w3.weight"]
-            w = load_model_layers(keys, path)
+        def _resolve(module, dotted: str):
+            obj = module
+            for a in dotted.split("."):
+                obj = getattr(obj, a)
+            return obj
 
-            # router (gate): weight is trainable; bias is the frozen aux-free balance bias
-            _copy(ffn.router.weight, _need(w, pre + "gate.weight"))
-            _copy(ffn.router.bias, _need(w, pre + "gate.bias"))
-            # single shared expert
-            for wn in ("w1", "w2", "w3"):
-                _copy(getattr(ffn.shared_experts, wn).weight,
-                      _need(w, f"{pre}shared_experts.{wn}.weight"))
-            # routed experts: stacked [n_local, out, in]; local slot i <- global expert off+i
-            for wn in ("w1", "w2", "w3"):
-                stacked = getattr(ffn.experts, wn)
-                slot_shape = tuple(stacked.shape[1:])
-                for i, e in enumerate(eids):
-                    src = _need(w, f"{pre}experts.{e}.{wn}.weight").to(
-                        device=stacked.device, dtype=stacked.dtype
-                    )
-                    if tuple(src.shape) != slot_shape:
-                        raise ValueError(
-                            f"init-moe-from-target: expert {e} {wn} {tuple(src.shape)} != "
-                            f"draft slot {slot_shape} (needs faithful 256 x {bb.moe_inter_dim})."
-                        )
-                    stacked.data[i].copy_(src)
+        for n in range(bb.n_draft_layers):
+            blk = self.layers[n]
+            pre = f"layers.{tids[n]}."
+
+            simple = [(pre + vk, da) for part in ("attn", "hc", "norm") if part in parts
+                      for vk, da in PART_MAP[part]]
+
+            moe_keys: list[str] = []
+            eids: list[int] = []
+            if "moe" in parts:
+                ffn = blk.ffn
+                off = int(getattr(ffn, "ep_expert_offset", 0))
+                eids = [off + i for i in range(ffn.experts.w1.shape[0])]
+                moe_keys = [pre + "ffn.gate.weight", pre + "ffn.gate.bias",
+                            pre + "ffn.shared_experts.w1.weight",
+                            pre + "ffn.shared_experts.w2.weight",
+                            pre + "ffn.shared_experts.w3.weight"]
+                for e in eids:
+                    moe_keys += [f"{pre}ffn.experts.{e}.w1.weight",
+                                 f"{pre}ffn.experts.{e}.w2.weight",
+                                 f"{pre}ffn.experts.{e}.w3.weight"]
+
+            w = load_model_layers([vk for vk, _ in simple] + moe_keys, path)
+
+            for vk, da in simple:
+                _copy(_resolve(blk, da), _need(w, vk))
+
+            if "moe" in parts:
+                # router (gate): weight trainable; bias is the frozen aux-free balance bias
+                _copy(ffn.router.weight, _need(w, pre + "ffn.gate.weight"))
+                _copy(ffn.router.bias, _need(w, pre + "ffn.gate.bias"))
+                for wn in ("w1", "w2", "w3"):
+                    _copy(getattr(ffn.shared_experts, wn).weight,
+                          _need(w, f"{pre}ffn.shared_experts.{wn}.weight"))
+                # routed experts: stacked [n_local, out, in]; local slot i <- global expert off+i
+                for wn in ("w1", "w2", "w3"):
+                    stacked = getattr(ffn.experts, wn)
+                    slot_shape = tuple(stacked.shape[1:])
+                    for i, e in enumerate(eids):
+                        src = _need(w, f"{pre}ffn.experts.{e}.{wn}.weight").to(
+                            device=stacked.device, dtype=stacked.dtype)
+                        if tuple(src.shape) != slot_shape:
+                            raise ValueError(
+                                f"init-from-target: expert {e} {wn} {tuple(src.shape)} != "
+                                f"draft slot {slot_shape} (needs faithful config)."
+                            )
+                        stacked.data[i].copy_(src)
 
         logging.getLogger(__name__).info(
-            "init-moe-from-target: warm-started %d draft MoE layers from verifier layers "
-            "%s (%d local experts/layer + router + shared).",
-            bb.n_draft_layers, list(tids[: bb.n_draft_layers]),
-            self.layers[0].ffn.experts.w1.shape[0],
+            "init-from-target: warm-started parts %s of %d draft layers from verifier layers %s.",
+            sorted(parts), bb.n_draft_layers, list(tids[: bb.n_draft_layers]),
         )
 
     def _init_backbone_params(self) -> None:

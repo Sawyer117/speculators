@@ -63,7 +63,11 @@ NOVAL="${NO_VAL:-0}"                    # NO_VAL=1 -> cancel the per-epoch valid
                                        # which dominates the epoch; --no-validation trains on the FULL data.
 INITMOE="${INIT_MOE:-0}"               # INIT_MOE=1 -> warm-start the draft MoE (experts+router+shared) from
                                        # the verifier's target layers (draft n <- target_layer_ids[n]).
-                                       # Trainable init; faithful (256x2048) only. A/B vs from-scratch.
+                                       # Trainable init; faithful only. A/B vs from-scratch.
+INITATTN="${INIT_ATTN:-0}"             # INIT_ATTN=1  -> warm-start MLA core projections (wq_*/wkv/wo_*/sink)
+INITHC="${INIT_HC:-0}"                 # INIT_HC=1    -> warm-start the two hyper-connections (attn_hc/ffn_hc)
+INITNORM="${INIT_NORM:-0}"             # INIT_NORM=1  -> warm-start the two RMSNorms (attn_norm/ffn_norm)
+INITLAYER="${INIT_LAYER:-0}"           # INIT_LAYER=1 -> WHOLE layer = attn+hc+norm+moe (coherent target layer)
 
 # ---- per-mode config ----
 if [ "$MODE" = "faithful" ]; then
@@ -100,8 +104,12 @@ fi
 
 # NO_VAL=1 -> append --no-validation (skip the slow per-epoch val pass, train on full data).
 if [ "$NOVAL" = "1" ]; then EXTRA="$EXTRA --no-validation"; fi
-# INIT_MOE=1 -> append --init-moe-from-target (warm-start draft MoE from verifier layers).
+# INIT_*=1 -> append the matching --init-*-from-target warm-start flag(s).
 if [ "$INITMOE" = "1" ]; then EXTRA="$EXTRA --init-moe-from-target"; fi
+if [ "$INITATTN" = "1" ]; then EXTRA="$EXTRA --init-attn-from-target"; fi
+if [ "$INITHC" = "1" ]; then EXTRA="$EXTRA --init-hc-from-target"; fi
+if [ "$INITNORM" = "1" ]; then EXTRA="$EXTRA --init-norm-from-target"; fi
+if [ "$INITLAYER" = "1" ]; then EXTRA="$EXTRA --init-layer-from-target"; fi
 
 # ---- preflight ----
 if [ -f "$CANN_ENV" ]; then
@@ -128,7 +136,7 @@ LOG="$RUN/${TAG}_${TS}.log"
 SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
-echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL  init_moe=$INITMOE"
+echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL  init(moe/attn/hc/norm/layer)=$INITMOE/$INITATTN/$INITHC/$INITNORM/$INITLAYER"
 echo " block=$BLOCK (drafts $((BLOCK-1)) tokens = gamma; slot 0 anchor)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"

@@ -885,6 +885,30 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--init-attn-from-target",
+        action="store_true",
+        help="Warm-start each draft layer's MLA core projections (wq_a/q_norm/wq_b/wkv/"
+             "kv_norm/wo_a/wo_b/attn_sink) from the matching verifier layer (dsv4_dspark).",
+    )
+    parser.add_argument(
+        "--init-hc-from-target",
+        action="store_true",
+        help="Warm-start each draft layer's two hyper-connections (attn_hc/ffn_hc) from the "
+             "matching verifier layer (dsv4_dspark).",
+    )
+    parser.add_argument(
+        "--init-norm-from-target",
+        action="store_true",
+        help="Warm-start each draft layer's two RMSNorms (attn_norm/ffn_norm) from the "
+             "matching verifier layer (dsv4_dspark).",
+    )
+    parser.add_argument(
+        "--init-layer-from-target",
+        action="store_true",
+        help="Convenience: warm-start the WHOLE draft layer (attn + hc + norm + moe) from the "
+             "matching verifier layer — a coherent target layer (dsv4_dspark).",
+    )
+    parser.add_argument(
         "--no-validation",
         action="store_true",
         help=(
