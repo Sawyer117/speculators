@@ -736,6 +736,13 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
                     if h > 0:
                         plt.text(b.get_x() + b.get_width() / 2, h + 0.012, f"{h:.2f}",
                                  ha="center", va="bottom", fontsize=8, weight="bold")
+            # released-draft per-position ACCEPT marginals (shape ref), same as the single-run plot
+            rel = [0.81, 0.68, 0.58, 0.48, 0.39]
+            if len(labels) == len(rel):
+                plt.plot(xx, rel, "o--", color="#D62828", lw=1.6, ms=6, zorder=4,
+                         label="released draft accept marginal (ref)")
+                for i, r in enumerate(rel):
+                    plt.text(i, r + 0.02, f"{r:.2f}", ha="center", color="#D62828", fontsize=9)
             plt.ylim(0, 1.0); plt.xticks(xx, labels); plt.legend(loc="upper right")
             plt.ylabel("greedy accuracy  (argmax == target)")
             plt.title(f"Per-position draft accuracy — {label} vs {blabel} (last {n} steps)")
