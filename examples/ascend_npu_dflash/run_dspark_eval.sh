@@ -19,7 +19,12 @@ MAX_NEW="${MAX_NEW:-2048}"
 TOKENIZER="${TOKENIZER:-/share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
 BASE="http://localhost:$PORT"
 export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"   # corp proxy hijacks localhost
+# box HF access is flaky → force datasets/hub to the LOCAL cache (~/.cache/huggingface). Set OFFLINE=0 to
+# allow network (e.g. to first-time download a dataset). The datasets must already be cached under OFFLINE=1.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-${OFFLINE:-1}}" HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-${OFFLINE:-1}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# DSV4 tokenizer ships NO chat_template → apply this jinja (ported for training data prep). Override via CHAT_TEMPLATE=.
+CHAT_TEMPLATE="${CHAT_TEMPLATE:-$SCRIPT_DIR/dsv4_chat_template.jinja}"
 
 echo ">>> [1/4] waiting for serve on :$PORT (up to 600s) ..."
 for _ in $(seq 1 120); do
@@ -40,6 +45,7 @@ curl -s --noproxy '*' "$BASE/metrics" | grep -E "spec_decode_num_(drafts|accepte
 
 echo ">>> [4/4] $DATASET accept_len (Evaluator, greedy temp0/top-p1/top-k1) — bar = released 3.94 ..."
 exec python "$SCRIPT_DIR/Evaluator.py" \
-  --base-url "$BASE" --model "$MODEL" --tokenizer "$TOKENIZER" --dataset "$DATASET" \
+  --base-url "$BASE" --model "$MODEL" --tokenizer "$TOKENIZER" --chat-template "$CHAT_TEMPLATE" \
+  --dataset "$DATASET" \
   --concurrency "$CONCURRENCY" --warmup-steps 10 --max-new-tokens "$MAX_NEW" \
   --temperature 0 --top-p 1 --top-k 1

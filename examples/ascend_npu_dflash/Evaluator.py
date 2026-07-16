@@ -716,6 +716,12 @@ def main():
         help="Local tokenizer path/id for AutoTokenizer. Defaults to --model; set a LOCAL ckpt dir "
         "(e.g. the bf16 target) when --model is a served-name like `dsv4` (else HF tries to download it).",
     )
+    ap.add_argument(
+        "--chat-template",
+        default=None,
+        help="Path to a .jinja chat template applied to the tokenizer. REQUIRED for DSV4 (its tokenizer "
+        "ships NO chat_template) — use examples/ascend_npu_dflash/dsv4_chat_template.jinja.",
+    )
 
     ap.add_argument(
         "--dataset",
@@ -748,6 +754,10 @@ def main():
     tok_src = args.tokenizer or args.model
     print(f"Loading tokenizer from {tok_src}...")
     tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
+    if args.chat_template:
+        with open(args.chat_template) as _f:
+            tokenizer.chat_template = _f.read()
+        print(f"Applied chat template from {args.chat_template}")
 
     if args.dataset == "all":
         dataset_names = list(DATASETS.keys())
