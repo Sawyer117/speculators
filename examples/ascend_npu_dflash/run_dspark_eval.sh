@@ -12,7 +12,10 @@ PORT="${PORT:-7000}"
 MODEL="${MODEL:-dsv4}"
 DATASET="${DATASET:-gsm8k}"          # only gsm8k by default — /metrics counters reset mid-run, so a
                                      # single dataset is the trustworthy accept_len (see memory).
-CONCURRENCY="${CONCURRENCY:-16}"     # bf16 dual-node: keep <=64 (KV overflow -> garbage above that).
+CONCURRENCY="${CONCURRENCY:-16}"     # bf16 dual-node: keep <=64 client (KV overflow -> garbage above that).
+NUM_PROMPTS="${NUM_PROMPTS:-0}"      # 0 = full dataset (1319 for gsm8k, ~2h @ conc16). 200 is a stable
+                                     # accept_len in ~10min. accept_len is a per-token average — a few
+                                     # hundred prompts is plenty; full run only tightens the estimate.
 MAX_NEW="${MAX_NEW:-2048}"
 # LOCAL tokenizer dir — --model is the served-name `dsv4` (for the API), NOT a HF repo, so the tokenizer
 # must load from a local path (the bf16 target has tokenizer.json). Override via TOKENIZER=<dir>.
@@ -44,8 +47,9 @@ curl -s --noproxy '*' "$BASE/metrics" | grep -E "spec_decode_num_(drafts|accepte
   || echo "    (!! no spec_decode counters — serve fell back to AR? check speculative_config in ~/dsv4_bf16_head.log)"
 
 echo ">>> [4/4] $DATASET accept_len (Evaluator, greedy temp0/top-p1/top-k1) — bar = released 3.94 ..."
+NP_ARG=(); [ "$NUM_PROMPTS" -gt 0 ] 2>/dev/null && NP_ARG=(--num-prompts "$NUM_PROMPTS")
 exec python "$SCRIPT_DIR/Evaluator.py" \
   --base-url "$BASE" --model "$MODEL" --tokenizer "$TOKENIZER" --chat-template "$CHAT_TEMPLATE" \
-  --dataset "$DATASET" \
+  --dataset "$DATASET" "${NP_ARG[@]}" \
   --concurrency "$CONCURRENCY" --warmup-steps 10 --max-new-tokens "$MAX_NEW" \
   --temperature 0 --top-p 1 --top-k 1
