@@ -153,4 +153,17 @@ def compute_metrics(
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
 
+    # HARD greedy accept length — the INFERENCE-equivalent metric (temp=0 spec-decode).
+    # Per block, the longest sequential prefix of draft slots 1..gamma where
+    # argmax(draft)==argmax(target), plus the always-emitted anchor. The `accept_len`
+    # above assumes SAMPLING (E[len] under sum_v min(p,q) acceptance) and is systematically
+    # HIGHER than this; vllm-ascend spec-decode reports THIS hard number. Logging both makes
+    # the train-metric vs serve-metric comparison apples-to-apples (see the 2.9-vs-1.36 gap).
+    with torch.no_grad():
+        hard_match = (pred_ids == target_ids).view(num_blocks, block_size)[:, 1:]
+        hard_match = hard_match.to(accept_rate.dtype) * draft_mask
+        hard_len = hard_match.cumprod(dim=-1).sum(dim=-1) + 1.0  # 1 until first miss, then frozen
+        metrics["hard_accept_len_sum"] = (hard_len * block_valid).sum()
+        metrics["hard_accept_len_total"] = block_valid.sum().clamp_min(1.0)
+
     return loss, metrics
