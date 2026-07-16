@@ -453,6 +453,19 @@ def main() -> None:
 
     # ---------------- recent dynamics (is it STILL learning?) ----------------
     N = args.recent
+
+    def _slope_per_1k(pts):
+        """Least-squares slope of value vs step, scaled to Δ per 1000 steps (signed)."""
+        if len(pts) < 20:
+            return None
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+        den = sum((x - mx) ** 2 for x in xs)
+        if den == 0:
+            return None
+        return (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den) * 1000.0
+
     def wtrend(key, higher_better):
         s = [(step_of(r), f(r, key)) for r in good if f(r, key) is not None and step_of(r) >= 0]
         if len(s) < 40:
@@ -460,28 +473,45 @@ def main() -> None:
         n = N if len(s) >= 2 * N else max(15, len(s) // 3)
         recent = [v for _, v in s[-n:]]
         prior = [v for _, v in s[-2 * n:-n]] or [v for _, v in s[:-n]] or recent
-        pr, rc, d = median(prior), median(recent), median([v for _, v in s[-n:]]) - median(prior)
+        pr, rc = median(prior), median(recent)
+        d = rc - pr
         noise = 2 * (pstdev(recent) / max(1, len(recent) ** 0.5)) if len(recent) > 1 else 0
-        if higher_better:
-            verdict = "↑ improving" if d > noise else ("↓ WORSENING" if d < -noise else "→ plateaued")
+        # LONG-HORIZON least-squares slope (Δ/1000 steps) over the last ~third of the run — the
+        # short median-vs-median window can't see a slow creep against per-batch accept_len noise.
+        length = min(len(s), max(2000, len(s) // 3))
+        slope = _slope_per_1k(s[-length:])
+        lh_change = (slope / 1000.0 * length) if slope is not None else 0.0  # implied Δ over that window
+        good_dir = slope is not None and ((slope > 0) == higher_better)
+        if (d > noise) if higher_better else (d < -noise):
+            verdict = "↑ improving" if higher_better else "↓ improving"
+        elif (d < -noise) if higher_better else (d > noise):
+            verdict = "↓ WORSENING" if higher_better else "↑ WORSENING"
+        elif slope is not None and abs(lh_change) > 2 * noise:
+            # short window flat, but the long horizon has moved more than the short-window noise
+            verdict = (f"→ short-flat, SLOW-CREEP {'↑' if higher_better else '↓'}" if good_dir
+                       else f"→ short-flat, SLOW {'↓' if higher_better else '↑'}-DRIFT")
         else:
-            verdict = "↓ improving" if d < -noise else ("↑ WORSENING" if d > noise else "→ plateaued")
-        return pr, rc, d, verdict, (s[-n][0], s[-1][0]), n
-    print(f"\n-- RECENT DYNAMICS (last ~{N} steps vs the {N} before) " + "-" * 20)
+            verdict = "→ plateaued"
+        return pr, rc, d, verdict, (s[-n][0], s[-1][0]), n, slope
+
+    print(f"\n-- RECENT DYNAMICS (short: last ~{N} vs prior {N}; + long-horizon slope) " + "-" * 6)
     verdicts = {}
     for key, lab, hb in [("train/loss", "loss", False), ("train/accept_len", "accept_len", True),
                          ("train/full_acc", "full_acc", True)]:
         t = wtrend(key, hb)
         if t:
-            pr, rc, d, verdict, span, n = t
+            pr, rc, d, verdict, span, n, slope = t
             verdicts[lab] = verdict
-            flag = "⚠️ " if "WORSENING" in verdict else ""
-            print(f"{lab:11}: prior {fmt(pr)} → recent {fmt(rc)}  (Δ{d:+.3f})  {flag}{verdict}"
+            flag = "⚠️ " if ("WORSENING" in verdict or "DRIFT" in verdict) else ""
+            sl = f"  LH {slope:+.3f}/1k" if slope is not None else ""
+            print(f"{lab:11}: prior {fmt(pr)} → recent {fmt(rc)}  (Δ{d:+.3f}){sl}  {flag}{verdict}"
                   f"   [steps {span[0]}..{span[1]}]")
     if verdicts.get("loss") == "↑ WORSENING" and verdicts.get("accept_len") == "↓ WORSENING":
         print("  ⚠️ BOTH loss↑ and accept_len↓ over the recent window → possible divergence / overfit / lr too high.")
-    elif all("plateaued" in v for v in verdicts.values()) and verdicts:
-        print("  → plateaued on all metrics — near-converged, or stuck (try lr schedule / more data if far from 3.94).")
+    elif verdicts and any("SLOW-CREEP" in v for v in verdicts.values()):
+        print("  → short window flat but still SLOWLY improving on the long horizon — NOT converged; keep going.")
+    elif verdicts and all(v == "→ plateaued" for v in verdicts.values()):
+        print("  → truly plateaued on all metrics — near-converged or stuck (lr schedule / more data if far from 3.94).")
 
     # ---------------- timing (steady-state) ----------------
     print("\n-- TIMING (per stage: STEADY vs EFFECTIVE-avg incl spikes) " + "-" * 16)
