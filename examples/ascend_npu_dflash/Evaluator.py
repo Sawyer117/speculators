@@ -708,7 +708,13 @@ def main():
     ap.add_argument(
         "--model",
         required=True,
-        help="Path/name as passed to `vllm serve`.",
+        help="Model name sent in the API request (the vllm --served-model-name, e.g. `dsv4`).",
+    )
+    ap.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Local tokenizer path/id for AutoTokenizer. Defaults to --model; set a LOCAL ckpt dir "
+        "(e.g. the bf16 target) when --model is a served-name like `dsv4` (else HF tries to download it).",
     )
 
     ap.add_argument(
@@ -739,8 +745,9 @@ def main():
 
     args = ap.parse_args()
 
-    print(f"Loading tokenizer for {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tok_src = args.tokenizer or args.model
+    print(f"Loading tokenizer from {tok_src}...")
+    tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
 
     if args.dataset == "all":
         dataset_names = list(DATASETS.keys())
