@@ -47,6 +47,8 @@ EAGER="${EAGER:-1}"                # 1 = --enforce-eager (reliable FIRST bring-u
 QUANT="${QUANT:-}"                 # empty = bf16; QUANT=ascend + MODEL=<w8a8 ckpt> to serve w8a8
 ENABLE_EP="${ENABLE_EP:-1}"        # ★ ON by default on A3 (intra-node EP works). Set ENABLE_EP=0 to TP-shard.
 PREFETCH="${PREFETCH:-1}"; LOAD_THREADS="${LOAD_THREADS:-16}"
+DRAFT="${DRAFT:-}"                 # set DRAFT=<dspark mtp dir> → spec-decode with a DSpark draft (else plain serve)
+NUM_SPEC="${NUM_SPEC:-5}"          # = dspark_block_size (released DSV4 draft = 5). draft shards under the engine's TP/EP.
 
 # shellcheck disable=SC1090
 source "$CANN_ENV"
@@ -74,10 +76,14 @@ QUANT_ARGS=(); [ -n "$QUANT" ] && QUANT_ARGS=(--quantization "$QUANT")
 EP_ARGS=(); [ "$ENABLE_EP" = "1" ] && EP_ARGS=(--enable-expert-parallel)
 LOAD_ARGS=(); [ "$PREFETCH" = "1" ] && LOAD_ARGS=(--safetensors-load-strategy prefetch)
 LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num_threads\":$LOAD_THREADS}")
+# DSpark spec-decode: point the draft at the converted mtp.* dir (method mtp). Draft shards under the
+# engine's TP/EP; num_speculative_tokens = dspark_block_size (5). Unset DRAFT → plain target serve.
+SPEC_ARGS=(); [ -n "$DRAFT" ] && SPEC_ARGS=(--speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\"}")
 
 pkill -9 -u "$USER" -f vllm 2>/dev/null; sleep 10
 
 echo ">>> [A3 single-node] model=$MODEL  DP$DP / TP$TP / EP=$ENABLE_EP  eager=$EAGER  port=$API_PORT"
+echo ">>> draft=${DRAFT:-<none, plain serve>}  num_spec=$NUM_SPEC"
 echo ">>> full engine log = THIS stdout (you launched under nohup → ~/dsv4_a3.log). No poll to Ctrl+C."
 exec vllm serve "$MODEL" --served-model-name dsv4 --port "$API_PORT" \
   --data-parallel-size "$DP" --data-parallel-size-local "$DP" \
@@ -87,5 +93,5 @@ exec vllm serve "$MODEL" --served-model-name dsv4 --port "$API_PORT" \
   --max-num-batched-tokens "$MAXBATCHTOK" \
   --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching --async-scheduling \
   --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}' \
-  "${LOAD_ARGS[@]}" \
+  "${LOAD_ARGS[@]}" "${SPEC_ARGS[@]}" \
   $EAGER_FLAG "${GRAPH_ARGS[@]}"
