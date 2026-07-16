@@ -201,8 +201,12 @@ fi
 SPEC_ARGS=()
 if [ -n "$DRAFT" ]; then
   { [ "$HS_EXTRACT" = "1" ] || [ "$HS_DUMP" = "1" ]; } && { echo "!! DRAFT is mutually exclusive with HS_EXTRACT/HS_DUMP"; exit 2; }
+  # ★ CRITICAL: route the draft attention through the STANDARD DSA (PA_ND paged) path. The default
+  # (=0) uses the custom dspark_attention TND wrapper, which NaNs at KV>128 (our KV=window128+block5=133).
+  # PA_ND is the correct, op-validated path (kernel session: bit-equal to the triton kernel, meanAbs 1.26e-7).
+  export VLLM_ASCEND_DSPARK_USE_STANDARD_DSA="${VLLM_ASCEND_DSPARK_USE_STANDARD_DSA:-1}"
   SPEC_ARGS=( --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\"}" )
-  echo ">>> [DSpark] spec-decode draft=$DRAFT  num_speculative_tokens=$NUM_SPEC  (EP=${ENABLE_EP:-off}, eager=$EAGER)"
+  echo ">>> [DSpark] spec-decode draft=$DRAFT  num_speculative_tokens=$NUM_SPEC  (EP=${ENABLE_EP:-off}, eager=$EAGER, STANDARD_DSA=$VLLM_ASCEND_DSPARK_USE_STANDARD_DSA)"
 fi
 
 # common serve flags (bf16 = NO --quantization; NO --enable-expert-parallel by default)

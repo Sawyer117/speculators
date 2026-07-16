@@ -78,12 +78,19 @@ LOAD_ARGS=(); [ "$PREFETCH" = "1" ] && LOAD_ARGS=(--safetensors-load-strategy pr
 LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num_threads\":$LOAD_THREADS}")
 # DSpark spec-decode: point the draft at the converted mtp.* dir (method mtp). Draft shards under the
 # engine's TP/EP; num_speculative_tokens = dspark_block_size (5). Unset DRAFT → plain target serve.
-SPEC_ARGS=(); [ -n "$DRAFT" ] && SPEC_ARGS=(--speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\"}")
+# ★ CRITICAL flag: STANDARD_DSA=1 routes the draft attention through the PA_ND (paged) op path. The
+# default (=0) uses the custom TND wrapper which NaNs at KV>128 (our KV=window128+block5=133). PA_ND is
+# the correct, op-validated path (kernel session: bit-equal to the triton kernel, meanAbs 1.26e-7).
+SPEC_ARGS=()
+if [ -n "$DRAFT" ]; then
+  export VLLM_ASCEND_DSPARK_USE_STANDARD_DSA="${VLLM_ASCEND_DSPARK_USE_STANDARD_DSA:-1}"
+  SPEC_ARGS=(--speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\"}")
+fi
 
 pkill -9 -u "$USER" -f vllm 2>/dev/null; sleep 10
 
 echo ">>> [A3 single-node] model=$MODEL  DP$DP / TP$TP / EP=$ENABLE_EP  eager=$EAGER  port=$API_PORT"
-echo ">>> draft=${DRAFT:-<none, plain serve>}  num_spec=$NUM_SPEC"
+echo ">>> draft=${DRAFT:-<none, plain serve>}  num_spec=$NUM_SPEC  STANDARD_DSA=${VLLM_ASCEND_DSPARK_USE_STANDARD_DSA:-<unset>}"
 echo ">>> full engine log = THIS stdout (you launched under nohup → ~/dsv4_a3.log). No poll to Ctrl+C."
 exec vllm serve "$MODEL" --served-model-name dsv4 --port "$API_PORT" \
   --data-parallel-size "$DP" --data-parallel-size-local "$DP" \
