@@ -210,9 +210,14 @@ if [ -n "$DRAFT" ]; then
   # (=0) uses the custom dspark_attention TND wrapper, which NaNs at KV>128 (our KV=window128+block5=133).
   # PA_ND is the correct, op-validated path (kernel session: bit-equal to the triton kernel, meanAbs 1.26e-7).
   export VLLM_ASCEND_DSPARK_USE_STANDARD_DSA="${VLLM_ASCEND_DSPARK_USE_STANDARD_DSA:-1}"
-  # eagle_aux_hidden_state_layer_ids goes through draft_model_config.hf_config (proven by HS_EXTRACT) so the
-  # target captures exactly the 3 layers the draft's main_proj wants (else 4-layer default → dim mismatch).
-  SPEC_ARGS=( --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\",\"draft_model_config\":{\"hf_config\":{\"eagle_aux_hidden_state_layer_ids\":$DSPARK_AUX_LAYERS}}}" )
+  # Pin the target's captured aux layers to the 3 the draft's main_proj wants (else the serve uses the
+  # 4-layer EAGLE3 default → target emits 4*H, draft wants 3*H → dim mismatch at the first draft). BOTH
+  # channels, since we can't see which one _get_eagle3_aux_layers_from_config reads on this build:
+  #   (a) --hf-overrides on the TARGET (--model): dspark_target_layer_ids → drives get_mtp_target_hidden_states
+  #       + the DSV4 get_eagle3_default_aux_hidden_state_layers.
+  #   (b) speculative_config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids (the HS_EXTRACT path).
+  SPEC_ARGS=( --hf-overrides "{\"dspark_target_layer_ids\":$DSPARK_AUX_LAYERS}"
+              --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\",\"draft_model_config\":{\"hf_config\":{\"eagle_aux_hidden_state_layer_ids\":$DSPARK_AUX_LAYERS}}}" )
   echo ">>> [DSpark] spec-decode draft=$DRAFT  num_speculative_tokens=$NUM_SPEC  aux_layers=$DSPARK_AUX_LAYERS  (EP=${ENABLE_EP:-off}, eager=$EAGER, STANDARD_DSA=$VLLM_ASCEND_DSPARK_USE_STANDARD_DSA)"
 fi
 

@@ -86,7 +86,9 @@ LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num
 SPEC_ARGS=()
 if [ -n "$DRAFT" ]; then
   export VLLM_ASCEND_DSPARK_USE_STANDARD_DSA="${VLLM_ASCEND_DSPARK_USE_STANDARD_DSA:-1}"
-  SPEC_ARGS=(--speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\",\"draft_model_config\":{\"hf_config\":{\"eagle_aux_hidden_state_layer_ids\":$DSPARK_AUX_LAYERS}}}")
+  # pin aux layers via BOTH channels (target --hf-overrides + draft eagle_aux) — see dualnode script.
+  SPEC_ARGS=(--hf-overrides "{\"dspark_target_layer_ids\":$DSPARK_AUX_LAYERS}"
+             --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\",\"draft_model_config\":{\"hf_config\":{\"eagle_aux_hidden_state_layer_ids\":$DSPARK_AUX_LAYERS}}}")
 fi
 
 pkill -9 -u "$USER" -f vllm 2>/dev/null; sleep 10
