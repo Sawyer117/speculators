@@ -216,9 +216,12 @@ if [ -n "$DRAFT" ]; then
   #   (a) --hf-overrides on the TARGET (--model): dspark_target_layer_ids → drives get_mtp_target_hidden_states
   #       + the DSV4 get_eagle3_default_aux_hidden_state_layers.
   #   (b) speculative_config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids (the HS_EXTRACT path).
+  # Draft-side sampling of the block tokens. Official DSpark vLLM recipe uses "greedy"
+  # (README: draft_sample_method:"greedy") — matches our temp=0 eval. Override via DRAFT_SAMPLE_METHOD=.
+  DRAFT_SAMPLE_METHOD="${DRAFT_SAMPLE_METHOD:-greedy}"
   SPEC_ARGS=( --hf-overrides "{\"dspark_target_layer_ids\":$DSPARK_AUX_LAYERS}"
-              --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\",\"draft_model_config\":{\"hf_config\":{\"eagle_aux_hidden_state_layer_ids\":$DSPARK_AUX_LAYERS}}}" )
-  echo ">>> [DSpark] spec-decode draft=$DRAFT  num_speculative_tokens=$NUM_SPEC  aux_layers=$DSPARK_AUX_LAYERS  (EP=${ENABLE_EP:-off}, eager=$EAGER, STANDARD_DSA=$VLLM_ASCEND_DSPARK_USE_STANDARD_DSA)"
+              --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\",\"draft_sample_method\":\"$DRAFT_SAMPLE_METHOD\",\"draft_model_config\":{\"hf_config\":{\"eagle_aux_hidden_state_layer_ids\":$DSPARK_AUX_LAYERS}}}" )
+  echo ">>> [DSpark] spec-decode draft=$DRAFT  num_speculative_tokens=$NUM_SPEC  draft_sample=$DRAFT_SAMPLE_METHOD  aux_layers=$DSPARK_AUX_LAYERS  (EP=${ENABLE_EP:-off}, eager=$EAGER, STANDARD_DSA=$VLLM_ASCEND_DSPARK_USE_STANDARD_DSA)"
 fi
 
 # common serve flags (bf16 = NO --quantization; NO --enable-expert-parallel by default)
