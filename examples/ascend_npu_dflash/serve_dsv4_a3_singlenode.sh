@@ -49,8 +49,8 @@ ENABLE_EP="${ENABLE_EP:-1}"        # ★ ON by default on A3 (intra-node EP work
 PREFETCH="${PREFETCH:-1}"; LOAD_THREADS="${LOAD_THREADS:-16}"
 DRAFT="${DRAFT:-}"                 # set DRAFT=<dspark mtp dir> → spec-decode with a DSpark draft (else plain serve)
 NUM_SPEC="${NUM_SPEC:-5}"          # = dspark_block_size (released DSV4 draft = 5). draft shards under the engine's TP/EP.
-DSPARK_TARGET_LAYERS="${DSPARK_TARGET_LAYERS:-[40,41,42]}"  # target aux layers → MUST match draft's dspark_target_layer_ids
-                                  # (3 → main_proj=3*H). Override the target config so it emits 3*H, not 4*H (dim mismatch).
+                                  # Aux-layer count is pinned via the DRAFT config's eagle_aux_hidden_state_layer_ids
+                                  # (converter writes it = dspark_target_layer_ids) — else serve defaults to 4 → dim mismatch.
 
 # shellcheck disable=SC1090
 source "$CANN_ENV"
@@ -86,8 +86,7 @@ LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num
 SPEC_ARGS=()
 if [ -n "$DRAFT" ]; then
   export VLLM_ASCEND_DSPARK_USE_STANDARD_DSA="${VLLM_ASCEND_DSPARK_USE_STANDARD_DSA:-1}"
-  SPEC_ARGS=(--hf-overrides "{\"dspark_target_layer_ids\":$DSPARK_TARGET_LAYERS}"
-             --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\"}")
+  SPEC_ARGS=(--speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\"}")
 fi
 
 pkill -9 -u "$USER" -f vllm 2>/dev/null; sleep 10

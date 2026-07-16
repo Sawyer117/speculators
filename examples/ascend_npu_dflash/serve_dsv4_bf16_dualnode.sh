@@ -81,11 +81,11 @@ DRAFT="${DRAFT:-}"                        # set DRAFT=<dspark mtp dir> → DSpar
                                           # with HS_EXTRACT/HS_DUMP). Draft shards intra-node under TP (EP off),
                                           # same as the target. For a FIRST spec-decode bring-up use EAGER=1.
 NUM_SPEC="${NUM_SPEC:-5}"                 # = dspark_block_size (released DSV4 draft = 5).
-DSPARK_TARGET_LAYERS="${DSPARK_TARGET_LAYERS:-[40,41,42]}"  # target aux layers the draft conditions on. MUST match
-                                          # the draft's dspark_target_layer_ids (3 → main_proj = 3*H). The bf16 target
-                                          # config may carry a different count (e.g. 4 = [40,41,42,43]) → target emits
-                                          # 4*H, draft expects 3*H → "expanded size (12288) must match (16384)". We
-                                          # --hf-override the TARGET to match the draft.
+                                          # NB: the target's aux-layer count (which the draft's main_proj must match)
+                                          # is pinned via the DRAFT config's `eagle_aux_hidden_state_layer_ids`
+                                          # (the converter now writes it = dspark_target_layer_ids). If the serve
+                                          # errors "expanded size (12288) must match (16384)" the draft config is
+                                          # missing that key → the serve fell back to the 4-layer EAGLE3 default.
 
 # ---- firewall subcommand: whitelist BOTH peer IPs in firewalld's trusted zone ----
 # Ascend HCCL opens many ephemeral ports between ranks; the default zone REJECTs them
@@ -210,10 +210,8 @@ if [ -n "$DRAFT" ]; then
   # (=0) uses the custom dspark_attention TND wrapper, which NaNs at KV>128 (our KV=window128+block5=133).
   # PA_ND is the correct, op-validated path (kernel session: bit-equal to the triton kernel, meanAbs 1.26e-7).
   export VLLM_ASCEND_DSPARK_USE_STANDARD_DSA="${VLLM_ASCEND_DSPARK_USE_STANDARD_DSA:-1}"
-  # force the TARGET to capture exactly the layers the draft's main_proj expects (else dim mismatch)
-  SPEC_ARGS=( --hf-overrides "{\"dspark_target_layer_ids\":$DSPARK_TARGET_LAYERS}"
-              --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\"}" )
-  echo ">>> [DSpark] spec-decode draft=$DRAFT  num_speculative_tokens=$NUM_SPEC  target_layers=$DSPARK_TARGET_LAYERS  (EP=${ENABLE_EP:-off}, eager=$EAGER, STANDARD_DSA=$VLLM_ASCEND_DSPARK_USE_STANDARD_DSA)"
+  SPEC_ARGS=( --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\"}" )
+  echo ">>> [DSpark] spec-decode draft=$DRAFT  num_speculative_tokens=$NUM_SPEC  (EP=${ENABLE_EP:-off}, eager=$EAGER, STANDARD_DSA=$VLLM_ASCEND_DSPARK_USE_STANDARD_DSA)"
 fi
 
 # common serve flags (bf16 = NO --quantization; NO --enable-expert-parallel by default)

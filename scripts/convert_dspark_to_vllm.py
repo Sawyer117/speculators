@@ -200,11 +200,21 @@ def main() -> None:
     save_file(out, str(out_dir / "model.safetensors"), metadata={"format": "pt"})
     print(f"\n>>> wrote {out_dir / 'model.safetensors'}")
 
-    # config.json — copied, NOT synthesized. Must be made vLLM-Ascend-DSpark-loadable.
+    # config.json — copied, then patched to be vLLM-Ascend-DSpark spec-decode-loadable.
     src_cfg = Path(args.config_from) if args.config_from else (in_dir / "config.json")
     if src_cfg.exists():
-        shutil.copy(src_cfg, out_dir / "config.json")
-        print(f">>> copied config.json from {src_cfg}")
+        cfg = json.loads(src_cfg.read_text())
+        # ★ serve reads the aux target layers from `eagle_aux_hidden_state_layer_ids` (EAGLE3 path in
+        # model_runner). The released draft config leaves it None → the serve falls back to
+        # get_eagle3_default_aux_hidden_state_layers() = 4 layers → target emits 4*H while our draft's
+        # main_proj wants 3*H (dspark_target_layer_ids) → dim mismatch at the first draft proposal.
+        # Pin it to dspark_target_layer_ids so the target captures exactly the layers the draft trained on.
+        tids = cfg.get("dspark_target_layer_ids")
+        if tids and not cfg.get("eagle_aux_hidden_state_layer_ids"):
+            cfg["eagle_aux_hidden_state_layer_ids"] = tids
+            print(f">>> patched config.json: eagle_aux_hidden_state_layer_ids = {tids} (from dspark_target_layer_ids)")
+        (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+        print(f">>> wrote config.json (from {src_cfg})")
     else:
         print(f"!! no config.json at {src_cfg} — provide one in {out_dir} before serving")
     print("⚠  VERIFY config.json before loading: `architectures`, `dspark_block_size`, "
