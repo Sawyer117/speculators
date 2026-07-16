@@ -77,6 +77,10 @@ ENABLE_EP="${ENABLE_EP:-}"                # ★ empty = NO expert-parallel (DEFA
                                           # (HcclAllGather stuck at seq_num 1). Without EP, MoE experts are
                                           # TP-sharded intra-node (no cross-node all-gather). Set ENABLE_EP=1
                                           # only after the cross-node HCCL AllGather is actually fixed.
+DRAFT="${DRAFT:-}"                        # set DRAFT=<dspark mtp dir> → DSpark spec-decode (mutually exclusive
+                                          # with HS_EXTRACT/HS_DUMP). Draft shards intra-node under TP (EP off),
+                                          # same as the target. For a FIRST spec-decode bring-up use EAGER=1.
+NUM_SPEC="${NUM_SPEC:-5}"                 # = dspark_block_size (released DSV4 draft = 5).
 
 # ---- firewall subcommand: whitelist BOTH peer IPs in firewalld's trusted zone ----
 # Ascend HCCL opens many ephemeral ports between ranks; the default zone REJECTs them
@@ -190,6 +194,17 @@ if [ "$HS_DUMP" = "1" ]; then
   echo ">>> [HS_DUMP] plan B dumper ON: layers $DSPARK_LAYERS -> $DSPARK_HS_DIR (hs_*.safetensors); drive prefill-only (max_tokens=1)"
 fi
 
+# ---- optional DSpark SPEC-DECODE (serve a converted DSpark draft) ----
+# DRAFT=<dir> points --speculative-config at our converted mtp.* draft (method mtp,
+# num_speculative_tokens = dspark_block_size). Mutually exclusive with the HS producers
+# above (those hijack --speculative_config for extract_hidden_states). Enable on BOTH nodes.
+SPEC_ARGS=()
+if [ -n "$DRAFT" ]; then
+  { [ "$HS_EXTRACT" = "1" ] || [ "$HS_DUMP" = "1" ]; } && { echo "!! DRAFT is mutually exclusive with HS_EXTRACT/HS_DUMP"; exit 2; }
+  SPEC_ARGS=( --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\"}" )
+  echo ">>> [DSpark] spec-decode draft=$DRAFT  num_speculative_tokens=$NUM_SPEC  (EP=${ENABLE_EP:-off}, eager=$EAGER)"
+fi
+
 # common serve flags (bf16 = NO --quantization; NO --enable-expert-parallel by default)
 COMMON=( "$MODEL"
   --data-parallel-size "$DP" --data-parallel-size-local 1
@@ -200,7 +215,7 @@ COMMON=( "$MODEL"
   --max-num-batched-tokens "$MAXBATCHTOK"
   --gpu-memory-utilization "$GPUUTIL_EFF" --no-enable-prefix-caching --async-scheduling
   --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}'
-  "${LOAD_ARGS[@]}" "${HS_ARGS[@]}" "${HS_DUMP_ARGS[@]}"
+  "${LOAD_ARGS[@]}" "${HS_ARGS[@]}" "${HS_DUMP_ARGS[@]}" "${SPEC_ARGS[@]}"
   $EAGER_FLAG "${GRAPH_ARGS[@]}" )
 # NB: the ckpt FS reports as "DPC" → vLLM disables auto-prefetch (only NFS/Lustre
 # auto-detected), so weight load took ~20 min. --safetensors-load-strategy prefetch
