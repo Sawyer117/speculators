@@ -124,6 +124,23 @@ def step_of(r) -> int:
     return int(f(r, "global_step") or -1)
 
 
+def epoch_boundaries(recs) -> list[tuple[int, int]]:
+    """Global_steps at which the parsed ``epoch`` field increments → (step, new_epoch) per boundary.
+    ``step`` = the first global_step of the new epoch; ``new_epoch`` = its 0-indexed epoch value
+    (so the log's "epoch 2/5 started" == epoch field 1 == the first boundary here). Empty for a
+    single-epoch run → no clutter. Used to draw vertical epoch markers on the step-axis plots."""
+    out, prev = [], None
+    for r in recs:
+        e, s = f(r, "epoch"), step_of(r)
+        if e is None or s < 0:
+            continue
+        e = int(e)
+        if prev is not None and e > prev:
+            out.append((s, e))
+        prev = e
+    return out
+
+
 def col(recs, key):
     """Finite values of `key` across records (drops None/nan/inf)."""
     out = []
@@ -752,11 +769,22 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
 
     ttl_suffix = f"  ({label} solid vs {blabel} dashed)" if have_base else ""
 
+    # epoch boundaries of the CURRENT run — vertical markers on every step-axis plot below.
+    ep_bounds = epoch_boundaries(recs)
+
+    def _epoch_lines():
+        for s, e in ep_bounds:
+            plt.axvline(s, color="0.55", ls=":", lw=0.9, alpha=0.75, zorder=0)
+            plt.annotate(f"e{e}", xy=(s, 1.0), xycoords=("data", "axes fraction"),
+                         xytext=(2, -2), textcoords="offset points",
+                         color="0.4", fontsize=7, ha="left", va="top")
+
     # 1) loss
     plt.figure(figsize=(9, 4))
     for k, lab, c in [("train/loss", "total", "#222222"), ("train/ce_loss", "ce", "#2E6CF6"),
                       ("train/tv_loss", "tv", "#1B8A4E"), ("train/confidence_loss", "confidence", "#D62828")]:
         _overlay(k, c, lab, good, bgood)
+    _epoch_lines()
     plt.xlabel("step"); plt.ylabel("loss"); plt.title("Loss" + ttl_suffix); plt.grid(alpha=.3); _legend()
     plt.tight_layout(); plt.savefig(f"{out}/loss.png", dpi=120); plt.close()
 
@@ -767,6 +795,7 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
                       ("train/full_acc", "full_acc", "#D62828")]:
         _overlay(k, c, lab, good, bgood)
     plt.axhline(3.94, ls="--", c="grey", lw=.8, label="released AL 3.94")
+    _epoch_lines()
     plt.xlabel("step"); plt.ylabel("accept"); plt.title("Acceptance" + ttl_suffix); plt.grid(alpha=.3); _legend()
     plt.tight_layout(); plt.savefig(f"{out}/acceptance.png", dpi=120); plt.close()
 
@@ -811,6 +840,7 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
             plt.ylim(1.0, max(4.2, data_top))
         plt.annotate(f"{label} ~{cur:.2f}", xy=(x[-1], cur), xytext=(x[-1], cur - 0.06),
                      color="#2E6CF6", fontsize=10, ha="right", weight="bold")
+        _epoch_lines()
         plt.xlabel("step"); plt.ylabel("acceptance length")
         plt.title((f"Acceptance length — {label} vs {blabel}" if have_base
                    else "Acceptance length — raw vs smoothed") + " (target = released-draft 3.94)")
@@ -881,6 +911,7 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
                       ("train/confidence_abs_error", "abs_error", "#D62828"),
                       ("train/confidence_cumprod_bias", "cumprod_bias", "#8A2BE2")]:
         _overlay(k, c, lab, good, bgood)
+    _epoch_lines()
     plt.xlabel("step"); plt.ylabel("confidence"); plt.title("Confidence calibration" + ttl_suffix)
     plt.grid(alpha=.3); _legend()
     plt.tight_layout(); plt.savefig(f"{out}/confidence.png", dpi=120); plt.close()
@@ -891,6 +922,7 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
                       ("profile/bwd_ms", "bwd", "#1B8A4E"), ("profile/opt_ms", "opt", "#8A2BE2"),
                       ("profile/step_ms", "step", "#222222")]:
         _overlay(k, c, lab, recs, brecs)
+    _epoch_lines()
     plt.yscale("log"); plt.xlabel("step"); plt.ylabel("ms (log)"); _legend(ncol=5, fontsize=8)
     plt.title("Per-stage time (log-y — spikes are the recompiles)" + ttl_suffix); plt.grid(alpha=.3, which="both")
     plt.tight_layout(); plt.savefig(f"{out}/timing.png", dpi=120); plt.close()
@@ -978,6 +1010,9 @@ def _plots_multi(runs, out):
         s = series(recs_, key)
         return [a for a, _ in s], [b for _, b in s]
 
+    # epoch boundaries of the CURRENT run (runs[0]); marked on every step-axis plot.
+    ep_bounds = epoch_boundaries(runs[0]["recs"]) if runs else []
+
     def _overlay(key, fname, title, ylabel, *, train=True, logy=False, target=None):
         plt.figure(figsize=(9.5, 4.8))
         allv, drew = [], False
@@ -1000,6 +1035,11 @@ def _plots_multi(runs, out):
         if not drew:
             plt.close()
             return
+        for s, e in ep_bounds:  # current-run epoch markers
+            plt.axvline(s, color="0.55", ls=":", lw=0.9, alpha=0.75, zorder=0)
+            plt.annotate(f"e{e}", xy=(s, 1.0), xycoords=("data", "axes fraction"),
+                         xytext=(2, -2), textcoords="offset points",
+                         color="0.4", fontsize=7, ha="left", va="top")
         if logy:
             plt.yscale("log")
         if target is not None:
