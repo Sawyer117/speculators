@@ -9,10 +9,20 @@ deliberately separates DSpark from DFlash (its own query-length, `blk = 1 + num_
 the `num_spec % dspark_block_size` constraint**, and **removes** `VLLM_ASCEND_DSPARK_USE_STANDARD_DSA`
 (the TND-NaN/PA_ND dilemma). Expectation: released draft on the new build → ~3.9.
 
-**PR relationship:** `pr-12005 = pr-12004 + one commit`. Checking out **#12005 gets all three**
-rewrite commits (`a586569e` noncausal DSA, `56f210c9` draft model, `431a64b1` eager decoding).
-#11431 is a *separate* refactor of the same #11196 — **not needed** (12005 already self-contains the
-noncausal DSA).
+**PR relationship (tracking issue #11126) — a 4-PR STACK by @QwertyJack, each depends on the previous:**
+`#12003` (attn, noncausal DSA/SAS) → `#12004` (draft model) → `#12005` (eager spec-decode, the
+"correctness baseline") → `#12006` (FULL ACLGraph, perf-only). The `pr-12005` head branch already
+**folds the whole stack** (its main-based diff contains PRs 1-2), and its extra dep `#11765` (generic
+`AscendDsparkProposer`) is **already MERGED into main** — so **checking out `#12005` head is
+self-contained** (verified: `dspark_proposer.py`, `deepseek_v4_dspark_proposer.py`,
+`deepseek_v4_draft.py` all present). `#12006` (graph) is optional. `#11431` (@drslark) is a **separate,
+competing** refactor — **do NOT mix it in**.
+
+**⚠️ STATUS — these are WIP, not finished.** As of 2026-07-16: **#12004/#12005/#12006 are DRAFT**,
+#12003 is ready, **none are merged, all `mergeable=False`** (conflicts with a moved main). Human review
+is early (mostly bot reviews: gemini-code-assist, github-actions conflict warnings); the heavy human
+review is on the original monolith #11196. So: **build a pinned snapshot of #12005 to VALIDATE the fix,
+not as a final/production drop — it will change.** Record the exact head commit you build.
 
 ## What we DON'T need to port
 All 15 of our fork's commits over its old base are the **old DSpark** (`07b2167e` + fixes, incl.
@@ -62,6 +72,8 @@ python -c "import vllm_ascend, vllm; print('ok | vllm', vllm.__version__)"
 - **method:** leave `"mtp"` (still routed) or switch to `"dspark"` (official).
 - **num_spec:** constraint gone → try **7** (official) and **5** (apples-to-apples vs our 1.34 baseline).
 - **`VLLM_ASCEND_DSPARK_USE_STANDARD_DSA`:** now a **no-op** (flag removed) — harmless to leave, or drop it.
+- **Run `EAGER=1`.** #12005 is the *eager correctness baseline*; FULL ACLGraph is the later WIP #12006.
+  Validate correctness in eager first; only try graph mode once the accept number is confirmed.
 - Everything else unchanged: bf16 target, `dspark_target_layer_ids=[40,41,42]`, released draft dir,
   `draft_sample_method=greedy`.
 - Point env at the new env/build; run on **both** 115/116.
