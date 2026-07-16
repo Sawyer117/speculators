@@ -82,9 +82,14 @@ def _map(key: str, last: int):
         return ["embed.weight"]
     if key == "lm_head.weight":
         return ["head.weight"]
-    if key == "main_proj.weight":
+    # target-hidden conditioning: our DFlash/DSpark backbone names these `fc`/`hidden_norm`
+    # (dflash/core.py:93,98 — "fc(=main_proj role)"), NOT main_proj/main_norm. The released
+    # serve REQUIRES `mtp.0.main_proj`+`main_norm` (deepseek_v4_dspark.py load_weights required set),
+    # so map both spellings. fc = Linear(len(target_layer_ids)*H -> H, bias=False) => [H, 3H],
+    # shape-identical to serve main_proj [H, H*num_target_layers]; hidden_norm[H] = main_norm[H].
+    if key in ("fc.weight", "main_proj.weight"):
         return ["mtp.0.main_proj.weight"]
-    if key == "main_norm.weight":
+    if key in ("hidden_norm.weight", "main_norm.weight"):
         return ["mtp.0.main_norm.weight"]
     if key == "norm.weight":
         return [f"mtp.{last}.norm.weight"]
