@@ -31,6 +31,17 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
 
 ## Status at a glance
 
+- **ALL FIXES in one branch + upstream-synced; the real training run is going (2026-07-18).** `feat/dsv4-dspark
+  @ 4354a6d` now carries FIVE fixes: (1) pos0 **decay** slot-0, (2) **Markov** `prev_token_ids` alignment (slots
+  ≥1), (3) **metrics** slot-0 (soft accept_len/confidence), (4) **AMP fp32 master weights** (norm-frozen /
+  weight-decay-dropped bug — option B: small trainable params fp32, EP experts+frozen bf16; +~0.5 GB, no OOM), and
+  (5) a one-time **`git merge upstream/main`** (fork is a real fork, merge-base #736; gained #788 float32
+  divergence loss, #759 metric double-reduction, #711 checkpointer dtype). Fixes 1–2 are serve-validated against
+  the DSV4 proposer (slot k prev = pos p+k = raw block_tokens); the two are ORTHOGONAL (decay=slot 0,
+  Markov=slots 1–4). A smoke run caught + fixed a latent complex64 `freqs_cis` crash from the AMP selective cast;
+  re-smoke clean (no NaN, mem ~56 GB, fits). Watch: `position_0_acc` past lr-peak + **`hard_accept_len` breaking
+  the killed run's ~2.4**; AMP proof = norm-changed-vs-verifier at the 1st ckpt. Detail: the **2026-07-18 worklog
+  section**. (torch-2.12 compile env for the recompile bottleneck = a parallel later track.)
 - **Serve FIXED, then root-caused OUR draft (2026-07-17, REVERSES the earlier "serve bug, no retrain").**
   Rebuilt the serve to **#12006** (`dspark-dsv4-v3`); the known-good released draft (dequant'd bf16 via
   `build_released_draft_dir.py --dequant-bf16`) scores **gsm8k accept_len 4.658** on our serve (smooth
@@ -40,10 +51,10 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
   (every slot sampled). It gates in THREE places — target **roll**, slot-0 **loss-mask**, and the
   per-position **loss decay** (`dflash_loss_decay` zeroed pos 0 → slot-0 got no gradient, `position_0_acc
   ~0.03`; the piece we first missed). **Fixed + cross-validated byte-for-byte vs canonical DeepSpec**
-  (`exp(-pos/gamma)`, pos0 highest); upstream speculators has the same decay bug. Plus BLOCK 6→5 and a
-  bit-identical shared-KV attention (−2.1 GB). **Status: RETRAINING** (`MAX_ANCHORS=512 BLOCK=5 True`) —
-  watch `position_0_acc` climb + `hard_accept_len`→~3.9+. Commits/topology/detail: the **2026-07-17
-  worklog section** + EP-training §6.1.
+  (`exp(-pos/gamma)`, pos0 highest); upstream independently merged the identical fix as **#798** (we've since
+  synced the fork to `upstream/main` — see the 07-18 bullet). Plus BLOCK 6→5 and a bit-identical shared-KV
+  attention (−2.1 GB). **Superseded by the 2026-07-18 all-fixes run.** Detail: the **2026-07-17 worklog
+  section** + EP-training §6.1.
 - **Training levers** (`feat/dsv4-dspark @ 928ea32`): MoE warm-start from the target
   (**`INIT_LAYER=1` whole-layer — the chosen best; `INIT_MOE=1` MoE-only was worse/unstable**),
   skip-validation + train-on-full-data (`NO_VAL=1`), activation recompute

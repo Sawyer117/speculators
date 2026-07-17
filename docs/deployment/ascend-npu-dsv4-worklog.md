@@ -346,12 +346,51 @@ proposer. **Both fixes are now required and both are serve-validated** (decay = 
 in that area). HOLD opening until the two-fix retrain proves end-to-end (train metric + serve accept_len, double
 evidence). The Markov fix needs no PR of ours — it's the serve convention.
 
+## 2026-07-18 — a THIRD training bug (FSDP2 mixed-precision) + upstream sync; ALL-FIXES run launched
+
+**A third training-correctness bug, found via the GLM-5.2 DSpark article (§4.1): FSDP2 mixed-precision master
+weights.** The trainer blanket-cast `self.model.to(bf16)` BEFORE `fully_shard`, so FSDP2's
+`MixedPrecisionPolicy(param_dtype=bf16)` had **no fp32 master** → sub-ULP updates (norm ~1e-7) + AdamW weight
+decay were rounded away in bf16 → **RMSNorm silently frozen, decay dropped for all params** (the article's
+controlled ablation: **+13.5–28.9% accept_len**). Confirmed in our trainer (cast at setup_model, shard after).
+
+**Fix = option B (memory-safe), `4354a6d`:** keep the SMALL trainable params (norm/MLA/mHC/Markov/confidence heads)
+fp32 as masters; frozen params AND the big EP experts stay bf16 (full-fp32 experts ≈ +5–6 GB → OOM at 512 anchors;
+expert grads are rounding-robust). FSDP's policy casts the fp32 masters to bf16 for compute → no autocast (NPU
+autocast avoided). Cost: `mem/alloc` 18.95 → 19.43 GB (+~0.5 GB, the small-param fp32 masters + their fp32 AdamW
+moments); `mem/reserved` unchanged ~56 GB → **no anchor trim**. (Why no memory explosion: only the tiny trainable
+params go fp32; experts — the bulk — stay bf16.)
+
+**Upstream sync (one-time merge).** The fork IS a real fork of `upstream/main` (merge-base `21033a7` #736, 133
+ahead / 33 behind — an empty `merge-base` earlier was a SHALLOW-CLONE artifact, not "unrelated history"). Merged
+`upstream/main` on an isolated branch, resolving 11 conflicts (took upstream's canonical #798/#806/#760, kept our
+#805-equiv slot-0 metrics + AMP + EP + `dsv4_dspark` model). **Gained beyond the 4 we'd hand-ported:** #788
+(divergence losses in float32 under bf16 — shifts tv/kl magnitudes UP, so **don't compare loss across the merge**),
+#759 (metric double-reduction `.clone()`), #711's checkpointer §4.3 dtype normalization, + sliding-window / MRoPE
+/ JSD features (inert for DSV4).
+
+**Smoke caught a real latent bug — the AMP fix had NEVER run** (the earlier step-79-105 run was pre-AMP,
+`264af2d`). Its first selective cast skipped the complex64 RoPE `freqs_cis` buffer (`is_floating_point()` is False
+for complex) → NPU `aclnnIndex` crashed (`DT_COMPLEX64` not in its dtype support list). **Re-fixed in `4354a6d`:**
+blanket `.to(bf16)` FIRST (buffers incl. `freqs_cis` get the old working treatment) THEN upcast small trainable →
+fp32. **Re-smoke PASS:** no crash, no NaN, `mem/reserved 56.15 GB` (fits), metrics moving. `feat/dsv4-dspark`
+fast-forwarded to `4354a6d`; **the smoke run IS the real run** (same recipe, let it continue).
+
+**ALL FIXES now in one branch (`feat/dsv4-dspark @ 4354a6d`):** pos0 decay slot-0 · Markov `prev_token_ids` ·
+metrics slot-0 · AMP fp32 masters · upstream merge. **AMP definitive check (do at 1st checkpoint):** compare the
+ckpt's norm weights vs the verifier norm @[40,41,42] (the warm-start source) — **changed ⇒ norms training ⇒ AMP
+works** (the buggy code froze them at the warm-start values, so the article's `max|w−1|==0` canary doesn't apply
+to our warm-start).
+
 ## Open items / next
 
-- **[RESTART] The two-fix retrain** (109, `MAX_ANCHORS=512 BLOCK=5 CKPT_FREQ=0.5`, sample_from_anchor=True) — now
-  with BOTH the decay slot-0 fix AND the Markov `prev_token_ids` fix (`373deae`). Success = `position_0_acc` high
-  (~0.7) AND `accept_len`/`hard_accept_len` climb past the old ~1.9 toward released ~3.9+; per-position smooth.
-  Then convert (`convert_dspark_to_vllm.py` on `ckpt_.../0`) → eval on #12006 (`dspark-dsv4-serving`) + draft.
+- **[RUNNING] The ALL-FIXES run** (`MAX_ANCHORS=512 BLOCK=5 CKPT_FREQ=0.5 DSPARK_EP=1 NO_VAL=1 RECOMPUTE=1`,
+  `feat/dsv4-dspark @ 4354a6d`). Watch: `position_0_acc` climb past lr-peak (~step 245); **`hard_accept_len` break
+  the killed run's ~2.4** (Markov fix signal); no NaN; mem ~56 GB. At 1st ckpt: the norm-changed AMP check. Then
+  convert (`convert_dspark_to_vllm.py` on `ckpt_.../0`) → eval on #12006 (`dspark-dsv4-serving`) + draft.
+- **[PARALLEL] torch-2.12 compile env** (`dspark-dsv4-compile`, clone of `-austin`): kills the grouped-GEMM
+  recompile (62% wall-clock). CANN 9.0.0 compatible (validated). Gated on: this run stable + a fresh bit-exact
+  re-check post-merge + a `transfer_to_npu` guard. Recipe in `ascend-npu-dsv4-dspark-compile-recompile.md`.
 - **[DONE 07-17] #12006 serve rebuild + validation** (`dspark-dsv4-v3`): released bf16 draft = **4.658** on our
   serve ⇒ serve fixed; our epoch-1 draft ~1.758 ⇒ weights were the bug → `sample_from_anchor` root cause + fix.
 - **[DONE 07-17] Two train↔serve conventions fixed + serve-validated:** decay slot 0 (`928ea32`) + Markov
