@@ -1,12 +1,16 @@
-# Ascend NPU — DeepSeek-V4-Flash DSpark Inference (Setup & Status)
+# Ascend NPU — DSV4-Flash DSpark inference on the **w8a8** target (ARCHIVED track)
 
-> **Fork-only, team-internal — WIP.** Reproduce DeepSeek **DSpark** speculative-decoding
-> **inference** for **DeepSeek-V4-Flash** on Ascend NPU. Sibling of the Qwen3 DSpark docs
-> (`ascend-npu-dspark-install.md` / `ascend-npu-dspark-report.md`); this file is the **V4** line,
-> kept on its own branch so the two don't tangle.
+> **🗄️ ARCHIVED — this is the early w8a8 inference track, superseded.** It served the **w8a8-mtp**
+> target (INT8) and got **BLOCKED on a vLLM-0.23/main w8a8 regression** (§8, 2026-07-03 — proven not
+> CANN). That block is WHY the project **pivoted to a bf16 target + the DSV4-native DSpark draft**,
+> which is the CURRENT line. Kept for **provenance (why bf16)** and its **toolchain/env notes**
+> (§3–§4: the system-gcc-not-conda-clang rule, the exit-127 `patch` gotcha, the guaranteed
+> v0.22.1rc1 baseline). Do NOT treat its §8 status/next as current.
 >
-> **Status (2026-07-03):** environment building on `dspark-dsv4-base`; drafter extracted (13 GB);
-> serve + eval pending. Update the checkboxes in §8 as it progresses.
+> **Current instead:** pipeline index [`ascend-npu-dsv4-dspark-pipeline.md`](./ascend-npu-dsv4-dspark-pipeline.md);
+> live status [`ascend-npu-dsv4-worklog.md`](./ascend-npu-dsv4-worklog.md); bf16 serve
+> `serve_dsv4_bf16_dualnode.sh` + the DSpark-draft serve rebuild
+> [`vllm-ascend-dspark-rebuild.md`](./vllm-ascend-dspark-rebuild.md).
 
 ---
 
@@ -480,7 +484,8 @@ refactor, `55b8cd0d8` SFA o_proj TP weights). Same CANN → **don't reinstall CA
 validated #11196 in **bf16** → dtype-independent code is fine → the bug is the **w8a8 path on
 vLLM-0.23/main**. Exact regression not findable by static read (~150-commit bisect).
 
-**Next:** (A) get a working w8a8 baseline on the **v0.22.1 stack** (the `:v0.22.1rc1` image, or build
+**Next (SUPERSEDED — the project pivoted to a bf16 target instead of chasing this w8a8 baseline):**
+(A) get a working w8a8 baseline on the **v0.22.1 stack** (the `:v0.22.1rc1` image, or build
 vllm-ascend @ `v0.22.1rc1` + vLLM 0.22.1 on the same CANN 9.0.0); (B) **ask QwertyJack** whether
 #11196 supports w8a8 or only bf16 — the authoritative answer. (bf16 needs ~16 cards; we have 8 → OOM.)
 Old `:deepseekv4` image (5/6) = CANN **8.5.1** + vLLM **0.18** — a different OLD stack, not comparable.

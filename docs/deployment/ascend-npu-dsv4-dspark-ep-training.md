@@ -332,8 +332,10 @@ Qwen3 line; see note below). ⚠️ **Block-size convention gotcha (cost us a ru
 loss-masked; drafts `block_size − 1`, like DFlash `block16 → 15`). So **train with
 `--block-size 6`** to draft 5; the released config's `dspark_block_size = 5` is **γ** (= served
 num_spec), i.e. `block_size − 1`. Passing `--block-size 5` silently drafts only 4 (logs show
-`position_1..4`, accept_len ceiling 5) — a wrong, one-short draft. A converged draft has not yet
-been trained-to-eval on this EP stack.
+`position_1..4`, accept_len ceiling 5) — a wrong, one-short draft. A first train→eval pass IS now done
+(see **6.1** below): the epoch-1 draft evals low (1.36) but that is a **serve bug, not training** —
+weights vindicated. (Also: the `n_predict = dspark_block_size` inference quirk noted here is a
+**pre-rewrite artifact** — the #12005 serve rewrite removes it, so num_spec is no longer forced ÷5.)
 > **Provenance (this bit the project — full chain in §10.C):**
 > - **DSpark's own forward masks the anchor slot** → trains/drafts `block_size − 1`:
 >   `src/speculators/models/dsv4_dspark/core.py:343` (`mask_token_ids[:, ::block_size] = anchor token`)
@@ -359,9 +361,32 @@ The bar to match/beat is the **released DeepSeek DSV4-Flash DSpark draft**, meas
 | **accept length (AL)** | **3.94** (GPU reference: 3.86) |
 | per-position accept | `[0.81, 0.68, 0.58, 0.48, 0.39]` (AL = 1 + Σ = 3.94) |
 
-Fill our trained draft's per-dataset numbers here after a full train→eval pass at `num_spec=5`.
 **eval /metrics counter resets mid-run** on vllm-ascend spec_decode — use the reset-aware poller
 (`Evaluator.py @ a3c41a6`), or non-first-dataset accept lengths read low.
+
+### 6.1 First train→eval pass (2026-07-16) — training side healthy; eval blocked on a SERVE bug, not the draft
+
+epoch-1 ckpt `/home/a00652497/dspark_austin/run/ckpt_faithful_ep_20260715_213847/0` (faithful EP8,
+arrow_0715, `INIT_MOE=1`, lr 2e-4, block 6):
+
+- **Training side — healthy / on-track (count this, not just the eval).** Loss decreasing; **soft
+  accept_len ~2.9–3.1 median** by epoch 1 (soft = `Σ_v min(p_v,q_v) = 1−d_TV` = E[len] under *sampling*,
+  what `metrics.py` logs); **position_1 hard-argmax ≈0.82**. The draft *is* learning the target — the
+  training-side signals are decent.
+- **Eval side — 1.36, but a SERVE artifact.** epoch-1 ckpt → `scripts/convert_dspark_to_vllm.py` (UT-1
+  bit-exact) → served → gsm8k **hard greedy accept_len 1.36** (pos0 ≈0.32). **This is a serve bug, NOT the
+  weights:** the **released known-good draft scores the SAME ~1.34 on our serve** (proven — see worklog
+  2026-07-16), root-caused to our fork's **pre-rewrite DSpark** (proposer piggybacks DFlash). Every
+  statically-checkable piece (aux, non-causal window, sink, config, structure) matches DeepSeek's own
+  `inference/model.py`.
+- **⟹ Training is on track; the eval gap is the serve.** Fix = rebuild on the #12005 rewrite
+  ([`vllm-ascend-dspark-rebuild.md`](./vllm-ascend-dspark-rebuild.md)); **re-measure the trained draft after
+  that** (very possibly the number jumps once the serve is correct). Weights **VINDICATED — no retrain.**
+- Metric caveat: training soft accept_len (~2.9) and serve hard greedy accept_len (1.36) are *different
+  metrics* — don't equate them; the apples-to-apples signal was position_1 hard-argmax 0.82 (train) vs ~0.32
+  (serve), and the released-draft test settled that it's the serve.
+
+Fill the trained draft's per-dataset `num_spec=5` numbers here **after the #12005 serve rebuild** (a fair eval).
 
 > **⚠ Do NOT conflate models.** The `dspark_qwen3_4b_block7` accept lengths (gsm8k 6.189 /
 > math500 6.095 / humaneval 5.524 / mbpp 5.191 / mt-bench 3.747) are **Qwen3-4B, block7,

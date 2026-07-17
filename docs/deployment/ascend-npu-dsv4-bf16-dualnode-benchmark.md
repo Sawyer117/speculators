@@ -129,4 +129,4 @@ the live rollout's 0.74 narrows the gap somewhat.)
 - **`errors=0` is NOT a quality signal** — garbage still returns HTTP 200. Always spot-check the actual
   generated text (and gsm8k-score any new serve config) before trusting a rollout.
 - `--enable-expert-parallel` remains the single hardest-won lesson: it is REQUIRED off for two-node
-  A2 (561000). See `docs/deployment/ascend-npu-dsv4-dspark.md` and the memory notes.
+  A2 (561000). See `docs/deployment/ascend-npu-dsv4-dspark-w8a8-inference.md` and the memory notes.

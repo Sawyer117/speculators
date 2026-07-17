@@ -3,7 +3,7 @@
 # (vLLM 0.23.0 + vllm-ascend BUILT FROM SOURCE), into the CURRENT (activated) py3.11 env.
 #
 # This script is the SINGLE SOURCE OF TRUTH for the DSpark/DSV4 env — the markdown
-# install docs (ascend-npu-dspark-install.md / ascend-npu-dsv4-dspark.md) defer to it.
+# install docs (ascend-npu-dspark-install.md / ascend-npu-dsv4-dspark-w8a8-inference.md) defer to it.
 # Fix the recipe HERE, once; propagate to feature branches by merging main forward.
 #
 # Differs from the DFlash install_npu_env.sh (which is a separate, older stack):
