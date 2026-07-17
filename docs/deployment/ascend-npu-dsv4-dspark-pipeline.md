@@ -39,7 +39,8 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
   #12005 rewrite** ([`vllm-ascend-dspark-rebuild.md`](./vllm-ascend-dspark-rebuild.md)); re-measure the
   trained draft after. Weights vindicated — no retrain. Details: EP-training §6.1 + the worklog.
 - **Training levers** (`feat/dsv4-dspark @ 3953bc1`): MoE warm-start from the target
-  (`INIT_MOE=1`), skip-validation + train-on-full-data (`NO_VAL=1`), activation recompute
+  (**`INIT_LAYER=1` whole-layer — the chosen best; `INIT_MOE=1` MoE-only was worse/unstable**),
+  skip-validation + train-on-full-data (`NO_VAL=1`), activation recompute
   (`RECOMPUTE=1`, 384@3072), defaults `EPOCHS=5 / SEQLEN=3072 / LR=6e-4`; A/B two runs with
   `analyze_train_run.py --baseline`. Rationale in EP-training §4, run knobs in §7.
 - **Correctness validation:** see the **validation matrix + green-check checklist** in

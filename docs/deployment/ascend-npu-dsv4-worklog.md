@@ -175,7 +175,7 @@ Confirmed (no change needed):
 
 Corrected online command shipped (pre-launch audit above + `ascend-npu-dsv4-dspark-ep-training.md`). Faithful
 Plan-甲 draft (3×[MLA+sink+256-MoE+mHC] + markov/confidence heads) trained via speculators FSDP2 on 2×A2. Best
-run = arrow_0715 / whole-layer MoE warm-start (`--init-moe-from-target`) / lr 2e-4 / EPOCHS 5; **epoch-1 ckpt =
+run = arrow_0715 / **whole-layer warm-start (`--init-layer-from-target` / `INIT_LAYER=1`)** / lr 2e-4 / EPOCHS 5; **epoch-1 ckpt =
 `/home/a00652497/dspark_austin/run/ckpt_faithful_ep_20260715_213847/0`** (CKPT_FREQ 1.0). Epoch-0→1 showed NO
 accept jump (soft accept_len ~2.9–3.1 median, slow creep). 6e-4 NaN'd (1% vs DeepSpec 4% warmup) → 2e-4.
 **Branch convergence:** all train/serve/convert work now on ONE branch **`feat/dsv4-dspark`** (the old

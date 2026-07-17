@@ -286,7 +286,7 @@ work, no patches. See §6.
 | Draft attention | **SDPA** (`--draft-attn-impl sdpa`) | Ascend has no `simple_flex_attention`. The non-causal-sink SWA fused kernel is a separate in-progress optimization (see §5, §7 handoff repo). |
 | Rollout sampling | **greedy, temp=0 end-to-end** | Gen / train / eval all temp=0 → self-consistent (user's call). DeepSpec uses 0.7/top-p0.8; DSV4 official rec 1.0. Tripwire if ever benchmarked sampled. |
 | Per-epoch validation | **off-able** (`--no-validation` / `NO_VAL=1`) | The 10% held-out val split has **no pre-dumped HS**, so `on_missing=generate` re-generates it **serially via the serve every epoch** (the val loader is `num_workers=0` — forked val workers corrupt the child heap right after the epoch-boundary DCP checkpoint: `free(): invalid pointer`). That dominates the epoch and *looks* hung (only the tqdm bar creeps). `--no-validation` skips the val pass **and** trains on the **FULL** dataset (`split_ratio=1.0`); `train_data_ratio` (default 0.9) only applies when val is **on**, so nothing is silently wasted. |
-| MoE warm-start from target | **opt-in** (`--init-moe-from-target` / `INIT_MOE=1`) | A draft layer **is** a DSV4 target layer, so init each draft layer's MoE (routed experts + router + shared) from verifier layer `target_layer_ids[n]` (`[40,41,42]→[0,1,2]`) instead of random — a strong basin for the draft's job (predict next-token from the layer-40/41/42 hidden states). **1:1 copy** (verifier uses the official DeepSeek names; only rename `ffn.gate`→`router`; `w1`=gate/`w3`=up/`w2`=down). **Trainable** (not frozen, unlike the shared embed/lm_head). EP-aware: runs at build time when `GroupedExperts` are still plain per-rank tensors (before the `Shard(0)` wrap), so each rank copies only its `[ep_expert_offset : +n_local]` slice; no-op on meta params. **Faithful (256×2048) only** — fast-fails at startup on any dim/key mismatch. Verified on box: 256 experts, `moe_intermediate_size 2048`, `layers.{40,41,42}.ffn.{experts.{e}.w{1,2,3},gate.{weight,bias},shared_experts.w{1,2,3}}`. A/B vs from-scratch (early accept_len should start higher). Open (measurable): whether the **official** DSpark recipe warm-starts — `dspark_method.py` shows only loss+heads. |
+| MoE warm-start from target | **opt-in** (`--init-moe-from-target` / `INIT_MOE=1`) | A draft layer **is** a DSV4 target layer, so init each draft layer's MoE (routed experts + router + shared) from verifier layer `target_layer_ids[n]` (`[40,41,42]→[0,1,2]`) instead of random — a strong basin for the draft's job (predict next-token from the layer-40/41/42 hidden states). **1:1 copy** (verifier uses the official DeepSeek names; only rename `ffn.gate`→`router`; `w1`=gate/`w3`=up/`w2`=down). **Trainable** (not frozen, unlike the shared embed/lm_head). EP-aware: runs at build time when `GroupedExperts` are still plain per-rank tensors (before the `Shard(0)` wrap), so each rank copies only its `[ep_expert_offset : +n_local]` slice; no-op on meta params. **Faithful (256×2048) only** — fast-fails at startup on any dim/key mismatch. Verified on box: 256 experts, `moe_intermediate_size 2048`, `layers.{40,41,42}.ffn.{experts.{e}.w{1,2,3},gate.{weight,bias},shared_experts.w{1,2,3}}`. A/B vs from-scratch (early accept_len should start higher). Open (measurable): whether the **official** DSpark recipe warm-starts — `dspark_method.py` shows only loss+heads. **UPDATE:** generalized to per-part knobs `INIT_{ATTN,HC,NORM,MOE,LAYER}`; **whole-layer `INIT_LAYER=1` is the chosen best** — MoE-only (`INIT_MOE`) left a "warm-MoE-fed-by-random-attn" unlearning transient (init grad_norm ~200 & ce started 18 > random 11.8, vs whole-layer grad_norm ~47). All our real runs (incl. the epoch-1 ckpt in §6.1) use `INIT_LAYER=1`. |
 
 ## 5. Known follow-ups / not-yet-optimized
 
@@ -367,7 +367,7 @@ The bar to match/beat is the **released DeepSeek DSV4-Flash DSpark draft**, meas
 ### 6.1 First train→eval pass (2026-07-16) — training side healthy; eval blocked on a SERVE bug, not the draft
 
 epoch-1 ckpt `/home/a00652497/dspark_austin/run/ckpt_faithful_ep_20260715_213847/0` (faithful EP8,
-arrow_0715, `INIT_MOE=1`, lr 2e-4, block 6):
+arrow_0715, **`INIT_LAYER=1` (whole-layer warm-start — the chosen best; MoE-only `INIT_MOE` was worse/unstable)**, lr 2e-4, block 6):
 
 - **Training side — healthy / on-track (count this, not just the eval).** Loss decreasing; **soft
   accept_len ~2.9–3.1 median** by epoch 1 (soft = `Σ_v min(p_v,q_v) = 1−d_TV` = E[len] under *sampling*,
@@ -417,13 +417,16 @@ group). A3 single-node variant: `serve_dsv4_a3_singlenode.sh` (DP2/TP8/EP16, int
 **Train:**
 [`examples/ascend_npu_dflash/train_dsv4_dspark.sh`](../../examples/ascend_npu_dflash/train_dsv4_dspark.sh)
 — baked defaults now `LR=6e-4 EPOCHS=5 SEQLEN=3072 BLOCK=6`. Typical faithful run:
-`INIT_MOE=1 NO_VAL=1 MAX_ANCHORS=384 RECOMPUTE=1 DSPARK_EP=1 DATA=<arrow_dir> bash ... faithful`.
+`INIT_LAYER=1 NO_VAL=1 MAX_ANCHORS=384 RECOMPUTE=1 DSPARK_EP=1 DATA=<arrow_dir> bash ... faithful`
+(whole-layer warm-start is the chosen best; **`INIT_MOE=1` MoE-only was worse/unstable** — see §4).
 Modes: `reduced` (1L×32E smoke) / `faithful` (3L×256E, EP8). Env knobs:
 `SEQLEN MAX_ANCHORS LR EPOCHS BLOCK MASK_TOKEN CKPT_FREQ DSPARK_EP RECOMPUTE COMPILE NO_VAL
 INIT_MOE DSPARK_GROUPED_MOE NPROC RUN SAVE_PATH VERIFIER DATA HS_DIR ENDPOINT CANN_ENV`
 (the banner echoes their resolved values). Backgrounds a torchrun run; prints the tail command.
-`NO_VAL=1` → no per-epoch val + train on full data; `INIT_MOE=1` → warm-start MoE from the
-verifier; `RECOMPUTE=1` → activation recompute (needed past ~256 anchors). See §4 for each.
+`NO_VAL=1` → no per-epoch val + train on full data; **`INIT_LAYER=1` → whole-layer warm-start from the
+verifier (the chosen best)**; `INIT_MOE=1` → MoE-only warm-start (worse: unlearning transient, `INIT_LAYER`
+generalizes it — the knobs are `INIT_{ATTN,HC,NORM,MOE,LAYER}`); `RECOMPUTE=1` → activation recompute
+(needed past ~256 anchors). See §4 for each.
 
 **Rollout (data gen):** `rollout_a3_shard.sh` / `rollout_shard.sh` (greedy, temp=0; prep →
 Arrow). **HS-dump smoke:** `hs_dump_smoke.py`. **Eval:** `run_eval.sh` (background serve +
