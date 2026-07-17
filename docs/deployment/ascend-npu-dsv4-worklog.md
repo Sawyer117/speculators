@@ -171,14 +171,106 @@ Confirmed (no change needed):
   those 3 aux (input) + the verifier's final hidden (last), which through `verifier_lm_head` forms the
   training TARGET distribution. num_target_layers = len([40,41,42]) = 3 (no auto layer-add).
 
+## 2026-07-14/15 — DSpark draft training launched → epoch-1 ckpt
+
+Corrected online command shipped (pre-launch audit above + `ascend-npu-dsv4-dspark-ep-training.md`). Faithful
+Plan-甲 draft (3×[MLA+sink+256-MoE+mHC] + markov/confidence heads) trained via speculators FSDP2 on 2×A2. Best
+run = arrow_0715 / whole-layer MoE warm-start (`--init-moe-from-target`) / lr 2e-4 / EPOCHS 5; **epoch-1 ckpt =
+`/home/a00652497/dspark_austin/run/ckpt_faithful_ep_20260715_213847/0`** (CKPT_FREQ 1.0). Epoch-0→1 showed NO
+accept jump (soft accept_len ~2.9–3.1 median, slow creep). 6e-4 NaN'd (1% vs DeepSpec 4% warmup) → 2e-4.
+**Branch convergence:** all train/serve/convert work now on ONE branch **`feat/dsv4-dspark`** (the old
+`feat/dspark-confidence-head` / `-inference` split retired). See `ascend-npu-dsv4-dspark-ep-training.md`.
+
+## 2026-07-16 — convert draft → vllm-ascend `mtp.*`; UT-1 bit-exact
+
+`scripts/convert_dspark_to_vllm.py` (pure rename + expert-unstack, NO numeric transform): our stacked
+`layers.{n}.*` → released `mtp.*` (per-expert). **Converter bug caught on the first real `--inspect`**
+(`fb2151f`): our backbone names the target-hidden projection `fc`/`hidden_norm` (not `main_proj`/`main_norm`),
+so it was silently dropping the serve-required `mtp.0.main_proj`+`main_norm` → fixed. `confidence_head` is
+serve-skipped (training-only). **UT-1** (`scripts/verify_dspark_conversion.py`, independent inverse-map) =
+**2378/2378 bit-exact** → converter RULED OUT.
+
+## 2026-07-16 — serve bring-up (A2 bf16 dual-node, 115=head / 116=worker)
+
+All had to be true: (1) **`VLLM_ASCEND_DSPARK_USE_STANDARD_DSA=1`** — default 0 routes the draft attn through
+the custom `dspark_attention` TND path → **NaN at KV=window128+block5=133**; =1 = standard DSA PA_ND. (2) pin
+aux `[40,41,42]` via BOTH channels (`--hf-overrides dspark_target_layer_ids` on target +
+`draft_model_config.eagle_aux_hidden_state_layer_ids`) — else target emits 4-layer default (16384) vs draft's
+3-layer `main_proj` (12288) → dim mismatch on first draft. (3) **both nodes on the SAME serve commit** — a
+stale worker (116) crashed DP1 with the 16384 mismatch while the fixed head (DP0) lived (head-ok/worker-crash
+was the tell). (4) draft on **`/share`** (node-local /home invisible to peer) + world-readable (`chmod a+rX`,
+cross-user). Eval = `run_dspark_eval.sh`. Serve scripts do (1)+(2) when `DRAFT` set.
+
+## 2026-07-16 — ★ ACCEPT COLLAPSE, and the test that flipped the diagnosis
+
+Our epoch-1 draft on gsm8k = **accept_len 1.364** (pos0 32% / pos1 4% / pos2+≈0) vs released bar **3.94**. I
+first mis-framed it as a soft-vs-hard metric gap (training soft accept_len 2.9 = `Σ min(p,q)` = E[len] under
+sampling; serve = hard greedy argmax) — **user pushback: that can't explain per-position collapse; position_1
+is hard-argmax in BOTH and was ~0.82 in training vs ~0.32 at serve.** Right.
+
+Decisive move: **build a standalone RELEASED fp8 draft and serve it on OUR exact harness** (swap only the
+draft). `scripts/build_released_draft_dir.py` (`8a6a57c`): `mtp.*` fp8 verbatim from released shards 46/47/48 +
+`embed`/`head` borrowed from our bf16 draft + released fp8 `quantization_config` (`ignored_layers=[embed,head]`).
+Result: **released draft = accept_len 1.344, pos0 0.3265 / pos1 0.0167 — IDENTICAL to ours.**
+`num_draft_tokens/num_drafts = 110805/22161 = 5.0` ⇒ num_spec=5 IS live (the `block_size=2` load-log value is
+the KV **page** size — red herring). **⟹ a known-good draft collapses the same way ⇒ the SERVE is the bug,
+NOT our weights.** Training/conversion/definition VINDICATED, no retrain. (Needed `chmod a+rX` on the /share
+draft dir first — same cross-user gotcha, surfaced as `FileNotFoundError`.)
+
+## 2026-07-16 — exhaustive verify vs DeepSeek's reference → root cause
+
+Pulled the official reference `DeepSeek-V4-Flash-DSpark/inference/model.py` and diffed our serve (sandbox
+mirror `/workspace/vllm-ascend` @ box `60365071`) point-by-point. **ALL match:** aux reduction
+(`hidden_states.mean(dim=1)` over hc_mult @ `deepseek_v4.py:1242` == official `h.mean(dim=2)` @ `model.py:921`
+— dim index differs only because vLLM flattens batch×seq); aux post-layer, hc_post folds residual (layer fwd
+1084-1103), cat[40,41,42]; non-causal `win_right=4` (`causal=False` @ proposer 371/505); `attn_sink` +
+inverse-RoPE; config (block5/noise128799/markov256/hc4). Ruled out: method routing (`mtp`+`dspark_block_size`
+→ `AscendDSparkProposer`, `self.method="dflash"` = expected), STANDARD_DSA, `block_size=2`.
+
+**Root cause:** our fork `60365071` carries the **PRE-REWRITE DSpark, where the proposer piggybacks on the
+DFlash path** (`self.method="dflash"`, 760-line proposer). The `num_spec % 5 == 0` constraint (which rejected
+the official `num_spec=7`) traces to a **fork-local patch** (`patch_speculative_config.py`:
+`n_predict=dspark_block_size`), unlike every other MTP. Upstream `vllm-project/vllm-ascend` main has **NO
+DSpark** — it's fork-only. And the official 3.94 recipe (README: `method:"dspark", num_spec:7,
+draft_sample_method:"greedy"`, 4×GB300, fp8 kv, EP, deep_gemm) is **upstream vLLM-core on GB300** — a
+*different codebase* from our ascend fork's reimplementation.
+
+## 2026-07-16 — the rewrite (#12004+#12005) is the fix
+
+Fetched the post-#11196 PRs. #11196 (@QwertyJack, monolithic prototype) is being **decomposed into a 4-PR
+stack** (issue #11126): **#12003** (noncausal DSA attn) → **#12004** (draft model) → **#12005** (eager
+spec-decode = "correctness baseline") → **#12006** (FULL ACLGraph, perf). `#11431` (@drslark) is a *separate,
+competing* refactor. The rewrite **materially changes drafting**: proposer 760→196 lines; DSpark split OUT of
+DFlash into its own path (new code comment: "DSpark query length = num_spec, **unlike DFlash where it's
+num_spec+1**"); the `n_predict=dspark_block_size` ÷5 constraint **removed**;
+`VLLM_ASCEND_DSPARK_USE_STANDARD_DSA` **removed** (TND-NaN/PA_ND dilemma gone); method accepts `"dspark"` or
+`"mtp"`. **Status: #12004/#12005/#12006 are DRAFT/WIP, none merged, all `mergeable=False`, human review early
+(mostly bots); `#11765` (generic proposer dep) is MERGED to main.** `pr-12005` head folds 12003+12004
+(self-contained, verified). ⟹ our collapse is almost certainly the old DFlash-piggyback impl. Write-up: memory
+`dsv4-dspark-inference-conversion`; kernel handoff (now moot) `HANDOFF_dspark_accept_collapse_2026-07-16.md`.
+
+## 2026-07-16/17 — DECISION: rebuild the serve on #12005 (fresh env) → building
+
+Compat confirmed: **both HEAD and pr-12005 pin `VLLM_TAG=v0.23.0`** → reuse the box's vllm; `torch==torch-npu==
+2.10.0` identical. All 15 fork commits are superseded old-DSpark → **cherry-pick NONE** (`60365071` w8a8 o_proj
+fix is w8a8-only, irrelevant for bf16). CANN custom ops are **package-isolated** (`build_aclnn.sh` →
+`${ROOT_DIR}/vllm_ascend/_cann_ops_custom`; `utils.py:323` prepends *this package's* ops to
+`ASCEND_CUSTOM_OPP_PATH` at import) → rebuilding does NOT contaminate the running 60365071 serve. Plan (runbook
+`vllm-ascend-dspark-rebuild.md`): fresh conda env **`dspark-dsv4-serving`** (clone `-base`, inherits vllm
+0.23.0) + fresh github clone **`vllm-ascend-serving @ dspark-dsv4-v2 = 431a64b18b`** (pr-12005 head, a DRAFT →
+pin the commit) + `pip install -e .` (setup.py auto-chains `build_aclnn`) after sourcing CANN 9.0.0 nnal/atb in
+a fresh shell. Old env + `vllm-ascend-v4` (60365071) untouched for rollback. **Status: building.** vllm-ascend
+version string `0.19.1rc2.dev1028` is its own tag lineage (≠ vllm core 0.23.0), NOT a regression. Live status:
+memory `dsv4-dspark-serving-rebuild-worklog`.
+
 ## Open items / next
 
-- **Launch DSpark draft training on 108** with the corrected online command (must include
-  `--loss-fn dspark` and `--draft-attn-impl sdpa`). Pre-flight: (a) 108 env deployed on
-  `feat/dspark-confidence-head` **including commit `bcde32b`** (fresh clone or `git pull`); (b) HS_DUMP
-  serve up on 115/116, `DSPARK_HS_DIR == /share/canada_group_folder/dataset/dsv4_hs_dump`; (c) 108 can
-  reach `http://80.5.5.115:7000/v1`. Watch: online HS-request concurrency ≈ world_size × num_workers —
-  reduce `--num-workers` if the serve is stressed; draft as-is (`--num-layers 5 --block-size 5`), shrink
-  only on OOM.
-- Deploy env on 109 for 3–4 machine scale-out (setup script retargeted to `dspark_2026` + Plan B branches).
-- Deferred: extract track on vLLM 0.24 (upstream-standard; needs the serve re-validation + memory pathology).
+- **Finish the #12005 rebuild** (`dspark-dsv4-serving` / `vllm-ascend-serving@431a64b18b`); verify
+  `vllm_ascend.__file__` → serving dir and `ASCEND_CUSTOM_OPP_PATH` → serving. Runbook:
+  `vllm-ascend-dspark-rebuild.md`.
+- **Validate on the new build:** released draft → gsm8k 200 with **`EAGER=1`** (12005 = eager baseline) →
+  expect ~3.9. If yes ⇒ serve was the bug (confirmed) → then serve + measure OUR epoch-1 draft fairly. If still
+  ~1.3 ⇒ re-open the aux/attention audit.
+- **After validation:** track #12005 to merge or pin the snapshot; consider #12006 (ACLGraph) for throughput
+  once correctness holds.
+- (Superseded) the 2026-07-10 "launch training on 108" items are done; extract track on vLLM 0.24 stays deferred.
