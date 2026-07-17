@@ -134,10 +134,19 @@ class DSparkDraftModel(DFlashDraftModel):
         mask_tokens_size = num_blocks * block
         # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
         block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
-        # prev_token_ids[:, k] is the token preceding draft position k within the block.
-        prev_token_ids = torch.cat(
-            [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
-        )  # [num_blocks, block]
+        # prev_token_ids[:, k] = the token preceding draft slot k within the block.
+        # The alignment depends on sample_from_anchor (ported from upstream #806):
+        if self.config.sample_from_anchor:
+            # True (DSpark default / vllm serve): slot k predicts token p+k+1, so the
+            # token at the previous position is p+k == block_tokens[:, k] (raw). The
+            # autoregressive Markov chain conditions slot k's bias on block_tokens[:, k].
+            prev_token_ids = block_tokens
+        else:
+            # False (DFlash): slot k predicts token p+k, so the previous token within
+            # the block is block_tokens[:, k-1] (shift right, slot 0 keeps itself).
+            prev_token_ids = torch.cat(
+                [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
+            )  # [num_blocks, block]
         hidden_blocks = hidden.view(num_blocks, block, -1)
 
         confidence_logits = None
