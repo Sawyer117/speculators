@@ -14,7 +14,7 @@ import torch
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dflash.config import DFlashSpeculatorConfig
 from speculators.models.dspark.metrics import compute_metrics
-from speculators.models.metrics import resolve_loss_config
+from speculators.models.metrics import dflash_loss_decay, resolve_loss_config
 
 _DEFAULT_LOSS = resolve_loss_config('{"ce": 0.1, "tv": 0.9}')
 
@@ -83,3 +83,24 @@ class TestSampleFromAnchorMetrics:
         hal_false = float(m_false["hard_accept_len_sum"] / m_false["hard_accept_len_total"])
         assert abs(hal_true - 3.0) < 1e-4
         assert abs(hal_false - 2.0) < 1e-4
+
+
+class TestLossDecaySlot0:
+    """The per-position loss weight must NOT zero slot 0 under sample_from_anchor=True.
+
+    Root cause of the sample_from_anchor=True retrain's stuck slot-0 (position_0_acc~0.03,
+    zero gradient): the roll + loss-mask were gated, but dflash_loss_decay still multiplied
+    position 0 by (pos_idx != 0) -> weight 0 -> the first draft token got no gradient.
+    """
+
+    def test_true_weights_slot0_highest_false_zeros_it(self):
+        pos = torch.tensor([0, 1, 2, 3, 4])
+        w_true = dflash_loss_decay(pos, gamma=4.0, sample_from_anchor=True)
+        w_false = dflash_loss_decay(pos, gamma=4.0, sample_from_anchor=False)
+        # True: slot 0 gets the HIGHEST weight (1.0), then decays -> first token IS trained.
+        assert abs(float(w_true[0]) - 1.0) < 1e-6
+        assert float(w_true[1]) < float(w_true[0])
+        assert float(w_true[4]) < float(w_true[1])
+        # False (DFlash): slot 0 is the anchor -> weight 0 (would starve gradient under True).
+        assert float(w_false[0]) == 0.0
+        assert abs(float(w_false[1]) - 1.0) < 1e-6

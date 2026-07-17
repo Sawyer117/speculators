@@ -244,19 +244,31 @@ def lk_hybrid_loss(
     return elementwise_loss  # noqa: RET504
 
 
-def dflash_loss_decay(pos_idx: torch.Tensor, gamma: float, **_kwargs):
+def dflash_loss_decay(
+    pos_idx: torch.Tensor, gamma: float, sample_from_anchor: bool = False, **_kwargs
+):
     """Compute DFlash-style exponential decay weights per position.
 
-    Position 0 gets weight 0, position 1 gets weight 1, and subsequent positions
-    decay as exp(-(pos - 1) / gamma).
+    ``sample_from_anchor=False`` (DFlash / anchor-as-bonus): position 0 is the GIVEN
+    anchor (not trained) -> weight 0; position 1 -> weight 1; then exp(-(pos-1)/gamma).
+
+    ``sample_from_anchor=True`` (DSpark): EVERY slot is a trained prediction INCLUDING
+    slot 0 -> weight exp(-pos/gamma), so position 0 gets the HIGHEST weight (1.0) and
+    decays out. Zeroing position 0 here (the False behaviour) starves the first draft
+    token of gradient — it never learns (stuck at its warm-start level ~0.03), and since
+    the serve's sequential accept starts at slot 0, the whole draft collapses.
 
     Args:
         pos_idx: Position indices within each speculative block.
         gamma: Decay rate (higher = slower decay).
+        sample_from_anchor: whether slot 0 is a trained prediction (True) or the anchor.
 
     Returns:
         Decay multiplier tensor with same shape as pos_idx.
     """
+    if sample_from_anchor:
+        # w = 1 e^-1/gamma e^-2/gamma ... — position 0 is the highest, no zeroing.
+        return torch.exp(-pos_idx / gamma)
     # pos_idx = 0 1 2 3 0 1 2 3, block_size = 4
     decay_mult = torch.exp(-((pos_idx - 1).clamp(min=0)) / gamma)
     # decay_mult = e^-(0 0 1 2 0 0 1 2) / gamma
