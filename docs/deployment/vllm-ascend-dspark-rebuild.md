@@ -30,7 +30,16 @@ All 15 of our fork's commits over its old base are the **old DSpark** (`07b2167e
 superseded by the rewrite — cherry-pick none.** The lone non-DSpark commit `60365071`
 (w8a8 `o_proj` plain-matmul) is **w8a8-only → irrelevant for our bf16 serve.**
 
+## Cherry-pick / merge? — NO. Just check out the PR branch.
+The DSpark rewrite is a coherent branch on modern main; **cherry-picking our 15 old-DSpark commits onto
+it (or its commits onto our old base) is the wrong move** — all 15 are superseded, and the rewrite depends
+on newer-main infra. **Strategy = check out `pr-12005` head as a branch** (`dspark-dsv4-v2`), build it
+as-is. Optionally push that branch to `Sawyer117/vllm-ascend` for the record. Pin the exact head commit
+(`431a64b18b` today) since #12005 is a moving DRAFT.
+
 ## Compatibility (de-risked)
+- **vllm: BOTH our HEAD and pr-12005 pin `VLLM_TAG=v0.23.0`** (Dockerfile) — **same vllm the box already has.
+  Do NOT rebuild vllm; reuse `/home/a00652497/dspark_2026/installation/vllm-v0.23.0`.**
 - `requirements.txt` pins **`torch==2.10.0` / `torch-npu==2.10.0`** — **identical to the box**. No torch bump.
 - Method now accepts **`"dspark"` (official) or `"mtp"`** (`spec_decode/__init__.py:47`).
 - num_spec constraint gone → use official **7** or **5** freely.
@@ -54,10 +63,13 @@ cd ../vllm-ascend-v2
 conda create -n dspark-dsv4-v2 --clone dspark-dsv4-base    # keep -base intact
 conda activate dspark-dsv4-v2
 
-# 4) RECOMPILE the CANN custom ops (this is the real work — 83 csrc files changed),
-#    using the SAME toolchain/recipe a00652497 used for 60365071 (CANN 9.0.0 / torch_npu 2.10):
-bash csrc/build.sh                    # + build_aclnn.sh / build_batch_invariant_ops.sh if your original build ran them
-pip install -e . --no-build-isolation
+# 4) RECOMPILE the CANN custom ops (this is the real work — 83 csrc files changed:
+#    torch_binding, sparse_attn/hc_post/causal_conv1d kernels — the new noncausal DSA needs them).
+#    ⚠️ FIRST source the 9.0.0 nnal/atb set_env in a FRESH shell (NOT the 900env's stale 8.5.1 atb —
+#       that causes libatb.so / "Mki::Dl undefined symbol" clashes). Then run the SAME recipe
+#       a00652497 used to build 60365071 (same CANN 9.0.0 / torch_npu 2.10):
+bash csrc/build.sh                    # builds ophost/opapi/opgraph/onnxplugin (+ ops_transformer install.sh)
+pip install -e . --no-build-isolation # vllm 0.23.0 already present from the cloned env → no vllm rebuild
 
 # 5) sanity
 python -c "import vllm_ascend, vllm; print('ok | vllm', vllm.__version__)"
