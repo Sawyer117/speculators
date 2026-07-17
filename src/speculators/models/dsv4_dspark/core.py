@@ -560,6 +560,29 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             # False: slot 0 is the given anchor (not predicted) -> mask its loss. True
             # (DSpark): slot 0 IS a trained prediction (from the anchor's hidden) -> keep.
             aligned_loss_mask[:, :: self.block_size] = 0
+
+        # DSPARK_DIAGNOSE=1: one-shot dump of the per-slot TARGET alignment — is
+        # argmax(targets[slot k]) the TRUE next token input_ids[anchor+k+1]? Decides
+        # "slot-0 target misaligned (data)" vs "target fine, draft can't learn (model)".
+        if os.environ.get("DSPARK_DIAGNOSE") == "1" and not getattr(self, "_diag_done", False):
+            self._diag_done = True
+            with torch.no_grad():
+                bs = self.block_size
+                tgt_arg = targets.view(-1, bs, targets.shape[-1]).argmax(-1)  # [nb, bs] draft-vocab
+                d2t = getattr(self, "d2t", None)
+                ap = anchor_positions.reshape(-1)
+                seqlen = input_ids.shape[1]
+                print(f"\n### DSPARK_DIAGNOSE sample_from_anchor={self.config.sample_from_anchor} "
+                      f"block={bs} use_draft_vocab={getattr(self, 'use_draft_vocab', None)} ###", flush=True)
+                for j in range(min(6, int(ap.numel()))):
+                    a = int(ap[j])
+                    true_next = [int(input_ids[0, a + 1 + k]) if a + 1 + k < seqlen else -1
+                                 for k in range(bs)]
+                    tgt = [int(tgt_arg[j, k]) for k in range(bs)]
+                    tgt_v = [int(d2t[t]) for t in tgt] if d2t is not None else tgt
+                    aligned = [tgt_v[k] == true_next[k] for k in range(bs)]
+                    print(f"a={a} tok[a]={int(input_ids[0, a])} | true_next(a+1..a+{bs})={true_next} "
+                          f"| target_argmax(->verif)={tgt_v} | aligned={aligned}", flush=True)
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
 
     @staticmethod
