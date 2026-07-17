@@ -257,7 +257,9 @@ def shard_experts_as_dtensor(model: torch.nn.Module, mesh) -> None:
             setattr(module, name, torch.nn.Parameter(dt, requires_grad=p.requires_grad))
 
 
-def apply_fully_sharded(model: torch.nn.Module, mesh=None):
+def apply_fully_sharded(
+    model: torch.nn.Module, mesh=None, param_dtype: torch.dtype = torch.bfloat16
+):
     """Applies torch FSDP fully_shard to the model, wrapping layers in FSDPModule.
 
     A model may expose ``fsdp_wrap_plan() -> list[nn.Module]`` to declare the FSDP unit
@@ -271,7 +273,7 @@ def apply_fully_sharded(model: torch.nn.Module, mesh=None):
     before calling this function.
     """
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
+        param_dtype=param_dtype,
         reduce_dtype=torch.float32,
     )
 

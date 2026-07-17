@@ -64,12 +64,22 @@ class DSparkDraftModel(DFlashDraftModel):
         **kwargs,
     ) -> "DSparkDraftModel":
         """Create a DSpark model from training arguments (mirrors DFlash)."""
+        enable_confidence_head_arg = kwargs.get("enable_confidence_head")
+        confidence_head_with_markov_arg = kwargs.get("confidence_head_with_markov")
         config = DSparkSpeculatorConfig(
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
-            enable_confidence_head=kwargs.get("enable_confidence_head", True),
-            confidence_head_with_markov=kwargs.get("confidence_head_with_markov", True),
+            enable_confidence_head=(
+                True
+                if enable_confidence_head_arg is None
+                else enable_confidence_head_arg
+            ),
+            confidence_head_with_markov=(
+                True
+                if confidence_head_with_markov_arg is None
+                else confidence_head_with_markov_arg
+            ),
         )
 
         model = cls(config=config)
@@ -134,16 +144,15 @@ class DSparkDraftModel(DFlashDraftModel):
         mask_tokens_size = num_blocks * block
         # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
         block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
-        # prev_token_ids[:, k] = the token preceding draft slot k within the block.
-        # The alignment depends on sample_from_anchor (ported from upstream #806):
         if self.config.sample_from_anchor:
-            # True (DSpark default / vllm serve): slot k predicts token p+k+1, so the
-            # token at the previous position is p+k == block_tokens[:, k] (raw). The
-            # autoregressive Markov chain conditions slot k's bias on block_tokens[:, k].
+            # With sample_from_anchor=True (DSpark default), slot k predicts
+            # token p+k+1 and the inference Markov chain conditions slot k's
+            # bias on the token at the previous position p+k.
             prev_token_ids = block_tokens
         else:
-            # False (DFlash): slot k predicts token p+k, so the previous token within
-            # the block is block_tokens[:, k-1] (shift right, slot 0 keeps itself).
+            # With sample_from_anchor=False (Dflash default), slot k predicts
+            # token p+k, so the previous token within the block is
+            # block_tokens[:, k-1] (shifted).
             prev_token_ids = torch.cat(
                 [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
             )  # [num_blocks, block]
@@ -188,5 +197,4 @@ class DSparkDraftModel(DFlashDraftModel):
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
         )
-        draft_tokens = torch.argmax(logits, dim=-1)
-        return draft_tokens, loss, metrics
+        return None, loss, metrics
