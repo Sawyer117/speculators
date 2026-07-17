@@ -314,13 +314,46 @@ rolling HS to shared `/share/.../dsv4_hs_dump`. Eval later uses #12006 (`dspark-
 `train/position_0_acc` (must climb from 0 — the decay fix's direct signal) + `hard_accept_len` → released ~3.9+;
 per-position should become smooth (pos0 highest). No re-dump needed — aux verified identical between builds.
 
+## 2026-07-17 (later) — a SECOND train↔serve mismatch: Markov prev_token off-by-one (slots ≥1); both fixes serve-validated; run restarted
+
+The `sample_from_anchor=True` retrain was climbing correctly (`position_0_acc` 0.03 → **0.73**, decay fix works)
+but `accept_len` stalled ~1.9 — **too low for a healthy slot 0**. Found the cause: a **second** train↔serve
+mismatch, ORTHOGONAL to the decay one, in the **Markov head's `prev_token_ids`**.
+
+**Our DSV4 draft (`DSV4DSparkDraftModel`) overrides only `_backbone_forward`; it INHERITS `DSparkDraftModel.forward`**,
+whose `prev_token_ids` used the DFlash **shifted concat UNCONDITIONALLY** (`torch.cat([block_tokens[:,:1],
+block_tokens[:,:-1]])`). **Cross-validated against the AUTHORITATIVE serve proposer** (`vllm-ascend`
+`deepseek_v4_dspark_proposer._sample_sequential`, the code that produces the released draft's 4.658): the loop is
+`prev_ids = seed_buffer` (= anchor token) → per step `logits = base[:,k] + markov_bias(markov_embed(prev_ids))` →
+`prev_ids = draft_buffer[:,k]`. So **slot k's Markov prev = the token at position p+k** (seed=anchor for k=0, then
+the autoregressively-drafted token). Teacher-forced equivalent = **raw `block_tokens[:, k]`**; the shifted concat
+fed `block_tokens[:, k-1]` = position p+k−1 → **off-by-one for every slot ≥1**.
+
+**KEY — the two bugs are ORTHOGONAL, and the decay A/B was NOT confounded:** slot 0's prev = `block_tokens[:,0]`
+= anchor in BOTH old and new, so the Markov bug touches **only slots ≥1**; slot 0's problem was **purely the
+decay**. So `decay → slot 0`, `Markov → slots 1–4`, independent. This is why the run showed `position_0_acc 0.73`
+(decay fixed slot 0) yet `accept_len ~1.9` (slots 1–4 Markov still misaligned, capping the block).
+
+**Fix:** gate `prev_token_ids` on `sample_from_anchor` (True → raw `block_tokens`, False → shifted), in the
+inherited `dspark/core.py` forward. **`feat/dsv4-dspark @ 373deae`.** Verified line-by-line against the serve
+proposer. **Both fixes are now required and both are serve-validated** (decay = slot 0, Markov = slots 1–4).
+
+**Action:** STOPPED the (Markov-buggy) run at step ~1532; pull + restart with both fixes (same recipe).
+
+**Upstream decay PR staged (not opened):** branch `fix/dspark-slot0-loss-decay @ 8a564c3` on `Sawyer117/speculators`
+(off upstream main) — `dflash_loss_decay` gains a `sample_from_anchor` branch (True → `exp(-pos/gamma)`, slot 0 =
+1.0), threaded from dspark+dflash `compute_metrics`; decay UT extended. Commit cites **no other PRs** (we're already
+in that area). HOLD opening until the two-fix retrain proves end-to-end (train metric + serve accept_len, double
+evidence). The Markov fix needs no PR of ours — it's the serve convention.
+
 ## Open items / next
 
-- **[IN PROGRESS] The `sample_from_anchor=True` retrain** (109, `MAX_ANCHORS=512 BLOCK=5 CKPT_FREQ=0.5`).
-  Success = `position_0_acc` climbs from 0 and `hard_accept_len` → ~3.9+; per-position smooth (pos0 highest).
+- **[RESTART] The two-fix retrain** (109, `MAX_ANCHORS=512 BLOCK=5 CKPT_FREQ=0.5`, sample_from_anchor=True) — now
+  with BOTH the decay slot-0 fix AND the Markov `prev_token_ids` fix (`373deae`). Success = `position_0_acc` high
+  (~0.7) AND `accept_len`/`hard_accept_len` climb past the old ~1.9 toward released ~3.9+; per-position smooth.
   Then convert (`convert_dspark_to_vllm.py` on `ckpt_.../0`) → eval on #12006 (`dspark-dsv4-serving`) + draft.
 - **[DONE 07-17] #12006 serve rebuild + validation** (`dspark-dsv4-v3`): released bf16 draft = **4.658** on our
   serve ⇒ serve fixed; our epoch-1 draft ~1.758 ⇒ weights were the bug → `sample_from_anchor` root cause + fix.
-- **Upstream PR candidate:** thread `sample_from_anchor` into the dspark `compute_metrics` decay_fn (upstream's
-  `dflash_loss_decay` zeros pos 0 even under True — starves slot 0). Ours matches canonical DeepSpec.
+- **[DONE 07-17] Two train↔serve conventions fixed + serve-validated:** decay slot 0 (`928ea32`) + Markov
+  prev_token (`373deae`). Orthogonal (slot 0 vs slots 1–4). Decay PR branch staged (`8a564c3`), held pending e2e.
 - **Deferred:** track #12006 to merge or keep the pinned snapshot; extract track on vLLM 0.24 stays deferred.
