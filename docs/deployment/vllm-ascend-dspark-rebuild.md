@@ -95,7 +95,18 @@ Released draft (`/share/.../released_draft_fp8_standalone`) → `run_dspark_eval
 - **~3.9** ⇒ the rewrite fixed it → then serve OUR draft and measure it fairly.
 - still **~1.3** ⇒ deeper than the proposer rewrite (unlikely given the evidence) → back to the aux/attention audit in `HANDOFF_dspark_accept_collapse_2026-07-16.md`.
 
+## Custom ops are PACKAGE-ISOLATED (no contamination — verified)
+Rebuilding does NOT clobber the working 60365071 serve. `csrc/build_aclnn.sh` installs to
+`custom_ops_install_dir="${ROOT_DIR}/vllm_ascend/_cann_ops_custom"` (the checkout dir), and
+`vllm_ascend/utils.py:323` prepends *this package's* ops to `ASCEND_CUSTOM_OPP_PATH` at import — each
+env/checkout finds its own ops. Confirm on the box: (1) `grep -n custom_ops_install_dir= csrc/build_aclnn.sh`;
+(2) after build, new ops under `vllm-ascend-serving/vllm_ascend/_cann_ops_custom/vendors/` while
+`vllm-ascend-v4/...` is untouched; (3) `ls "$ASCEND_OPP_PATH/vendors/"` gains nothing; (4) in the serving
+env `python -c "import vllm_ascend,os;print(os.environ.get('ASCEND_CUSTOM_OPP_PATH'))"` starts with the
+serving path. Only gotcha: ensure nothing hard-codes `ASCEND_CUSTOM_OPP_PATH` at vllm-ascend-v4 in the
+serve script / 900env (`env | grep OPP`).
+
 ## Risks
-- OPEN/WIP PR (#12005 unmerged) — may have rough edges.
-- 250-commit main jump — unrelated API/behavior drift possible; that's why worktree + separate env.
-- csrc recompile needs the CANN build env (the box has it — it built 60365071).
+- OPEN/WIP PR (#12005 unmerged, DRAFT) — may have rough edges; pin the head commit.
+- ~235-commit main jump — unrelated API/behavior drift possible; that's why separate clone + separate env.
+- csrc recompile needs the CANN build env (the box has it — it built 60365071); source 9.0.0 nnal/atb fresh.
