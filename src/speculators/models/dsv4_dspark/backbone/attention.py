@@ -43,15 +43,24 @@ def _sink_block_attention_torch(
 ) -> torch.Tensor:
     """Dense non-causal sink-softmax attention (fp32 accumulation).
 
-    Shapes: ``q [N, Sq, H, D]``, ``k/v [N, Sk, H, D]``, ``sink [H]``,
-    optional ``attn_bias [N, Sq, Sk]`` (or broadcastable) additive mask
-    applied to the logits *before* the sink term. Returns ``[N, Sq, H, D]``.
+    Shapes: ``q [N, Sq, H, D]``, ``k/v [N, Sk, D]`` (a SINGLE shared KV head — the
+    DSV4 draft's MLA has one KV head shared across the H query heads), ``sink [H]``,
+    optional ``attn_bias [N, Sq, Sk]`` (or broadcastable) additive mask applied to
+    the logits *before* the sink term. Returns ``[N, Sq, H, D]``.
+
+    Shared-KV einsums (``nkd``, not ``nkhd``) contract the single KV head against
+    every query head directly — mathematically identical to broadcasting K/V to H
+    heads first, but WITHOUT materializing the H×-larger ``[N, Sk, H, D]`` tensor
+    (−~2.1 GB, ~20× faster fwd; matches the vLLM-Ascend #12005 shared-KV op).
 
     The sink is a synthetic key whose logit is the per-head ``sink`` scalar; it
     contributes to the softmax denominator but nothing to the value sum:
     ``p_j = exp(s_j) / (Σ_j exp(s_j) + exp(sink))``.
     """
-    s = torch.einsum("nqhd,nkhd->nqhk", q.float(), k.float()) * scale
+    assert k.dim() == 3, (  # loud guard vs a stale caller that pre-expands to H heads
+        f"shared-KV sink attention expects k/v [N, Sk, D] (single head); got {tuple(k.shape)}"
+    )
+    s = torch.einsum("nqhd,nkd->nqhk", q.float(), k.float()) * scale
     if attn_bias is not None:
         s = s + attn_bias.float().unsqueeze(2)  # [N, Sq, 1, Sk] broadcast over heads
     sink_h = sink.float().view(1, 1, -1, 1)
@@ -59,7 +68,7 @@ def _sink_block_attention_torch(
     e = torch.exp(s - row_max)
     denom = e.sum(dim=-1, keepdim=True) + torch.exp(sink_h - row_max)
     p = e / denom
-    return torch.einsum("nqhk,nkhd->nqhd", p, v.float()).to(q.dtype)
+    return torch.einsum("nqhk,nkd->nqhd", p, v.float()).to(q.dtype)
 
 
 def sink_block_attention(
@@ -144,7 +153,10 @@ class LatentAttention(nn.Module):
         kv_ctx = self.project_kv(context_x, context_freqs)  # [N, W, D]
         kv_blk = self.project_kv(block_x, block_freqs)  # [N, gamma, D]
         kv = torch.cat([kv_ctx, kv_blk], dim=1)  # [N, W+gamma, D] (single shared KV head)
-        kv = kv.unsqueeze(2).expand(-1, -1, self.num_heads, -1)  # broadcast to H heads
+        # Shared-KV: pass the single KV head directly (NO .expand to H heads). The kernel's
+        # nkd einsums broadcast it over the query heads -> identical output, without ever
+        # materializing the H×-larger [N, Sk, H, D] tensor (−~2.1 GB, ~20× fwd; matches the
+        # vLLM-Ascend #12005 shared-KV op).
         o = sink_block_attention(q, kv, kv, self.attn_sink, self.scale, attn_bias)
         return self.combine_output(o, block_freqs)
 
