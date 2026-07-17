@@ -31,14 +31,20 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
 
 ## Status at a glance
 
-- **Pipeline: run end-to-end** (env → rollout → HS-producing serve → EP training → checkpoint
-  save all validated on the box). **First train→eval pass done (2026-07-16):** training side healthy
-  (soft accept_len ~2.9–3.1, position_1 ~0.82) but the epoch-1 draft **evals low (gsm8k hard 1.36)** —
-  proven a **SERVE bug, not the weights** (the released known-good draft scores the same ~1.34 on our
-  serve; root-caused to the fork's pre-rewrite DSpark). **Fix in progress: rebuild the serve on the
-  #12005 rewrite** ([`vllm-ascend-dspark-rebuild.md`](./vllm-ascend-dspark-rebuild.md)); re-measure the
-  trained draft after. Weights vindicated — no retrain. Details: EP-training §6.1 + the worklog.
-- **Training levers** (`feat/dsv4-dspark @ 3953bc1`): MoE warm-start from the target
+- **Serve FIXED, then root-caused OUR draft (2026-07-17, REVERSES the earlier "serve bug, no retrain").**
+  Rebuilt the serve to **#12006** (`dspark-dsv4-v3`); the known-good released draft (dequant'd bf16 via
+  `build_released_draft_dir.py --dequant-bf16`) scores **gsm8k accept_len 4.658** on our serve (smooth
+  pos0 0.925→pos4 0.538, above official 3.94) ⇒ the serve is fixed. Our epoch-1 draft still evals ~1.758
+  (sharp pos0→pos1 cliff) on the SAME serve ⇒ **the weights were the problem.** Root cause: the fork
+  **DELETED upstream's `sample_from_anchor` switch and hardcoded FALSE**; DSpark serving needs **True**
+  (every slot sampled). It gates in THREE places — target **roll**, slot-0 **loss-mask**, and the
+  per-position **loss decay** (`dflash_loss_decay` zeroed pos 0 → slot-0 got no gradient, `position_0_acc
+  ~0.03`; the piece we first missed). **Fixed + cross-validated byte-for-byte vs canonical DeepSpec**
+  (`exp(-pos/gamma)`, pos0 highest); upstream speculators has the same decay bug. Plus BLOCK 6→5 and a
+  bit-identical shared-KV attention (−2.1 GB). **Status: RETRAINING** (`MAX_ANCHORS=512 BLOCK=5 True`) —
+  watch `position_0_acc` climb + `hard_accept_len`→~3.9+. Commits/topology/detail: the **2026-07-17
+  worklog section** + EP-training §6.1.
+- **Training levers** (`feat/dsv4-dspark @ 928ea32`): MoE warm-start from the target
   (**`INIT_LAYER=1` whole-layer — the chosen best; `INIT_MOE=1` MoE-only was worse/unstable**),
   skip-validation + train-on-full-data (`NO_VAL=1`), activation recompute
   (`RECOMPUTE=1`, 384@3072), defaults `EPOCHS=5 / SEQLEN=3072 / LR=6e-4`; A/B two runs with

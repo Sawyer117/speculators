@@ -263,14 +263,64 @@ a fresh shell. Old env + `vllm-ascend-v4` (60365071) untouched for rollback. **S
 version string `0.19.1rc2.dev1028` is its own tag lineage (≠ vllm core 0.23.0), NOT a regression. Live status:
 memory `dsv4-dspark-serving-rebuild-worklog`.
 
+## 2026-07-17 — serve fixed on #12006; root-caused OUR draft to `sample_from_anchor`; retraining
+
+**The #12006 rebuild WORKED.** Serve = `vllm-ascend-serving @ dspark-dsv4-v3` (#12005 + the python-only ACLGraph
+commit — no csrc recompile; DP token padding handled via `_pad_request_rows` for eager+graph). Built a **bf16**
+released control with `scripts/build_released_draft_dir.py --dequant-bf16` (dequant the released fp8 `mtp.*` →
+bf16 with the proven DeepSeek block-fp8 math; needed because the rewrite binds draft precision to the bf16
+target). **The known-good released draft scores gsm8k accept_len 4.658 on our serve — smooth pos0 0.925 → pos4
+0.538, ABOVE the official 3.94** ⇒ the serve is fixed/excellent. Our epoch-1 draft still evals ~1.758 with a
+sharp pos0 0.646 → pos1 0.06 cliff on the SAME serve ⇒ **the problem was OUR weights, not the serve** (the earlier
+"serve bug, weights vindicated, no retrain" conclusion is REVERSED — it held only for the old broken serve).
+
+**Root cause: the fork DELETED upstream's `sample_from_anchor` switch and hardcoded the FALSE branch.** DSpark
+serving samples EVERY block slot (slot 0 predicts the next token from the anchor/seed) ⇒ it needs
+`sample_from_anchor=True`; we trained FALSE (targets rolled +1 → every slot off-by-one; slot 0 masked). Ruled out
+first, all MATCHING the serve / canonical DeepSpec: RoPE pairing + YaRN (within-block Δangle 0.002–0.009 rad,
+negligible — numerically checked), QuaRot (our converted config has no rotation), noise token (both 128799),
+Markov head (both vanilla first-order), aux VALUES (the target `deepseek_v4.py` layer forward is byte-identical
+between the dumper and serve builds), and the whole block scheme (DeepSpec `common.py` mask/noise/positions/
+target-alignment byte-identical to ours). So the bug was never the block code — only the deleted switch.
+
+**`sample_from_anchor=True` needs gating in THREE places (found in order):** (1) the **target roll**
+(`dsv4_dspark/core.py`) — skip under True; (2) the **slot-0 loss mask** — don't zero slot 0 under True; (3) the
+**per-position loss DECAY** (`models/metrics.py::dflash_loss_decay`) — the one we first MISSED. It hardcoded
+`w * (pos_idx != 0)` → slot 0 weight 0 → zero gradient, so the first (gated 1+2 only) retrain gave
+`position_0_acc ~0.03` FLAT while pos1-4 learned (~0.37 decay), which kills `hard_accept_len` (the sequential
+accept starts at slot 0). A one-shot `DSPARK_DIAGNOSE=1` probe proved the targets are correctly aligned
+(`argmax(targets[slot k]) == true token[anchor+k+1]` for all slots incl 0) → NOT a data bug; the decay was it.
+**Fix: under True → `exp(-pos/gamma)` (slot 0 = highest weight 1.0, decays out).**
+
+**Cross-validated vs canonical DeepSpec:** its `_build_loss_weight_mask` (`modeling/dspark/loss.py`) =
+`exp(-arange(block_size)/gamma)` → position 0 weight 1.0 — **byte-equivalent to our fix**, and DeepSpec trained
+the working released draft (pos0 = 0.925). **Upstream speculators HAS the same bug** (its `compute_metrics` has
+`sample_from_anchor` for `start_pos` but never threads it into the `decay_fn`) → a real upstream bug worth a PR.
+
+**Also fixed:** `train_dsv4_dspark.sh` **BLOCK 6→5** (under True `speculative_tokens = block_size`, so BLOCK=5
+= released `dspark_block_size=5`; the old BLOCK=6 was the False `block_size-1=5` workaround, which under True
+would draft 6 slots) and the **shared-KV sink attention** (`backbone/attention.py`: drop the per-head `.expand`,
+`nkd` einsums — bit-identical (parity UT), −~2.1 GB, ~20× fwd, matches the #12005 shared-KV op — frees anchors).
+
+**Commits (`feat/dsv4-dspark`):** `88ad6a4` roll+mask gate + config + UT · `c80b942` BLOCK 6→5 · `595d058`
+shared-KV attn + parity UT · `d430086` `DSPARK_DIAGNOSE` probe · `928ea32` loss-decay slot 0 + UT.
+
+**Topology (3-machine online HS):** **109 = trainer** (`train_dsv4_dspark.sh`, drives `--vllm-endpoint` so the
+serve dumps HS on demand); **115 (head) + 116 (worker) = bf16 target serve** with `HS_DUMP=1` (env
+`dspark-dsv4-austin` = `vllm-ascend-v4 @ feat/dsv4-hs-dumper`, **NOT** #12006 — the dump hook is our feature),
+rolling HS to shared `/share/.../dsv4_hs_dump`. Eval later uses #12006 (`dspark-dsv4-serving`) + the draft.
+
+**Status: RETRAINING** (109: `MAX_ANCHORS=512 BLOCK=5 sample_from_anchor=True INIT_LAYER=1 CKPT_FREQ=0.5`). Watch
+`train/position_0_acc` (must climb from 0 — the decay fix's direct signal) + `hard_accept_len` → released ~3.9+;
+per-position should become smooth (pos0 highest). No re-dump needed — aux verified identical between builds.
+
 ## Open items / next
 
-- **Finish the #12005 rebuild** (`dspark-dsv4-serving` / `vllm-ascend-serving@431a64b18b`); verify
-  `vllm_ascend.__file__` → serving dir and `ASCEND_CUSTOM_OPP_PATH` → serving. Runbook:
-  `vllm-ascend-dspark-rebuild.md`.
-- **Validate on the new build:** released draft → gsm8k 200 with **`EAGER=1`** (12005 = eager baseline) →
-  expect ~3.9. If yes ⇒ serve was the bug (confirmed) → then serve + measure OUR epoch-1 draft fairly. If still
-  ~1.3 ⇒ re-open the aux/attention audit.
-- **After validation:** track #12005 to merge or pin the snapshot; consider #12006 (ACLGraph) for throughput
-  once correctness holds.
-- (Superseded) the 2026-07-10 "launch training on 108" items are done; extract track on vLLM 0.24 stays deferred.
+- **[IN PROGRESS] The `sample_from_anchor=True` retrain** (109, `MAX_ANCHORS=512 BLOCK=5 CKPT_FREQ=0.5`).
+  Success = `position_0_acc` climbs from 0 and `hard_accept_len` → ~3.9+; per-position smooth (pos0 highest).
+  Then convert (`convert_dspark_to_vllm.py` on `ckpt_.../0`) → eval on #12006 (`dspark-dsv4-serving`) + draft.
+- **[DONE 07-17] #12006 serve rebuild + validation** (`dspark-dsv4-v3`): released bf16 draft = **4.658** on our
+  serve ⇒ serve fixed; our epoch-1 draft ~1.758 ⇒ weights were the bug → `sample_from_anchor` root cause + fix.
+- **Upstream PR candidate:** thread `sample_from_anchor` into the dspark `compute_metrics` decay_fn (upstream's
+  `dflash_loss_decay` zeros pos 0 even under True — starves slot 0). Ours matches canonical DeepSpec.
+- **Deferred:** track #12006 to merge or keep the pinned snapshot; extract track on vLLM 0.24 stays deferred.
