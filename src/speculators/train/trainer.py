@@ -256,17 +256,37 @@ class Trainer:
         # Verify model is compatible with training infrastructure
         SpeculatorModel.verify_training_compatible(self.model)
 
-        self.model.to(self.config.hidden_states_dtype)  # type: ignore[arg-type]
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
         )
 
         if not self.is_distributed:
-            # Single device case
+            # Single device case: no FSDP mixed-precision policy, so cast the whole
+            # model to the compute dtype directly.
+            self.model.to(self.config.hidden_states_dtype)  # type: ignore[arg-type]
             self.model.to(self.local_rank)  # type: ignore[arg-type]
             if load_checkpoint:
                 self.checkpointer.load_model_state_dict(self.model)
             return
+
+        # Distributed (FSDP) AMP master weights. DO NOT blanket-cast the model to bf16
+        # before fully_shard: FSDP2's MixedPrecisionPolicy keeps params in the dtype they
+        # enter sharding with, so a pre-cast leaves NO fp32 master and every sub-ULP
+        # update (norm weights ~1e-7) + AdamW weight decay is rounded away in bf16 (norms
+        # silently frozen). Instead keep the SMALL trainable params (norm/MLA/mHC/heads)
+        # in fp32 as masters — the policy (param_dtype=bf16) casts them to bf16 for
+        # compute. Frozen params AND the big EP experts go to bf16 (fp32 experts would OOM
+        # at high anchor counts, and their large grads are far less rounding-sensitive),
+        # so those keep no fp32 master.
+        _hs_dtype = self.config.hidden_states_dtype
+        _ep_local = getattr(self.model, "ep_local_param_keys", None)
+        _expert_keys = set(_ep_local()) if callable(_ep_local) else set()
+        for _name, _p in self.model.named_parameters():
+            if (not _p.requires_grad) or (_name in _expert_keys):
+                _p.data = _p.data.to(_hs_dtype)
+        for _b in self.model.buffers():
+            if _b.is_floating_point():
+                _b.data = _b.data.to(_hs_dtype)
 
         # Distributed case
         # Capture full state dict on rank 0 before FSDP sharding
