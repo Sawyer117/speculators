@@ -515,7 +515,11 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             verifier_logits = self.verifier_lm_head(
                 self.verifier_norm(verifier_last_hidden_states)
             )
-            verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+            if not self.config.sample_from_anchor:
+                # False: shift right by 1 so slot j predicts the token AT position j
+                # (slot 0 = the given anchor). True (DSpark, matches the vllm-ascend
+                # serve): NO shift — slot k predicts the NEXT token (position k+1).
+                verifier_logits = torch.roll(verifier_logits, 1, dims=1)
             targets = verifier_logits[:, anchored_block_indices]
 
         # DSV4 RoPE freqs at the ctx and block absolute positions.
@@ -552,7 +556,10 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 aligned_loss_mask.dtype
             )
         )
-        aligned_loss_mask[:, :: self.block_size] = 0
+        if not self.config.sample_from_anchor:
+            # False: slot 0 is the given anchor (not predicted) -> mask its loss. True
+            # (DSpark): slot 0 IS a trained prediction (from the anchor's hidden) -> keep.
+            aligned_loss_mask[:, :: self.block_size] = 0
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
 
     @staticmethod

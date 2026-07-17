@@ -70,6 +70,16 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         "bidirectional.",
     )
 
+    sample_from_anchor: bool = Field(
+        default=False,
+        description="If True, ALL block_size draft slots are sampled predictions: slot 0 "
+        "predicts the token AFTER the anchor from the anchor's own hidden, targets are NOT "
+        "shifted, and slot 0 IS trained. If False, slot 0 is the given anchor (targets "
+        "rolled right by 1 so slot j predicts the token AT position j, slot 0 loss masked; "
+        "only block_size-1 predictions). DSpark serving (vllm-ascend) samples every slot, "
+        "so DSpark trains with True; plain DFlash uses False.",
+    )
+
     @field_serializer("transformer_layer_config")
     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
         """Serialize transformer config to dict."""

@@ -174,6 +174,15 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "draft_attn_impl", "simple_flex_attention"
         )
         block_size = kwargs.get("block_size", 8)
+        # sample_from_anchor selects the block task: True (DSpark default) samples every
+        # slot (slot 0 predicts from the anchor -> block_size emitted tokens, targets NOT
+        # shifted, slot 0 trained); False (DFlash) treats slot 0 as the given anchor
+        # (block_size-1 emitted, targets rolled, slot 0 masked). MUST match the serve.
+        default_sample_from_anchor = "dspark" in algorithm
+        sample_from_anchor = kwargs.get("sample_from_anchor")
+        if sample_from_anchor is None:
+            sample_from_anchor = default_sample_from_anchor
+        speculative_tokens = block_size if sample_from_anchor else block_size - 1
         return {
             "transformer_layer_config": verifier_config,
             "draft_vocab_size": kwargs["draft_vocab_size"],
@@ -181,11 +190,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "aux_hidden_state_layer_ids": target_layer_ids,
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
+            "sample_from_anchor": sample_from_anchor,
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
                 proposal_methods=[
-                    # First block position is the anchor, not emitted during gen.
-                    GreedyTokenProposalConfig(speculative_tokens=block_size - 1)
+                    # sample_from_anchor True -> block_size emitted; False -> the anchor is
+                    # a bonus token, block_size-1 emitted.
+                    GreedyTokenProposalConfig(speculative_tokens=speculative_tokens)
                 ],
                 default_proposal_method="greedy",
                 verifier=VerifierConfig.from_pretrained(
@@ -351,8 +362,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             verifier_logits = self.verifier_lm_head(
                 self.verifier_norm(verifier_last_hidden_states)
             )
-            # Shift right by 1 so verifier_logits[i] predicts token at position i
-            verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+            if not self.config.sample_from_anchor:
+                # False: shift right by 1 so slot j predicts the token AT position j
+                # (slot 0 = the given anchor). True: no shift — slot k predicts the NEXT
+                # token (position k+1); every slot is a sampled prediction.
+                verifier_logits = torch.roll(verifier_logits, 1, dims=1)
             targets = verifier_logits[:, anchored_block_indices]
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
@@ -383,7 +397,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             .to(aligned_loss_mask.dtype)
         )  # shape: [1, num_anchors*block_size]
 
-        aligned_loss_mask[:, :: self.block_size] = 0
+        # False: slot 0 is the given anchor (not predicted) -> mask its loss. True: slot 0
+        # is a trained prediction -> keep it.
+        if not self.config.sample_from_anchor:
+            aligned_loss_mask[:, :: self.block_size] = 0
 
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
 

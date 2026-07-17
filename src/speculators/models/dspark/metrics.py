@@ -56,8 +56,15 @@ def compute_metrics(
     confidence_head_alpha: float = 1.0,
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
+    sample_from_anchor: bool = True,
 ) -> tuple[torch.Tensor, dict]:
-    """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
+    """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs).
+
+    ``sample_from_anchor`` picks the block task (must match training / the serve): True
+    (DSpark) samples every slot incl. slot 0, so per-position accuracy is reported from
+    position 0 and the hard accept-length counts all block_size slots; False treats slot 0
+    as the given anchor (reported/counted from position 1).
+    """
 
     device = logits.device
     seq_len = logits.shape[1]
@@ -141,15 +148,17 @@ def compute_metrics(
         metrics["accept_len_sum"] = (per_block_len * block_valid).sum()
         metrics["accept_len_total"] = block_valid.sum().clamp_min(1.0)
 
-    # Per-position greedy accuracy (position 0 is the anchor — excluded).
+    # Per-position greedy accuracy. sample_from_anchor=True (DSpark): slot 0 is a real
+    # prediction -> report from position 0; False: slot 0 is the given anchor -> skip it.
+    start_pos = 0 if sample_from_anchor else 1
     pred_ids = torch.argmax(logits, dim=-1)
     target_ids = torch.argmax(targets, dim=-1)
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )
-    metrics["full_acc_sum"] = correct_per_pos[1:].sum()
-    metrics["full_acc_total"] = total_per_pos[1:].sum()
-    for pos in range(1, block_size):
+    metrics["full_acc_sum"] = correct_per_pos[start_pos:].sum()
+    metrics["full_acc_total"] = total_per_pos[start_pos:].sum()
+    for pos in range(start_pos, block_size):
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
 
@@ -160,8 +169,12 @@ def compute_metrics(
     # HIGHER than this; vllm-ascend spec-decode reports THIS hard number. Logging both makes
     # the train-metric vs serve-metric comparison apples-to-apples (see the 2.9-vs-1.36 gap).
     with torch.no_grad():
-        hard_match = (pred_ids == target_ids).view(num_blocks, block_size)[:, 1:]
-        hard_match = hard_match.to(accept_rate.dtype) * draft_mask
+        # True (DSpark): all block_size slots are drafted -> count them all; False: slot 0
+        # is the anchor bonus -> count slots 1.. only. +1.0 = the always-emitted verifier token.
+        hslice = slice(None) if sample_from_anchor else slice(1, None)
+        hmask = loss_mask.to(accept_rate.dtype).view(num_blocks, block_size)[:, hslice]
+        hard_match = (pred_ids == target_ids).view(num_blocks, block_size)[:, hslice]
+        hard_match = hard_match.to(accept_rate.dtype) * hmask
         hard_len = hard_match.cumprod(dim=-1).sum(dim=-1) + 1.0  # 1 until first miss, then frozen
         metrics["hard_accept_len_sum"] = (hard_len * block_valid).sum()
         metrics["hard_accept_len_total"] = block_valid.sum().clamp_min(1.0)

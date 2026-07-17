@@ -53,3 +53,12 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "hidden state as the confidence-head input."
         ),
     )
+
+    # DSpark serving (vllm-ascend) samples EVERY block slot (slot 0 predicts from the
+    # anchor's own hidden, no target shift, slot 0 trained), so DSpark overrides the
+    # DFlash default to True. Training with False produces off-by-one targets + an
+    # untrained slot 0 that collapse at serve.
+    sample_from_anchor: bool = Field(
+        default=True,
+        description="DSpark trains all block_size slots (True). See DFlashSpeculatorConfig.",
+    )
