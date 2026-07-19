@@ -22,6 +22,12 @@ Unless a run says otherwise, all numbers below share:
   - `per-position pos_k` = **cumulative survival** `S_k = P(prefix 0..k all accepted)` (monotone ↓).
     Identity: `Σ_{k=0..4} S_k + 1 = accept_len`. Conditional per-slot accuracy = `S_k / S_{k−1}`
     (this is the "is THIS slot any good, given the prefix held" number — read the cliff here).
+  - `throughput` (tok/s) + `TTFT / ITL / E2E latency` are **hardware- and config-dependent** — log
+    them, but compare *only within an identical serve* (same #12006 stack, node count/parallelism,
+    concurrency). accept_len is the hardware-independent quality metric; a real *speedup* number needs
+    the **no-spec base** tok/s (see [Baselines](#baselines--todo)). The full latency breakdown
+    (Mean TTFT / Mean+Median ITL / E2E mean) for every run is in its **raw eval log** (path in the run
+    block); the tables here carry accept_len / accept_rate / throughput / per-position.
 - **Bar to beat**: official released DSV4 draft **AL 3.94 @ num_spec=5** (vllm-ascend #11196).
   Our-serve released draft = **gsm8k 4.658** (gsm8k-only so far; full-all pending, see [Baselines](#baselines--todo)).
 
@@ -34,6 +40,17 @@ multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
 |-----|:-----:|:-------:|:---------:|:----:|:--------:|:----:|-------|
 | **released draft** *(bar)* | 4.658 | — | — | — | — | — | official 3.94 @ ns5; our-serve gsm8k-only, full-all TODO |
 | `epoch4-17w` | 3.404 | 3.265 | 3.312 | 3.058 | 2.344 | 3.08 | ⚠ wrong dataset (17W not 45W); all fixes in |
+
+### Throughput (tok/s) by dataset
+
+⚠ Hardware/config-dependent — comparable **only within the same serve** (see metric defs). Logged for
+reference / regression, not as a cross-hardware quality metric. `no-spec base` = the AR reference the
+speedup is measured against.
+
+| Run | gsm8k | math500 | humaneval | mbpp | mt-bench |
+|-----|:-----:|:-------:|:---------:|:----:|:--------:|
+| `no-spec base` *(ref, gsm8k-only so far)* | 302.69 | — | — | — | — |
+| `epoch4-17w` | 162.26 | 256.48 | 143.19 | 285.44 | 220.50 |
 
 ## Runs (detail)
 
@@ -49,6 +66,7 @@ multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
   FSDP2 AMP fp32-master (**option-B**: small trainable fp32, EP experts stay bf16) + upstream merge
   (#788 float32 divergence loss, #759 metric clone). This is the first fully-fixed, serve-validated draft.
 - **Serve / eval**: [Shared setup](#shared-setup).
+- **Raw eval log** (full TTFT/ITL/E2E): `~/eval_epoch4_17w_all.log` on head node 115.
 
 | Dataset | Samples | tok/s | accept_len | accept_rate | pos0 | pos1 | pos2 | pos3 | pos4 |
 |---------|:-------:|:-----:|:----------:|:-----------:|:----:|:----:|:----:|:----:|:----:|
