@@ -217,6 +217,22 @@ def main() -> None:
         print(f">>> wrote config.json (from {src_cfg})")
     else:
         print(f"!! no config.json at {src_cfg} — provide one in {out_dir} before serving")
+
+    # Make the output world-READABLE so a *different* account can serve it (the serve process
+    # often runs as a different user than the one that converted). umask on the writer is
+    # commonly 077 → files land 600 → the serve user gets FileNotFoundError (ENOENT, not EACCES)
+    # on model.safetensors. Files: 0644, the dir itself: 0755 (traverse+list). NB: mode travels
+    # WITH the file on `mv`; only the DESTINATION's parent dirs still need o+x to be reachable.
+    try:
+        out_dir.chmod(0o755)
+        for _f in out_dir.iterdir():
+            if _f.is_file():
+                _f.chmod(0o644)
+        print(f">>> chmod: {out_dir} 0755, files 0644 (readable by the serve account)")
+    except OSError as _e:  # some shared FS reject chmod — non-fatal, user can chmod by hand
+        print(f"!! could not chmod {out_dir} ({_e}); if the serve account can't read it, run: "
+              f"chmod -R a+rX {out_dir}")
+
     print("⚠  VERIFY config.json before loading: `architectures`, `dspark_block_size`, "
           "`num_nextn_predict_layers` must match the RELEASED draft's config (from step-1 eval).")
     print("⚠  Run --inspect on the ACTUAL ckpt first to confirm the expert layout "
