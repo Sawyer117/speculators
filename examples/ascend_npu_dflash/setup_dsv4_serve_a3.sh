@@ -69,8 +69,12 @@ python -c "import torch, torch_npu; print('torch', torch.__version__, torch_npu.
 # ---- vLLM 0.23.0 (+empty) — SAME vllm #12006 pins; do NOT rebuild if present ----
 [ -d "$INST/vllm-v0.23.0/.git" ] || git clone --depth 1 --branch v0.23.0 https://github.com/vllm-project/vllm.git "$INST/vllm-v0.23.0"
 cd "$INST/vllm-v0.23.0"
-python -c "import vllm" 2>/dev/null || TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation -v
-python -c "import vllm; print('vllm', vllm.__version__)"
+# ★ guard on the INSTALLED dist (pip show), NOT `import vllm` — the import check FALSE-PASSES here
+# because cwd IS the vllm source dir, so `import vllm` picks up ./vllm/ (note the "_version" warning)
+# and the real install is skipped → later `from vllm import envs` in vllm_ascend dies with
+# "No module named 'vllm'". pip show reflects the actual editable install regardless of cwd.
+python -m pip show vllm >/dev/null 2>&1 || TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_TARGET_DEVICE=empty python -m pip install -e . --no-build-isolation -v
+( cd /tmp && python -c "import vllm; print('vllm', vllm.__version__)" )   # verify from a neutral cwd
 
 # ---- vllm-ascend @ PR #12006 (compiles V4 CANN ops — the moment of truth, ~30-40 min) ----
 if [ ! -d "$VA_DIR/.git" ]; then
@@ -81,7 +85,10 @@ git fetch origin "pull/$VA_PR/head:dspark-dsv4-v3"
 git checkout -B dspark-dsv4-v3 dspark-dsv4-v3
 [ -n "$VA_COMMIT" ] && git checkout "$VA_COMMIT" 2>/dev/null || echo ">>> (using live PR#$VA_PR head)"
 echo ">>> vllm-ascend at: $(git log --oneline -1)"
-python -m pip install numba einops pandas msgpack
+# ★ regex is a BUILD-TIME dep of the CANN op codegen (csrc/.../ascendc_impl_build.py `import regex`).
+# The serve env installs no transformers (which normally drags regex in), so add it explicitly here —
+# else build_aclnn dies with "No module named 'regex'" and vllm_ascend never builds.
+python -m pip install numba einops pandas msgpack regex
 python -m pip install --no-deps torchvision==0.25.0 torchaudio==2.10.0 --extra-index-url $HW/repository/pypi/simple
 python -m pip install triton-ascend==3.2.1 --extra-index-url $HW/repository/pypi/simple --extra-index-url $HW/ascend/repos/pypi
 pip install --no-deps "numpy==2.3.5"    # triton-ascend silently downgrades numpy → force back
