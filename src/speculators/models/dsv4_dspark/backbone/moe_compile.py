@@ -42,6 +42,17 @@ def _install_compile_shims() -> None:
         if gc is not None:
             mod.get_device_capability = _safe_cap(gc)
     torch._dynamo.config.capture_scalar_outputs = True
+    # ★ RECOMPILE-THRASH FIX (the 54%-wall-clock spikes that survived maybe_mark_dynamic).
+    # maybe_mark_dynamic does NOT collapse the grouped-GEMM to a single kernel on the NPU AscendC
+    # path — after DSPARK_MOE_BUCKET quantization there are still >8 distinct routed-token shapes
+    # (seq-len varies per rollout sample). dynamo's DEFAULT cache_size_limit is 8: once exceeded it
+    # LRU-EVICTS a compiled shape, and when that shape recurs it triggers a fresh ~21s AscendC
+    # rebuild -> perpetual thrash that never amortizes (726 recompiles over a 7774-step run = 54%).
+    # Raise the limits so every bucket shape compiles ONCE and stays resident (kernels are also
+    # disk-cached under /tmp/.npu_kernels_$USER, so the ceiling is cheap). Confirm the cause with
+    # TORCH_LOGS=recompiles -> "hit config.cache_size_limit (8)".
+    torch._dynamo.config.cache_size_limit = 256
+    torch._dynamo.config.accumulated_cache_size_limit = 512
 
 
 def _register_grouped_mm_npu() -> None:
