@@ -52,7 +52,10 @@ conda remove -y gxx_linux-aarch64 gcc_linux-aarch64 clang clangxx lld 2>/dev/nul
 unset CC CXX
 
 # ---- build deps ----
-python -m pip install -U pip setuptools "setuptools-scm>=8" wheel packaging ninja jinja2 pybind11
+# ★ cmake is REQUIRED at RUNTIME: inductor_npu_ext's AscendC kernel jit (autofuse/ascendc_compile)
+# shells out to `cmake` to build each kernel.so — missing it => torch.compile dies "Failed to build
+# ascend kernel / FileNotFoundError: 'cmake'" on the first COMPILE=1 step. ninja alone is not enough.
+python -m pip install -U pip setuptools "setuptools-scm>=8" wheel packaging "cmake>=3.26" ninja jinja2 pybind11
 
 # ---- torch 2.12.0 +cpu (★ MUST be the +cpu wheel via the CPU index — the default aarch64 wheel is
 #      +cu130 and makes torch_npu 2.12.0rc1 crash at import) + torch_npu 2.12.0rc1 (Ascend source) ----
