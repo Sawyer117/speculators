@@ -30,8 +30,10 @@ SECURITY: ``path`` is an opaque key from the client; we ONLY serve files that (a
 import argparse
 import os
 import re
+import signal
 import ssl
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -112,6 +114,8 @@ def main():
                     help="keep files after sending (default: delete after send = rolling buffer)")
     ap.add_argument("--wait-ms", type=int, default=3000,
                     help="poll this long for a not-yet-flushed file before returning 404")
+    ap.add_argument("--pidfile", help="write my PID here on start, remove on clean exit "
+                    "(for `kill $(cat pidfile)` graceful shutdown)")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -128,13 +132,33 @@ def main():
         ctx.load_cert_chain(args.certfile, args.keyfile)
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
+    # graceful shutdown: SIGTERM/SIGINT -> httpd.shutdown() (must run OFF the serve_forever thread,
+    # else it deadlocks). So `kill <pid>`, `pkill -f hs_sidecar.py`, or Ctrl-C all stop it cleanly —
+    # in-flight fetches drain, then serve_forever() returns and we server_close().
+    def _graceful(signum, _frame):
+        print(f">>> hs_sidecar: signal {signal.Signals(signum).name} -> shutting down", flush=True)
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _graceful)
+    signal.signal(signal.SIGINT, _graceful)
+
+    if args.pidfile:
+        with open(args.pidfile, "w") as f:
+            f.write(str(os.getpid()))
+
     print(f">>> hs_sidecar {scheme}://{args.host}:{args.port}/hs   root={root}   "
-          f"token={'on' if args.token else 'off'}   delete={'off' if args.no_delete else 'on'}",
-          flush=True)
+          f"token={'on' if args.token else 'off'}   delete={'off' if args.no_delete else 'on'}   "
+          f"pid={os.getpid()}", flush=True)
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
-        httpd.shutdown()
+    finally:
+        httpd.server_close()
+        if args.pidfile:
+            try:
+                os.remove(args.pidfile)
+            except OSError:
+                pass
+        print(">>> hs_sidecar: stopped", flush=True)
 
 
 if __name__ == "__main__":

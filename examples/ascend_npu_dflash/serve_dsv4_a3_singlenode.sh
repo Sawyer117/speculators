@@ -52,7 +52,8 @@ TP="${TP:-8}"; DP="${DP:-2}"       # DP2×TP8/EP16 for BF16 = matches the A2-pro
                                    # For w8a8 you can use TP=4 DP=4 (the official layout).
 MAXLEN="${MAXLEN:-8192}"; MAXBATCHTOK="${MAXBATCHTOK:-8192}"; MAXSEQS="${MAXSEQS:-64}"
 GPUUTIL="${GPUUTIL:-0.9}"
-EAGER="${EAGER:-1}"                # 1 = --enforce-eager (reliable FIRST bring-up); 0 = graph (peak)
+EAGER="${EAGER:-0}"                # ★ DEFAULT = graph mode (ACLGraph FULL_DECODE_ONLY, peak decode).
+                                   # Manual EAGER=1 → --enforce-eager (safest first bring-up / debug).
 QUANT="${QUANT:-}"                 # empty = bf16; QUANT=ascend + MODEL=<w8a8 ckpt> to serve w8a8
 ENABLE_EP="${ENABLE_EP:-1}"        # ★ ON by default on A3 (intra-node EP works). Set ENABLE_EP=0 to TP-shard.
 PREFETCH="${PREFETCH:-1}"; LOAD_THREADS="${LOAD_THREADS:-16}"
@@ -74,6 +75,7 @@ HS_SIDECAR_PORT="${HS_SIDECAR_PORT:-9009}"
 HS_SIDECAR_CERT="${HS_SIDECAR_CERT:-}"   # set BOTH cert+key → sidecar serves HTTPS; else plain HTTP (fine intra-cluster)
 HS_SIDECAR_KEY="${HS_SIDECAR_KEY:-}"
 HS_SIDECAR_LOG="${HS_SIDECAR_LOG:-$HOME/hs_sidecar.log}"   # sidecar's own log (token on/off, requests) lands here
+HS_SIDECAR_PIDFILE="${HS_SIDECAR_PIDFILE:-$HOME/hs_sidecar.pid}"  # graceful stop: kill $(cat $HS_SIDECAR_PIDFILE)
 
 # shellcheck disable=SC1090
 source "$CANN_ENV"
@@ -133,16 +135,19 @@ if [ "$HS_DUMP" = "1" ]; then
   # NO-SHARED-FS: bind the sidecar INTO this launch so there's ONE command and --root can't drift from
   # the dump dir. Started in the background BEFORE `exec vllm` (survives the exec, keeps serving the dir).
   if [ "$HS_SIDECAR" = "1" ]; then
-    pkill -9 -u "$USER" -f 'hs_sidecar.py' 2>/dev/null || true
+    pkill -TERM -u "$USER" -f 'hs_sidecar.py' 2>/dev/null; sleep 1   # graceful (SIGTERM → httpd.shutdown)
+    pkill -9    -u "$USER" -f 'hs_sidecar.py' 2>/dev/null || true    # backstop if it didn't exit
     SIDECAR_TLS=(); _scheme=http
     if [ -n "$HS_SIDECAR_CERT" ] && [ -n "$HS_SIDECAR_KEY" ]; then
       SIDECAR_TLS=(--certfile "$HS_SIDECAR_CERT" --keyfile "$HS_SIDECAR_KEY"); _scheme=https
     fi
     nohup python "$SCRIPT_DIR/hs_sidecar.py" \
       --root "$DSPARK_HS_DIR" --port "$HS_SIDECAR_PORT" "${SIDECAR_TLS[@]}" \
+      --pidfile "$HS_SIDECAR_PIDFILE" \
       > "$HS_SIDECAR_LOG" 2>&1 &
     echo ">>> [HS_SIDECAR] $_scheme://0.0.0.0:$HS_SIDECAR_PORT/hs  root=$DSPARK_HS_DIR  pid=$!  (token from \$HS_SIDECAR_TOKEN)  log=$HS_SIDECAR_LOG"
     echo ">>>   remote trainer → HS_FETCH_BASE=$_scheme://<this-box-ip>:$HS_SIDECAR_PORT  hidden_states_path=$DSPARK_HS_DIR"
+    echo ">>>   graceful stop → kill \$(cat $HS_SIDECAR_PIDFILE)   (SIGTERM → drains in-flight, then exits)"
   fi
 fi
 if [ "$HS_SIDECAR" = "1" ] && [ "$HS_DUMP" != "1" ]; then
