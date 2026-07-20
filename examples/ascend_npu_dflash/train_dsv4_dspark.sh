@@ -120,7 +120,13 @@ else
 fi
 mkdir -p "$RUN" 2>/dev/null || { echo "!! cannot create RUN=$RUN (different box user?) — override e.g. RUN=\$HOME/dspark_austin/run"; exit 1; }
 rm -f "$HS_DIR"/hs_*.safetensors*                     # stale dumps collide with data row idx
-export no_proxy=127.0.0.1,localhost,80.5.5.115,80.5.5.116 NO_PROXY=127.0.0.1,localhost,80.5.5.115,80.5.5.116
+# proxy-bypass hosts DERIVED from the endpoint (+ optional remote HS sidecar) so this works on
+# BOTH A2 (endpoint 115/116, shared FS) and A3 (endpoint 182 + HS_FETCH_BASE 182, no shared FS).
+# The old hardcoded 115/116 list silently sent A3's 182 traffic through the MITM proxy → HS fetch hung.
+_ep_host="$(printf '%s' "$ENDPOINT"        | sed -E 's#^https?://([^:/]+).*#\1#')"
+_fb_host="$(printf '%s' "${HS_FETCH_BASE:-}" | sed -E 's#^https?://([^:/]+).*#\1#')"
+export no_proxy="127.0.0.1,localhost,${_ep_host}${_fb_host:+,$_fb_host}"
+export NO_PROXY="$no_proxy"
 if ! curl -sf --noproxy '*' "$ENDPOINT/models" >/dev/null 2>&1; then
   echo "WARN: serve not reachable at $ENDPOINT — start 115/116 first (or set ENDPOINT=)."
 fi
