@@ -31,6 +31,20 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
 
 ## Status at a glance
 
+- **A3 two-box move + eval baselines locked (2026-07-20).** New topology: **182 = A3 inference + training-HS
+  producer**, **176 = A3 training on the torch-2.12 COMPILE stack** (data/weights migrating A3
+  `/home/canada_group_folder` → A2 `/share`). One-shot env builds: `setup_dsv4_serve_a3.sh` (#12006 serve, now
+  pins transformers==5.13.0 + VLLM_ENGINE_READY_TIMEOUT_S=1800 for the 543 GB load) and
+  `setup_dsv4_train_compile.sh` (torch 2.12.0+cpu / torch_npu 2.12.0rc1 / inductor_npu_ext / triton-ascend, no
+  vLLM). **No-shared-FS HS transport SOLVED:** `hs_sidecar.py` serves the dumped `hs_<id>.safetensors` over
+  HTTP(S) to the remote trainer (`HS_FETCH_BASE`), and the validated **Plan-B dumper is ported onto the #12006
+  A3 stack** — `Sawyer117/vllm-ascend@dspark-dsv4-v3-hsdump` (zero-risk: #12006 already exposes
+  `get_mtp_target_hidden_states()`; pure-python, no rebuild), enabled by `serve_dsv4_a3_singlenode.sh HS_DUMP=1`.
+  **Eval baselines** now in the append-only ledger (stage 5): released draft full-`DATASET=all` **mean 4.42**
+  (gsm8k 4.658 reproduced); our best `epoch4-17w` **mean 3.08 = 70%** (gap = the pos3/pos4 tail). Static
+  scoreboard `plot_best_vs_baseline.py`; `analyze_train_run.py` overlays the 3 released refs. **77W** dataset
+  (775,965 deduped, the newest/most-complete — supersedes 17W/45W) registered (§3.1) + being prepped to
+  `arrow_0720_77w` for the next retrain. See the **2026-07-20 worklog section** for the live bring-up detail.
 - **ALL FIXES in one branch + upstream-synced; the real training run is going (2026-07-18).** `feat/dsv4-dspark
   @ 4354a6d` now carries FIVE fixes: (1) pos0 **decay** slot-0, (2) **Markov** `prev_token_ids` alignment (slots
   ≥1), (3) **metrics** slot-0 (soft accept_len/confidence), (4) **AMP fp32 master weights** (norm-frozen /
