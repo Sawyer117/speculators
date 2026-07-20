@@ -20,6 +20,28 @@ if not torch.cuda.is_available():
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
     except ImportError:
         pass
+    except Exception:  # noqa: BLE001
+        # torch_npu 2.12.0rc1 ships an inconsistent transfer_to_npu: its _init() calls
+        # torch_npu._apply_patches(patchs) but the installed _apply_patches() takes 0 args
+        # -> TypeError mid-init. Recover in two layers so a broken torch_npu build doesn't
+        # hard-fail training:
+        #   (1) make _apply_patches arity-tolerant and RE-import transfer_to_npu so it
+        #       finishes the full cuda->npu redirection (incl. torch.Tensor.to / .cuda);
+        #   (2) belt-and-suspenders: point the seven torch.cuda.* stats/seed/sync helpers the
+        #       trainer actually uses at torch.npu (idempotent if (1) already patched them).
+        import importlib  # noqa: PLC0415
+        import torch_npu  # noqa: PLC0415
+
+        with contextlib.suppress(Exception):
+            _ap = torch_npu._apply_patches
+            torch_npu._apply_patches = lambda *a, **k: _ap()  # tolerate the extra arg
+            importlib.import_module("torch_npu.contrib.transfer_to_npu")
+        for _fn in (
+            "manual_seed_all", "empty_cache", "synchronize", "memory_allocated",
+            "memory_reserved", "max_memory_allocated", "max_memory_reserved",
+        ):
+            if hasattr(torch, "npu") and hasattr(torch.npu, _fn):
+                setattr(torch.cuda, _fn, getattr(torch.npu, _fn))
 
 import transformers
 from packaging import version
