@@ -56,7 +56,15 @@ python -m pip install -U pip setuptools "setuptools-scm>=8" wheel packaging ninj
 
 # ---- torch 2.12.0 +cpu (★ MUST be the +cpu wheel via the CPU index — the default aarch64 wheel is
 #      +cu130 and makes torch_npu 2.12.0rc1 crash at import) + torch_npu 2.12.0rc1 (Ascend source) ----
-python -m pip install "torch==2.12.0" --index-url "$CPU_IDX"
+# ★ the box proxy MITMs pytorch.org with a self-signed cert (SSLCertVerificationError); trust the
+#   pytorch hosts. download.pytorch.org 302-redirects to download-r2.pytorch.org, so trust BOTH.
+#   (override the full set via PIP_TRUSTED if your proxy differs.)
+PIP_TRUSTED="${PIP_TRUSTED:---trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org --trusted-host pypi.org --trusted-host files.pythonhosted.org}"
+python -m pip install "torch==2.12.0" --index-url "$CPU_IDX" $PIP_TRUSTED
+# ★ HARD GATE: if torch is not +cpu (e.g. SSL still failed → torch_npu pulled +cu130), STOP now —
+#   otherwise torch_npu drags cuda-toolkit + nvidia-* and the whole stack is wrong.
+python -c "import torch,sys; v=torch.__version__; print('torch', v); sys.exit(0 if '+cpu' in v else 1)" \
+  || { echo '!! torch is NOT +cpu — fix the pytorch.org SSL/proxy (PIP_TRUSTED / REQUESTS_CA_BUNDLE) and rerun; do NOT continue.'; exit 4; }
 python -m pip install "torch_npu==2.12.0rc1" --extra-index-url "$TORCH_NPU_IDX"
 python -m pip install decorator "scipy>=1.7.3" ml-dtypes attrs psutil pyyaml
 # do NOT `from torch_npu.contrib import transfer_to_npu` — it crashes on this stack; plain import only.
