@@ -47,6 +47,20 @@ Detailed throughput: [`ascend-npu-dsv4-bf16-dualnode-benchmark.md`](ascend-npu-d
 - Pre-split once into 16 balanced shards (round-robin): `split -n r/16 -d -a 2 --additional-suffix=.jsonl full.jsonl shards/shard_`. Each shard ≈ **88,807 rows**.
 - Base dir: `/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/` (A2) — `shards/` (input prompts), `out/` + `out_bf16/` (rolled outputs), `dflash_online_hidden_states/` (legacy DFlash HS).
 
+### 3.1 Dataset registry (rollout snapshots)
+
+Three snapshots of the rollout exist. **`77W` is the newest + most complete (fully deduplicated) — it
+SUPERSEDES 17W/45W as the training set once prepped to Arrow.** All under
+`…/open_perfectblend.dsv4_rollout/`. ⚠️ Migration in progress: 77W currently lives on **176 under
+`/home/canada_group_folder`** (A3, no `/share`); the plan is to move **all data + weights to A2
+`/share`**, so 77W's final home = `/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/…`.
+
+| tag | rows | format | location (as of 2026-07-20) | provenance / status |
+|-----|------|--------|-----------------------------|---------------------|
+| **17W** | ~177,000 | Arrow (prepped) | A2 `/share/…/arrow` | earliest prep = the **default `arrow`**. ⚠️ `epoch4-17w` trained on this **BY MISTAKE** (the run omitted `DATA=` → fell back to this default). Do not reuse. |
+| **45W** | 450,000 | Arrow (prepped) | A2 `/share/…/arrow_0715` | `head -n 450000` of an earlier clean jsonl → `arrow_0715`. Intended target, **not yet trained on**. |
+| **77W** | **775,965** | **JSONL (clean, deduped — NEEDS PREP → Arrow)** | 176 `/home/canada_group_folder/…/out_bf16_clean/rollout_all.clean.jsonl` | ★ **newest + most complete deduplicated full set.** Already garbage-cleaned; feed straight into `prepare_data.py` (§6). Prep output → e.g. `…/arrow_0720_77w`. Move to A2 `/share` with the rest. |
+
 ## 4. Rollout generation
 
 Roll each shard through the DSV4-bf16 serve (`rollout_a3_shard.sh <SID>` for A3; the same
