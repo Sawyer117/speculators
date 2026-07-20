@@ -357,12 +357,16 @@ class ArrowDataset(BaseDataset):
         """Get lengths of the dataset samples."""
         return list(self.data.with_format(None)["seq_len"])
 
-    def _dump_generate_hs(self, input_ids, file_idx: int) -> str:
+    def _dump_generate_hs(self, input_ids, file_idx: int) -> dict[str, torch.Tensor]:
         """DSPARK_HS_DUMP path (Plan B): fire a prefill-only request tagged
-        ``X-Request-Id=hs_<file_idx>`` and wait for the serve-side dumper to write
-        ``hs_<file_idx>.safetensors`` into ``hidden_states_path`` (which MUST equal the
-        serve's ``DSPARK_HS_DIR``). Returns its path. Drop-in for the connector-based
-        ``generate_hidden_states`` (our serve returns no ``kv_transfer_params``)."""
+        ``X-Request-Id=hs_<file_idx>``, wait for the serve-side dumper to produce
+        ``hs_<file_idx>.safetensors``, and return the LOADED hidden states. Works in BOTH
+        transports: shared-FS (poll the local path) and remote (``HS_FETCH_BASE`` -> each
+        poll GETs the sidecar, which waits for the flush, streams the bytes, then deletes
+        the file on the serve). A local ``path.exists()`` is ALWAYS False on the trainer in
+        remote mode, so the poll MUST go through the remote-aware loader. Drop-in for the
+        connector-based ``generate_hidden_states`` (our serve returns no
+        ``kv_transfer_params``)."""
         self.client.completions.create(
             model=self.model,
             prompt=list(input_ids),
@@ -372,22 +376,26 @@ class ArrowDataset(BaseDataset):
             timeout=self.request_timeout,
         )
         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        # Poll until the file is actually LOADABLE, not merely present. On a
-        # cross-node shared FS (trainer and serve on different hosts, /share over
-        # NFS) the dirent can become visible (path.exists() True) BEFORE the
-        # renamed inode's data is readable on this node, so a bare
-        # exists()-then-open races and safetensors raises "No such file". Retrying
-        # the load absorbs that lag (and any partial write) — this is the resilience
-        # the connector-based generate_hidden_states gets from its max_retries.
+        # Poll until the HS are actually LOADABLE via the remote-aware loader:
+        #  * remote (HS_FETCH_BASE): each attempt GETs the sidecar (the file lives on the
+        #    SERVE box; the sidecar waits for the dump to flush, streams it, then deletes
+        #    it). A successful GET consumes the file, so return the loaded dict directly.
+        #  * shared-FS: load_file with the .lock / NFS dirent-vs-data-lag resilience the
+        #    connector's max_retries provides, then apply the rolling-buffer unlink.
         deadline = time.monotonic() + 60.0
         last_err: Exception | None = None
         while time.monotonic() < deadline:
-            if path.exists():
-                try:
-                    load_file(str(path))
-                    return str(path)
-                except Exception as e:  # noqa: BLE001 - dirent up, data not yet visible
-                    last_err = e
+            try:
+                loaded_hs = _maybe_load_hs_file(path)
+                if loaded_hs is not None:
+                    if not _HS_FETCH_BASE and self.on_generate == "delete":
+                        try:
+                            path.unlink()  # shared-FS rolling buffer (remote already deleted)
+                        except OSError:
+                            pass
+                    return loaded_hs
+            except Exception as e:  # noqa: BLE001 - dirent up, data not yet visible / transient
+                last_err = e
             time.sleep(0.1)
         raise TimeoutError(
             f"DSPARK_HS_DUMP: {path} not loadable after 60s (last error: {last_err})"
@@ -402,7 +410,10 @@ class ArrowDataset(BaseDataset):
 
         try:
             if _HS_DUMP:
-                hs_filepath = self._dump_generate_hs(
+                # Fires the prefill trigger, polls (remote-aware) until loadable, and
+                # returns the loaded dict; the shared-FS rolling-buffer unlink is handled
+                # inside (remote sidecar already deleted after streaming).
+                loaded_hs = self._dump_generate_hs(
                     client_item["input_ids"], self._map_to_file_idx(index)
                 )
             else:
@@ -413,28 +424,25 @@ class ArrowDataset(BaseDataset):
                     timeout=self.request_timeout,
                     max_retries=self.max_retries,
                 )
+                loaded_hs = _maybe_load_hs_file(Path(hs_filepath))
+                if loaded_hs is None:
+                    raise ValueError(f"Failed to load hidden states from {hs_filepath}")
 
-            loaded_hs = _maybe_load_hs_file(Path(hs_filepath))
-            if loaded_hs is None:
-                raise ValueError(f"Failed to load hidden states from {hs_filepath}")
+                # Connector-path rolling buffer. In remote-fetch mode the file lives on the
+                # serve box and the sidecar already deleted it after sending; nothing local.
+                if not _HS_FETCH_BASE:
+                    match self.on_generate:
+                        case "cache":
+                            file_idx = self._map_to_file_idx(index)
+                            target_path = (
+                                self.hidden_states_path / f"hs_{file_idx}.safetensors"
+                            )
+                            if Path(hs_filepath) != target_path:
+                                shutil.move(hs_filepath, target_path)
+                        case "delete":
+                            Path(hs_filepath).unlink()
 
             check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
-
-            # In remote-fetch mode the file lives on the serve box and the sidecar
-            # already deleted it after sending; nothing local to move/unlink here.
-            if not _HS_FETCH_BASE:
-                match self.on_generate:
-                    case "cache":
-                        file_idx = self._map_to_file_idx(index)
-                        target_path = (
-                            self.hidden_states_path / f"hs_{file_idx}.safetensors"
-                        )
-                        # In DSPARK_HS_DUMP mode the dumper already wrote to target_path;
-                        # a self-move would error, so skip it (file is already cached).
-                        if Path(hs_filepath) != target_path:
-                            shutil.move(hs_filepath, target_path)
-                    case "delete":
-                        Path(hs_filepath).unlink()
         except Exception as e:
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise
@@ -449,7 +457,14 @@ class ArrowDataset(BaseDataset):
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
         candidate_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        loaded_hs = _maybe_load_hs_file(candidate_path)
+        # Remote-fetch generate mode produces HS on demand and the sidecar deletes each
+        # file after streaming it (rolling buffer) -> nothing ever pre-exists on the serve.
+        # Skip the initial probe (it would block on the sidecar's wait-ms for an absent
+        # file, every sample) and trigger+fetch straight away below.
+        if _HS_FETCH_BASE and self.on_missing == "generate":
+            loaded_hs = None
+        else:
+            loaded_hs = _maybe_load_hs_file(candidate_path)
 
         if loaded_hs is None:
             match self.on_missing:
