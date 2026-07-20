@@ -136,6 +136,19 @@ else
   echo ">>> AMP: option A (experts get fp32 master, upstream #711) — fits under EP=1"
 fi
 
+# ---- COMPILE=1 on NPU: two box-dependent footguns the inductor_npu_ext AscendC path hits ----
+# (1) umask: inductor's codecache REJECTS a group/world-writable kernel.so ("must not be writable
+#     by group or others"). On a umask-002 box the AscendC build emits 0o775 and compile dies with an
+#     opaque "Failed to build ascend kernel"; umask 0022 makes new .so 0o755. (This is exactly why a
+#     umask-022 box compiled fine while a umask-002 box didn't — deterministic, not fork luck.)
+# (2) spawn the compile worker: forking a torch_npu-initialised, multithreaded training process yields
+#     flaky build failures (pytorch #148651 / #108586). spawn = clean fresh worker.
+if [ "$COMPILE" = "1" ]; then
+  umask 0022
+  export TORCHINDUCTOR_WORKER_START="${TORCHINDUCTOR_WORKER_START:-spawn}"
+  echo ">>> COMPILE=1: umask 0022 (kernel.so must be 0o755, not 0o775) + TORCHINDUCTOR_WORKER_START=$TORCHINDUCTOR_WORKER_START"
+fi
+
 # ---- preflight ----
 if [ -f "$CANN_ENV" ]; then
   set +e; source "$CANN_ENV"; set -e         # env scripts return nonzero benignly
