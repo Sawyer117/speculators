@@ -99,4 +99,10 @@ def run(w1, w3, w2, x, counts, swiglu_limit, scores):
     Fuses ``w13 = cat([w1, w3])`` and marks the token dim dynamic (one kernel for every token count)."""
     w13 = torch.cat([w1, w3], dim=1)          # [E, 2*inter, dim]
     torch._dynamo.maybe_mark_dynamic(x, 0)
+    # ★ scores[N] shares x's token dim N. If ONLY x is marked, dynamo/inductor still specializes on
+    # scores' concrete shape -> a fresh per-shape recompile every time the routed-token count changes
+    # (each DSPARK_MOE_BUCKET step) = the recompile spikes that survived compilation. Mark it too so
+    # ALL token-dependent inputs are dynamic -> one shape-generic kernel, no recompile. (The isolated
+    # test_compile_grouped_mm.py used a single token count, so it never exposed this.)
+    torch._dynamo.maybe_mark_dynamic(scores, 0)
     return _COMPILED(w13, w2, x, counts, swiglu_limit, scores)
