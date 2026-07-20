@@ -29,8 +29,17 @@
 #   curl -s --noproxy '*' http://localhost:7000/v1/chat/completions -H 'Content-Type: application/json' \
 #     -d '{"model":"dsv4","messages":[{"role":"user","content":"从1数到40，用空格分隔"}],"temperature":0,"max_tokens":256}' \
 #     | python -c "import sys,json;print(json.load(sys.stdin)['choices'][0]['message']['content'])"
+#
+# HS PRODUCER for training (Plan B) — TWO modes:
+#   * shared FS (default): HS_DUMP=1 → verifier-only prefill dumps hs_<id>.safetensors into DSPARK_HS_DIR;
+#     the trainer reads that dir DIRECTLY (A2 /share). No sidecar.
+#   * NO shared FS (A3 182-serve / 176-train): add HS_SIDECAR=1 → this script ALSO auto-starts
+#     hs_sidecar.py (one command, --root = the same DSPARK_HS_DIR) so a remote trainer pulls via HS_FETCH_BASE:
+#       HS_DUMP=1 HS_SIDECAR=1 HS_SIDECAR_TOKEN=s3cret DSPARK_HS_DIR=/home/n84449292/dsv4_hs_dump \
+#         nohup bash serve_dsv4_a3_singlenode.sh > ~/dsv4_a3_hsdump.log 2>&1 &
 # NB: no `set -u` — sourcing CANN/conda references unbound vars ($ZSH_VERSION).
 set -o pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # to locate the sibling hs_sidecar.py
 
 MODEL="${MODEL:-/home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"   # A3 convention: /home/canada_group_folder (symlink-faked per box)
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"     # CANN 9.0.0 (same across the fleet)
@@ -54,8 +63,17 @@ DSPARK_AUX_LAYERS="${DSPARK_AUX_LAYERS:-[40,41,42]}"  # target aux layers the dr
 HS_DUMP="${HS_DUMP:-}"            # set HS_DUMP=1 → Plan B HS PRODUCER for TRAINING (verifier prefill dumps
                                   # hs_<id>.safetensors, NO draft). Needs the DsparkHSDumper hook in vllm-ascend
                                   # (vllm_ascend/dspark_hs_dumper.py + model_runner). Mutually exclusive with DRAFT.
-DSPARK_HS_DIR="${DSPARK_HS_DIR:-/home/canada_group_folder/dataset/dsv4_hs_dump}"  # A3-LOCAL (no /share); the
-                                  # trainer on a REMOTE box pulls these via hs_sidecar.py over HTTP (HS_FETCH_BASE).
+DSPARK_HS_DIR="${DSPARK_HS_DIR:-/home/canada_group_folder/dataset/dsv4_hs_dump}"  # where the dumps land.
+                                  # DEFAULT ASSUMPTION: this dir is on SHARED storage the trainer reads DIRECTLY
+                                  # (A2 /share) → NO sidecar. Only if the trainer box does NOT share this FS
+                                  # (A3 182-serve / 176-train) do you flip HS_SIDECAR=1 below.
+HS_SIDECAR="${HS_SIDECAR:-0}"     # ★ NO-SHARED-FS switch. =1 (only acts with HS_DUMP=1) auto-starts hs_sidecar.py
+                                  # HERE with --root=$DSPARK_HS_DIR (same var → CAN'T mismatch), so a REMOTE
+                                  # trainer pulls over HTTP(S) via HS_FETCH_BASE. Leave 0 when the dump dir is shared.
+HS_SIDECAR_PORT="${HS_SIDECAR_PORT:-9009}"
+HS_SIDECAR_CERT="${HS_SIDECAR_CERT:-}"   # set BOTH cert+key → sidecar serves HTTPS; else plain HTTP (fine intra-cluster)
+HS_SIDECAR_KEY="${HS_SIDECAR_KEY:-}"
+HS_SIDECAR_LOG="${HS_SIDECAR_LOG:-$HOME/hs_sidecar.log}"   # sidecar's own log (token on/off, requests) lands here
 
 # shellcheck disable=SC1090
 source "$CANN_ENV"
@@ -112,6 +130,23 @@ if [ "$HS_DUMP" = "1" ]; then
   mkdir -p "$DSPARK_HS_DIR" 2>/dev/null; chmod 0777 "$DSPARK_HS_DIR" 2>/dev/null || true
   HS_ARGS=(--hf-overrides "{\"dspark_target_layer_ids\":$DSPARK_AUX_LAYERS}")
   echo ">>> [HS_DUMP] Plan B producer → $DSPARK_HS_DIR (hs_<id>.safetensors); aux $DSPARK_AUX_LAYERS; NO draft"
+  # NO-SHARED-FS: bind the sidecar INTO this launch so there's ONE command and --root can't drift from
+  # the dump dir. Started in the background BEFORE `exec vllm` (survives the exec, keeps serving the dir).
+  if [ "$HS_SIDECAR" = "1" ]; then
+    pkill -9 -u "$USER" -f 'hs_sidecar.py' 2>/dev/null || true
+    SIDECAR_TLS=(); _scheme=http
+    if [ -n "$HS_SIDECAR_CERT" ] && [ -n "$HS_SIDECAR_KEY" ]; then
+      SIDECAR_TLS=(--certfile "$HS_SIDECAR_CERT" --keyfile "$HS_SIDECAR_KEY"); _scheme=https
+    fi
+    nohup python "$SCRIPT_DIR/hs_sidecar.py" \
+      --root "$DSPARK_HS_DIR" --port "$HS_SIDECAR_PORT" "${SIDECAR_TLS[@]}" \
+      > "$HS_SIDECAR_LOG" 2>&1 &
+    echo ">>> [HS_SIDECAR] $_scheme://0.0.0.0:$HS_SIDECAR_PORT/hs  root=$DSPARK_HS_DIR  pid=$!  (token from \$HS_SIDECAR_TOKEN)  log=$HS_SIDECAR_LOG"
+    echo ">>>   remote trainer → HS_FETCH_BASE=$_scheme://<this-box-ip>:$HS_SIDECAR_PORT  hidden_states_path=$DSPARK_HS_DIR"
+  fi
+fi
+if [ "$HS_SIDECAR" = "1" ] && [ "$HS_DUMP" != "1" ]; then
+  echo ">>> [HS_SIDECAR] ignored — needs HS_DUMP=1 (no producer = nothing to serve). Add HS_DUMP=1."
 fi
 
 pkill -9 -u "$USER" -f vllm 2>/dev/null; sleep 10
