@@ -51,6 +51,11 @@ DRAFT="${DRAFT:-}"                 # set DRAFT=<dspark mtp dir> → spec-decode 
 NUM_SPEC="${NUM_SPEC:-5}"          # = dspark_block_size (released DSV4 draft = 5). draft shards under the engine's TP/EP.
 DSPARK_AUX_LAYERS="${DSPARK_AUX_LAYERS:-[40,41,42]}"  # target aux layers the draft's main_proj consumes (3 → 3*H),
                                   # passed via speculative_config.draft_model_config.hf_config — else 4-layer default → dim mismatch.
+HS_DUMP="${HS_DUMP:-}"            # set HS_DUMP=1 → Plan B HS PRODUCER for TRAINING (verifier prefill dumps
+                                  # hs_<id>.safetensors, NO draft). Needs the DsparkHSDumper hook in vllm-ascend
+                                  # (vllm_ascend/dspark_hs_dumper.py + model_runner). Mutually exclusive with DRAFT.
+DSPARK_HS_DIR="${DSPARK_HS_DIR:-/home/canada_group_folder/dataset/dsv4_hs_dump}"  # A3-LOCAL (no /share); the
+                                  # trainer on a REMOTE box pulls these via hs_sidecar.py over HTTP (HS_FETCH_BASE).
 
 # shellcheck disable=SC1090
 source "$CANN_ENV"
@@ -91,6 +96,19 @@ if [ -n "$DRAFT" ]; then
              --speculative-config "{\"model\":\"$DRAFT\",\"num_speculative_tokens\":$NUM_SPEC,\"method\":\"mtp\",\"draft_model_config\":{\"hf_config\":{\"eagle_aux_hidden_state_layer_ids\":$DSPARK_AUX_LAYERS}}}")
 fi
 
+# Plan B HS PRODUCER (HS_DUMP=1): verifier prefill dumps hs_<id>.safetensors via the DsparkHSDumper runner
+# hook (vllm_ascend/dspark_hs_dumper.py). Needs the target config to carry dspark_target_layer_ids so the model
+# allocates the aux buffer get_mtp_target_hidden_states() reads (same --hf-overrides the draft path uses). NO
+# draft: target-only prefill. The dumper chmods each file 0777 so a cross-uid remote trainer can read+unlink it.
+HS_ARGS=()
+if [ "$HS_DUMP" = "1" ]; then
+  [ -n "$DRAFT" ] && { echo "!! HS_DUMP=1 is mutually exclusive with DRAFT (the HS producer serves the target only)"; exit 2; }
+  export DSPARK_HS_DUMP=1 DSPARK_HS_DIR
+  mkdir -p "$DSPARK_HS_DIR" 2>/dev/null; chmod 0777 "$DSPARK_HS_DIR" 2>/dev/null || true
+  HS_ARGS=(--hf-overrides "{\"dspark_target_layer_ids\":$DSPARK_AUX_LAYERS}")
+  echo ">>> [HS_DUMP] Plan B producer → $DSPARK_HS_DIR (hs_<id>.safetensors); aux $DSPARK_AUX_LAYERS; NO draft"
+fi
+
 pkill -9 -u "$USER" -f vllm 2>/dev/null; sleep 10
 
 echo ">>> [A3 single-node] model=$MODEL  DP$DP / TP$TP / EP=$ENABLE_EP  eager=$EAGER  port=$API_PORT"
@@ -104,5 +122,5 @@ exec vllm serve "$MODEL" --served-model-name dsv4 --port "$API_PORT" \
   --max-num-batched-tokens "$MAXBATCHTOK" \
   --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching --async-scheduling \
   --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}' \
-  "${LOAD_ARGS[@]}" "${SPEC_ARGS[@]}" \
+  "${LOAD_ARGS[@]}" "${SPEC_ARGS[@]}" "${HS_ARGS[@]}" \
   $EAGER_FLAG "${GRAPH_ARGS[@]}"
