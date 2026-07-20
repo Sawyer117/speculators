@@ -91,7 +91,13 @@ echo ">>> vllm-ascend at: $(git log --oneline -1)"
 python -m pip install numba einops pandas msgpack regex
 python -m pip install --no-deps torchvision==0.25.0 torchaudio==2.10.0 --extra-index-url $HW/repository/pypi/simple
 python -m pip install triton-ascend==3.2.1 --extra-index-url $HW/repository/pypi/simple --extra-index-url $HW/ascend/repos/pypi
-pip install --no-deps "numpy==2.3.5"    # triton-ascend silently downgrades numpy → force back
+# ★ transformers PINNED to #12006's requirement (requirements.txt / pyproject: transformers==5.13.0).
+# vllm-ascend is installed --no-deps (protects torch), so its transformers pin is skipped → the env
+# gets only vllm's older transitive transformers, which LACKS HunYuanVLProcessor. vllm_ascend/__init__
+# unconditionally loads patch/hunyuan_vl_processor_compat (register_model), so the serve dies at startup
+# with "cannot import name 'HunYuanVLProcessor'". Install the exact version #12006 expects.
+python -m pip install "transformers==5.13.0"
+pip install --no-deps "numpy==2.3.5"    # triton-ascend + transformers may bump numpy → force back (LAST)
 rm -rf build csrc/build                  # MANDATORY between builds — CMake caches the compiler choice
 pip install -e . --no-deps --no-build-isolation -v 2>&1 | tee ~/va_serve_build.log
 python -c "import numpy; print('numpy', numpy.__version__)"
