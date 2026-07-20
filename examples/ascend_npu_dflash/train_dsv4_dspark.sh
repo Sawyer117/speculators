@@ -64,6 +64,13 @@ COMPILE="${COMPILE:-0}"                # ★ SEED TECH: torch.compile'd experts 
                                        # recompile, ~1.74x). REQUIRES the torch-2.12 stack (torch 2.12+cpu /
                                        # torch_npu 2.12rc1 / inductor_npu_ext / triton-ascend) — do NOT set
                                        # on the 2.10 main stack (desyncs train vs the 2.10 serve).
+# Dataloader concurrency = HS fetch concurrency. DEFAULT 4 in REMOTE mode (HS_FETCH_BASE set): the
+# remote HS fetch is expensive (~100 MB/sample prefill+HTTP through ONE serve MAXSEQS=64 + one sidecar
+# process), so NPROC*NUM_WORKERS concurrent fetchers must stay near the serve's cap, else the first
+# batch never assembles (all ranks I/O-block, AICore 0%). Shared-FS (no HS_FETCH_BASE) keeps 12 (local
+# reads are cheap). Override with NUM_WORKERS=.
+if [ -n "${HS_FETCH_BASE:-}" ]; then NUM_WORKERS="${NUM_WORKERS:-4}"; else NUM_WORKERS="${NUM_WORKERS:-12}"; fi
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
 NOVAL="${NO_VAL:-0}"                    # NO_VAL=1 -> cancel the per-epoch validation pass. Val does SERIAL
                                        # online HS generation for the 10% held-out split (num_workers=0),
                                        # which dominates the epoch; --no-validation trains on the FULL data.
@@ -181,6 +188,7 @@ nohup env \
     --draft-attn-impl sdpa --loss-fn '{"ce":0.1,"tv":0.9}' \
     --optimizer adamw --lr "$LR" --epochs "$EPOCHS" $EXTRA \
     --on-missing generate --on-generate delete \
+    --num-workers "$NUM_WORKERS" --prefetch-factor "$PREFETCH_FACTOR" \
     --hidden-states-path "$HS_DIR" --vllm-endpoint "$ENDPOINT" \
     --verifier-name-or-path "$VERIFIER" --data-path "$DATA" \
     --save-path "$SAVE_PATH" --log-dir "$RUN" \
