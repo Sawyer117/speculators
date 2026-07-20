@@ -82,14 +82,25 @@ def make_handler(root: Path, token, delete: bool, wait_ms: int):
             if not p.exists():
                 return self._reply(404, b"not ready")
             try:
-                data = p.read_bytes()
+                size = p.stat().st_size
             except OSError as e:
                 return self._reply(500, str(e).encode())
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(size))
             self.end_headers()
-            self.wfile.write(data)             # if this raises (client hung up), we keep the file
+            # STREAM in chunks — do NOT read the whole ~100 MB into memory: with many concurrent
+            # fetches that is GBs of allocation churn per process. If a write raises (client hung
+            # up) we keep the file (return before the unlink).
+            try:
+                with open(p, "rb") as fh:
+                    while True:
+                        chunk = fh.read(1 << 20)   # 1 MiB
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except OSError:
+                return
             if delete:
                 try:
                     p.unlink()
@@ -97,6 +108,40 @@ def make_handler(root: Path, token, delete: bool, wait_ms: int):
                     pass
 
     return H
+
+
+def _serve(httpd, pidfile=None, child_pids=()):
+    """serve_forever with graceful SIGTERM/SIGINT shutdown. The parent forwards the signal to its
+    prefork children then reaps them; a child just stops itself. ``pkill -f hs_sidecar.py`` signals
+    every process directly; ``kill $(cat pidfile)`` hits the parent, which fans out to the children."""
+    def _graceful(signum, _frame):
+        for cp in child_pids:
+            try:
+                os.kill(cp, signal.SIGTERM)
+            except OSError:
+                pass
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _graceful)
+    signal.signal(signal.SIGINT, _graceful)
+    if pidfile:
+        with open(pidfile, "w") as f:
+            f.write(str(os.getpid()))
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+        for cp in child_pids:
+            try:
+                os.waitpid(cp, 0)
+            except OSError:
+                pass
+        if pidfile:
+            try:
+                os.remove(pidfile)
+            except OSError:
+                pass
+            print(">>> hs_sidecar: stopped", flush=True)
 
 
 def main():
@@ -116,6 +161,11 @@ def main():
                     help="poll this long for a not-yet-flushed file before returning 404")
     ap.add_argument("--pidfile", help="write my PID here on start, remove on clean exit "
                     "(for `kill $(cat pidfile)` graceful shutdown)")
+    ap.add_argument("--workers", type=int, default=int(os.environ.get("HS_SIDECAR_WORKERS", "1")),
+                    help="prefork this many processes sharing the listen socket (default 1 / "
+                    "$HS_SIDECAR_WORKERS). >1 lets many concurrent ~100 MB transfers run in TRUE "
+                    "parallel (one Python process can't — GIL/memory), reclaiming the multi-stream "
+                    "bandwidth a single-stream sidecar leaves on the table. Use 8 for the A3 remote link.")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -132,33 +182,24 @@ def main():
         ctx.load_cert_chain(args.certfile, args.keyfile)
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
-    # graceful shutdown: SIGTERM/SIGINT -> httpd.shutdown() (must run OFF the serve_forever thread,
-    # else it deadlocks). So `kill <pid>`, `pkill -f hs_sidecar.py`, or Ctrl-C all stop it cleanly —
-    # in-flight fetches drain, then serve_forever() returns and we server_close().
-    def _graceful(signum, _frame):
-        print(f">>> hs_sidecar: signal {signal.Signals(signum).name} -> shutting down", flush=True)
-        threading.Thread(target=httpd.shutdown, daemon=True).start()
 
-    signal.signal(signal.SIGTERM, _graceful)
-    signal.signal(signal.SIGINT, _graceful)
-
-    if args.pidfile:
-        with open(args.pidfile, "w") as f:
-            f.write(str(os.getpid()))
+    workers = max(1, args.workers)
+    # PREFORK: the socket is bound ONCE (above); fork workers-1 children that all serve_forever()
+    # on the SHARED listening socket (the OS load-balances accept() across them). One Python
+    # process can't push many concurrent ~100 MB transfers in parallel (GIL + memory churn); N
+    # processes reclaim the multi-stream bandwidth a single-stream sidecar leaves unused.
+    child_pids = []
+    for _ in range(workers - 1):
+        pid = os.fork()
+        if pid == 0:
+            _serve(httpd)                    # child: no pidfile, no children of its own
+            os._exit(0)
+        child_pids.append(pid)
 
     print(f">>> hs_sidecar {scheme}://{args.host}:{args.port}/hs   root={root}   "
           f"token={'on' if args.token else 'off'}   delete={'off' if args.no_delete else 'on'}   "
-          f"pid={os.getpid()}", flush=True)
-    try:
-        httpd.serve_forever()
-    finally:
-        httpd.server_close()
-        if args.pidfile:
-            try:
-                os.remove(args.pidfile)
-            except OSError:
-                pass
-        print(">>> hs_sidecar: stopped", flush=True)
+          f"workers={workers}   pid={os.getpid()}", flush=True)
+    _serve(httpd, pidfile=args.pidfile, child_pids=child_pids)
 
 
 if __name__ == "__main__":

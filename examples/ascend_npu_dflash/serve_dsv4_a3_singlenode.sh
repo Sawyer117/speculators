@@ -78,6 +78,9 @@ HS_SIDECAR_CERT="${HS_SIDECAR_CERT:-}"   # set BOTH cert+key → sidecar serves 
 HS_SIDECAR_KEY="${HS_SIDECAR_KEY:-}"
 HS_SIDECAR_LOG="${HS_SIDECAR_LOG:-$HOME/hs_sidecar.log}"   # sidecar's own log (token on/off, requests) lands here
 HS_SIDECAR_PIDFILE="${HS_SIDECAR_PIDFILE:-$HOME/hs_sidecar.pid}"  # graceful stop: kill $(cat $HS_SIDECAR_PIDFILE)
+HS_SIDECAR_WORKERS="${HS_SIDECAR_WORKERS:-8}"  # prefork N processes → concurrent ~100MB HS transfers run in
+                                  # TRUE parallel (single Python process is GIL/mem-bound → leaves multi-stream
+                                  # bandwidth unused; the A3 remote link needs it). Set 1 for the old behavior.
 
 # shellcheck disable=SC1090
 source "$CANN_ENV"
@@ -145,7 +148,7 @@ if [ "$HS_DUMP" = "1" ]; then
     fi
     nohup python "$SCRIPT_DIR/hs_sidecar.py" \
       --root "$DSPARK_HS_DIR" --port "$HS_SIDECAR_PORT" "${SIDECAR_TLS[@]}" \
-      --pidfile "$HS_SIDECAR_PIDFILE" \
+      --workers "$HS_SIDECAR_WORKERS" --pidfile "$HS_SIDECAR_PIDFILE" \
       > "$HS_SIDECAR_LOG" 2>&1 &
     echo ">>> [HS_SIDECAR] $_scheme://0.0.0.0:$HS_SIDECAR_PORT/hs  root=$DSPARK_HS_DIR  pid=$!  (token from \$HS_SIDECAR_TOKEN)  log=$HS_SIDECAR_LOG"
     echo ">>>   remote trainer → HS_FETCH_BASE=$_scheme://<this-box-ip>:$HS_SIDECAR_PORT  hidden_states_path=$DSPARK_HS_DIR"
