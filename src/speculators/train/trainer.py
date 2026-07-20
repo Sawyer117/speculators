@@ -141,6 +141,12 @@ class TrainerConfig(NamedTuple):
     checkpoint_freq: float = 1
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
+    # AMP master weights for the EP routed experts. Default False = option A = upstream #711
+    # semantics: EVERY trainable param (incl experts) gets a fp32 master (all-trainable upcast).
+    # True = option B (fork memory path): experts stay bf16 (no fp32 master). Only meaningful with
+    # EP experts under FSDP2; needed for the EP-off faithful path where rank0 materialises the full
+    # unsharded model (fp32 experts would OOM there). Under EP=1 (the training norm) A fits fine.
+    bf16_experts: bool = False
     log_freq: int = 1
     fsdp_shard: bool = False
 
@@ -318,15 +324,21 @@ class Trainer:
         # (norm/MLA/mHC/heads) back to fp32 as MASTER weights, so their sub-ULP updates
         # (norm ~1e-7) + AdamW weight decay survive bf16 — FSDP2's MixedPrecisionPolicy
         # keeps the pre-shard dtype, so a bf16-only param has no master and gets silently
-        # frozen. Frozen params AND the big EP experts stay bf16 (fp32 experts would OOM
-        # at high anchor counts; their large grads are far less rounding-sensitive). The
-        # one-time init precision loss on the upcast is negligible — the warm-start source
-        # is bf16 anyway; what matters is the fp32 ACCUMULATION across steps.
+        # frozen. By DEFAULT (option A = upstream #711) EVERY trainable param — experts
+        # included — is upcast, so it gets a fp32 master; this is safe under EP=1 (each rank
+        # only holds/upcasts its own 1/EP expert slice, no rank0 full-fp32 materialisation).
+        # ``bf16_experts=True`` (option B) keeps the EP experts bf16 — the memory path for the
+        # EP-OFF faithful run, where rank0 materialises the FULL unsharded model and fp32
+        # experts (~15B) would OOM. Their large grads are far less rounding-sensitive, so the
+        # bf16 compromise is numerically cheap. The one-time upcast precision loss is negligible
+        # (warm-start source is bf16); what matters is the fp32 ACCUMULATION across steps.
         self.model.to(self.config.hidden_states_dtype)  # type: ignore[arg-type]
         _ep_local = getattr(self.model, "ep_local_param_keys", None)
         _expert_keys = set(_ep_local()) if callable(_ep_local) else set()
         for _name, _p in self.model.named_parameters():
-            if _p.requires_grad and _name not in _expert_keys:
+            if _p.requires_grad and (
+                not self.config.bf16_experts or _name not in _expert_keys
+            ):
                 _p.data = _p.data.to(torch.float32)
 
         # Distributed case

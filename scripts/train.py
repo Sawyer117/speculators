@@ -753,6 +753,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         checkpoint_freq=args.checkpoint_freq,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
+        bf16_experts=args.bf16_experts,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
     )
@@ -1169,6 +1170,14 @@ def parse_args():
         "Model master weights are always kept in fp32. "
         "Options: float32 (full precision), bfloat16 (recommended). "
         "Note: float16 is not supported (requires gradient scaling).",
+    )
+    parser.add_argument(
+        "--bf16-experts",
+        action="store_true",
+        help="Option B (memory): keep the EP routed experts in bf16 (no fp32 master) instead "
+        "of the default (option A = upstream: every trainable param, experts included, gets a "
+        "fp32 master). REQUIRED for the EP-off faithful path (rank0 materialises the full "
+        "unsharded model → fp32 experts OOM); unnecessary under EP=1, where A fits.",
     )
     parser.add_argument(
         "--deterministic-cuda",

@@ -52,6 +52,11 @@ BLOCK="${BLOCK:-5}"                     # ★ BLOCK = # draft slots per block = 
                                        # tokens = MAX_ANCHORS*BLOCK -> memory (256*5=1280).
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
 EP="${DSPARK_EP:-0}"
+BF16EXPERTS="${BF16_EXPERTS:-auto}"     # AMP masters for EP experts. DEFAULT "auto": option A (upstream —
+                                       # experts get fp32 masters) EXCEPT the faithful+EP=0 path, which
+                                       # rank0-materialises the full unsharded model → fp32 experts OOM, so
+                                       # auto-downgrades to option B there. Force with BF16_EXPERTS=1 (always
+                                       # bf16 experts) or =0 (always fp32). Under EP=1 (the training norm) A fits.
 RECOMPUTE="${RECOMPUTE:-0}"             # activation checkpointing: recompute each draft layer in backward
                                        # -> frees activation so MAX_ANCHORS scales past the memory wall
                                        # (the lever to slow an HS-bound step to the serve's HS rate).
@@ -111,6 +116,18 @@ if [ "$INITATTN" = "1" ]; then EXTRA="$EXTRA --init-attn-from-target"; fi
 if [ "$INITHC" = "1" ]; then EXTRA="$EXTRA --init-hc-from-target"; fi
 if [ "$INITNORM" = "1" ]; then EXTRA="$EXTRA --init-norm-from-target"; fi
 if [ "$INITLAYER" = "1" ]; then EXTRA="$EXTRA --init-layer-from-target"; fi
+
+# AMP experts: resolve "auto" -> downgrade to bf16 experts ONLY on the faithful+EP=0 path (rank0
+# materialises the full unsharded model; fp32 experts would OOM). EP=1 / reduced keep option A.
+if [ "$BF16EXPERTS" = "auto" ]; then
+  if [ "$MODE" = "faithful" ] && [ "$EP" != "1" ]; then BF16EXPERTS=1; else BF16EXPERTS=0; fi
+fi
+if [ "$BF16EXPERTS" = "1" ]; then
+  EXTRA="$EXTRA --bf16-experts"
+  echo ">>> AMP: option B (experts stay bf16, no fp32 master) — memory path for faithful+EP=0"
+else
+  echo ">>> AMP: option A (experts get fp32 master, upstream #711) — fits under EP=1"
+fi
 
 # ---- preflight ----
 if [ -f "$CANN_ENV" ]; then
