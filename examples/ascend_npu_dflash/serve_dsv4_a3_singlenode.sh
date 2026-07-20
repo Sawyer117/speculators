@@ -75,6 +75,11 @@ export VLLM_ASCEND_ENABLE_FUSED_MC2="${VLLM_ASCEND_ENABLE_FUSED_MC2:-1}"
 # first bring-up misbehaves, try VLLM_ASCEND_ENABLE_FLASHCOMM1=0.
 export VLLM_ASCEND_ENABLE_FLASHCOMM1="${VLLM_ASCEND_ENABLE_FLASHCOMM1:-1}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
+# ★ engine-ready timeout: the API frontend waits VLLM_ENGINE_READY_TIMEOUT_S for the engine cores.
+# Loading the 543 GB bf16 model + KV alloc + warmup takes ~11-12 min (> the 600s default), so a fresh
+# bring-up hits "TimeoutError: Timed out waiting for engine core processes to start" and the ApiServer
+# dies (exit 1) even though the engine was ~90s from ready. 1800s gives the big-model load headroom.
+export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-1800}"
 
 EAGER_FLAG=""; GRAPH_ARGS=()
 if [ "$EAGER" = "1" ]; then EAGER_FLAG="--enforce-eager"
