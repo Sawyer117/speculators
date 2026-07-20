@@ -724,6 +724,53 @@ def main() -> None:
     print("=" * 78)
 
 
+# ── released-draft BASELINE reference (our #12006 serve, full DATASET=all, 2026-07-20) ──
+# Source of truth: docs/deployment/ascend-npu-dsv4-dspark-eval-results.md (the `released draft` row).
+# Shown as background reference lines on the accept_len + per-position plots (replaced the old single
+# 3.94 official line). `avg` = unweighted mean over the 5 eval datasets.
+RELEASED_ACCEPT_LEN = {"gsm8k": 4.658, "mt-bench": 3.294, "avg": 4.42}
+# per-position CUMULATIVE accept rate S_k (= P(prefix 0..k accepted)) from the same eval:
+_RELEASED_POS_CUM = {
+    "gsm8k":    [0.9277, 0.8277, 0.7329, 0.6355, 0.5345],
+    "mt-bench": [0.7921, 0.5855, 0.4145, 0.2932, 0.2087],
+    "avg":      [0.9016, 0.7874, 0.6722, 0.5741, 0.4827],
+}
+_REF_STYLE = {"gsm8k": ("#D62828", "--"), "mt-bench": ("#8C2FBF", ":"), "avg": ("#1B8A4E", "-.")}
+
+
+def _cum_to_marginal(cum):
+    """S_k (cumulative survival) → c_k = S_k/S_{k-1} (per-slot marginal). The training position bars
+    measure MARGINAL greedy accuracy (argmax==target per slot), so the reference must be marginal too
+    — overlaying the cumulative S_k on marginal bars would falsely flatter the tail."""
+    out, prev = [], 1.0
+    for s in cum:
+        out.append(s / prev if prev > 1e-9 else 0.0)
+        prev = s
+    return out
+
+
+# per-slot MARGINAL, matched to the training bars' metric (derived from the cumulative eval numbers)
+RELEASED_POS_MARGINAL = {k: _cum_to_marginal(v) for k, v in _RELEASED_POS_CUM.items()}
+
+
+def _draw_accept_len_refs(plt):
+    """3 horizontal released-accept_len refs (replaces the single 3.94 line). Returns the top ref."""
+    for name, al in RELEASED_ACCEPT_LEN.items():
+        c, ls = _REF_STYLE[name]
+        plt.axhline(al, ls=ls, lw=1.5, color=c, alpha=0.9, zorder=1,
+                    label=f"released {name} AL {al:.2f}")
+    return max(RELEASED_ACCEPT_LEN.values())
+
+
+def _draw_pos_refs(plt, xs, npos):
+    """3 released per-slot MARGINAL refs (replaces the single `rel` line)."""
+    for name, marg in RELEASED_POS_MARGINAL.items():
+        if len(marg) >= npos:
+            c, ls = _REF_STYLE[name]
+            plt.plot(xs, marg[:npos], marker="o", ls=ls, color=c, lw=1.5, ms=5, zorder=4,
+                     label=f"released {name} (per-slot)")
+
+
 def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=None):
     try:
         import matplotlib
@@ -794,7 +841,7 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
                       ("train/accept_rate", "accept_rate", "#1B8A4E"),
                       ("train/full_acc", "full_acc", "#D62828")]:
         _overlay(k, c, lab, good, bgood)
-    plt.axhline(3.94, ls="--", c="grey", lw=.8, label="released AL 3.94")
+    _draw_accept_len_refs(plt)   # released gsm8k / mt-bench / avg accept_len (replaces single 3.94)
     _epoch_lines()
     plt.xlabel("step"); plt.ylabel("accept"); plt.title("Acceptance" + ttl_suffix); plt.grid(alpha=.3); _legend()
     plt.tight_layout(); plt.savefig(f"{out}/acceptance.png", dpi=120); plt.close()
@@ -827,23 +874,15 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
         # accept_len climbs near the target, show the full axis + the highlighted target line.
         ally = y + base_y
         data_top = (max(ally) if ally else 1.5) + 0.15
-        if data_top < 3.6:
-            plt.ylim(1.0, data_top)
-            plt.annotate("↑ released-draft target = 3.94 (off-scale — early training)",
-                         xy=(0.5, 0.97), xycoords="axes fraction", ha="center", va="top",
-                         color="#D62828", fontsize=10, weight="bold")
-        else:
-            plt.axhline(3.94, ls="--", lw=2.4, color="#D62828",
-                        label="released draft AL = 3.94 (paper / vllm-ascend PR #11196)")
-            plt.annotate("target 3.94", xy=(x[0], 3.94), xytext=(x[0], 3.99),
-                         color="#D62828", fontsize=11, weight="bold")
-            plt.ylim(1.0, max(4.2, data_top))
+        ref_top = _draw_accept_len_refs(plt)             # released gsm8k/mt-bench/avg (replaces 3.94)
+        plt.ylim(1.0, max(ref_top + 0.25, data_top))     # keep all 3 refs on-scale
         plt.annotate(f"{label} ~{cur:.2f}", xy=(x[-1], cur), xytext=(x[-1], cur - 0.06),
                      color="#2E6CF6", fontsize=10, ha="right", weight="bold")
         _epoch_lines()
         plt.xlabel("step"); plt.ylabel("acceptance length")
         plt.title((f"Acceptance length — {label} vs {blabel}" if have_base
-                   else "Acceptance length — raw vs smoothed") + " (target = released-draft 3.94)")
+                   else "Acceptance length — raw vs smoothed")
+                  + " (refs: released gsm8k 4.66 / mt-bench 3.29 / avg 4.42)")
         plt.legend(loc="lower right"); plt.grid(alpha=.3)
         plt.tight_layout(); plt.savefig(f"{out}/accept_len.png", dpi=120); plt.close()
 
@@ -870,13 +909,8 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
                     if h > 0:
                         plt.text(b.get_x() + b.get_width() / 2, h + 0.012, f"{h:.2f}",
                                  ha="center", va="bottom", fontsize=8, weight="bold")
-            # released-draft per-position ACCEPT marginals (shape ref), same as the single-run plot
-            rel = [0.81, 0.68, 0.58, 0.48, 0.39]
-            if len(labels) == len(rel):
-                plt.plot(xx, rel, "o--", color="#D62828", lw=1.6, ms=6, zorder=4,
-                         label="released draft accept marginal (ref)")
-                for i, r in enumerate(rel):
-                    plt.text(i, r + 0.02, f"{r:.2f}", ha="center", color="#D62828", fontsize=9)
+            # released-draft per-slot MARGINAL accept (our #12006 full-all): gsm8k / mt-bench / avg
+            _draw_pos_refs(plt, xx, len(labels))
             plt.ylim(0, 1.0); plt.xticks(xx, labels); plt.legend(loc="upper right")
             plt.ylabel("greedy accuracy  (argmax == target)")
             plt.title(f"Per-position draft accuracy — {label} vs {blabel} (last {n} steps)")
@@ -890,14 +924,9 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
             for b, v in zip(bars, vals):
                 plt.text(b.get_x() + b.get_width() / 2, v + 0.012, f"{v:.3f}",
                          ha="center", va="bottom", fontsize=11, weight="bold", color="#1B2538")
-            # released-draft per-position ACCEPT marginals (a related-but-different metric) as a shape ref
-            rel = [0.81, 0.68, 0.58, 0.48, 0.39]
-            if len(pos_keys) == len(rel):
-                plt.plot(labels, rel, "o--", color="#D62828", lw=1.6, ms=6, zorder=4,
-                         label="released draft accept marginal (ref)")
-                for i, r in enumerate(rel):
-                    plt.text(i, r + 0.02, f"{r:.2f}", ha="center", color="#D62828", fontsize=9)
-                plt.legend(loc="upper right")
+            # released-draft per-slot MARGINAL accept (our #12006 full-all): gsm8k / mt-bench / avg
+            _draw_pos_refs(plt, labels, len(pos_keys))
+            plt.legend(loc="upper right")
             plt.ylim(0, 1.0)
             plt.ylabel("greedy accuracy  (argmax == target)")
             plt.title(f"Per-position draft accuracy — last {n} steps (decays p1→p{len(pos_keys)})")
@@ -1013,7 +1042,7 @@ def _plots_multi(runs, out):
     # epoch boundaries of the CURRENT run (runs[0]); marked on every step-axis plot.
     ep_bounds = epoch_boundaries(runs[0]["recs"]) if runs else []
 
-    def _overlay(key, fname, title, ylabel, *, train=True, logy=False, target=None):
+    def _overlay(key, fname, title, ylabel, *, train=True, logy=False, target=None, accept_len_refs=False):
         plt.figure(figsize=(9.5, 4.8))
         allv, drew = [], False
         for r in runs:
@@ -1042,7 +1071,11 @@ def _plots_multi(runs, out):
                          color="0.4", fontsize=7, ha="left", va="top")
         if logy:
             plt.yscale("log")
-        if target is not None:
+        if accept_len_refs:
+            top = (max(allv) if allv else 1.5) + 0.15
+            ref_top = _draw_accept_len_refs(plt)      # released gsm8k/mt-bench/avg (replaces 3.94)
+            plt.ylim(1.0, max(ref_top + 0.25, top))
+        elif target is not None:
             top = (max(allv) if allv else 1.5) + 0.15
             if top < target - 0.34:
                 plt.ylim(1.0, top)
@@ -1056,7 +1089,7 @@ def _plots_multi(runs, out):
         plt.grid(alpha=.3, which="both" if logy else "major"); plt.legend(loc="best", fontsize=9)
         plt.tight_layout(); plt.savefig(f"{out}/{fname}", dpi=120); plt.close()
 
-    _overlay("train/accept_len", "accept_len.png", "Acceptance length — all runs", "acceptance length", target=3.94)
+    _overlay("train/accept_len", "accept_len.png", "Acceptance length — all runs", "acceptance length", accept_len_refs=True)
     _overlay("train/loss", "loss.png", "Total loss — all runs", "loss")
     _overlay("train/accept_rate", "accept_rate.png", "Accept rate — all runs", "accept_rate")
     _overlay("train/full_acc", "full_acc.png", "Full-block accuracy — all runs", "full_acc")
@@ -1073,13 +1106,8 @@ def _plots_multi(runs, out):
             g = r["good"][-50:]
             vals = [(median(col(g, k)) if col(g, k) else 0.0) for k in pos_keys]
             plt.bar(xx + (j - (n - 1) / 2) * w, vals, w, color=r["color"], zorder=3, label=r["label"])
-        # released-draft per-position ACCEPT marginals (shape ref), same as the single-run plot
-        rel = [0.81, 0.68, 0.58, 0.48, 0.39]
-        if len(pos_keys) == len(rel):
-            plt.plot(xx, rel, "o--", color="#D62828", lw=1.6, ms=6, zorder=4,
-                     label="released draft accept marginal (ref)")
-            for i, rv in enumerate(rel):
-                plt.text(xx[i], rv + 0.02, f"{rv:.2f}", ha="center", color="#D62828", fontsize=9)
+        # released-draft per-slot MARGINAL accept (our #12006 full-all): gsm8k / mt-bench / avg
+        _draw_pos_refs(plt, xx, len(pos_keys))
         plt.ylim(0, 1.0); plt.xticks(xx, labels); plt.legend(loc="upper right", fontsize=9)
         plt.ylabel("greedy accuracy  (argmax == target)")
         plt.title("Per-position draft accuracy — all runs (last 50 steps)")
