@@ -29,7 +29,10 @@ Unless a run says otherwise, all numbers below share:
     (Mean TTFT / Mean+Median ITL / E2E mean) for every run is in its **raw eval log** (path in the run
     block); the tables here carry accept_len / accept_rate / throughput / per-position.
 - **Bar to beat**: official released DSV4 draft **AL 3.94 @ num_spec=5** (vllm-ascend #11196).
-  Our-serve released draft = **gsm8k 4.658** (gsm8k-only so far; full-all pending, see [Baselines](#baselines--todo)).
+  Our-serve released draft = **full-all done (mean 4.42; gsm8k 4.658 reproduced exactly)** — the
+  definitive per-dataset bar, see the [released row](#summary--accept_len-by-dataset) + detail below.
+  (Our serve runs *above* the official 3.94 because #12006 + bf16 dequant; use the released *row* as
+  the same-serve target, and 3.94 only as the cross-stack sanity floor.)
 
 ## Summary — accept_len by dataset
 
@@ -38,8 +41,8 @@ multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
 
 | Run | gsm8k | math500 | humaneval | mbpp | mt-bench | mean | notes |
 |-----|:-----:|:-------:|:---------:|:----:|:--------:|:----:|-------|
-| **released draft** *(bar)* | 4.658 | — | — | — | — | — | official 3.94 @ ns5; our-serve gsm8k-only, full-all TODO |
-| `epoch4-17w` | 3.404 | 3.265 | 3.312 | 3.058 | 2.344 | 3.08 | ⚠ wrong dataset (17W not 45W); all fixes in |
+| **released draft** *(bar)* | 4.658 | 4.661 | 4.942 | 4.535 | 3.294 | **4.42** | official 3.94 @ ns5; full-all on our serve ✓ |
+| `epoch4-17w` | 3.404 | 3.265 | 3.312 | 3.058 | 2.344 | 3.08 | ⚠ wrong dataset (17W not 45W); all fixes in; **gap = tail** |
 
 ### Throughput (tok/s) by dataset
 
@@ -50,9 +53,36 @@ speedup is measured against.
 | Run | gsm8k | math500 | humaneval | mbpp | mt-bench |
 |-----|:-----:|:-------:|:---------:|:----:|:--------:|
 | `no-spec base` *(ref, gsm8k-only so far)* | 302.69 | — | — | — | — |
+| **released draft** | 187.55 | 313.03 | 169.41 | 374.51 | 268.59 |
 | `epoch4-17w` | 162.26 | 256.48 | 143.19 | 285.44 | 220.50 |
 
 ## Runs (detail)
+
+### `released draft` (bar) — 2026-07-20
+
+- **Draft**: `/share/canada_group_folder/ckpt/released_draft_bf16_standalone` — DeepSeek's official
+  DSV4-Flash DSpark draft, dequantized to bf16 (`build_released_draft_dir.py --dequant-bf16`). The
+  reference our own drafts must approach. (⚠ built by `a00652497` with umask 077 → weights land `0600`;
+  a cross-account serve needs `chmod -R a+rX` on the dir first — same class as the converter's auto-chmod.)
+- **Serve / eval**: [Shared setup](#shared-setup). gsm8k reproduces **4.658 exactly** vs the prior
+  gsm8k-only run → confirms the serve mechanism is bit-stable run-to-run.
+- **Raw eval log**: `~/eval_released_all.log` on head node 115.
+
+| Dataset | Samples | tok/s | accept_len | accept_rate | pos0 | pos1 | pos2 | pos3 | pos4 |
+|---------|:-------:|:-----:|:----------:|:-----------:|:----:|:----:|:----:|:----:|:----:|
+| gsm8k | 1309 | 187.55 | **4.658** | 73.17% | 92.77 | 82.77 | 73.29 | 63.55 | 53.45 |
+| math500 | 490 | 313.03 | **4.661** | 73.22% | 91.78 | 82.53 | 73.01 | 63.83 | 54.93 |
+| humaneval | 154 | 169.41 | **4.942** | 78.84% | 95.60 | 88.94 | 78.02 | 70.16 | 61.47 |
+| mbpp | 247 | 374.51 | **4.535** | 70.69% | 91.42 | 80.91 | 70.33 | 60.20 | 50.61 |
+| mt-bench | 70 | 268.59 | **3.294** | 45.88% | 79.21 | 58.55 | 41.45 | 29.32 | 20.87 |
+
+**Read.** The shape a well-trained DSpark draft *should* have: per-position decays **smoothly, no cliff**.
+gsm8k conditional per-slot = **93 / 89 / 89 / 87 / 84 %** (nearly flat — every slot ~85-90%), vs
+`epoch4-17w`'s **90 / 80 / 75 / 36 / 26 %** (cliff at pos3). The **entire epoch4↔released gap lives in
+the tail**: released pos3/pos4 = 63.6 / 53.5 % where our 17W draft is 19.2 / 5.0 % — released *learned*
+the far slots, ours didn't (17W underfit + exp-decay downweight). Direct proof the tail is a
+data/training deficit, not a structural ceiling → recoverable by the 45W retrain. mt-bench is hardest
+even for released (3.294, pos0 79%) — multi-turn chat genuinely stresses a block draft.
 
 ### `epoch4-17w` — 2026-07-19
 
@@ -87,8 +117,10 @@ draft. The tail is recoverable → the 45W (`arrow_0715`) retrain targets pos3/p
 
 ## Baselines / TODO
 
-- [ ] **released draft — full `DATASET=all`** on our serve (same config) → fills the bar row for
-      apples-to-apples across all 5 datasets. Swap `DRAFT=/share/canada_group_folder/ckpt/released_draft_bf16_standalone`.
-- [ ] **no-spec base** tok/s reference (have gsm8k 302.69 tok/s from earlier no-spec run).
-- [ ] **45W (`arrow_0715`) retrain** — the real deliverable; expected to lift pos3/pos4 toward released.
+- [x] **released draft — full `DATASET=all`** on our serve → **DONE 2026-07-20** (mean 4.42; gsm8k 4.658
+      reproduced). This is now the same-serve bar row + detail section above.
+- [ ] **no-spec base** tok/s reference — have gsm8k 302.69; extend to `DATASET=all` for a per-dataset
+      speedup denominator (spec-decode tok/s ÷ no-spec tok/s).
+- [ ] **45W (`arrow_0715`) retrain** — the real deliverable; must lift pos3/pos4 (19/5 → toward
+      released's 64/53) to close the tail gap. This is where accept_len 3.08 → ~4.4 comes from.
 - [ ] **epoch0–3 of the 17W run** — convert + eval each for the epoch→accept_len curve.
