@@ -48,6 +48,16 @@ conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/ma
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
 conda env list | grep -qw "$CONDA_ENV" || conda create -n "$CONDA_ENV" python=3.11 -y
 conda activate "$CONDA_ENV"
+# ★ GUARD: `conda activate` can silently no-op (broken/half-baked env, or missing shell hook) and the
+# rest of the script then pip-installs into the SYSTEM python -> torch 2.12 (py3.11-only wheels) fails
+# "not found" on py3.9 and everything lands in --user. Fail LOUDLY with the fix instead.
+case "$(command -v python)" in
+  *"/envs/$CONDA_ENV/"*) : ;;
+  *) echo "!! conda activate '$CONDA_ENV' did NOT take — python is '$(command -v python)'"
+     echo "   ($(python -V 2>&1)), NOT the env's. Almost always a HALF-BAKED existing env."
+     echo "   FIX:  conda env remove -n $CONDA_ENV -y   then re-run (it recreates a fresh py3.11)."
+     exit 5;;
+esac
 conda remove -y gxx_linux-aarch64 gcc_linux-aarch64 clang clangxx lld 2>/dev/null; true
 unset CC CXX
 
