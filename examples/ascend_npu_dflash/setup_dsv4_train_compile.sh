@@ -83,10 +83,16 @@ python -m pip install -e "$INST/torchair/experimental/_inductor_npu_ext/python/"
 python -m pip uninstall -y triton 2>/dev/null; true
 python -m pip install triton-ascend --extra-index-url "$HW/repository/pypi/simple" --extra-index-url "$HW/ascend/repos/pypi"
 
-# ---- speculators (editable, --no-deps) + transformers + train/rollout/HS-fetch deps ----
+# ---- speculators (editable, --no-deps) + its runtime deps EXCEPT torch/torchaudio/torchvision ----
+# ★ --no-deps protects torch 2.12+cpu, but then we MUST hand-install speculators' declared deps or
+#   the import chain dies (e.g. `import openai` in train/data.py). This mirrors pyproject [project]
+#   .dependencies minus the torch stack (torch is already installed; torchaudio/torchvision aren't
+#   imported by prep/train and would drag a mismatched torch).
 python -m pip install --no-deps -e "$ROOT/speculators"
 python -m pip install "transformers>=4.56.1,<5.14.0"
-python -m pip install datasets safetensors requests aiohttp tqdm loguru typer pydantic-settings tensorboard matplotlib
+python -m pip install "openai>=2.0.0" datasets safetensors requests aiohttp tqdm \
+  "loguru>=0.7.2,<=0.7.3" typer pydantic pydantic-settings rich click protobuf huggingface-hub \
+  tensorboard matplotlib
 
 # ---- numpy 2.3.5 forced LAST (triton-ascend pins numpy<2 and would downgrade it) ----
 python -m pip install --no-deps "numpy==$NUMPY_VER"
