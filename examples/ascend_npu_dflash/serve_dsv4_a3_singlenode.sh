@@ -43,7 +43,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # to locate the sib
 
 MODEL="${MODEL:-/home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"   # A3 convention: /home/canada_group_folder (symlink-faked per box)
 CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"     # CANN 9.0.0 (same across the fleet)
-CONDA_ENV="${CONDA_ENV:-dspark-dsv4-base}"
+CONDA_ENV="${CONDA_ENV:-dspark-dsv4-serving}"   # A3 #12006 eval/HS-producer env (setup_dsv4_serve_a3.sh
+                                   # creates it). NOT dspark-dsv4-base — that lacks vllm-ascend → the serve
+                                   # dies "Failed to infer device type" (NPU platform plugin not installed).
 API_PORT="${API_PORT:-7000}"
 TP="${TP:-8}"; DP="${DP:-2}"       # DP2×TP8/EP16 for BF16 = matches the A2-proven fit (~37GB weights,
                                    # ~15GB KV/device). The official A3 recipe's DP4/TP4 shards the dense
