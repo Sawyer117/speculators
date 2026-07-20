@@ -754,21 +754,39 @@ RELEASED_POS_MARGINAL = {k: _cum_to_marginal(v) for k, v in _RELEASED_POS_CUM.it
 
 
 def _draw_accept_len_refs(plt):
-    """3 horizontal released-accept_len refs (replaces the single 3.94 line). Returns the top ref."""
+    """3 horizontal released-accept_len refs (replaces the single 3.94 line), each tagged INLINE at
+    the left edge so the line is self-identifying at a glance (not only via legend/title). Returns
+    the top ref value (for ylim)."""
+    ax = plt.gca()
     for name, al in RELEASED_ACCEPT_LEN.items():
         c, ls = _REF_STYLE[name]
         plt.axhline(al, ls=ls, lw=1.5, color=c, alpha=0.9, zorder=1,
                     label=f"released {name} AL {al:.2f}")
+        # inline colour-matched tag at the LEFT edge (x = axes fraction, y = data): the training
+        # curve is low/early there, so it never collides with these high (3.3–4.7) reference lines.
+        ax.text(0.006, al, f"released {name} {al:.2f}", transform=ax.get_yaxis_transform(),
+                color=c, fontsize=8, va="bottom", ha="left", weight="bold", zorder=6,
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.75))
     return max(RELEASED_ACCEPT_LEN.values())
 
 
 def _draw_pos_refs(plt, xs, npos):
-    """3 released per-slot MARGINAL refs (replaces the single `rel` line)."""
-    for name, marg in RELEASED_POS_MARGINAL.items():
-        if len(marg) >= npos:
-            c, ls = _REF_STYLE[name]
-            plt.plot(xs, marg[:npos], marker="o", ls=ls, color=c, lw=1.5, ms=5, zorder=4,
-                     label=f"released {name} (per-slot)")
+    """3 released per-slot MARGINAL refs (replaces the single `rel` line), each tagged INLINE ON the
+    line at a STAGGERED slot (gsm8k & avg coincide at the tail, so distinct x avoids overlapping
+    text) so every line is self-identifying at a glance."""
+    ax = plt.gca()
+    names = [n for n in RELEASED_POS_MARGINAL if len(RELEASED_POS_MARGINAL[n]) >= npos]
+    for i, name in enumerate(names):
+        marg = RELEASED_POS_MARGINAL[name][:npos]
+        c, ls = _REF_STYLE[name]
+        plt.plot(xs, marg, marker="o", ls=ls, color=c, lw=1.5, ms=5, zorder=4,
+                 label=f"released {name} (per-slot)")
+        # label ON the line at a spread-out slot (i-th of len(names) → distinct x, no collisions)
+        j = 0 if len(names) == 1 else round(i * (npos - 1) / (len(names) - 1))
+        ax.annotate(f"released {name}", xy=(xs[j], marg[j]), xytext=(0, 8),
+                    textcoords="offset points", color=c, fontsize=8, ha="center", va="bottom",
+                    weight="bold", zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.75))
 
 
 def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=None):
@@ -867,8 +885,11 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
             if xb:
                 base_y = yb
                 bcur = _smoothed(xb, yb, "#E08A1E", "#C9A27A", blabel)
-                plt.annotate(f"{blabel} ~{bcur:.2f}", xy=(xb[-1], bcur), xytext=(xb[-1], bcur + 0.06),
-                             color="#E08A1E", fontsize=10, ha="right", weight="bold")
+                plt.annotate(f"{blabel} ~{bcur:.2f}", xy=(xb[-1], bcur), xytext=(-8, -20),
+                             textcoords="offset points", color="#E08A1E", fontsize=10, ha="right",
+                             weight="bold", zorder=7,
+                             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#E08A1E", alpha=0.92),
+                             arrowprops=dict(arrowstyle="-", color="#E08A1E", lw=0.8))
         # y-axis: when the data is far below the 3.94 target (early training), ZOOM to the data
         # so the two runs are legible/separable; show the target as an off-scale note. Once
         # accept_len climbs near the target, show the full axis + the highlighted target line.
@@ -876,13 +897,17 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
         data_top = (max(ally) if ally else 1.5) + 0.15
         ref_top = _draw_accept_len_refs(plt)             # released gsm8k/mt-bench/avg (replaces 3.94)
         plt.ylim(1.0, max(ref_top + 0.25, data_top))     # keep all 3 refs on-scale
-        plt.annotate(f"{label} ~{cur:.2f}", xy=(x[-1], cur), xytext=(x[-1], cur - 0.06),
-                     color="#2E6CF6", fontsize=10, ha="right", weight="bold")
+        # our-run end marker: white-boxed + leader so the blue curve doesn't hide it (was occluded)
+        plt.annotate(f"{label} ~{cur:.2f}", xy=(x[-1], cur), xytext=(-8, 18),
+                     textcoords="offset points", color="#2E6CF6", fontsize=10, ha="right",
+                     weight="bold", zorder=7,
+                     bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#2E6CF6", alpha=0.92),
+                     arrowprops=dict(arrowstyle="-", color="#2E6CF6", lw=0.8))
         _epoch_lines()
         plt.xlabel("step"); plt.ylabel("acceptance length")
         plt.title((f"Acceptance length — {label} vs {blabel}" if have_base
                    else "Acceptance length — raw vs smoothed")
-                  + " (refs: released gsm8k 4.66 / mt-bench 3.29 / avg 4.42)")
+                  + "   (horizontal lines = released full-all baselines, tagged inline)")
         plt.legend(loc="lower right"); plt.grid(alpha=.3)
         plt.tight_layout(); plt.savefig(f"{out}/accept_len.png", dpi=120); plt.close()
 
