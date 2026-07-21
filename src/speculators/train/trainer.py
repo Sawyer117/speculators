@@ -523,6 +523,25 @@ class Trainer:
             }
 
             timer.mark("fetch")
+            # --- DIAGNOSTIC (profiled steps only): per-rank fetch_ms + straggler-align wait --------
+            # fwd_ms was mis-reading the EP-MoE all-to-all's wait-for-straggler as "forward compute":
+            # a rank whose HS arrives late from the serve makes the FAST ranks block at the all-to-all,
+            # and that wait lands in THEIR fwd_ms while their OWN fetch_ms stays clean (rank0 = 24ms),
+            # so the analyzer mis-labels a serve/HS stall as a "recompile" fwd spike. all_gather each
+            # rank's fetch_ms here -- the gather doubles as an ALIGN BARRIER, so the straggler-wait is
+            # absorbed into align_ms (measured on this rank) instead of the forward below, and
+            # fetch_ms_ranks exposes WHICH rank stalled. If the spikes move fwd->align, it's HS-bound.
+            fetch_all: list[float] | None = None
+            align_ms = 0.0
+            if timer.enabled and self.is_distributed:
+                _fetch_local = (timer._marks["fetch"] - timer._marks["start"]) * 1000
+                _t_align = time.perf_counter()
+                _buf = torch.tensor([_fetch_local], device=self.local_rank, dtype=torch.float32)
+                _out = [torch.zeros_like(_buf) for _ in range(dist.get_world_size())]
+                dist.all_gather(_out, _buf)
+                align_ms = (time.perf_counter() - _t_align) * 1000
+                fetch_all = [round(float(t.item()), 1) for t in _out]
+            # --------------------------------------------------------------------------------------
             _draft_tokens, loss, metrics = self.model(
                 **gpu_batch, **(self.config.train_call_kwargs or {})
             )
@@ -553,6 +572,11 @@ class Trainer:
                 profile = timer.profile(num_tokens)
                 if profile is not None:
                     profile["grad_norm"] = float(grad_norm)
+                    if fetch_all is not None:
+                        # per-rank fetch + the straggler wait that was hiding in fwd_ms
+                        profile["fetch_ms_ranks"] = fetch_all
+                        profile["fetch_ms_max"] = max(fetch_all)
+                        profile["align_ms"] = round(align_ms, 1)
                 if self.is_distributed:
                     for v in metrics.values():
                         dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
