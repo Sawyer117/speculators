@@ -55,6 +55,16 @@ if not torch.cuda.is_available():
         if hasattr(torch, "npu") and hasattr(torch.npu, "get_device_properties"):
             torch.cuda.get_device_properties = torch.npu.get_device_properties
 
+    # torch 2.12 inductor bumps the collective timeout during a compile via
+    # dist.distributed_c10d._add_ephemeral_timeout_for_all_pgs; torch_npu 2.12rc1's _hccl_ impl
+    # crashes iterating _world.pg_map -> BackendCompilerFailed on the FIRST experts torch.compile.
+    # No-op it (our HCCL_CONNECT/EXEC_TIMEOUT=1800s already covers long compiles, so skipping the
+    # ephemeral bump is safe).
+    with contextlib.suppress(Exception):
+        import torch.distributed.distributed_c10d as _c10d  # noqa: PLC0415
+
+        _c10d._add_ephemeral_timeout_for_all_pgs = lambda *a, **k: None
+
     # ★ RECOMPILE FIX (cross-verified vs torchtitan-npu + MindSpeed-LLM): keep torch_npu's grouped-GEMM
     # on the SHAPE-GENERIC prebuilt aclnn kernel instead of JIT-compiling a per-shape AscendC kernel.
     # With jit_compile ON, `npu_grouped_matmul` rebuilds a ~26s kernel every time the routed-token count
