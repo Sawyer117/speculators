@@ -55,12 +55,12 @@ DECAY_GAMMA="${DECAY_GAMMA:-4.0}"       # loss per-position decay: weight_k = ex
                                        # LARGER gamma = flatter = more gradient to LATER slots (pos3/4/5);
                                        # very large -> ~uniform. The knob to lift late-position accept when
                                        # the per-position curve decays faster than the released draft's.
-SWA_WINDOW="${SWA_WINDOW:-128}"        # draft sliding-window context (--sliding-window). ★ DEFAULT 128 to
-                                       # MATCH the released draft's config (sliding_window=128). Our earlier
-                                       # runs used the CLI default 2048 -> a RECIPE divergence from released
-                                       # (NOT a train/serve bug: our draft saved 2048 and served at 2048,
-                                       # self-consistent — just unlike the proven 128 recipe). Set 2048 to
-                                       # A/B the old behavior. The dead `window_size` config field is unrelated.
+SWA_WINDOW="${SWA_WINDOW:-128}"        # draft sliding-window context (--sliding-window). ★ 128 = ALIGN to
+                                       # the released draft (config sliding_window=128). POLICY: full fidelity
+                                       # to the released recipe — every divergent field gets aligned, we do NOT
+                                       # keep our own value just because it ran. (Our old runs used the CLI
+                                       # default 2048 = a divergence; now closed.) The dead `window_size` field
+                                       # is a separate unused config knob, unrelated.
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
 EP="${DSPARK_EP:-0}"
 BF16EXPERTS="${BF16_EXPERTS:-auto}"     # AMP masters for EP experts. DEFAULT "auto": option A (upstream —
