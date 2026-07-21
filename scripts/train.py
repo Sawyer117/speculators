@@ -43,6 +43,25 @@ if not torch.cuda.is_available():
             if hasattr(torch, "npu") and hasattr(torch.npu, _fn):
                 setattr(torch.cuda, _fn, getattr(torch.npu, _fn))
 
+    # ★ RECOMPILE FIX (cross-verified vs torchtitan-npu + MindSpeed-LLM): keep torch_npu's grouped-GEMM
+    # on the SHAPE-GENERIC prebuilt aclnn kernel instead of JIT-compiling a per-shape AscendC kernel.
+    # With jit_compile ON, `npu_grouped_matmul` rebuilds a ~26s kernel every time the routed-token count
+    # changes (variable EP routing) -> 40%+ wall-clock lost to fwd "recompile" spikes. MindSpeed-LLM
+    # defaults `--jit-compile=False` for exactly this; the eager grouped-matmul is variable-`group_list`
+    # tolerant, so no per-shape rebuild. (The OTHER half is running the GMM EAGER, i.e. COMPILE=0 --
+    # torchtitan-npu excludes the experts from torch.compile because inductor-NPU specializes the fused
+    # AscendC kernel per shape regardless of maybe_mark_dynamic. So: COMPILE=0 + jit_compile=False =
+    # recompile-free, no bucketing/capacity needed.)
+    with contextlib.suppress(Exception):
+        import torch_npu  # noqa: PLC0415
+
+        torch_npu.npu.set_compile_mode(jit_compile=False)
+        print(
+            ">>> [NPU] jit_compile=False: grouped-GEMM uses the shape-generic aclnn kernel "
+            "(no per-shape AscendC recompile).",
+            flush=True,
+        )
+
 import transformers
 from packaging import version
 from transformers import LlamaConfig, PretrainedConfig
