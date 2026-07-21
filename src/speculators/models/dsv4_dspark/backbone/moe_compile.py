@@ -17,6 +17,8 @@ Graft C = ``torch.compile(backend="inductor")`` + ``maybe_mark_dynamic(x, 0)`` +
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 _ENABLED = False
@@ -49,10 +51,11 @@ def _install_compile_shims() -> None:
     # LRU-EVICTS a compiled shape, and when that shape recurs it triggers a fresh ~21s AscendC
     # rebuild -> perpetual thrash that never amortizes (726 recompiles over a 7774-step run = 54%).
     # Raise the limits so every bucket shape compiles ONCE and stays resident (kernels are also
-    # disk-cached under /tmp/.npu_kernels_$USER, so the ceiling is cheap). Confirm the cause with
-    # TORCH_LOGS=recompiles -> "hit config.cache_size_limit (8)".
-    torch._dynamo.config.cache_size_limit = 256
-    torch._dynamo.config.accumulated_cache_size_limit = 512
+    # disk-cached under $TMPDIR/.npu_kernels_$USER, so the ceiling is cheap). Confirm the cause with
+    # TORCH_LOGS=recompiles -> "hit config.cache_size_limit (8)". Override via DSPARK_COMPILE_CACHE_LIMIT.
+    _lim = int(os.environ.get("DSPARK_COMPILE_CACHE_LIMIT", "1024"))
+    torch._dynamo.config.cache_size_limit = _lim
+    torch._dynamo.config.accumulated_cache_size_limit = _lim * 2
 
 
 def _register_grouped_mm_npu() -> None:
