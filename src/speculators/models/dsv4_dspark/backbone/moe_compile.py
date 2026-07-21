@@ -93,37 +93,28 @@ def _expert_activation(h, swiglu_limit, scores):
 
 
 def enable() -> None:
-    """Register the NPU grouped-mm impl + compile ONLY the SwiGLU bridge. Call ONCE at startup, ONLY on
-    the torch-2.12 stack with ``DSPARK_COMPILE=1``. No-op / unsafe on the 2.10 main stack."""
-    global _ENABLED, _COMPILED
+    """Register the NPU ``aten::_grouped_mm`` -> ``npu_grouped_matmul`` impl. FULLY EAGER now — NOTHING
+    is torch.compile'd (see run()). Call ONCE at startup with ``DSPARK_COMPILE=1`` on the torch-2.12
+    stack (needs ``torch._grouped_mm``). No-op / unsafe on the 2.10 main stack."""
+    global _ENABLED
     if _ENABLED:
         return
-    _install_compile_shims()
-    _register_grouped_mm_npu()
-    import inductor_npu_ext  # noqa: F401, PLC0415  (engages AscendC codegen; bypasses torch_npu's Triton inductor)
-
-    # ★ Compile ONLY the elementwise activation, NOT the grouped-GEMMs. Both reference NPU MoE stacks
-    # (torchtitan-npu `_compile_children_except(moe,{'experts'})`, MindSpeed `--jit-compile=False`) keep
-    # the grouped-matmul OUT of the JIT/inductor path so it stays on the shape-generic aclnn kernel;
-    # compiling it makes inductor-NPU specialize a per-shape AscendC kernel = the ~26s recompile spikes.
-    _COMPILED = torch.compile(_expert_activation, backend="inductor")
+    _install_compile_shims()      # harmless dynamo / get_device_capability shims
+    _register_grouped_mm_npu()    # torch._grouped_mm -> npu_grouped_matmul on NPU (needed for the eager GMMs)
     _ENABLED = True
 
 
 def run(w1, w3, w2, x, counts, swiglu_limit, scores):
     """Experts forward used by ``moe_grouped_gemm._fused_permute_dispatch_npu`` when enabled.
-    ★ EAGER grouped-GEMMs (``torch._grouped_mm`` -> ``npu_grouped_matmul``; with ``jit_compile=False``
-    they use the shape-generic aclnn kernel -> NO per-shape AscendC rebuild) + a COMPILED elementwise
-    SwiGLU bridge. IDENTICAL numerics to the old whole-thing-compiled path (same ``torch._grouped_mm``),
-    but recompile-free. ``w13 = cat([w1, w3])`` stacked ``[E, 2*inter, dim]``; ``x[N, dim]`` routed
-    tokens; ``counts[E]``; ``scores[N]`` router weights."""
+    ★ FULLY EAGER: eager grouped-GEMMs + eager SwiGLU, NOTHING torch.compile'd. On this inductor_npu_ext
+    stack, compiling ANY variable-token op (even the elementwise swiglu bridge) makes inductor-NPU
+    codegen a per-shape AscendC kernel = the ~26s recompile spikes (CONFIRMED: jit_compile=False took,
+    yet the compiled-swiglu variant still recompiled 61%). So compile nothing; with jit_compile=False the
+    eager ``torch._grouped_mm`` uses the shape-generic aclnn kernel -> ZERO per-shape rebuild. Uses the
+    SAME ``torch._grouped_mm`` as the old compiled path (correct numerics), NOT the broken
+    ``swiglu_grouped``/``_NpuGroupedMatmul`` eager path. ``w13 = cat([w1, w3])`` [E, 2*inter, dim]."""
     w13 = torch.cat([w1, w3], dim=1)                        # [E, 2*inter, dim]
     offs = torch.cumsum(counts, dim=0, dtype=torch.int32)
-    # EAGER grouped-GEMM 1 (gate|up). NOT compiled -> no per-shape AscendC codegen.
-    h = torch._grouped_mm(x.bfloat16(), w13.bfloat16().transpose(-2, -1), offs=offs)   # [N, 2*inter]
-    # Compile ONLY the elementwise bridge; mark the token dim dynamic so the one swiglu kernel is generic.
-    torch._dynamo.maybe_mark_dynamic(h, 0)
-    torch._dynamo.maybe_mark_dynamic(scores, 0)
-    h = _COMPILED(h, swiglu_limit, scores)                 # [N, inter]
-    # EAGER grouped-GEMM 2 (down).
-    return torch._grouped_mm(h.bfloat16(), w2.bfloat16().transpose(-2, -1), offs=offs).float()  # [N, dim]
+    h = torch._grouped_mm(x.bfloat16(), w13.bfloat16().transpose(-2, -1), offs=offs)   # [N, 2*inter] EAGER
+    h = _expert_activation(h, swiglu_limit, scores)        # [N, inter] EAGER swiglu (NOT compiled)
+    return torch._grouped_mm(h.bfloat16(), w2.bfloat16().transpose(-2, -1), offs=offs).float()  # [N, dim] EAGER
