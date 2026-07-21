@@ -61,6 +61,14 @@ SWA_WINDOW="${SWA_WINDOW:-128}"        # draft sliding-window context (--sliding
                                        # keep our own value just because it ran. (Our old runs used the CLI
                                        # default 2048 = a divergence; now closed.) The dead `window_size` field
                                        # is a separate unused config knob, unrelated.
+SCHED_TYPE="${SCHED_TYPE:-cosine}"     # LR scheduler (--scheduler-type). cosine = align to the DeepSpec DSpark
+                                       # trainer (was speculators' default linear).
+WARMUP_RATIO="${WARMUP_RATIO:-0.04}"   # --scheduler-warmup-ratio; 0.04 (4%) = DeepSpec. Previously unset (~no
+                                       # warmup). NB the 6e-4-NaN memory blames too-little warmup — this closes it.
+LOSS_FN="${LOSS_FN:-{\"ce\":0.1,\"tv\":1.8}}"  # ce + TVD weights. ★ tv 1.8 (not 0.9): speculators `tv_loss` = TVD
+                                       # = 1/2 of DeepSpec's L1 (=sum|p-q|=2*TVD, PR #648 chose the standard TVD
+                                       # normalization), so tv 1.8 restores DeepSpec's effective ce:dist = 0.1:1.8
+                                       # balance. Pure normalization-convention alignment. Set LOSS_FN=... to override.
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
 EP="${DSPARK_EP:-0}"
 BF16EXPERTS="${BF16_EXPERTS:-auto}"     # AMP masters for EP experts. DEFAULT "auto": option A (upstream —
@@ -223,7 +231,8 @@ nohup env \
     --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
     --dflash-decay-gamma "$DECAY_GAMMA" --sliding-window "$SWA_WINDOW" \
     --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" \
-    --draft-attn-impl sdpa --loss-fn '{"ce":0.1,"tv":0.9}' \
+    --draft-attn-impl sdpa --loss-fn "$LOSS_FN" \
+    --scheduler-type "$SCHED_TYPE" --scheduler-warmup-ratio "$WARMUP_RATIO" \
     --optimizer adamw --lr "$LR" --epochs "$EPOCHS" $EXTRA \
     --on-missing generate --on-generate delete \
     --num-workers "$NUM_WORKERS" --prefetch-factor "$PREFETCH_FACTOR" \
