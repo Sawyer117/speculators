@@ -143,10 +143,23 @@ fi
 #     umask-022 box compiled fine while a umask-002 box didn't — deterministic, not fork luck.)
 # (2) spawn the compile worker: forking a torch_npu-initialised, multithreaded training process yields
 #     flaky build failures (pytorch #148651 / #108586). spawn = clean fresh worker.
+# (3) persistent compile cache on a LOCAL disk under COMPILE_CACHE_DIR (default $RUN/compile_cache).
+#     Survives /tmp cleanup so kernels are REUSED across runs (a killed+relaunched run skips the full
+#     AscendC rebuild warmup). Redirects all 3 cache layers at once — inductor codecache
+#     (TORCHINDUCTOR_CACHE_DIR), triton-ascend (TRITON_CACHE_DIR), and the AscendC .npu_kernels_$USER
+#     dir (which follows $TMPDIR). ★ MUST be a LOCAL disk, NOT /share: inductor file-LOCKS the
+#     codecache, so a networked FS makes compile slow/flaky (and contends with the training's /share
+#     I/O). cache_size_limit default 1024 (DSPARK_COMPILE_CACHE_LIMIT), consumed in moe_compile.py.
 if [ "$COMPILE" = "1" ]; then
   umask 0022
   export TORCHINDUCTOR_WORKER_START="${TORCHINDUCTOR_WORKER_START:-spawn}"
-  echo ">>> COMPILE=1: umask 0022 (kernel.so must be 0o755, not 0o775) + TORCHINDUCTOR_WORKER_START=$TORCHINDUCTOR_WORKER_START"
+  COMPILE_CACHE_DIR="${COMPILE_CACHE_DIR:-$RUN/compile_cache}"
+  mkdir -p "$COMPILE_CACHE_DIR/inductor" "$COMPILE_CACHE_DIR/triton" "$COMPILE_CACHE_DIR/tmp"
+  export TORCHINDUCTOR_CACHE_DIR="$COMPILE_CACHE_DIR/inductor"
+  export TRITON_CACHE_DIR="$COMPILE_CACHE_DIR/triton"
+  export TMPDIR="$COMPILE_CACHE_DIR/tmp"
+  export DSPARK_COMPILE_CACHE_LIMIT="${DSPARK_COMPILE_CACHE_LIMIT:-1024}"
+  echo ">>> COMPILE=1: umask 0022 | WORKER_START=$TORCHINDUCTOR_WORKER_START | cache_dir=$COMPILE_CACHE_DIR (local disk) | cache_limit=$DSPARK_COMPILE_CACHE_LIMIT"
 fi
 
 # ---- preflight ----
