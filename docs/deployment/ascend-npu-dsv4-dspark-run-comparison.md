@@ -6,22 +6,26 @@ Reference table for the three DSV4-DSpark draft-training runs we compare. Compan
 eval ledger (`ascend-npu-dsv4-dspark-eval-results.md`) — that one holds serve-side accept-length;
 this one holds the **training-config** differences so cross-run curves are read correctly.
 
-| Axis | **17W-5EP (old stack)** | **A2 (today, control)** | **A3 (today, full-align)** |
+| Axis | **17W-5EP** | **A2** | **A3** |
 |---|---|---|---|
-| **Data** | 17W (177k rows, wrong-default small set) | **77W** | **77W** |
-| **Window (SWA)** | 2048 | 2048 (old) | **128** (aligned to released) |
-| **Scheduler / warmup** | old (unaligned) | old | **cosine / 0.04** |
-| **tv (distill) weight** | 0.9 | 0.9 | **1.8** (= DeepSpec L1 balance) |
-| **LR** | 2e-4 | 2e-4 | **3e-4** (raised from 2e-4, √2 batch-scaling) |
-| _— below: affects speed/memory, not quality —_ | | | |
-| **Experts precision** | old stack | **bf16** (option-B) | **fp32** (option-A) |
-| **WORLD_SIZE / DP** | 8 | **8** (measured `[rank7]`) | **16** (measured `WORLD_SIZE=16` / `[rank15]`) |
-| **Mesh** | — | FSDP8 + EP8 | **FSDP16 + EP16** (1D mesh, FSDP = EP = world_size) |
-| **Global batch** | 8·b | 8·b | **16·b = 2×** |
-| **steps/epoch** | **~4,900** (measured: 24,512 / 5) | **~21,500** (computed) | **~10,700** (computed) |
-| **Epochs** | 5 | 5 | **10** (compensates the half steps/epoch → same total updates as A2) |
-| **Total updates** | ~24,500 | ~107k | ~107k (= A2) |
-| **Stack / compile** | torch 2.10, no compile | 2.12, COMPILE=1 | 2.12, COMPILE=1 |
+| **Data** | 17W | 77W | 77W |
+| **Window (SWA)** | 2048 | 2048 | 128 |
+| **Scheduler / warmup** | linear | linear | cosine / 0.04 |
+| **tv weight** | 0.9 | 0.9 | 1.8 |
+| **LR** | 2e-4 | 2e-4 | 3e-4 |
+| **Expert master (AMP)** | — | bf16 | fp32 |
+| **Mesh (FSDP=EP=ws)** | 8-card | FSDP8 + EP8 | FSDP16 + EP16 |
+| **Global batch** | 8·b | 8·b | 16·b |
+| **steps/epoch** | ~4,900 | ~21,500 | ~10,700 |
+| **Stack / compile** | 2.10, no compile | 2.12, COMPILE=1 | 2.12, COMPILE=1 |
+
+_Rows 1–5 drive quality; rows 6–10 affect speed/memory only._
+
+> **Expert master (AMP)** is the fp32-master / optimizer-state precision only — the expert
+> **forward is bf16 in every run AND at serve** (FSDP2 casts to bf16 for compute; the fp32
+> master is used solely in the optimizer step). So option-A (A3) keeps train/serve forward
+> consistency (bf16 = bf16); fp32 buys precise updates, not a different forward. Both A2 and A3
+> use MAX_ANCHORS=512, so the modest per-step fwd gap is 16-way vs 8-way collective overhead.
 
 ## How to read cross-run curves
 
