@@ -141,6 +141,29 @@ def epoch_boundaries(recs) -> list[tuple[int, int]]:
     return out
 
 
+# tqdm's "  N/M [elapsed<remaining, rate]" bar — M = len(train_loader) = full-epoch step count.
+# M is epoch-invariant, so it's readable even mid-epoch-0 (before any epoch boundary exists).
+_TQDM_TOTAL = re.compile(r"(\d+)/(\d+)\s*\[\d[\d:]*<")
+
+
+def _steps_per_epoch(recs, raw_text: str = "") -> int | None:
+    """Full-epoch step count (``len(train_loader)``). Preferred source: the tqdm ``N/M [t<t`` bar in
+    the raw log (``M`` = steps/epoch, present from step 1 so it works while still in epoch 0). Fallback:
+    the spacing between parsed ``epoch`` boundary increments. ``None`` if neither is available
+    (→ the footer/console just show steps/wall and skip the per-epoch projection)."""
+    totals = [int(m.group(2)) for m in _TQDM_TOTAL.finditer(raw_text or "")]
+    if totals:
+        return max(totals)  # a resumed epoch's bar is a shorter slice → max = the true full length
+    eb = epoch_boundaries(recs)
+    if eb:
+        steps0 = [step_of(r) for r in recs if step_of(r) >= 0]
+        pts = ([min(steps0)] if steps0 else []) + [s for s, _ in eb]
+        diffs = [b - a for a, b in zip(pts, pts[1:]) if b > a]
+        if diffs:
+            return int(median(diffs))
+    return None
+
+
 def col(recs, key):
     """Finite values of `key` across records (drops None/nan/inf)."""
     out = []
@@ -199,17 +222,18 @@ def _default_label(path: str) -> str:
 
 
 def _load_and_skip(path: str, skip: int, quiet: bool = False):
-    """resolve → load → drop steps < skip. Returns (recs, ckpt_steps) or (None, None) if no metrics."""
+    """resolve → load → drop steps < skip. Returns (recs, ckpt_steps, steps_per_epoch) — the last two
+    are None when there are no metrics / no epoch length is discoverable."""
     recs, raw_text = load(resolve_log(path))
     if not recs:
-        return None, None
+        return None, None, None
     if skip > 0:
         kept = [r for r in recs if step_of(r) >= skip]
         if kept:
             if not quiet:
                 print(f"(--skip {skip}: dropped {len(recs) - len(kept)} warmup/regen steps; analyzing {len(kept)})")
             recs = kept
-    return recs, checkpoint_steps(raw_text)
+    return recs, checkpoint_steps(raw_text), _steps_per_epoch(recs, raw_text)
 
 
 def _headline(recs, ckpt_steps, spike_k=3.0) -> dict:
@@ -364,7 +388,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
 
-    recs, ckpt_steps = _load_and_skip(args.logfile, args.skip)
+    recs, ckpt_steps, steps_per_epoch = _load_and_skip(args.logfile, args.skip)
     if recs is None:
         print("!! no metric records parsed — is this a trainer.py rich-logger log?")
         return
@@ -380,7 +404,7 @@ def main() -> None:
         blabels = args.baseline_label or []
         for i, bpath in enumerate(args.baseline):
             blabel = blabels[i] if i < len(blabels) else _default_label(bpath)
-            brecs, bckpt = _load_and_skip(bpath, args.skip, quiet=True)
+            brecs, bckpt, _ = _load_and_skip(bpath, args.skip, quiet=True)
             if brecs is None:
                 print(f"!! baseline '{bpath}' had no metrics — skipping")
                 continue
@@ -724,7 +748,8 @@ def main() -> None:
                              ["profile/fetch_ms", "profile/fwd_ms", "profile/bwd_ms", "profile/opt_ms", "profile/step_ms"]},
                     "ckpt_steps": b["ckpt"], "label": b["label"],
                 }
-            _plots(recs, good, pos_keys, reps, ckpt_steps, args.out, cur_label, base)
+            _plots(recs, good, pos_keys, reps, ckpt_steps, args.out, cur_label, base,
+                   steps_per_epoch=steps_per_epoch)
     print("=" * 78)
 
 
@@ -793,7 +818,18 @@ def _draw_pos_refs(plt, xs, npos):
                     bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.75))
 
 
-def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=None):
+def _timing_tag(recs, reps, spe) -> str:
+    """The 3-number corner tag for the loss plot: step-time (steady) · steps · time-per-epoch.
+    time/epoch needs steps/epoch (``spe``); if unknown it's just dropped (2 numbers)."""
+    steady = (reps.get("profile/step_ms") or {}).get("steady_med")
+    n = len([r for r in recs if step_of(r) >= 0])
+    parts = ([f"step {steady:.0f} ms"] if steady else []) + [f"{n:,} steps"]
+    if spe and steady:
+        parts.append(f"~{spe * steady / 3.6e6:.1f} h/epoch  ({spe:,} steps/ep)")
+    return "   ·   ".join(parts)
+
+
+def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=None, steps_per_epoch=None):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -848,13 +884,18 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
                          xytext=(2, -2), textcoords="offset points",
                          color="0.4", fontsize=7, ha="left", va="top")
 
-    # 1) loss
+    # 1) loss  (+ a small 3-number tag in the corner: step-time · steps · time-per-epoch)
     plt.figure(figsize=(9, 4))
     for k, lab, c in [("train/loss", "total", "#222222"), ("train/ce_loss", "ce", "#2E6CF6"),
                       ("train/tv_loss", "tv", "#1B8A4E"), ("train/confidence_loss", "confidence", "#D62828")]:
         _overlay(k, c, lab, good, bgood)
     _epoch_lines()
     plt.xlabel("step"); plt.ylabel("loss"); plt.title("Loss" + ttl_suffix); plt.grid(alpha=.3); _legend()
+    tag = _timing_tag(recs, reps, steps_per_epoch)
+    if tag:
+        plt.gca().text(0.015, 0.03, tag, transform=plt.gca().transAxes, fontsize=8.5,
+                       family="monospace", va="bottom", ha="left", color="#333",
+                       bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", alpha=0.85))
     plt.tight_layout(); plt.savefig(f"{out}/loss.png", dpi=120); plt.close()
 
     # 2) acceptance + per-position (overview)
