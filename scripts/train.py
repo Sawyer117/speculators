@@ -43,6 +43,18 @@ if not torch.cuda.is_available():
             if hasattr(torch, "npu") and hasattr(torch.npu, _fn):
                 setattr(torch.cuda, _fn, getattr(torch.npu, _fn))
 
+    # torch 2.12's dist.broadcast gates an NVLS cuda-only path on
+    # `tensor.is_cuda and torch.cuda.get_device_capability(tensor.device)[0] >= 9`. transfer_to_npu
+    # makes npu tensors report is_cuda=True but does NOT redirect get_device_capability/properties ->
+    # it hits "Torch not compiled with CUDA enabled" inside set_model_state_dict's broadcast (same class
+    # of transfer_to_npu gap as the 7 funcs shimmed above). Shim both so the cuda-only path is skipped
+    # (cap (0,0) < 9) and broadcast runs on NPU.
+    with contextlib.suppress(Exception):
+        torch.cuda.get_device_capability = lambda *a, **k: (0, 0)
+    with contextlib.suppress(Exception):
+        if hasattr(torch, "npu") and hasattr(torch.npu, "get_device_properties"):
+            torch.cuda.get_device_properties = torch.npu.get_device_properties
+
     # ★ RECOMPILE FIX (cross-verified vs torchtitan-npu + MindSpeed-LLM): keep torch_npu's grouped-GEMM
     # on the SHAPE-GENERIC prebuilt aclnn kernel instead of JIT-compiling a per-shape AscendC kernel.
     # With jit_compile ON, `npu_grouped_matmul` rebuilds a ~26s kernel every time the routed-token count
