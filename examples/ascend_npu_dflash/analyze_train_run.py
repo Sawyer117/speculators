@@ -610,7 +610,7 @@ def main() -> None:
             print("  worst steps  : " + ", ".join(f"{s}({v/1000:.1f}s)" for s, v in worst))
 
     # ---------------- bottleneck breakdown: recompile vs HS vs ckpt (compile-worth-it verdict) ----------------
-    print("\n-- BOTTLENECK BREAKDOWN (where wall-clock goes; is the compile fix worth it?) " + "-" * 1)
+    print("\n-- BOTTLENECK BREAKDOWN (where wall-clock goes; recompile = inductor-NPU per-shape codegen) " + "-" * 1)
     total = sum(col(recs, "profile/step_ms")) or 1.0
     fwd_steady = reps["profile/fwd_ms"]["steady_med"] or 0.0
     fetch_steady = reps["profile/fetch_ms"]["steady_med"] or 0.0
@@ -638,8 +638,12 @@ def main() -> None:
     rc, hs = 100 * recompile_ov / total, 100 * hs_ov / total
     print("  ── verdict ──")
     if recompile_ov >= 2 * hs_ov and rc >= 10:
-        print(f"    RECOMPILE-bound (fwd {rc:.0f}% vs HS {hs:.0f}%): compile + maybe_mark_dynamic is the permanent")
-        print(f"    fix and IS worth the inductor_npu_ext setup — ~{rc:.0f}% of wall-clock is recoverable.")
+        print(f"    RECOMPILE-bound (fwd {rc:.0f}% vs HS {hs:.0f}%). ⚠ COMPILING the grouped-GEMM IS THE CAUSE,")
+        print("    not the cure: inductor-NPU codegens a per-shape AscendC kernel per routed-token count.")
+        print("    torchtitan-npu keeps the GMM eager; MindSpeed-LLM defaults --jit-compile=False. FIX =")
+        print(f"    eager grouped-GEMM + torch_npu jit_compile=False (shape-generic aclnn), ~{rc:.0f}% recoverable.")
+        print("    NB this 'recompile' tag is heuristic (fwd>3x steady) — confirm it's NOT an HS straggler")
+        print("    via align_ms~1ms in the raw log, and the true cause via TORCH_LOGS=recompiles.")
     elif hs_ov >= 2 * recompile_ov and hs >= 10:
         print(f"    HS/SERVING-bound (HS {hs:.0f}% vs fwd {rc:.0f}%): compile WON'T help — the serve can't dump HS")
         print(f"    fast enough. Fix the HS pipeline (serve throughput / prefetch), NOT the MoE kernel.")
