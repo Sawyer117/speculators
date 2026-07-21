@@ -152,8 +152,17 @@ def _fused_permute_dispatch_npu(x: torch.Tensor, indices: torch.Tensor, w_flat: 
         out = moe_compile.run(w1, w3, w2, routed_input, counts,
                               experts.swiglu_limit, routed_scores.reshape(-1))    # [nb*k, dim]
     else:
-        out = swiglu_grouped(routed_input.float(), w1.float(), w3.float(), w2.float(),
-                             counts, routed_scores.reshape(-1).float(),
+        # ★ bf16 experts (was .float()=fp32). Rationale: (1) train/serve CONSISTENCY — the serve
+        # runs the draft's MoE in bf16, so fp32-train/bf16-serve is a needless numerical gap (we've
+        # been bitten by train/serve convention mismatches before); (2) SPEED — fp32 grouped-GEMM
+        # over 256 experts was the bulk of the COMPILE=0 steady cost (~2.2s vs ~1.6s); (3) CORRECTNESS
+        # is preserved by AMP option-A: fp32 MASTER weights + optimizer keep the cross-step update
+        # accumulation precise, while the matmul (bf16 in, fp32 ACCUMULATE on-device) is where bf16
+        # belongs. Mirrors the validated compile path (moe_compile._experts_grouped_mm uses bf16).
+        # NOTE: the CPU fp32 oracle (_grouped_matmul_torch) is unchanged — any eager-vs-oracle parity
+        # test must use a bf16 tolerance, not bit-exact.
+        out = swiglu_grouped(routed_input.bfloat16(), w1.bfloat16(), w3.bfloat16(), w2.bfloat16(),
+                             counts, routed_scores.reshape(-1).bfloat16(),
                              experts.swiglu_limit, _grouped_matmul)               # [nb*k, dim]
     unpermuted = torch_npu.npu_moe_token_unpermute(out.to(routed_input.dtype), sorted_idx, None)
     if nb > n:
