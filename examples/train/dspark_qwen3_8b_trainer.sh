@@ -41,6 +41,14 @@ MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
+CONFIDENCE_LENGTH_ALPHA=0.0
+CONFIDENCE_LOSS_WEIGHTING="uniform"   # uniform | match-draft
+FIRST_ERROR_FOCAL_ALPHA=0.0
+ADAPTIVE_LOSS="none"                  # none | cat | ssal
+# Set SSAL_CURRICULUM_ARGS=(--ssal-curriculum) to enable decay→SSAL mix.
+SSAL_CURRICULUM_ARGS=(--no-ssal-curriculum)
+SSAL_CURRICULUM_START=0.1
+SSAL_CURRICULUM_END=0.6
 
 # Ascend NPU assignments (online training needs separate devices for vLLM/training)
 VLLM_NPUS="0,1,2,3"
@@ -92,6 +100,13 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
+    --confidence-length-alpha "$CONFIDENCE_LENGTH_ALPHA" \
+    --confidence-loss-weighting "$CONFIDENCE_LOSS_WEIGHTING" \
+    --first-error-focal-alpha "$FIRST_ERROR_FOCAL_ALPHA" \
+    --adaptive-loss "$ADAPTIVE_LOSS" \
+    "${SSAL_CURRICULUM_ARGS[@]}" \
+    --ssal-curriculum-start "$SSAL_CURRICULUM_START" \
+    --ssal-curriculum-end "$SSAL_CURRICULUM_END" \
     --on-missing generate \
     --on-generate delete \
     > "$LOG_FILE" 2>&1 &

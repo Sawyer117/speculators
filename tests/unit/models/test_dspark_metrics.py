@@ -190,3 +190,132 @@ class TestComputeMetrics:
             assert key in metrics
         # all metric values must be tensors (so dist.reduce works in the trainer)
         assert all(torch.is_tensor(v) for v in metrics.values())
+
+    def test_ssal_ignores_gamma(self):
+        torch.manual_seed(0)
+        logits = torch.randn(1, 4, 8)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.ones(1, 4)
+        loss_a, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="ssal",
+            gamma=1.0,
+        )
+        loss_b, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="ssal",
+            gamma=100.0,
+        )
+        assert torch.allclose(loss_a, loss_b)
+
+    def test_ssal_curriculum_mix_between_decay_and_ssal(self):
+        torch.manual_seed(1)
+        logits = torch.randn(1, 4, 8)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.ones(1, 4)
+        pure_decay, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="none",
+            gamma=4.0,
+        )
+        pure_ssal, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="ssal",
+            ssal_decay_weight=0.0,
+        )
+        mixed, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="ssal",
+            ssal_decay_weight=1.0,
+            gamma=4.0,
+        )
+        assert torch.allclose(mixed, pure_decay)
+        assert not torch.allclose(pure_ssal, pure_decay)
+
+    def test_first_error_focal_increases_loss(self):
+        logits = _ids_to_logits(torch.tensor([[0, 4, 5, 3]]), 8)
+        targets = _ids_to_logits(torch.tensor([[0, 1, 2, 3]]), 8)
+        loss_mask = torch.ones(1, 4)
+        base, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            first_error_focal_alpha=0.0,
+        )
+        focal, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            first_error_focal_alpha=1.0,
+        )
+        assert float(focal) > float(base)
+
+    def test_confidence_length_and_uniform_vs_match_draft(self):
+        torch.manual_seed(2)
+        logits = torch.randn(1, 4, 8)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.ones(1, 4)
+        conf = torch.randn(1, 4)
+        _, m_len = compute_metrics(
+            logits,
+            targets,
+            conf,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            confidence_length_alpha=0.1,
+        )
+        assert "confidence_length_loss_sum" in m_len
+
+        loss_u, _ = compute_metrics(
+            logits,
+            targets,
+            conf,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            confidence_loss_weighting="uniform",
+            gamma=1.0,
+        )
+        loss_m, _ = compute_metrics(
+            logits,
+            targets,
+            conf,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            confidence_loss_weighting="match-draft",
+            gamma=1.0,
+        )
+        assert not torch.allclose(loss_u, loss_m)

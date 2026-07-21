@@ -1150,6 +1150,51 @@ def parse_args():
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
     )
     parser.add_argument(
+        "--confidence-length-alpha",
+        type=float,
+        default=0.0,
+        help="DSpark: Smooth-L1 weight on predicted accept length (default: 0).",
+    )
+    parser.add_argument(
+        "--confidence-loss-weighting",
+        type=str,
+        default="uniform",
+        choices=["uniform", "match-draft"],
+        help="DSpark: how to weight confidence BCE over positions "
+        "(default: uniform).",
+    )
+    parser.add_argument(
+        "--first-error-focal-alpha",
+        type=float,
+        default=0.0,
+        help="DSpark: weight of first-error focal CE (default: 0).",
+    )
+    parser.add_argument(
+        "--adaptive-loss",
+        type=str,
+        default="none",
+        choices=["none", "cat", "ssal"],
+        help="DSpark: adaptive position weights (default: none = fixed decay).",
+    )
+    parser.add_argument(
+        "--ssal-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="DSpark: mix decay→SSAL over training (requires --adaptive-loss ssal).",
+    )
+    parser.add_argument(
+        "--ssal-curriculum-start",
+        type=float,
+        default=0.1,
+        help="Progress fraction where decay→SSAL mix begins (default: 0.1).",
+    )
+    parser.add_argument(
+        "--ssal-curriculum-end",
+        type=float,
+        default=0.6,
+        help="Progress fraction where mix reaches pure SSAL (default: 0.6).",
+    )
+    parser.add_argument(
         "--draft-attn-impl",
         type=str,
         default="simple_flex_attention",

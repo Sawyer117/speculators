@@ -126,6 +126,31 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     assert val_kw["confidence_head_alpha"] == 0.5
 
 
+def test_dspark_adaptive_and_confidence_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--adaptive-loss",
+            "ssal",
+            "--ssal-curriculum",
+            "--confidence-length-alpha",
+            "0.1",
+            "--confidence-loss-weighting",
+            "match-draft",
+            "--first-error-focal-alpha",
+            "0.3",
+        ],
+    )
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["adaptive_loss"] == "ssal"
+    assert train_kw["ssal_curriculum"] is True
+    assert train_kw["confidence_length_alpha"] == 0.1
+    assert train_kw["confidence_loss_weighting"] == "match-draft"
+    assert train_kw["first_error_focal_alpha"] == 0.3
+    assert "ssal_curriculum" not in val_kw
+    assert val_kw["ssal_decay_weight"] == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Per-speculator-type defaults for draft_arch, norm_before_fc, norm_output
 # ---------------------------------------------------------------------------

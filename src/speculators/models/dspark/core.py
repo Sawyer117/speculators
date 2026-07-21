@@ -94,6 +94,15 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma = kwargs.get("dflash_decay_gamma", 4.0)
         max_anchors = kwargs.get("max_anchors", 3072)
         confidence_head_alpha = kwargs.get("confidence_head_alpha", 1.0)
+        confidence_length_alpha = kwargs.get("confidence_length_alpha", 0.0)
+        confidence_loss_weighting = kwargs.get(
+            "confidence_loss_weighting", "uniform"
+        )
+        first_error_focal_alpha = kwargs.get("first_error_focal_alpha", 0.0)
+        adaptive_loss = kwargs.get("adaptive_loss", "none")
+        ssal_curriculum = kwargs.get("ssal_curriculum", False)
+        ssal_curriculum_start = kwargs.get("ssal_curriculum_start", 0.1)
+        ssal_curriculum_end = kwargs.get("ssal_curriculum_end", 0.6)
         per_position_loss_weight = kwargs.get(
             "per_position_loss_weight", "fixed-exp-decay"
         )
@@ -103,10 +112,20 @@ class DSparkDraftModel(DFlashDraftModel):
             "gamma": gamma,
             "max_anchors": max_anchors,
             "confidence_head_alpha": confidence_head_alpha,
+            "confidence_length_alpha": confidence_length_alpha,
+            "confidence_loss_weighting": confidence_loss_weighting,
+            "first_error_focal_alpha": first_error_focal_alpha,
+            "adaptive_loss": adaptive_loss,
+            "ssal_decay_weight": 0.0,
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
         }
-        return dict(shared), dict(shared)
+        train_kw = dict(shared)
+        if ssal_curriculum:
+            train_kw["ssal_curriculum"] = True
+            train_kw["ssal_curriculum_start"] = ssal_curriculum_start
+            train_kw["ssal_curriculum_end"] = ssal_curriculum_end
+        return train_kw, dict(shared)
 
     @conditional_torch_compile
     def forward(
@@ -121,6 +140,11 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma: float = 4.0,
         max_anchors: int = 3072,
         confidence_head_alpha: float = 1.0,
+        confidence_length_alpha: float = 0.0,
+        confidence_loss_weighting: str = "uniform",
+        first_error_focal_alpha: float = 0.0,
+        adaptive_loss: str = "none",
+        ssal_decay_weight: float = 0.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
         **kwargs,
@@ -193,6 +217,11 @@ class DSparkDraftModel(DFlashDraftModel):
             loss_config=loss_config or _DEFAULT_LOSS_CONFIG,
             gamma=gamma,
             confidence_head_alpha=confidence_head_alpha,
+            confidence_length_alpha=confidence_length_alpha,
+            confidence_loss_weighting=confidence_loss_weighting,  # type: ignore[arg-type]
+            first_error_focal_alpha=first_error_focal_alpha,
+            adaptive_loss=adaptive_loss,  # type: ignore[arg-type]
+            ssal_decay_weight=ssal_decay_weight,
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,

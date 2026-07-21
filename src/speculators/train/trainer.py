@@ -206,6 +206,32 @@ class Trainer:
         self.setup_trainer()
         self.setup_model()
         self.setup_optimizer()
+        self._init_ssal_curriculum()
+
+    def _init_ssal_curriculum(self) -> None:
+        """Pull SSAL curriculum knobs out of train_call_kwargs (not model inputs)."""
+        kwargs = self.config.train_call_kwargs
+        self._ssal_curriculum = False
+        self._ssal_curriculum_start = 0.1
+        self._ssal_curriculum_end = 0.6
+        self._ssal_total_steps: int | None = None
+        if kwargs and kwargs.pop("ssal_curriculum", False):
+            self._ssal_curriculum = True
+            self._ssal_curriculum_start = float(
+                kwargs.pop("ssal_curriculum_start", 0.1)
+            )
+            self._ssal_curriculum_end = float(kwargs.pop("ssal_curriculum_end", 0.6))
+
+    def _ssal_decay_weight(self) -> float:
+        """λ: 1 → 0 over [start, end] of training progress."""
+        progress = self.global_step / self._ssal_total_steps
+        start = self._ssal_curriculum_start
+        end = self._ssal_curriculum_end
+        if progress <= start:
+            return 1.0
+        if progress >= end:
+            return 0.0
+        return 1.0 - (progress - start) / (end - start)
 
     def _training_state_path(self, epoch: int) -> Path:
         return self.checkpointer.path / str(epoch) / "training_state.json"
@@ -443,6 +469,8 @@ class Trainer:
 
         # Capture full-epoch step count before any resume fast-skip mutation.
         num_steps = len(self.train_loader)
+        if self._ssal_curriculum and self._ssal_total_steps is None:
+            self._ssal_total_steps = self.config.num_epochs * num_steps
 
         # Determine how many batches to skip for mid-epoch resume.
         skip_steps = self._prepare_resume_skip(epoch)
@@ -475,8 +503,11 @@ class Trainer:
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
                 timer.mark("fetch")
+                call_kwargs = self.config.train_call_kwargs or {}
+                if self._ssal_curriculum:
+                    call_kwargs["ssal_decay_weight"] = self._ssal_decay_weight()
                 _draft_tokens, loss, metrics = self.model(
-                    **gpu_batch, **(self.config.train_call_kwargs or {})
+                    **gpu_batch, **call_kwargs
                 )
 
             timer.mark("fwd")
