@@ -50,6 +50,11 @@ BLOCK="${BLOCK:-5}"                     # ★ BLOCK = # draft slots per block = 
                                        # WRONG off-by-one task with slot 0 untrained and collapsed at serve
                                        # (fixed in dspark core). DO NOT use 6 now. NB: BLOCK scales draft-forward
                                        # tokens = MAX_ANCHORS*BLOCK -> memory (256*5=1280).
+DECAY_GAMMA="${DECAY_GAMMA:-4.0}"       # loss per-position decay: weight_k = exp(-k/gamma) over the BLOCK
+                                       # slots. Canonical DSpark = 4.0 -> slots [1.0,0.78,0.61,0.47,0.37].
+                                       # LARGER gamma = flatter = more gradient to LATER slots (pos3/4/5);
+                                       # very large -> ~uniform. The knob to lift late-position accept when
+                                       # the per-position curve decays faster than the released draft's.
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
 EP="${DSPARK_EP:-0}"
 BF16EXPERTS="${BF16_EXPERTS:-auto}"     # AMP masters for EP experts. DEFAULT "auto": option A (upstream —
@@ -210,6 +215,7 @@ nohup env \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
     --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
     --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
+    --dflash-decay-gamma "$DECAY_GAMMA" \
     --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" \
     --draft-attn-impl sdpa --loss-fn '{"ce":0.1,"tv":0.9}' \
     --optimizer adamw --lr "$LR" --epochs "$EPOCHS" $EXTRA \
