@@ -34,6 +34,9 @@ _MOE_OP = "moe_dispatch"
 # to few shapes (recompiles amortize after the first few). Padding is a few % of the TOKEN dim
 # (NOT per-expert capacity), so the memory/compute waste is small. 0/1 disables bucketing.
 _MOE_BUCKET = int(os.environ.get("DSPARK_MOE_BUCKET", "512"))
+# DSPARK_PROFILE_MOE=1 -> sync+time each MoE sub-op (permute / experts-GEMM / unpermute) and print on any
+# sub-op > 2s. Pins WHICH op does the per-shape AscendC build (the fwd "recompile" spike). Diagnostic only.
+_MOE_PROF = os.environ.get("DSPARK_PROFILE_MOE") == "1"
 # Fused Ascend routing ops (npu_moe_token_permute/unpermute AND npu_moe_token_unpermute_grad) FAIL
 # on a 0-row input ("input shape has 0", error 561002). Under EP a rank can receive 0 tokens in a
 # step (all top-k picks miss its 32 experts) -> the local grouped path gets [0, dim] and the unpermute
@@ -139,12 +142,19 @@ def _fused_permute_dispatch_npu(x: torch.Tensor, indices: torch.Tensor, w_flat: 
         w_flat = F.pad(w_flat.reshape(n, k), (0, 0, 0, pad)).reshape(-1)  # [nb*k] zero weight
 
     # Ascend routing ops take int32 expert ids (ids < n_experts fit); ids are non-differentiable.
+    if _MOE_PROF:
+        import time as _time  # noqa: PLC0415
+        torch.npu.synchronize()
+        _t0 = _time.perf_counter()
     idx = indices.to(torch.int32)
     routed_input, sorted_idx = torch_npu.npu_moe_token_permute(x, idx)            # [nb*k, dim]
     routed_scores, _ = torch_npu.npu_moe_token_permute(
         w_flat.reshape(-1, 1), idx.reshape(-1, 1)
     )                                                                             # [nb*k, 1]
     counts = torch.bincount(indices.reshape(-1), minlength=n_experts)            # [E], sum = nb*k
+    if _MOE_PROF:
+        torch.npu.synchronize()
+        _t1 = _time.perf_counter()
     from . import moe_compile  # noqa: PLC0415  (Graft B+C; _ENABLED only on the torch-2.12 stack)
 
     if moe_compile._ENABLED:
@@ -164,7 +174,21 @@ def _fused_permute_dispatch_npu(x: torch.Tensor, indices: torch.Tensor, w_flat: 
         out = swiglu_grouped(routed_input.bfloat16(), w1.bfloat16(), w3.bfloat16(), w2.bfloat16(),
                              counts, routed_scores.reshape(-1).bfloat16(),
                              experts.swiglu_limit, _grouped_matmul)               # [nb*k, dim]
+    if _MOE_PROF:
+        torch.npu.synchronize()
+        _t2 = _time.perf_counter()
     unpermuted = torch_npu.npu_moe_token_unpermute(out.to(routed_input.dtype), sorted_idx, None)
+    if _MOE_PROF:
+        torch.npu.synchronize()
+        _t3 = _time.perf_counter()
+        _pm, _gm, _um = (_t1 - _t0) * 1000, (_t2 - _t1) * 1000, (_t3 - _t2) * 1000
+        if max(_pm, _gm, _um) > 2000.0:  # a spike: report WHICH sub-op built the per-shape kernel
+            try:
+                _r = torch.distributed.get_rank()
+            except Exception:  # noqa: BLE001
+                _r = 0
+            print(f">>> [MOE-PROF r{_r}] n={n} nb={nb} k={k}  permute+bincount={_pm:.0f}ms  "
+                  f"experts_gemm={_gm:.0f}ms  unpermute={_um:.0f}ms", flush=True)
     if nb > n:
         unpermuted = unpermuted.view(nb, k, dim)[:n].reshape(n * k, dim)         # drop pad tokens
     return unpermuted
