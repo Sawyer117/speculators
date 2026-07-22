@@ -69,6 +69,10 @@ LOSS_FN="${LOSS_FN:-{\"ce\":0.1,\"tv\":1.8}}"  # ce + TVD weights. ★ tv 1.8 (n
                                        # = 1/2 of DeepSpec's L1 (=sum|p-q|=2*TVD, PR #648 chose the standard TVD
                                        # normalization), so tv 1.8 restores DeepSpec's effective ce:dist = 0.1:1.8
                                        # balance. Pure normalization-convention alignment. Set LOSS_FN=... to override.
+NOISE_STD="${NOISE_STD:-0.05}"          # --noise-std: uniform ±std noise added to target hidden states (aug).
+                                       # 0.05 = current / DFlash-inherited default. ★ A/B knob: NOISE_STD=0 =
+                                       # DeepSpec (it trains with ZERO hidden-state noise) — top candidate to
+                                       # sharpen the pos2+ tail. Change ONE variable per run.
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
 EP="${DSPARK_EP:-0}"
 BF16EXPERTS="${BF16_EXPERTS:-auto}"     # AMP masters for EP experts. DEFAULT "auto": option A (upstream —
@@ -230,7 +234,7 @@ nohup env \
     --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
     --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
     --dflash-decay-gamma "$DECAY_GAMMA" --sliding-window "$SWA_WINDOW" \
-    --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" \
+    --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" --noise-std "$NOISE_STD" \
     --draft-attn-impl sdpa --loss-fn "$LOSS_FN" \
     --scheduler-type "$SCHED_TYPE" --scheduler-warmup-ratio "$WARMUP_RATIO" \
     --optimizer adamw --lr "$LR" --epochs "$EPOCHS" $EXTRA \
