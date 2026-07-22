@@ -226,14 +226,14 @@ def _load_and_skip(path: str, skip: int, quiet: bool = False):
     are None when there are no metrics / no epoch length is discoverable."""
     recs, raw_text = load(resolve_log(path))
     if not recs:
-        return None, None, None
+        return None, None, None, None
     if skip > 0:
         kept = [r for r in recs if step_of(r) >= skip]
         if kept:
             if not quiet:
                 print(f"(--skip {skip}: dropped {len(recs) - len(kept)} warmup/regen steps; analyzing {len(kept)})")
             recs = kept
-    return recs, checkpoint_steps(raw_text), _steps_per_epoch(recs, raw_text)
+    return recs, checkpoint_steps(raw_text), _steps_per_epoch(recs, raw_text), raw_text
 
 
 def _headline(recs, ckpt_steps, spike_k=3.0) -> dict:
@@ -385,10 +385,54 @@ def _build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def fwd_profiler_report(text: str) -> None:
+    """Attribute forward-time spikes to sub-ops from DSPARK_PROFILE_FWD / DSPARK_PROFILE_MOE prints.
+
+    Backward compatible: if the log has NO profiler lines (profilers off, or an older run), prints
+    nothing. Complements the recompile%/hs% headline (which splits fwd_ms vs fetch_ms), by naming
+    WHICH compute sub-op (MLA / mHC-Sinkhorn / MoE) — and which MoE internal — carries the spike."""
+    fwd = re.findall(r"\[FWD_PROF\]\s+([\w.]+):\s+(\d+)\s*ms", text)
+    moe = re.findall(
+        r"\[MOE-PROF r\d+\][^\n]*?permute\+bincount=(\d+)ms\s+experts_gemm=(\d+)ms\s+unpermute=(\d+)ms",
+        text,
+    )
+    if not fwd and not moe:
+        return  # no profiler data — stay silent (backward compatible with pre-profiler logs)
+
+    print("\n-- FWD PROFILER (sub-op spike attribution) " + "-" * 35)
+
+    if fwd:
+        agg = {}
+        for tag, ms in fwd:
+            agg.setdefault(tag, []).append(int(ms))
+        rows = sorted(agg.items(), key=lambda kv: sum(kv[1]), reverse=True)
+        print(f"  block sub-ops (DSPARK_PROFILE_FWD): {len(fwd)} spike print(s)")
+        for tag, xs in rows:
+            print(f"    {tag:10} n={len(xs):>4}  max={max(xs):>6}ms  mean={sum(xs) // len(xs):>6}ms  "
+                  f"Σ={sum(xs):>8}ms")
+        print(f"  → dominant fwd sub-op: {rows[0][0]}   (MLA=latent attn, mHC=Sinkhorn hyper-conn, MoE=experts)")
+
+    if moe:
+        pm = [int(a) for a, _, _ in moe]
+        gm = [int(b) for _, b, _ in moe]
+        um = [int(c) for _, _, c in moe]
+        wins = {"permute+bincount": 0, "experts_gemm": 0, "unpermute": 0}
+        for a, b, c in moe:
+            trio = {"permute+bincount": int(a), "experts_gemm": int(b), "unpermute": int(c)}
+            wins[max(trio, key=trio.get)] += 1
+        top = max(wins, key=wins.get)
+        print(f"  MoE internals (DSPARK_PROFILE_MOE): {len(moe)} spike print(s)")
+        for name, xs in (("permute+bincount", pm), ("experts_gemm", gm), ("unpermute", um)):
+            print(f"    {name:16} max={max(xs):>6}ms  mean={sum(xs) // len(xs):>6}ms")
+        print(f"  → MoE spike usually in: {top}  ({wins[top]}/{len(moe)})")
+
+    print("  cross-check the free headline: fetch_ms/align_ms high = HS-fetch stall (not compute).")
+
+
 def main() -> None:
     args = _build_parser().parse_args()
 
-    recs, ckpt_steps, steps_per_epoch = _load_and_skip(args.logfile, args.skip)
+    recs, ckpt_steps, steps_per_epoch, raw_text = _load_and_skip(args.logfile, args.skip)
     if recs is None:
         print("!! no metric records parsed — is this a trainer.py rich-logger log?")
         return
@@ -404,7 +448,7 @@ def main() -> None:
         blabels = args.baseline_label or []
         for i, bpath in enumerate(args.baseline):
             blabel = blabels[i] if i < len(blabels) else _default_label(bpath)
-            brecs, bckpt, _ = _load_and_skip(bpath, args.skip, quiet=True)
+            brecs, bckpt, _, _ = _load_and_skip(bpath, args.skip, quiet=True)
             if brecs is None:
                 print(f"!! baseline '{bpath}' had no metrics — skipping")
                 continue
@@ -491,6 +535,8 @@ def main() -> None:
               f" | pred_mean {fmt(last_n_med('train/confidence_pred_mean'))}"
               f" vs accept_rate {fmt(last_n_med('train/accept_rate'))}"
               f" | cumprod_bias {fmt(last_n_med('train/confidence_cumprod_bias'))}")
+
+    fwd_profiler_report(raw_text)
 
     # ---------------- recent dynamics (is it STILL learning?) ----------------
     N = args.recent
