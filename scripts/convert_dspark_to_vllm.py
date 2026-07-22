@@ -213,8 +213,31 @@ def main() -> None:
         if tids and not cfg.get("eagle_aux_hidden_state_layer_ids"):
             cfg["eagle_aux_hidden_state_layer_ids"] = tids
             print(f">>> patched config.json: eagle_aux_hidden_state_layer_ids = {tids} (from dspark_target_layer_ids)")
+        # ★ GUARD the serve-critical fields. The vLLM-Ascend DSpark serve reads these dspark_*/
+        # sliding_window names; if any is ABSENT it silently falls back to a WRONG default and caps
+        # (or crashes) acceptance — NOT a loud error at serve time. Known silent fallbacks:
+        #   dspark_noise_token_id absent  -> mask slots filled with token 0 (proposer: `... or 0`)
+        #                                    -> wrong draft-attn inputs on slots 1..g-1 -> capped tail
+        #   dspark_target_layer_ids/eagle_aux absent -> eagle3's 4 default aux layers -> 4H vs 3H
+        #                                    main_proj -> dim-mismatch crash at first proposal
+        #   sliding_window absent          -> hf_config.sliding_window AttributeError at serve
+        # Our OWN (plain-name) config lacks these, so this fires loudly if you forget --config-from.
+        _required = ["dspark_noise_token_id", "dspark_target_layer_ids", "dspark_block_size",
+                     "dspark_markov_rank", "sliding_window", "eagle_aux_hidden_state_layer_ids"]
+        _missing = [k for k in _required if cfg.get(k) in (None, "", [])]
+        if _missing:
+            raise SystemExit(
+                f"!! config from {src_cfg} is MISSING serve-critical field(s): {_missing}\n"
+                f"   The vLLM-Ascend DSpark serve would silently use wrong defaults (mask-slot token 0,\n"
+                f"   or eagle3's 4 aux layers -> 3H/4H main_proj crash). Pass --config-from <the RELEASED\n"
+                f"   draft config.json> (it carries all dspark_* fields), not our plain-name training config."
+            )
         (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
         print(f">>> wrote config.json (from {src_cfg})")
+        print("    serve-critical fields: "
+              + "  ".join(f"{k}={cfg.get(k)}" for k in
+                          ("dspark_noise_token_id", "dspark_block_size", "dspark_target_layer_ids",
+                           "sliding_window", "dspark_markov_rank")))
     else:
         print(f"!! no config.json at {src_cfg} — provide one in {out_dir} before serving")
 
