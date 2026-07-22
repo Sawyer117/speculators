@@ -24,6 +24,30 @@ from .hyper import HyperConnection, place
 from .moe import MoE
 from .norm import RMSNorm
 
+import os as _os
+import time as _time
+
+# DSPARK_PROFILE_FWD=1 -> sync+time each block sub-op (mHC = Sinkhorn hyper-connection, MLA = latent
+# attention, MoE) and print any > DSPARK_PROFILE_FWD_MS (default 2000ms). Complements DSPARK_PROFILE_MOE
+# (which splits the MoE internals). Pins whether a fwd spike is MLA / mHC-Sinkhorn / MoE vs. HS-fetch
+# (read fetch_ms/align_ms for that). Diagnostic only; syncs serialize the pipe so it SLOWS the run —
+# off (default) = zero cost. Lower DSPARK_PROFILE_FWD_MS (e.g. 0) to print every sub-op every step.
+_FWD_PROF = _os.environ.get("DSPARK_PROFILE_FWD") == "1"
+_FWD_PROF_MS = float(_os.environ.get("DSPARK_PROFILE_FWD_MS", "2000"))
+
+
+def _prof(tag, fn):
+    if not _FWD_PROF:
+        return fn()
+    torch.npu.synchronize()
+    _t0 = _time.perf_counter()
+    out = fn()
+    torch.npu.synchronize()
+    _dt = (_time.perf_counter() - _t0) * 1000.0
+    if _dt > _FWD_PROF_MS:
+        print(f"[FWD_PROF] {tag}: {_dt:.0f} ms", flush=True)
+    return out
+
 
 class MhcDecoderBlock(nn.Module):
     """Latent-attention + MoE block with two-site hyper-connections."""
@@ -50,14 +74,14 @@ class MhcDecoderBlock(nn.Module):
         ``context_x [N, W, dim]`` is the shared target-hidden context (``main_x``).
         """
         residual = streams
-        post, comb, x = self.attn_hc(streams)
+        post, comb, x = _prof("mHC.attn", lambda: self.attn_hc(streams))
         x = self.attn_norm(x)
-        x = self.attn(x, context_x, block_freqs, context_freqs, attn_bias)
+        x = _prof("MLA.attn", lambda: self.attn(x, context_x, block_freqs, context_freqs, attn_bias))
         streams = place(x, residual, post, comb)
 
         residual = streams
-        post, comb, x = self.ffn_hc(streams)
+        post, comb, x = _prof("mHC.ffn", lambda: self.ffn_hc(streams))
         x = self.ffn_norm(x)
-        x = self.ffn(x)
+        x = _prof("MoE.ffn", lambda: self.ffn(x))
         streams = place(x, residual, post, comb)
         return streams
