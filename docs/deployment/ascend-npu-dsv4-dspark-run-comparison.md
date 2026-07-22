@@ -16,7 +16,7 @@ this one holds the **training-config** differences so cross-run curves are read 
 | **Expert master (AMP)** | — | bf16 | fp32 |
 | **Mesh (FSDP=EP=ws)** | 8-card | FSDP8 + EP8 | FSDP16 + EP16 |
 | **Global batch** | 8·b | 8·b | 16·b |
-| **steps/epoch** | ~4,900 | ~21,500 | ~10,700 |
+| **steps/epoch** | ~4,900 | ~24,800 | **12,388** (measured) |
 | **Stack / compile** | 2.10, no compile | 2.12, COMPILE=1 | 2.12, COMPILE=1 |
 
 _Rows 1–5 drive quality; rows 6–10 affect speed/memory only._
@@ -38,19 +38,13 @@ _Rows 1–5 drive quality; rows 6–10 affect speed/memory only._
    `epoch4-17w` trained with a healthy-looking tail yet collapsed at eval (gsm8k pos3/4 = 19/5).
    The verdict is always **convert + eval → serve-side pos3/4**.
 
-## steps/epoch derivation
+## steps/epoch — A3 now MEASURED
 
-Only 17W-5EP crossed full epochs, so it is the measured anchor (24,512 steps / 5 epochs ≈ 4,900).
-The 77W runs are extrapolated:
+**A3-77W = 12,388 steps/epoch, MEASURED** (2× the 0.5-epoch checkpoint at step 6194; `CKPT_FREQ=0.5`).
+Back-out: per-rank batch = 4 → global batch = ws×4 = 16×4 = **64**; 77W Arrow ≈ 793k rows / 64 ≈ 12.4k. ✓
+By the DP relation (per-rank batch is equal across runs, no BATCH knob), **A2 (ws 8) = 2× A3 ≈ 24,800**.
+17W-5EP ≈ **4,900** (its own 24,512 steps / 5 epochs; smaller 17W dataset).
 
-```
-steps/epoch(run) = steps/epoch(17W) × [rows(run) / rows(17W)] × [world_size(17W) / world_size(run)]
-```
-
-- rows: 17W ≈ 177,000, 77W ≈ 775,965 (ratio ≈ 4.38) — the per-rank batch cancels out of the ratio.
-- A2-77W (ws 8): 4,900 × 4.38 × (8/8) ≈ **21,500**
-- A3-77W (ws 16): 4,900 × 4.38 × (8/16) ≈ **10,700**
-
-Consistency check: both 77W runs were still in epoch 0 when sampled (A2 @ 10,809 < 21,500;
-A3 @ 2,208 < 10,700), which matches the absence of any epoch boundary in their logs.
-(If the 77W Arrow row count differs from ~776k after prep, scale both 77W numbers proportionally.)
+⚠️ My earlier *extrapolated* A3 (~10,700, scaled from the 17W anchor) was **~15% low** — the direct
+measurement supersedes it. A3 total = 10 epochs × 12,388 ≈ **124k steps** (at the current recompile-taxed
+~4s/step effective, ~13 h/epoch → the full 10-epoch run is a multi-day haul).
