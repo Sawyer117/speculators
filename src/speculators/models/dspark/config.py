@@ -12,10 +12,10 @@ __all__ = [
 
 @SpeculatorModelConfig.register("dspark")
 class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
-    """DFlash config plus a Markov logit-bias head and a confidence head.
+    """DFlash config plus sequential correction and confidence heads.
 
-    The Markov head lets each draft position condition on previously sampled
-    tokens within the block; the confidence head predicts the per-position
+    The active sequential head lets each draft position condition on previously
+    sampled tokens within the block; the confidence head predicts per-position
     acceptance probability. All DFlash fields are inherited unchanged.
     """
 
@@ -53,6 +53,52 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         ),
     )
 
+    # Logit-aware causal correction head. When enabled it replaces MarkovHead.
+    enable_correction_head: bool = Field(
+        default=False,
+        description=(
+            "Replace the Markov head with a causal head that predicts a gated "
+            "hidden-space residual from previous-token, hidden, and base-logit "
+            "features. The frozen LM head projects the residual to logits."
+        ),
+    )
+    correction_hidden_size: int = Field(
+        default=512,
+        gt=0,
+        description="Hidden width of the causal correction head.",
+    )
+    correction_rank: int = Field(
+        default=256,
+        gt=0,
+        description="Low-rank bottleneck used to produce the hidden residual.",
+    )
+    correction_num_layers: int = Field(
+        default=1,
+        gt=0,
+        description="Number of causal Transformer layers in the correction head.",
+    )
+    correction_num_heads: int = Field(
+        default=8,
+        gt=0,
+        description="Attention heads in each correction layer.",
+    )
+    correction_top_k: int = Field(
+        default=8,
+        gt=0,
+        description="Top-k base-logit candidates summarized for correction.",
+    )
+    correction_gate_bias: float = Field(
+        default=0.0,
+        description="Initial bias of the sigmoid hidden-residual gate.",
+    )
+    correction_rollout_metrics: bool = Field(
+        default=True,
+        description=(
+            "Measure greedy self-feedback correction metrics during validation. "
+            "Disable to reduce validation compute."
+        ),
+    )
+
     # Confidence head.
     enable_confidence_head: bool = Field(
         default=True,
@@ -61,7 +107,15 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     confidence_head_with_markov: bool = Field(
         default=True,
         description=(
-            "Concatenate the Markov previous-token embedding with the backbone "
-            "hidden state as the confidence-head input."
+            "Concatenate the active sequential state (Markov embedding or causal "
+            "correction state) with the backbone hidden state for confidence."
+        ),
+    )
+    confidence_detach_features: bool = Field(
+        default=False,
+        description=(
+            "Detach backbone and sequential features before ConfidenceHead. "
+            "False lets confidence loss train the active Markov/correction path; "
+            "True makes confidence a fully auxiliary observer."
         ),
     )

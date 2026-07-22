@@ -257,6 +257,118 @@ class TestComputeMetrics:
         assert torch.allclose(mixed, pure_decay)
         assert not torch.allclose(pure_ssal, pure_decay)
 
+    def test_correction_curriculum_and_gain_metrics(self):
+        target_ids = torch.tensor([[1, 2, 3, 4]])
+        targets = _ids_to_logits(target_ids, 8)
+        corrected_logits = targets.clone()
+        base_logits = _ids_to_logits(torch.tensor([[5, 6, 7, 0]]), 8)
+        loss_mask = torch.ones(1, 4)
+
+        pure_base, _ = compute_metrics(
+            base_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+        )
+        base_phase, base_metrics = compute_metrics(
+            corrected_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            base_logits=base_logits,
+            correction_base_weight=torch.tensor(1.0),
+        )
+        corrected_phase, corrected_metrics = compute_metrics(
+            corrected_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            base_logits=base_logits,
+            correction_base_weight=torch.tensor(0.0),
+        )
+
+        assert torch.allclose(base_phase, pure_base)
+        assert float(corrected_phase) < float(base_phase)
+        assert "base_accept_len_sum" in base_metrics
+        gain = (
+            corrected_metrics["correction_accept_len_gain_sum"]
+            / corrected_metrics["correction_accept_len_gain_total"]
+        )
+        assert float(gain) > 1.5
+        correction_rms = (
+            corrected_metrics["correction_logit_rms_sum"]
+            / corrected_metrics["correction_logit_rms_total"]
+        )
+        assert float(correction_rms) > 0.0
+        argmax_change = (
+            corrected_metrics["correction_argmax_change_rate_sum"]
+            / corrected_metrics["correction_argmax_change_rate_total"]
+        )
+        assert float(argmax_change) == 1.0
+        assert (
+            float(corrected_metrics["dspark_head_change_correct_count_sum"]) == 4.0
+        )
+        assert float(corrected_metrics["dspark_head_change_wrong_count_sum"]) == 0.0
+        assert float(corrected_metrics["dspark_head_harmed_count_sum"]) == 0.0
+
+    def test_head_and_rollout_change_outcome_counts(self):
+        targets = _ids_to_logits(torch.tensor([[1, 2, 3, 4]]), 8)
+        base_logits = _ids_to_logits(torch.tensor([[1, 6, 7, 4]]), 8)
+        head_logits = _ids_to_logits(torch.tensor([[5, 2, 0, 4]]), 8)
+        rollout_logits = _ids_to_logits(torch.tensor([[1, 2, 0, 5]]), 8)
+
+        _, metrics = compute_metrics(
+            head_logits,
+            targets,
+            None,
+            torch.ones(1, 4),
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            base_logits=base_logits,
+            rollout_logits=rollout_logits,
+        )
+
+        assert float(metrics["dspark_head_change_correct_count_sum"]) == 1.0
+        assert float(metrics["dspark_head_change_wrong_count_sum"]) == 2.0
+        assert float(metrics["dspark_head_harmed_count_sum"]) == 1.0
+        assert float(metrics["dspark_head_change_accuracy_sum"]) == 1.0
+        assert float(metrics["dspark_head_change_accuracy_total"]) == 3.0
+        assert float(metrics["causal_rollout_change_correct_count_sum"]) == 1.0
+        assert float(metrics["causal_rollout_change_wrong_count_sum"]) == 2.0
+        assert float(metrics["causal_rollout_harmed_count_sum"]) == 1.0
+
+    def test_rollout_metrics_are_separate_from_teacher_forcing(self):
+        target_ids = torch.tensor([[1, 2, 3, 4]])
+        targets = _ids_to_logits(target_ids, 8)
+        teacher_forced_logits = targets.clone()
+        rollout_logits = _ids_to_logits(torch.tensor([[1, 6, 7, 0]]), 8)
+        loss_mask = torch.ones(1, 4)
+
+        _, metrics = compute_metrics(
+            teacher_forced_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            rollout_logits=rollout_logits,
+        )
+
+        teacher_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
+        rollout_len = (
+            metrics["rollout_accept_len_sum"]
+            / metrics["rollout_accept_len_total"]
+        )
+        assert float(teacher_len) > float(rollout_len)
+        assert float(teacher_len) > 2.9
+        assert float(rollout_len) < 2.1
+
     def test_first_error_focal_increases_loss(self):
         logits = _ids_to_logits(torch.tensor([[0, 4, 5, 3]]), 8)
         targets = _ids_to_logits(torch.tensor([[0, 1, 2, 3]]), 8)

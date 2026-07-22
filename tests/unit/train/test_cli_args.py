@@ -151,6 +151,50 @@ def test_dspark_adaptive_and_confidence_cli(monkeypatch):
     assert val_kw["ssal_decay_weight"] == 0.0
 
 
+def test_dspark_correction_head_cli_and_curriculum(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-hidden-size",
+            "96",
+            "--correction-rank",
+            "48",
+            "--correction-num-layers",
+            "2",
+            "--correction-num-heads",
+            "6",
+            "--correction-top-k",
+            "12",
+            "--correction-gate-bias",
+            "-1.0",
+            "--no-correction-rollout-metrics",
+            "--confidence-detach-features",
+            "--correction-curriculum",
+            "--correction-curriculum-end",
+            "0.15",
+        ],
+    )
+    assert args.enable_correction_head is True
+    assert args.correction_hidden_size == 96
+    assert args.correction_rank == 48
+    assert args.correction_num_layers == 2
+    assert args.correction_num_heads == 6
+    assert args.correction_top_k == 12
+    assert args.correction_gate_bias == -1.0
+    assert args.correction_rollout_metrics is False
+    assert args.confidence_detach_features is True
+
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["correction_curriculum"] is True
+    assert train_kw["correction_curriculum_end"] == 0.15
+    assert train_kw["correction_base_weight"] == 0.0
+    assert "correction_curriculum" not in val_kw
+    assert val_kw["correction_base_weight"] == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Per-speculator-type defaults for draft_arch, norm_before_fc, norm_output
 # ---------------------------------------------------------------------------

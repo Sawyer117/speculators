@@ -6,6 +6,8 @@ loss = compound_loss(logits, targets)
      + focal_alpha * CE(first greedy error)
 
 Optional adaptive position weights (CAT / SSAL) replace fixed decay.
+For the correction head, an optional short curriculum mixes the unchanged base
+objective into the corrected objective and reports both acceptance lengths.
 """
 
 from functools import partial
@@ -91,7 +93,42 @@ def _accept_length(
     return prefix.sum(dim=-1) + 1.0
 
 
-def compute_metrics(
+def _change_outcome_metrics(
+    prefix: str,
+    candidate_ids: torch.Tensor,
+    base_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Count whether changed argmax predictions became correct or wrong."""
+    valid = loss_mask.bool()
+    changed = (candidate_ids != base_ids) & valid
+    candidate_correct = candidate_ids == target_ids
+    base_correct = base_ids == target_ids
+
+    changed_to_correct = changed & candidate_correct
+    changed_to_wrong = changed & ~candidate_correct
+    harmed = changed & base_correct & ~candidate_correct
+    dtype = torch.float32
+    correct_count = changed_to_correct.sum().to(dtype)
+    wrong_count = changed_to_wrong.sum().to(dtype)
+    harmed_count = harmed.sum().to(dtype)
+    changed_count = changed.sum().to(dtype)
+    one = torch.ones((), device=loss_mask.device, dtype=dtype)
+
+    return {
+        f"{prefix}_change_correct_count_sum": correct_count,
+        f"{prefix}_change_correct_count_total": one,
+        f"{prefix}_change_wrong_count_sum": wrong_count,
+        f"{prefix}_change_wrong_count_total": one.clone(),
+        f"{prefix}_harmed_count_sum": harmed_count,
+        f"{prefix}_harmed_count_total": one.clone(),
+        f"{prefix}_change_accuracy_sum": correct_count.clone(),
+        f"{prefix}_change_accuracy_total": changed_count,
+    }
+
+
+def compute_metrics(  # noqa: C901
     logits: torch.Tensor,  # [1, T, draft_vocab_size]
     targets: torch.Tensor,  # [1, T, draft_vocab_size]
     confidence_logits: torch.Tensor | None,  # [1, T] or None
@@ -104,7 +141,10 @@ def compute_metrics(
     confidence_loss_weighting: ConfidenceLossWeighting = "uniform",
     first_error_focal_alpha: float = 0.0,
     adaptive_loss: AdaptiveLoss = "none",
-    ssal_decay_weight: float = 0.0,
+    ssal_decay_weight: torch.Tensor | float = 0.0,
+    base_logits: torch.Tensor | None = None,
+    rollout_logits: torch.Tensor | None = None,
+    correction_base_weight: torch.Tensor | float = 0.0,
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
@@ -120,7 +160,14 @@ def compute_metrics(
     with torch.no_grad():
         draft_p = softmax(logits.float(), dim=-1)
         target_p = softmax(targets.float(), dim=-1)
+        target_ids = torch.argmax(targets, dim=-1)
         accept_rate = torch.minimum(draft_p, target_p).sum(dim=-1)  # [1, T]
+        rollout_accept_rate = None
+        if rollout_logits is not None:
+            if rollout_logits.shape != logits.shape:
+                raise ValueError("rollout_logits and logits must have the same shape")
+            rollout_p = softmax(rollout_logits.float(), dim=-1)
+            rollout_accept_rate = torch.minimum(rollout_p, target_p).sum(dim=-1)
 
     if per_position_loss_weight == "dpace":
         decay_fn = partial(
@@ -136,8 +183,9 @@ def compute_metrics(
             adaptive_scores = accept_rate
         elif adaptive_loss == "cat":
             with torch.no_grad():
-                target_ids = torch.argmax(targets, dim=-1, keepdim=True)
-                adaptive_scores = target_p.gather(-1, target_ids).squeeze(-1)
+                adaptive_scores = target_p.gather(
+                    -1, target_ids.unsqueeze(-1)
+                ).squeeze(-1)
         draft_weights = position_weights(
             pos_idx.to(logits.dtype),
             block_size=block_size,
@@ -150,9 +198,10 @@ def compute_metrics(
         )
         decay_fn = lambda pos, **_kw: draft_weights  # noqa: E731
 
-    loss, term_losses = compound_loss(
+    final_draft_loss, term_losses = compound_loss(
         logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
     )
+    final_objective = final_draft_loss
 
     if first_error_focal_alpha > 0.0:
         fe_weights = (
@@ -168,7 +217,39 @@ def compute_metrics(
         fe_loss = _first_error_focal_loss(
             logits, targets, loss_mask, block_size, fe_weights, start_pos
         )
-        loss = loss + first_error_focal_alpha * fe_loss
+        final_objective = final_objective + first_error_focal_alpha * fe_loss
+
+    base_loss = None
+    if base_logits is not None:
+        base_loss, _ = compound_loss(
+            base_logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_config=loss_config,
+            decay_fn=decay_fn,
+        )
+        if first_error_focal_alpha > 0.0:
+            base_fe_loss = _first_error_focal_loss(
+                base_logits,
+                targets,
+                loss_mask,
+                block_size,
+                fe_weights,
+                start_pos,
+            )
+            base_loss = base_loss + first_error_focal_alpha * base_fe_loss
+        base_weight = torch.as_tensor(
+            correction_base_weight,
+            device=final_objective.device,
+            dtype=final_objective.dtype,
+        ).clamp(0.0, 1.0)
+        loss = base_weight * base_loss + (1.0 - base_weight) * final_objective
+    else:
+        base_weight = torch.zeros(
+            (), device=final_objective.device, dtype=final_objective.dtype
+        )
+        loss = final_objective
 
     num_blocks = seq_len // block_size
     with torch.no_grad():
@@ -179,6 +260,13 @@ def compute_metrics(
         accept_prefix = (accept_blocks[:, start_pos:] * draft_mask).cumprod(dim=-1)
 
     metrics: dict[str, Any] = {}
+    if base_loss is not None:
+        metrics["base_loss_sum"] = base_loss.detach().clone()
+        metrics["base_loss_total"] = torch.ones((), device=device)
+        metrics["corrected_loss_sum"] = final_objective.detach().clone()
+        metrics["corrected_loss_total"] = torch.ones((), device=device)
+        metrics["correction_base_weight_sum"] = base_weight.detach().clone()
+        metrics["correction_base_weight_total"] = torch.ones((), device=device)
     if confidence_logits is not None:
         c_star = accept_rate.detach().to(confidence_logits.dtype)
         bce = binary_cross_entropy_with_logits(
@@ -245,8 +333,89 @@ def compute_metrics(
         metrics["accept_len_sum"] = (per_block_len * block_valid).sum()
         metrics["accept_len_total"] = block_valid.sum().clamp_min(1.0)
 
+        if base_logits is not None:
+            base_p = softmax(base_logits.float(), dim=-1)
+            base_accept_rate = torch.minimum(base_p, target_p).sum(dim=-1)
+            base_accept_blocks = base_accept_rate.view(num_blocks, block_size)
+            base_prefix = (
+                base_accept_blocks[:, start_pos:] * draft_mask
+            ).cumprod(dim=-1)
+            base_per_block_len = base_prefix.sum(dim=-1) + 1.0
+            metrics["base_accept_rate_sum"] = (base_accept_rate * mask_f).sum()
+            metrics["base_accept_rate_total"] = mask_f.sum().clamp_min(1.0)
+            metrics["correction_accept_rate_gain_sum"] = (
+                (accept_rate - base_accept_rate) * mask_f
+            ).sum()
+            metrics["correction_accept_rate_gain_total"] = mask_f.sum().clamp_min(
+                1.0
+            )
+            metrics["base_accept_len_sum"] = (
+                base_per_block_len * block_valid
+            ).sum()
+            metrics["base_accept_len_total"] = block_valid.sum().clamp_min(1.0)
+            metrics["correction_accept_len_gain_sum"] = (
+                (per_block_len - base_per_block_len) * block_valid
+            ).sum()
+            metrics["correction_accept_len_gain_total"] = block_valid.sum().clamp_min(
+                1.0
+            )
+
+            delta_logits = logits.float() - base_logits.float()
+            delta_rms = delta_logits.square().mean(dim=-1).sqrt()
+            metrics["correction_logit_rms_sum"] = (delta_rms * mask_f).sum()
+            metrics["correction_logit_rms_total"] = mask_f.sum().clamp_min(1.0)
+            argmax_changed = (
+                logits.argmax(dim=-1) != base_logits.argmax(dim=-1)
+            ).to(mask_f.dtype)
+            metrics["correction_argmax_change_rate_sum"] = (
+                argmax_changed * mask_f
+            ).sum()
+            metrics["correction_argmax_change_rate_total"] = mask_f.sum().clamp_min(
+                1.0
+            )
+            base_ids = base_logits.argmax(dim=-1)
+            metrics.update(
+                _change_outcome_metrics(
+                    "dspark_head",
+                    logits.argmax(dim=-1),
+                    base_ids,
+                    target_ids,
+                    loss_mask,
+                )
+            )
+
+        if rollout_accept_rate is not None:
+            rollout_accept_blocks = rollout_accept_rate.view(num_blocks, block_size)
+            rollout_prefix = (
+                rollout_accept_blocks[:, start_pos:] * draft_mask
+            ).cumprod(dim=-1)
+            rollout_per_block_len = rollout_prefix.sum(dim=-1) + 1.0
+            metrics["rollout_accept_rate_sum"] = (
+                rollout_accept_rate * mask_f
+            ).sum()
+            metrics["rollout_accept_rate_total"] = mask_f.sum().clamp_min(1.0)
+            metrics["rollout_accept_len_sum"] = (
+                rollout_per_block_len * block_valid
+            ).sum()
+            metrics["rollout_accept_len_total"] = block_valid.sum().clamp_min(1.0)
+            if base_logits is not None and rollout_logits is not None:
+                metrics["rollout_accept_len_gain_sum"] = (
+                    (rollout_per_block_len - base_per_block_len) * block_valid
+                ).sum()
+                metrics["rollout_accept_len_gain_total"] = block_valid.sum().clamp_min(
+                    1.0
+                )
+                metrics.update(
+                    _change_outcome_metrics(
+                        "causal_rollout",
+                        rollout_logits.argmax(dim=-1),
+                        base_ids,
+                        target_ids,
+                        loss_mask,
+                    )
+                )
+
     pred_ids = torch.argmax(logits, dim=-1)
-    target_ids = torch.argmax(targets, dim=-1)
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )
@@ -255,5 +424,13 @@ def compute_metrics(
     for pos in range(start_pos, block_size):
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
+
+    if rollout_logits is not None:
+        rollout_ids = torch.argmax(rollout_logits, dim=-1)
+        rollout_correct, rollout_total = compute_accuracy_multi_step(
+            rollout_ids, target_ids, loss_mask, pos_idx, block_size
+        )
+        metrics["rollout_full_acc_sum"] = rollout_correct[start_pos:].sum()
+        metrics["rollout_full_acc_total"] = rollout_total[start_pos:].sum()
 
     return loss, metrics

@@ -1,9 +1,81 @@
-"""Unit tests for DSpark Markov and confidence heads."""
+"""Unit tests for DSpark sequential and confidence heads."""
 
 import pytest
 import torch
 
-from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
+from speculators.models.dspark.model_definitions import (
+    CausalCorrectionHead,
+    ConfidenceHead,
+    MarkovHead,
+)
+
+
+class TestCausalCorrectionHead:
+    def _head(self):
+        torch.manual_seed(0)
+        return CausalCorrectionHead(
+            input_hidden_size=16,
+            token_embedding_size=16,
+            correction_hidden_size=12,
+            correction_rank=8,
+            num_layers=2,
+            num_heads=3,
+        ).eval()
+
+    def _inputs(self, seq_len=4):
+        torch.manual_seed(1)
+        return (
+            torch.randn(2, seq_len, 16),
+            torch.randn(2, seq_len, 16),
+            torch.randn(2, seq_len, 16),
+            torch.randn(2, seq_len, 3),
+        )
+
+    def test_shape_and_zero_initialized_residual(self):
+        head = self._head()
+        delta, states, cache = head(*self._inputs())
+        assert delta.shape == (2, 4, 16)
+        assert states.shape == (2, 4, 12)
+        assert cache is None
+        assert torch.count_nonzero(delta) == 0
+        assert torch.isfinite(states).all()
+
+    def test_future_inputs_do_not_change_prefix(self):
+        head = self._head()
+        inputs = list(self._inputs())
+        _, states_a, _ = head(*inputs)
+        changed = [value.clone() for value in inputs]
+        for value in changed:
+            value[:, 2:] = torch.randn_like(value[:, 2:]) * 100.0
+        _, states_b, _ = head(*changed)
+        assert torch.allclose(states_a[:, :2], states_b[:, :2], atol=1e-5)
+
+    def test_cached_rollout_matches_full_sequence(self):
+        head = self._head()
+        inputs = self._inputs()
+        _, full_states, _ = head(*inputs)
+
+        cache = None
+        step_states = []
+        for position in range(inputs[0].shape[1]):
+            step_inputs = tuple(
+                value[:, position : position + 1] for value in inputs
+            )
+            _, states, cache = head(
+                *step_inputs,
+                cache=cache,
+                use_cache=True,
+            )
+            step_states.append(states)
+
+        assert cache is not None
+        assert len(cache) == 2
+        assert torch.allclose(
+            full_states,
+            torch.cat(step_states, dim=1),
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
 
 class TestMarkovHead:

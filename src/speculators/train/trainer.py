@@ -206,27 +206,34 @@ class Trainer:
         self.setup_trainer()
         self.setup_model()
         self.setup_optimizer()
-        self._init_ssal_curriculum()
+        self._init_loss_curricula()
 
-    def _init_ssal_curriculum(self) -> None:
-        """Pull SSAL curriculum knobs out of train_call_kwargs (not model inputs)."""
+    def _init_loss_curricula(self) -> None:
+        """Pull trainer-owned loss schedules out of the model call kwargs."""
         kwargs = self.config.train_call_kwargs
         self._ssal_curriculum = False
         self._ssal_curriculum_start = 0.1
         self._ssal_curriculum_end = 0.6
-        self._ssal_total_steps: int | None = None
+        self._correction_curriculum = False
+        self._correction_curriculum_end = 0.2
+        self._curriculum_total_steps: int | None = None
         if kwargs and kwargs.pop("ssal_curriculum", False):
             self._ssal_curriculum = True
             self._ssal_curriculum_start = float(
                 kwargs.pop("ssal_curriculum_start", 0.1)
             )
             self._ssal_curriculum_end = float(kwargs.pop("ssal_curriculum_end", 0.6))
+        if kwargs and kwargs.pop("correction_curriculum", False):
+            self._correction_curriculum = True
+            self._correction_curriculum_end = float(
+                kwargs.pop("correction_curriculum_end", 0.2)
+            )
 
-    def _ssal_decay_weight(self) -> float:
-        """λ: 1 → 0 over [start, end] of training progress."""
-        progress = self.global_step / self._ssal_total_steps
-        start = self._ssal_curriculum_start
-        end = self._ssal_curriculum_end
+    def _curriculum_decay_weight(self, start: float, end: float) -> float:
+        """Return a 1-to-0 linear weight over a training-progress interval."""
+        if self._curriculum_total_steps is None or self._curriculum_total_steps <= 0:
+            raise RuntimeError("curriculum total steps must be initialized")
+        progress = self.global_step / self._curriculum_total_steps
         if progress <= start:
             return 1.0
         if progress >= end:
@@ -469,8 +476,10 @@ class Trainer:
 
         # Capture full-epoch step count before any resume fast-skip mutation.
         num_steps = len(self.train_loader)
-        if self._ssal_curriculum and self._ssal_total_steps is None:
-            self._ssal_total_steps = self.config.num_epochs * num_steps
+        if (
+            self._ssal_curriculum or self._correction_curriculum
+        ) and self._curriculum_total_steps is None:
+            self._curriculum_total_steps = self.config.num_epochs * num_steps
 
         # Determine how many batches to skip for mid-epoch resume.
         skip_steps = self._prepare_resume_skip(epoch)
@@ -503,9 +512,30 @@ class Trainer:
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
                 timer.mark("fetch")
-                call_kwargs = self.config.train_call_kwargs or {}
+                call_kwargs = dict(self.config.train_call_kwargs or {})
+                batch_device = next(
+                    value.device
+                    for value in gpu_batch.values()
+                    if isinstance(value, torch.Tensor)
+                )
                 if self._ssal_curriculum:
-                    call_kwargs["ssal_decay_weight"] = self._ssal_decay_weight()
+                    ssal_weight = self._curriculum_decay_weight(
+                        self._ssal_curriculum_start, self._ssal_curriculum_end
+                    )
+                    call_kwargs["ssal_decay_weight"] = torch.tensor(
+                        ssal_weight,
+                        device=batch_device,
+                        dtype=torch.float32,
+                    )
+                if self._correction_curriculum:
+                    correction_weight = self._curriculum_decay_weight(
+                        0.0, self._correction_curriculum_end
+                    )
+                    call_kwargs["correction_base_weight"] = torch.tensor(
+                        correction_weight,
+                        device=batch_device,
+                        dtype=torch.float32,
+                    )
                 _draft_tokens, loss, metrics = self.model(
                     **gpu_batch, **call_kwargs
                 )

@@ -3,7 +3,7 @@
 #
 # Runs the full online DSpark training pipeline on Ascend: data preparation,
 # vLLM server launch, and training with hidden states generated on-the-fly.
-# DSpark extends DFlash with a Markov head and a confidence head.
+# DSpark extends DFlash with a sequential correction and confidence head.
 #
 # Usage: Copy this script, modify the configuration variables below, then run:
 #   bash examples/train/dspark_qwen3_8b_sharegpt_online_ascend.sh
@@ -36,13 +36,26 @@ DRAFT_VOCAB_SIZE=32000
 TARGET_LAYER_IDS="1 9 17 25 33"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
 DRAFT_ATTN_IMPL="sdpa"     # Use eager/sdpa on hardware without flex attention.
 
-# Markov + confidence head settings
+# Correction + confidence head settings. Use an empty CORRECTION_HEAD_ARGS array
+# to fall back to the legacy Markov head.
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
+CORRECTION_HEAD_ARGS=(--enable-correction-head)
+CORRECTION_HIDDEN_SIZE=512
+CORRECTION_RANK=256
+CORRECTION_NUM_LAYERS=1
+CORRECTION_NUM_HEADS=8
+CORRECTION_TOP_K=8
+CORRECTION_GATE_BIAS=0.0
+CORRECTION_ROLLOUT_METRICS_ARGS=(--correction-rollout-metrics)
+CORRECTION_CURRICULUM_ARGS=(--correction-curriculum)
+CORRECTION_CURRICULUM_END=0.2
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
 CONFIDENCE_LENGTH_ALPHA=0.0
 CONFIDENCE_LOSS_WEIGHTING="uniform"   # uniform | match-draft
+# Use --confidence-detach-features to keep confidence fully auxiliary.
+CONFIDENCE_DETACH_FEATURES_ARGS=(--no-confidence-detach-features)
 FIRST_ERROR_FOCAL_ALPHA=0.0
 ADAPTIVE_LOSS="none"                  # none | cat | ssal
 # Set SSAL_CURRICULUM_ARGS=(--ssal-curriculum) to enable decay→SSAL mix.
@@ -96,12 +109,23 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --target-layer-ids $TARGET_LAYER_IDS \
     --markov-rank "$MARKOV_RANK" \
     --markov-head-type "$MARKOV_HEAD_TYPE" \
+    "${CORRECTION_HEAD_ARGS[@]}" \
+    --correction-hidden-size "$CORRECTION_HIDDEN_SIZE" \
+    --correction-rank "$CORRECTION_RANK" \
+    --correction-num-layers "$CORRECTION_NUM_LAYERS" \
+    --correction-num-heads "$CORRECTION_NUM_HEADS" \
+    --correction-top-k "$CORRECTION_TOP_K" \
+    --correction-gate-bias "$CORRECTION_GATE_BIAS" \
+    "${CORRECTION_ROLLOUT_METRICS_ARGS[@]}" \
+    "${CORRECTION_CURRICULUM_ARGS[@]}" \
+    --correction-curriculum-end "$CORRECTION_CURRICULUM_END" \
     --enable-confidence-head \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
     --confidence-length-alpha "$CONFIDENCE_LENGTH_ALPHA" \
     --confidence-loss-weighting "$CONFIDENCE_LOSS_WEIGHTING" \
+    "${CONFIDENCE_DETACH_FEATURES_ARGS[@]}" \
     --first-error-focal-alpha "$FIRST_ERROR_FOCAL_ALPHA" \
     --adaptive-loss "$ADAPTIVE_LOSS" \
     "${SSAL_CURRICULUM_ARGS[@]}" \
