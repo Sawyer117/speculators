@@ -11,9 +11,15 @@ Unless a run says otherwise, all numbers below share:
 
 - **Target**: `DeepSeek-V4-Flash-bf16`.
 - **Serve**: vllm-ascend PR **#12006 @ `386530d12`** (env `dspark-dsv4-serving`), A2 **dual-node bf16**
-  (115 head / 116 worker, `world_size=16`), **EAGER=0** (graph mode — #12006 fixed graph),
+  (115 head / 116 worker, `world_size=16`), **EAGER=0** (graph mode — #12006 ACLGraph; graph is the ONLY
+  mode that supports our DP2 dual-node — **eager/EAGER=1 raises "Eager DSpark does not support DP token padding"**),
   `num_speculative_tokens=5`, `draft_sample=greedy`, `aux_layers=[40,41,42]`,
   `VLLM_ASCEND_DSPARK_USE_STANDARD_DSA=1`. Serve script `examples/ascend_npu_dflash/serve_dsv4_bf16_dualnode.sh`.
+  > ⚠️ **2026-07-22 NOTE**: this row IS correct (386530d12 + EAGER=0). A rebuild attempt failed only because the
+  > editable install was left at `+g431a64b18` (v2 ops) while the checkout was 386530d12 (v3 python) = MISMATCHED
+  > build → the `_get_block_table` crash. FIX = clean rebuild AT 386530d12 (`git checkout 386530d12 && pip install
+  > -e . --no-deps --no-build-isolation`, confirm `pip list` shows `+g386530d12`) on BOTH nodes, then serve EAGER=0.
+  > EAGER=1 does NOT work here (eager DSpark can't do DP token padding); v2 `431a64b18` is eager-only (no graph).
 - **Eval**: `examples/ascend_npu_dflash/run_dspark_eval.sh` (→ `Evaluator.py`), **greedy**
   `temp0 / top-p1 / top-k1`, concurrency 16, `max_new_tokens=2048`, **FULL** datasets, warmup 10.
 - **Metric defs**:
@@ -43,6 +49,7 @@ multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
 |-----|:-----:|:-------:|:---------:|:----:|:--------:|:----:|-------|
 | **released draft** *(bar)* | 4.658 | 4.661 | 4.942 | 4.535 | 3.294 | **4.42** | official 3.94 @ ns5; full-all on our serve ✓ |
 | `epoch4-17w` | 3.404 | 3.265 | 3.312 | 3.058 | 2.344 | 3.08 | ⚠ wrong dataset (17W not 45W); all fixes in; **gap = tail** |
+| `ep0-77w` *(epoch 0)* | 3.186 | 3.041 | 3.079 | 2.868 | 2.255 | 2.89 | first ckpt of A3 77W run (LR 3e-4, noise 0.05); epoch0 vs 17w's epoch4 — **not** like-for-like; gap = tail (pos2 cliff) |
 
 ### Throughput (tok/s) by dataset
 
@@ -55,6 +62,7 @@ speedup is measured against.
 | `no-spec base` *(ref, gsm8k-only so far)* | 302.69 | — | — | — | — |
 | **released draft** | 187.55 | 313.03 | 169.41 | 374.51 | 268.59 |
 | `epoch4-17w` | 162.26 | 256.48 | 143.19 | 285.44 | 220.50 |
+| `ep0-77w` *(⚠ conc 48, NOT 16 — not comparable)* | 232.30 | 364.40 | 218.17 | 415.53 | 253.64 |
 
 ## Runs (detail)
 
@@ -114,6 +122,34 @@ underfits them — **NOT** autoregressive drift (DSpark backbone is a parallel n
 predictor; the only AR piece, the Markov head, sees train-consistent input on any prefix that counts
 toward `accept_len`). mt-bench low (2.344) = multi-turn chat, out-of-distribution for this non-chat
 draft. The tail is recoverable → the 45W (`arrow_0715`) retrain targets pos3/pos4.
+
+### `ep0-77w` — 2026-07-22
+
+- **Draft ckpt**: epoch-0 (first checkpoint) of the A3 **77W** full-alignment run (`arrow_0720_77w`, LR 3e-4, AdamW,
+  `noise_std=0.05`, tv 1.8, γ4, warm-start-layer ON, `block_size=5`, `sample_from_anchor=True`, all fixes in). Converted
+  via `convert_dspark_to_vllm.py` (2378/2378 bit-exact), served as `dsv4_dspark_ep0_vllm-77w`.
+- **Serve**: [Shared setup](#shared-setup) — #12006 `386530d12` (unpatched), **EAGER=0**, but **concurrency 48** (not the
+  shared 16) → its **throughput is NOT comparable** to the conc-16 rows above. `accept_len` IS comparable (per-draft,
+  concurrency-independent). ⚠ Requires node **109's rogue rollout process KILLED first** — its `/v1/completions` flood
+  drains a DP rank and triggers the DP-idle `dummy_run` crash (fixed by `Sawyer117/vllm-ascend@fix/dspark-dummy-dp-pad`,
+  not pulled here; with 109 dead it ran full-all clean without the patch).
+- **Raw eval log**: `~/eval_ep0_all.log` on head node 115.
+
+| Dataset | Samples | tok/s (conc48) | accept_len | accept_rate | pos0 | pos1 | pos2 | pos3 | pos4 |
+|---------|:-------:|:-----:|:----------:|:-----------:|:----:|:----:|:----:|:----:|:----:|
+| gsm8k | 1309 | 232.30 | **3.186** | 43.72% | 87.91 | 73.10 | 39.21 | 13.65 | 4.73 |
+| math500 | 490 | 364.40 | **3.041** | 40.83% | 84.81 | 68.76 | 35.60 | 11.40 | 3.58 |
+| humaneval | 154 | 218.17 | **3.079** | 41.57% | 90.27 | 74.20 | 31.85 | 9.54 | 2.01 |
+| mbpp | 247 | 415.53 | **2.868** | 37.37% | 84.40 | 64.07 | 28.51 | 7.93 | 1.93 |
+| mt-bench | 70 | 253.64 | **2.255** | 25.10% | 67.61 | 39.52 | 14.15 | 3.46 | 0.77 |
+
+**Read.** First checkpoint (epoch 0) of the 77W run. Headline sits below `epoch4-17w` (gsm8k 3.186 vs 3.404) — but that
+is **epoch-0 vs epoch-4, not like-for-like**; the 77W run has 10 epochs. Shape: healthy pos0/1 (gsm8k 88/73) then a
+**cliff already at pos2** (conditional 73→54%), *earlier* than 17w's pos3 cliff → the tail is the undertrained-at-epoch-0
+deficit, exactly as expected. The entire gap to released lives in pos2+ (released 73/64/53 vs ep0's 39/14/5). Watch the
+**per-position epoch curve** (pos2/3/4 lifting) as later ckpts convert+eval — that, not the headline, tells whether the
+tail is learning. mt-bench lowest (2.255, multi-turn chat OOD). Next: eval epoch1; then the **`noise_std=0` A/B**
+(DeepSpec trains with no hidden-state noise — top candidate tail fix).
 
 ## Baselines / TODO
 
