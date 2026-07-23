@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Static "our best vs released baseline" scoreboard TABLE (accept_len + per-position), to a PNG.
+"""Static "our runs vs released baseline" scoreboard TABLE (accept_len + per-position), to a PNG.
 
 Unlike analyze_train_run.py (which plots a LIVE training log), this figure reads NO log — it renders
 hardcoded result rows so the image is STABLE:
   * BASELINE never changes (the released draft, measured once).
-  * BEST only moves when a new run beats it and we EDIT the BEST* blocks below.
+  * RUNS is the list of OUR eval'd checkpoints; each renders one row under released per dataset.
 So it does not wiggle per-log; it's the fixed scoreboard. Numbers mirror the per-dataset accept_len
 AND per-position accept rate in docs/deployment/ascend-npu-dsv4-dspark-eval-results.md — keep in sync.
 
-Layout: one row per (dataset, run) — Released then Our best — with columns accept_len + pos0..pos4.
-Every "Our best" cell is shaded RdYlGn by its % of the baseline cell, so the tail collapse
-(pos3/pos4) reds out at a glance while pos0–2 stay green.
+Layout: per dataset, one Released row then one row per RUN — columns accept_len + pos0..pos4. Every
+run cell is shaded RdYlGn by its % of the baseline cell, so the tail collapse (pos3/pos4) reds out at
+a glance while pos0-2 stay green.
 
     python plot_best_vs_baseline.py                    # -> ./best_vs_baseline.png
     python plot_best_vs_baseline.py --out ~/scoreboard.png
@@ -31,17 +31,33 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
     "mt-bench":  [79.21, 58.55, 41.45, 29.32, 20.87],
 }
 
-# ── our current BEST trained draft. ✏️ UPDATE THESE THREE (label + BEST + BEST_POS) ONLY when a new
-#    run beats it — that is the only thing that should ever move this scoreboard.
-BEST_LABEL = "epoch4-17w (2026-07-19)"
-BEST = {"gsm8k": 3.404, "math500": 3.265, "humaneval": 3.312, "mbpp": 3.058, "mt-bench": 2.344}
-BEST_POS = {
-    "gsm8k":     [90.44, 71.96, 53.87, 19.18, 4.95],
-    "math500":   [87.82, 66.70, 50.16, 17.39, 4.43],
-    "humaneval": [92.75, 72.15, 49.56, 13.70, 3.00],
-    "mbpp":      [87.30, 62.25, 41.31, 12.36, 2.63],
-    "mt-bench":  [69.45, 38.90, 19.86, 5.28, 0.91],
-}
+# ── OUR trained runs, oldest→newest. ✏️ APPEND a dict here when a new ckpt is eval'd (keep in sync
+#    with the eval-results ledger). Current scoreboard = the window-128 / 77W run (epoch curve).
+#    (The old window-2048 `epoch4-17w` run was removed — different draft config, not comparable.)
+RUNS = [
+    {
+        "label": "ep0-77w (w128)",
+        "al": {"gsm8k": 3.186, "math500": 3.041, "humaneval": 3.079, "mbpp": 2.868, "mt-bench": 2.255},
+        "pos": {
+            "gsm8k":     [87.91, 73.10, 39.21, 13.65, 4.73],
+            "math500":   [84.81, 68.76, 35.60, 11.40, 3.58],
+            "humaneval": [90.27, 74.20, 31.85, 9.54, 2.01],
+            "mbpp":      [84.40, 64.07, 28.51, 7.93, 1.93],
+            "mt-bench":  [67.61, 39.52, 14.15, 3.46, 0.77],
+        },
+    },
+    {
+        "label": "ep2.5-77w (w128, noise0.05) ⚠176",
+        "al": {"gsm8k": 3.203, "math500": 3.096, "humaneval": 3.106, "mbpp": 2.928, "mt-bench": 2.272},
+        "pos": {
+            "gsm8k":     [88.53, 73.16, 39.37, 14.21, 5.07],
+            "math500":   [86.00, 69.90, 37.38, 12.45, 3.89],
+            "humaneval": [90.22, 74.45, 32.98, 10.46, 2.47],
+            "mbpp":      [86.36, 66.43, 29.55, 8.37, 2.07],
+            "mt-bench":  [68.33, 39.72, 14.55, 3.77, 0.82],
+        },
+    },
+]
 
 
 def _avg(d):
@@ -66,36 +82,38 @@ def main():
     except ImportError:
         raise SystemExit("need matplotlib — pip install matplotlib")
 
-    # assemble per-row data incl. the computed average row
-    base_al = dict(BASELINE, average=_avg(BASELINE))
-    best_al = dict(BEST, average=_avg(BEST))
-    base_pos = dict(BASELINE_POS, average=_avg_pos(BASELINE_POS))
-    best_pos = dict(BEST_POS, average=_avg_pos(BEST_POS))
     rows = DATASETS + ["average"]
+    base_al = dict(BASELINE, average=_avg(BASELINE))
+    base_pos = dict(BASELINE_POS, average=_avg_pos(BASELINE_POS))
+    runs = [{"label": r["label"],
+             "al": dict(r["al"], average=_avg(r["al"])),
+             "pos": dict(r["pos"], average=_avg_pos(r["pos"]))} for r in RUNS]
+    rows_per_group = 1 + len(runs)   # released + one row per run
 
     cmap = plt.get_cmap("RdYlGn")
-    norm = colors.Normalize(vmin=0, vmax=100)   # shade best cells 0–100% of baseline
+    norm = colors.Normalize(vmin=0, vmax=100)   # shade run cells 0–100% of baseline
 
     col_labels = ["Dataset", "Run", "accept_len", "pos0", "pos1", "pos2", "pos3", "pos4"]
-    cell_text, cell_colors = [], []
     NEUT = "#eef2f7"      # released (baseline) row cells
+    cell_text, cell_colors = [], []
     for d in rows:
-        pct_al = 100.0 * best_al[d] / base_al[d]
         # released row (fixed reference)
         cell_text.append([d, "released", f"{base_al[d]:.3f}"] + [f"{v:.1f}" for v in base_pos[d]])
         cell_colors.append([NEUT] * len(col_labels))
-        # our-best row — accept_len shows the % inline; every metric cell shaded by its own %
-        best_cells = [f"{best_al[d]:.3f}  ({pct_al:.0f}%)"] + [f"{v:.1f}" for v in best_pos[d]]
-        shaded = [colors.to_hex(cmap(norm(pct_al)))]
-        for i in range(5):
-            p = 100.0 * best_pos[d][i] / base_pos[d][i] if base_pos[d][i] else 0.0
-            shaded.append(colors.to_hex(cmap(norm(p))))
-        cell_text.append(["", "our best"] + best_cells)
-        cell_colors.append(["#ffffff", "#ffffff"] + shaded)
+        # one row per run — accept_len shows the % inline; every metric cell shaded by its own %
+        for run in runs:
+            pct_al = 100.0 * run["al"][d] / base_al[d] if base_al[d] else 0.0
+            cells = [f"{run['al'][d]:.3f}  ({pct_al:.0f}%)"] + [f"{v:.1f}" for v in run["pos"][d]]
+            shaded = [colors.to_hex(cmap(norm(pct_al)))]
+            for i in range(5):
+                p = 100.0 * run["pos"][d][i] / base_pos[d][i] if base_pos[d][i] else 0.0
+                shaded.append(colors.to_hex(cmap(norm(p))))
+            cell_text.append(["", run["label"]] + cells)
+            cell_colors.append(["#ffffff", "#ffffff"] + shaded)
 
-    fig, ax = plt.subplots(figsize=(11.0, 0.9 + 0.42 * (len(cell_text) + 1)))
+    fig, ax = plt.subplots(figsize=(11.5, 0.9 + 0.42 * (len(cell_text) + 1)))
     ax.axis("off")
-    ax.set_title("DSV4-DSpark  —  our best vs released baseline  (accept_len + per-position accept rate %)",
+    ax.set_title("DSV4-DSpark  —  our runs (w128, 77W) vs released baseline  (accept_len + per-position accept rate %)",
                  fontsize=13, fontweight="bold", pad=16)
 
     tbl = ax.table(cellText=cell_text, colLabels=col_labels, cellColours=cell_colors,
@@ -108,33 +126,33 @@ def main():
     for c in range(ncol):                                    # header
         tbl[0, c].set_text_props(fontweight="bold", color="white")
         tbl[0, c].set_facecolor("#33415a")
-    for ri in range(len(cell_text)):                         # dataset name + best-run cells bold
-        tr = tbl[ri + 1, 0]
+    for ri in range(len(cell_text)):                         # dataset name bold; run label italic
         if cell_text[ri][0]:
-            tr.set_text_props(fontweight="bold")
-        if cell_text[ri][1] == "our best":
+            tbl[ri + 1, 0].set_text_props(fontweight="bold")
+        if cell_text[ri][1] != "released":
             tbl[ri + 1, 1].set_text_props(fontstyle="italic")
-    for c in range(ncol):                                    # average group (last 2 rows) bold
-        tbl[len(cell_text) - 1, c].set_text_props(fontweight="bold")
-        tbl[len(cell_text), c].set_text_props(fontweight="bold")
-    for r in range(len(cell_text) + 1):                      # thin borders + group separators
+    for ri in range(len(cell_text) - rows_per_group, len(cell_text)):   # average group bold
+        for c in range(ncol):
+            tbl[ri + 1, c].set_text_props(fontweight="bold")
+    for r in range(len(cell_text) + 1):                      # thin borders + thick separator above each group
         for c in range(ncol):
             cell = tbl[r, c]
             cell.set_edgecolor("#c8d0da")
-            cell.set_linewidth(2.0 if (r > 0 and r % 2 == 1) else 0.5)  # thicker line above each dataset
+            thick = (r > 0 and (r - 1) % rows_per_group == 0)
+            cell.set_linewidth(2.0 if thick else 0.5)
 
     fig.text(0.5, 0.03,
-             "cell shading = Our best as % of the released baseline in that cell (green→red).  "
+             "cell shading = our run as % of the released baseline in that cell (green→red).  "
              "per-position = cumulative accept rate S_k (%).  "
              "baseline = released draft, full DATASET=all, #12006 serve, num_spec=5, greedy.  "
+             "⚠ ep2.5 on 176 A3-single serve (calibration pending).  "
              "Source: docs/deployment/ascend-npu-dsv4-dspark-eval-results.md",
-             ha="center", fontsize=6.5, color="0.45")
+             ha="center", fontsize=6.0, color="0.45")
     fig.savefig(args.out, dpi=150, bbox_inches="tight")
     print(f"saved: {args.out}")
-    print(f"  best avg {best_al['average']:.3f} = {100 * best_al['average'] / base_al['average']:.0f}% "
-          f"of released {base_al['average']:.3f};  "
-          f"avg per-pos best {[round(v) for v in best_pos['average']]} vs base "
-          f"{[round(v) for v in base_pos['average']]}")
+    for run in runs:
+        print(f"  {run['label']}: avg {run['al']['average']:.3f} = "
+              f"{100 * run['al']['average'] / base_al['average']:.0f}% of released {base_al['average']:.3f}")
 
 
 if __name__ == "__main__":

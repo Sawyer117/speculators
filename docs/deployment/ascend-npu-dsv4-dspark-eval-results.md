@@ -50,6 +50,7 @@ multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
 | **released draft** *(bar)* | 4.658 | 4.661 | 4.942 | 4.535 | 3.294 | **4.42** | official 3.94 @ ns5; full-all on our serve ✓ |
 | `epoch4-17w` | 3.404 | 3.265 | 3.312 | 3.058 | 2.344 | 3.08 | ⚠ wrong dataset (17W not 45W); all fixes in; **gap = tail** |
 | `ep0-77w` *(epoch 0)* | 3.186 | 3.041 | 3.079 | 2.868 | 2.255 | 2.89 | first ckpt of A3 77W run (LR 3e-4, noise 0.05); epoch0 vs 17w's epoch4 — **not** like-for-like; gap = tail (pos2 cliff) |
+| `ep2.5-77w` *(arm A, noise 0.05)* | 3.203 | 3.096 | 3.106 | 2.928 | 2.272 | 2.92 | epoch2-mid (30,969 steps) of A3 77W run; **≈ ep0 — FLAT, tail frozen** (gsm8k pos2/3/4 = 39/14/5, same as ep0) → 1.5 more epochs bought +0.03 mean. ⚠**176 A3-single serve, UNCALIBRATED** (released-on-176 pending — can't yet rule out serve capping vs training-flat) |
 
 ### Throughput (tok/s) by dataset
 
@@ -63,6 +64,7 @@ speedup is measured against.
 | **released draft** | 187.55 | 313.03 | 169.41 | 374.51 | 268.59 |
 | `epoch4-17w` | 162.26 | 256.48 | 143.19 | 285.44 | 220.50 |
 | `ep0-77w` *(⚠ conc 48, NOT 16 — not comparable)* | 232.30 | 364.40 | 218.17 | 415.53 | 253.64 |
+| `ep2.5-77w` *(⚠ conc 48 + A3-single serve — NOT comparable)* | 449.93 | 634.26 | 364.42 | 701.41 | 405.82 |
 
 ## Runs (detail)
 
@@ -150,6 +152,44 @@ deficit, exactly as expected. The entire gap to released lives in pos2+ (release
 **per-position epoch curve** (pos2/3/4 lifting) as later ckpts convert+eval — that, not the headline, tells whether the
 tail is learning. mt-bench lowest (2.255, multi-turn chat OOD). Next: eval epoch1; then the **`noise_std=0` A/B**
 (DeepSpec trains with no hidden-state noise — top candidate tail fix).
+
+### `ep2.5-77w` (arm A, noise 0.05) — 2026-07-23
+
+- **Draft ckpt**: **epoch2-mid** (`epoch2_step6193`, global_step 30,969 = **2.5 epochs**) of the A3 **77W** run
+  (`arrow_0720_77w`, LR 3e-4, AdamW, `noise_std=0.05`, tv 1.8, γ4, warm-start-layer ON, `block_size=5`,
+  `sample_from_anchor=True`). Converted via `convert_dspark_to_vllm.py` (2378/2378 bit-exact), served as
+  `dsv4_dspark_ep2.5_noise0.05_vllm-77w`. = **arm A** of the noise A/B (arm B = same fork at epoch1_end, noise 0).
+- **Serve**: ⚠ **DIFFERENT from Shared setup** — node **176 A3 SINGLE-NODE** (`serve_dsv4_a3_singlenode.sh`,
+  DP2/TP8/**EP16**), `386530d12`, **EAGER=0**, **`VLLM_ASCEND_ENABLE_FLASHCOMM1=0`** (A3-single graph-mode +
+  spec-decode needs FlashComm/seq-parallel OFF, else cudagraph "multiple of 6 and 8" crash), conc 48.
+  **⚠ THIS SERVE IS NOT YET CALIBRATED** — released-draft-on-176 (expect gsm8k 4.658) is PENDING; until it
+  reproduces, cannot distinguish "training flat" from "176 serve caps the tail."
+- **Raw eval log**: `~/eval_ep2.5_noise0.05.log` on 176.
+
+| Dataset | Samples | tok/s (conc48) | accept_len | accept_rate | pos0 | pos1 | pos2 | pos3 | pos4 |
+|---------|:-------:|:-----:|:----------:|:-----------:|:----:|:----:|:----:|:----:|:----:|
+| gsm8k | 1309 | 449.93 | **3.203** | 44.07% | 88.53 | 73.16 | 39.37 | 14.21 | 5.07 |
+| math500 | 490 | 634.26 | **3.096** | 41.92% | 86.00 | 69.90 | 37.38 | 12.45 | 3.89 |
+| humaneval | 154 | 364.42 | **3.106** | 42.12% | 90.22 | 74.45 | 32.98 | 10.46 | 2.47 |
+| mbpp | 247 | 701.41 | **2.928** | 38.56% | 86.36 | 66.43 | 29.55 | 8.37 | 2.07 |
+| mt-bench | 70 | 405.82 | **2.272** | 25.44% | 68.33 | 39.72 | 14.55 | 3.77 | 0.82 |
+
+**Read — the alarm.** 2.5 epochs vs ep0's 1 epoch = **essentially FLAT** (mean 2.92 vs 2.89, gsm8k 3.203 vs 3.186).
+The tail did **not** move: gsm8k pos2/3/4 = 39.4/14.2/5.1 (ep0: 39.2/13.7/4.7). 1.5 extra epochs (~18.5k steps) →
++0.02 accept_len. Meanwhile **training metrics rose** (train accept ~3.8, train pos3/4 ~0.64/0.59) → the eval-tail
+is decoupled from training progress. released proves the tail is learnable (63/53) so it's **our training/convention,
+not the architecture**. Leading hypothesis: **teacher-forcing exposure at the tail** — train pos_k sees the TRUE
+prefix; serve pos_k sees the draft's OWN (wrong) prefix, so more teacher-forced training never lifts the free-running
+tail. ⚠ BUT first rule out the serve: this is on the uncalibrated 176 A3-single serve — **run released-on-176 (expect
+4.658) before trusting "training is flat."** If 176 reads released < 4.658, the 3.203 is partly a serve artifact.
+
+> **★ ROOT CAUSE FOUND (2026-07-23) — it was a train↔serve mismatch, exactly at the later positions.** Training ran
+> **CAUSAL** intra-block attention (`train_dsv4_dspark.sh` never passed `--sliding-window-non-causal`, CLI default
+> False) but the vllm-ascend serve drafts the block **NON-CAUSAL** (`deepseek_v4_dspark_proposer.py:449 cad.causal=False`).
+> So every slot sees all γ slots at serve but only 0..k in training → the tail freezes and never improves with training,
+> while released (trained non-causal) gets 63/53. FIX = `--sliding-window-non-causal` (welded into `train_dsv4_dspark.sh`
+> as `NONCAUSAL=1` default) + **retrain from scratch** (serving side unchanged). See memory `dsv4-dspark-noncausal-root-cause`.
+> The `ep0`/`ep2.5` rows above are the CAUSAL (broken) baseline; the non-causal retrain is the real test.
 
 ## Baselines / TODO
 

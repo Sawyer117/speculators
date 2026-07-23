@@ -61,6 +61,14 @@ SWA_WINDOW="${SWA_WINDOW:-128}"        # draft sliding-window context (--sliding
                                        # keep our own value just because it ran. (Our old runs used the CLI
                                        # default 2048 = a divergence; now closed.) The dead `window_size` field
                                        # is a separate unused config knob, unrelated.
+NONCAUSAL="${NONCAUSAL:-1}"            # --sliding-window-non-causal: block-internal attention NON-CAUSAL (every
+                                       # draft slot sees ALL γ slots). ★ MUST be ON for DSV4-DSpark — the
+                                       # vllm-ascend serve drafts NON-causally (deepseek_v4_dspark_proposer.py
+                                       # `cad.causal=False`); training it OFF (the old CLI default) = causal block
+                                       # = a train↔serve mismatch that FREEZES the pos2+ tail (ep0≈ep2.5 flat;
+                                       # released, trained non-causal, gets 63/53). NONCAUSAL=0 only to reproduce
+                                       # the old broken causal runs. (train.py help's "vLLM doesn't support" note
+                                       # is STALE — our serve REQUIRES non-causal.)
 SCHED_TYPE="${SCHED_TYPE:-cosine}"     # LR scheduler (--scheduler-type). cosine = align to the DeepSpec DSpark
                                        # trainer (was speculators' default linear).
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"   # --scheduler-warmup-ratio; 0.04 (4%) = DeepSpec. Previously unset (~no
@@ -210,6 +218,10 @@ TS="$(date +%Y%m%d_%H%M%S)"
 TAG="$MODE"
 if [ "$EP" = "1" ]; then TAG="${TAG}_ep"; fi
 if [ "$GROUPED" = "1" ]; then TAG="${TAG}_grouped"; fi
+# --sliding-window-non-causal is action="store_true": add the flag ONLY when NONCAUSAL=1.
+# if-block (NOT `&&`) so a NONCAUSAL=0 test can't nonzero-abort under set -e.
+NONCAUSAL_FLAG=""
+if [ "$NONCAUSAL" = "1" ]; then NONCAUSAL_FLAG="--sliding-window-non-causal"; fi
 LOG="$RUN/${TAG}_${TS}.log"
 # Fresh per-run save-path so we DON'T auto-resume a stale (possibly non-EP) checkpoint
 # from ./output. Override SAVE_PATH=<dir> to resume a specific run.
@@ -217,7 +229,7 @@ SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
 echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL  init(moe/attn/hc/norm/layer)=$INITMOE/$INITATTN/$INITHC/$INITNORM/$INITLAYER"
-echo " block=$BLOCK (all $BLOCK slots drafted = gamma = num_spec; sample_from_anchor=True)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS"
+echo " block=$BLOCK (all $BLOCK slots drafted = gamma = num_spec; sample_from_anchor=True)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS  noncausal_block=$NONCAUSAL (=serve cad.causal=False)"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
 echo " data=$DATA"
@@ -233,7 +245,7 @@ nohup env \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
     --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
     --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
-    --dflash-decay-gamma "$DECAY_GAMMA" --sliding-window "$SWA_WINDOW" \
+    --dflash-decay-gamma "$DECAY_GAMMA" --sliding-window "$SWA_WINDOW" $NONCAUSAL_FLAG \
     --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" --noise-std "$NOISE_STD" \
     --draft-attn-impl sdpa --loss-fn "$LOSS_FN" \
     --scheduler-type "$SCHED_TYPE" --scheduler-warmup-ratio "$WARMUP_RATIO" \
