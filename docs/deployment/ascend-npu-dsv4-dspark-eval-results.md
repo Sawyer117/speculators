@@ -50,7 +50,8 @@ multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
 | **released draft** *(bar)* | 4.658 | 4.661 | 4.942 | 4.535 | 3.294 | **4.42** | official 3.94 @ ns5; full-all on our serve ✓ |
 | `epoch4-17w` | 3.404 | 3.265 | 3.312 | 3.058 | 2.344 | 3.08 | ⚠ wrong dataset (17W not 45W); all fixes in; **gap = tail** |
 | `ep0-77w` *(epoch 0)* | 3.186 | 3.041 | 3.079 | 2.868 | 2.255 | 2.89 | first ckpt of A3 77W run (LR 3e-4, noise 0.05); epoch0 vs 17w's epoch4 — **not** like-for-like; gap = tail (pos2 cliff) |
-| `ep2.5-77w` *(arm A, noise 0.05)* | 3.203 | 3.096 | 3.106 | 2.928 | 2.272 | 2.92 | epoch2-mid (30,969 steps) of A3 77W run; **≈ ep0 — FLAT, tail frozen** (gsm8k pos2/3/4 = 39/14/5, same as ep0) → 1.5 more epochs bought +0.03 mean. ⚠**176 A3-single serve, UNCALIBRATED** (released-on-176 pending — can't yet rule out serve capping vs training-flat) |
+| `ep2.5-77w` *(arm A, noise 0.05, CAUSAL)* | 3.203 | 3.096 | 3.106 | 2.928 | 2.272 | 2.92 | epoch2-mid (30,969 steps) of A3 77W run; **≈ ep0 — FLAT, tail frozen** (gsm8k pos2/3/4 = 39/14/5, same as ep0) → 1.5 more epochs bought +0.03 mean. 176 A3-single serve conc48. ~~serve capping?~~ **RESOLVED**: `ep0mid-77w-nc` on the SAME 176 serve hit 4.032 → serve does NOT cap → ep2.5's flatness was REAL (causal-training), not a serve artifact. |
+| **`ep0mid-77w` *(NON-CAUSAL fix, epoch0-mid)*** | **4.032** | **3.721** | **3.856** | **3.586** | **2.482** | **3.54** | ★ **THE non-causal fix lands.** epoch0-**mid** (step 6194 = 0.5 epoch) of the non-causal retrain (`--sliding-window-non-causal`, +#848 detach). Same 176 serve as ep2.5 → **only variable = train causality.** gsm8k **3.186→4.032** (+0.85), tail **pos2/3/4 = 59/46/35** vs causal's 39/14/5 (pos4 **7.4×**). **0.5ep non-causal >> 2.5ep causal.** Past official 3.94@ns5; 86.6% of released-on-our-serve at 0.5/10 epoch. |
 
 ### Throughput (tok/s) by dataset
 
@@ -65,6 +66,7 @@ speedup is measured against.
 | `epoch4-17w` | 162.26 | 256.48 | 143.19 | 285.44 | 220.50 |
 | `ep0-77w` *(⚠ conc 48, NOT 16 — not comparable)* | 232.30 | 364.40 | 218.17 | 415.53 | 253.64 |
 | `ep2.5-77w` *(⚠ conc 48 + A3-single serve — NOT comparable)* | 449.93 | 634.26 | 364.42 | 701.41 | 405.82 |
+| `ep0mid-77w` *(non-causal; ⚠ conc 48 + A3-single serve)* | 552.14 | 744.06 | 471.49 | 885.18 | 469.40 |
 
 ## Runs (detail)
 
@@ -190,6 +192,38 @@ tail. ⚠ BUT first rule out the serve: this is on the uncalibrated 176 A3-singl
 > while released (trained non-causal) gets 63/53. FIX = `--sliding-window-non-causal` (welded into `train_dsv4_dspark.sh`
 > as `NONCAUSAL=1` default) + **retrain from scratch** (serving side unchanged). See memory `dsv4-dspark-noncausal-root-cause`.
 > The `ep0`/`ep2.5` rows above are the CAUSAL (broken) baseline; the non-causal retrain is the real test.
+> **✅ CONFIRMED by `ep0mid-77w` below** — 0.5 epoch non-causal crushed 2.5 epoch causal; the tail unfroze exactly as predicted.
+
+### `ep0mid-77w` (NON-CAUSAL fix, epoch0-mid) — 2026-07-24
+
+- **Draft ckpt**: **epoch0-mid** (`epoch0_step6194`, 0.5 epoch) of the A3 **77W NON-CAUSAL retrain**
+  (`ckpt_faithful_ep_20260723_152149/0`; `--sliding-window-non-causal` = `NONCAUSAL=1`, +#848 confidence-detach,
+  LR 3e-4, AdamW, noise 0.05, tv 1.8, γ4, warm-start-layer ON, block_size=5, sample_from_anchor=True). Converted via
+  `convert_dspark_to_vllm.py` (2378/2378 bit-exact, `--config-from released_draft_bf16_standalone/config.json`), served as
+  `dsv4_dspark_ep0mid_noncausal_vllm-77w`.
+- **Serve**: **SAME as `ep2.5` above** — node 176 A3 single-node (`serve_dsv4_a3_singlenode.sh`, DP2/TP8/EP16),
+  `386530d12`, EAGER=0, `VLLM_ASCEND_ENABLE_FLASHCOMM1=0`, conc 48. → **ep2.5↔ep0mid is a clean same-serve A/B; the
+  only variable is train causality.**
+- **Raw eval log**: `~/eval_ep0mid_nc_all.log` on 176.
+
+| Dataset | Samples | tok/s (conc48) | accept_len | accept_rate | pos0 | pos1 | pos2 | pos3 | pos4 |
+|---------|:-------:|:-----:|:----------:|:-----------:|:----:|:----:|:----:|:----:|:----:|
+| gsm8k | 1309 | 552.14 | **4.032** | 60.64% | 88.54 | 74.73 | 58.88 | 46.05 | 35.00 |
+| math500 | 490 | 744.06 | **3.721** | 54.43% | 84.57 | 69.23 | 52.52 | 38.75 | 27.05 |
+| humaneval | 154 | 471.49 | **3.856** | 57.13% | 88.12 | 74.83 | 55.05 | 40.23 | 27.43 |
+| mbpp | 247 | 885.18 | **3.586** | 51.72% | 85.29 | 67.76 | 48.11 | 34.06 | 23.40 |
+| mt-bench | 70 | 469.40 | **2.482** | 29.64% | 67.41 | 39.89 | 21.83 | 12.21 | 6.86 |
+
+**Read — the fix lands, unambiguously.** Same 176 serve as causal `ep2.5`, only the training changed (causal→non-causal).
+gsm8k **3.203→4.032** (+0.85, +26%); the tail — frozen at 39/14/5 through 2.5 causal epochs — jumps to **59/46/35** at
+just **0.5 non-causal epoch** (pos4 **7.4×**). pos0/pos1 barely move (88/75, never the problem): the delta is entirely
+pos2+, the exact signature of unfreezing the late block slots (causal starved slot-k of slots >k; non-causal feeds it all
+γ). **0.5ep non-causal >> 2.5ep causal** → the causal runs were optimizing the wrong task, as diagnosed. Two bonus
+conclusions: (1) **176 serve is NOT capping** — it happily reports 4.032 → retroactively validates the 176 serve and
+confirms ep2.5's flatness was real (training), closing the "serve artifact" caveat; (2) gsm8k 4.032 already **exceeds the
+official 3.94@ns5** and is **86.6% of released-on-our-serve (4.658)** at 0.5/10 epoch — headroom to climb. Next: convert +
+eval later ckpts (epoch0-end, epoch1…) to watch the tail keep rising; the noise A/B and causal-warmstart ablations are now
+secondary (the primary fix is validated).
 
 ## Baselines / TODO
 

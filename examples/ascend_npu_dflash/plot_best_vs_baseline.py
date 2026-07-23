@@ -32,29 +32,21 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
 }
 
 # ── OUR trained runs, oldest→newest. ✏️ APPEND a dict here when a new ckpt is eval'd (keep in sync
-#    with the eval-results ledger). Current scoreboard = the window-128 / 77W run (epoch curve).
-#    (The old window-2048 `epoch4-17w` run was removed — different draft config, not comparable.)
+#    with the eval-results ledger). Current scoreboard = the NON-CAUSAL 77W run (`--sliding-window-non-causal`).
+#    The old CAUSAL rows (`ep0-77w`, `ep2.5-77w`) were REMOVED — they trained the wrong (causal) attention
+#    task and are a broken baseline, not comparable to the fixed non-causal draft. Raw data for them stays
+#    archived in the eval-results ledger detail sections. As later non-causal ckpts (epoch0-end, epoch1…)
+#    are eval'd, APPEND them here so this becomes the non-causal epoch curve toward released.
 RUNS = [
     {
-        "label": "ep0-77w (w128)",
-        "al": {"gsm8k": 3.186, "math500": 3.041, "humaneval": 3.079, "mbpp": 2.868, "mt-bench": 2.255},
+        "label": "ep0mid-77w (w128, non-causal)",
+        "al": {"gsm8k": 4.032, "math500": 3.721, "humaneval": 3.856, "mbpp": 3.586, "mt-bench": 2.482},
         "pos": {
-            "gsm8k":     [87.91, 73.10, 39.21, 13.65, 4.73],
-            "math500":   [84.81, 68.76, 35.60, 11.40, 3.58],
-            "humaneval": [90.27, 74.20, 31.85, 9.54, 2.01],
-            "mbpp":      [84.40, 64.07, 28.51, 7.93, 1.93],
-            "mt-bench":  [67.61, 39.52, 14.15, 3.46, 0.77],
-        },
-    },
-    {
-        "label": "ep2.5-77w (w128, noise0.05) ⚠176",
-        "al": {"gsm8k": 3.203, "math500": 3.096, "humaneval": 3.106, "mbpp": 2.928, "mt-bench": 2.272},
-        "pos": {
-            "gsm8k":     [88.53, 73.16, 39.37, 14.21, 5.07],
-            "math500":   [86.00, 69.90, 37.38, 12.45, 3.89],
-            "humaneval": [90.22, 74.45, 32.98, 10.46, 2.47],
-            "mbpp":      [86.36, 66.43, 29.55, 8.37, 2.07],
-            "mt-bench":  [68.33, 39.72, 14.55, 3.77, 0.82],
+            "gsm8k":     [88.54, 74.73, 58.88, 46.05, 35.00],
+            "math500":   [84.57, 69.23, 52.52, 38.75, 27.05],
+            "humaneval": [88.12, 74.83, 55.05, 40.23, 27.43],
+            "mbpp":      [85.29, 67.76, 48.11, 34.06, 23.40],
+            "mt-bench":  [67.41, 39.89, 21.83, 12.21, 6.86],
         },
     },
 ]
@@ -113,7 +105,7 @@ def main():
 
     fig, ax = plt.subplots(figsize=(11.5, 0.9 + 0.42 * (len(cell_text) + 1)))
     ax.axis("off")
-    ax.set_title("DSV4-DSpark  —  our runs (w128, 77W) vs released baseline  (accept_len + per-position accept rate %)",
+    ax.set_title("DSV4-DSpark  —  non-causal 77W run vs released baseline  (accept_len + per-position accept rate %)",
                  fontsize=13, fontweight="bold", pad=16)
 
     tbl = ax.table(cellText=cell_text, colLabels=col_labels, cellColours=cell_colors,
@@ -145,7 +137,7 @@ def main():
              "cell shading = our run as % of the released baseline in that cell (green→red).  "
              "per-position = cumulative accept rate S_k (%).  "
              "baseline = released draft, full DATASET=all, #12006 serve, num_spec=5, greedy.  "
-             "⚠ ep2.5 on 176 A3-single serve (calibration pending).  "
+             "ep0mid = 0.5-epoch non-causal ckpt on 176 A3-single serve (serve verified non-capping).  "
              "Source: docs/deployment/ascend-npu-dsv4-dspark-eval-results.md",
              ha="center", fontsize=6.0, color="0.45")
     fig.savefig(args.out, dpi=150, bbox_inches="tight")

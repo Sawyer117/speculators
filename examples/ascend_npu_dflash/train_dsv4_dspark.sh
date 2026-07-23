@@ -112,6 +112,15 @@ INITATTN="${INIT_ATTN:-0}"             # INIT_ATTN=1  -> warm-start MLA core pro
 INITHC="${INIT_HC:-0}"                 # INIT_HC=1    -> warm-start the two hyper-connections (attn_hc/ffn_hc)
 INITNORM="${INIT_NORM:-0}"             # INIT_NORM=1  -> warm-start the two RMSNorms (attn_norm/ffn_norm)
 INITLAYER="${INIT_LAYER:-0}"           # INIT_LAYER=1 -> WHOLE layer = attn+hc+norm+moe (coherent target layer)
+FROM_PRETRAINED="${FROM_PRETRAINED:-}"  # FROM_PRETRAINED=<dir> -> warm-start ALL draft weights from a saved
+                                       # speculator checkpoint (a <N>/ ckpt dir: config.json + model.safetensors),
+                                       # FRESH optimizer + FRESH cosine LR (NOT a resume). Takes precedence over
+                                       # the INIT_* flags (train.py: --from-pretrained wins). ★ ABLATION USE:
+                                       # warm-start from a prior CAUSAL run to test if its weights are a useful
+                                       # init for non-causal training. ⚠️ --sliding-window-non-causal is read from
+                                       # the LOADED config.json (NOT re-applied from CLI), so to train non-causal
+                                       # on a causal ckpt you MUST first set "sliding_window_non_causal": true in
+                                       # the copied dir's config.json — else NONCAUSAL=1 is silently ignored.
 
 # ---- per-mode config ----
 if [ "$MODE" = "faithful" ]; then
@@ -154,6 +163,7 @@ if [ "$INITATTN" = "1" ]; then EXTRA="$EXTRA --init-attn-from-target"; fi
 if [ "$INITHC" = "1" ]; then EXTRA="$EXTRA --init-hc-from-target"; fi
 if [ "$INITNORM" = "1" ]; then EXTRA="$EXTRA --init-norm-from-target"; fi
 if [ "$INITLAYER" = "1" ]; then EXTRA="$EXTRA --init-layer-from-target"; fi
+if [ -n "$FROM_PRETRAINED" ]; then EXTRA="$EXTRA --from-pretrained $FROM_PRETRAINED"; fi
 
 # AMP experts: resolve "auto" -> downgrade to bf16 experts ONLY on the faithful+EP=0 path (rank0
 # materialises the full unsharded model; fp32 experts would OOM). EP=1 / reduced keep option A.
