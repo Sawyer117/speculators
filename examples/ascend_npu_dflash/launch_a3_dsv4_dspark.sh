@@ -27,7 +27,11 @@ export CANN_ENV="${CANN_ENV:-/home/a00652497/900env_npu.sh}"
 # option-A fp32 experts = EP=1 + A3 128G AND do NOT set BF16_EXPERTS (runner default "auto" = option A).
 export DSPARK_EP="${DSPARK_EP:-1}"
 export NPROC="${NPROC:-16}"           # A3 = 8 chips x 2 = 16 logical devices = world_size 16 (FSDP16 + EP16)
-export MAX_ANCHORS="${MAX_ANCHORS:-512}"
+export MAX_ANCHORS="${MAX_ANCHORS:-576}"   # 576 (not 512): the 77W non-causal runs use 576 (A3 128G + RECOMPUTE=1
+                                           # fits it). MAX_ANCHORS = anchors/step = effective batch → affects the
+                                           # gradient, NOT just throughput. Pinned so the pinned launcher MATCHES the
+                                           # ep0mid/ep0end baseline (ckpt_faithful_ep_20260723_152149 trained at 576);
+                                           # a plain 512 relaunch would confound any A/B with a second variable.
 export RECOMPUTE="${RECOMPUTE:-1}"
 export COMPILE="${COMPILE:-1}"
 export NO_VAL="${NO_VAL:-1}"
