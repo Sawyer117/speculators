@@ -779,8 +779,9 @@ def main() -> None:
         if len(baselines) >= 2:
             # multi-run overlay (each run its own colour) — one metric per plot
             _plots_multi(
-                [{"label": cur_label, "recs": recs, "good": good}]
-                + [{"label": b["label"], "recs": b["recs"], "good": b["good"]} for b in baselines],
+                [{"label": cur_label, "recs": recs, "good": good, "ckpt": ckpt_steps}]
+                + [{"label": b["label"], "recs": b["recs"], "good": b["good"], "ckpt": b["ckpt"]}
+                   for b in baselines],
                 args.out,
             )
         else:
@@ -898,6 +899,23 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
         s = series(recs_, key)
         return [a for a, _ in s], [b for _, b in s]
 
+    def _mark_ckpts_p(x, y, cks, color):
+        """Dot + value at each checkpoint-save step (= epoch-half / epoch-end under CKPT_FREQ=0.5)."""
+        if not cks or len(x) < 2:
+            return
+        import numpy as np  # noqa: PLC0415
+        xa = np.asarray(x, float); ya = np.asarray(y, float); span = (xa[-1] - xa[0]) or 1.0
+        for cs in sorted(cks):
+            idx = int(np.argmin(np.abs(xa - cs)))
+            if abs(xa[idx] - cs) > 0.02 * span:
+                continue
+            lo, hi = max(0, idx - 3), min(len(ya), idx + 4)
+            val = float(median(list(ya[lo:hi])))
+            plt.plot(xa[idx], val, "o", ms=5, color=color, mec="white", mew=0.8, zorder=6)
+            plt.annotate(f"{val:.2f}", xy=(xa[idx], val), xytext=(0, 6), textcoords="offset points",
+                         fontsize=6.5, color=color, ha="center", va="bottom", zorder=6,
+                         bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.7))
+
     def _overlay(key, color, lab, cur_src, base_src):
         """current solid + (if comparing) baseline dashed, SAME color per metric."""
         x, y = xy(key, cur_src)
@@ -970,12 +988,14 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
             return median(yy[-min(50, len(yy)):])
 
         cur = _smoothed(x, y, "#2E6CF6", "#7A8AA8", label)
+        _mark_ckpts_p(x, y, ckpt_steps, "#2E6CF6")
         base_y = []
         if have_base:
             xb, yb = xy("train/accept_len", bgood)
             if xb:
                 base_y = yb
                 bcur = _smoothed(xb, yb, "#E08A1E", "#C9A27A", blabel)
+                _mark_ckpts_p(xb, yb, base.get("ckpt_steps"), "#E08A1E")
                 plt.annotate(f"{blabel} ~{bcur:.2f}", xy=(xb[-1], bcur), xytext=(-8, -20),
                              textcoords="offset points", color="#E08A1E", fontsize=10, ha="right",
                              weight="bold", zorder=7,
@@ -1158,6 +1178,29 @@ def _plots_multi(runs, out):
     # epoch boundaries of the CURRENT run (runs[0]); marked on every step-axis plot.
     ep_bounds = epoch_boundaries(runs[0]["recs"]) if runs else []
 
+    def _mark_ckpts(r, key, train=True):
+        """Dot + value label at each checkpoint-save step — under CKPT_FREQ=0.5 those are the
+        epoch-HALF and epoch-END points (= the ckpts that get converted + eval'd). Value = local
+        median around the step so it tracks the smoothed curve, colored per run."""
+        cks = sorted(s for s in (r.get("ckpt") or ()))
+        if not cks:
+            return
+        x, y = _xy(r["good"] if train else r["recs"], key)
+        if len(x) < 2:
+            return
+        xa = np.asarray(x, float); ya = np.asarray(y, float)
+        span = (xa[-1] - xa[0]) or 1.0
+        for cs in cks:
+            idx = int(np.argmin(np.abs(xa - cs)))
+            if abs(xa[idx] - cs) > 0.02 * span:      # this ckpt isn't within the run's plotted range
+                continue
+            lo, hi = max(0, idx - 3), min(len(ya), idx + 4)
+            val = float(median(list(ya[lo:hi])))
+            plt.plot(xa[idx], val, marker="o", ms=5, color=r["color"], mec="white", mew=0.8, zorder=6)
+            plt.annotate(f"{val:.2f}", xy=(xa[idx], val), xytext=(0, 6), textcoords="offset points",
+                         fontsize=6.5, color=r["color"], ha="center", va="bottom", zorder=6,
+                         bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.7))
+
     def _overlay(key, fname, title, ylabel, *, train=True, logy=False, target=None, accept_len_refs=False):
         plt.figure(figsize=(9.5, 4.8))
         allv, drew = [], False
@@ -1177,6 +1220,8 @@ def _plots_multi(runs, out):
                          label=f"{r['label']} ~{median(y[-min(50, len(y)):]):.3g}")
             else:
                 plt.plot(x, y, lw=1.6, color=c, label=r["label"])
+            if train:
+                _mark_ckpts(r, key, train)   # epoch-half + epoch-end value dots
         if not drew:
             plt.close()
             return
