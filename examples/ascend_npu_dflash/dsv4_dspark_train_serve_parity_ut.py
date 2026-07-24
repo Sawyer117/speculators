@@ -106,40 +106,65 @@ def test_t1_double_norm():
         x32 = x.float()
         return (x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + rms_eps)).to(x.dtype) * norm_w
 
-    # --- get a real POST-NORM hidden (what the dumper writes as verifier_last)
+    # --- get a real dumped verifier_last hidden (+ token_ids for the DECISIVE check)
+    tok_ids = None
     if hs_file and os.path.exists(hs_file):
         d = load_file(hs_file)
-        # dumped layout: hidden_states[..., last] = the post-norm final hidden [T, H] (data.py:507)
+        # dumped layout: hidden_states[..., last] = verifier_last [T, H] (data.py:507);
+        # token_ids = the rollout tokens (data.py:506).
         hs = d.get("hidden_states")
         if hs is not None and hs.dim() == 3:      # [T, n_layers, H] -> last layer
-            post_norm_h = hs[:, -1, :]
+            vlast = hs[:, -1, :]
         elif hs is not None and hs.dim() == 2 and hs.shape[-1] == H:
-            post_norm_h = hs
+            vlast = hs
         else:                                     # fall back to any [*,H] tensor
-            post_norm_h = next(v for v in d.values() if v.dim() >= 2 and v.shape[-1] == H).reshape(-1, H)
-        post_norm_h = post_norm_h.float()[:512]
-        print(f"  hidden: real dumped post-norm, {tuple(post_norm_h.shape)} from {os.path.basename(hs_file)}")
+            vlast = next(v for v in d.values() if v.dim() >= 2 and v.shape[-1] == H).reshape(-1, H)
+        vlast = vlast.float()
+        tok_ids = d.get("token_ids")
+        if tok_ids is not None:
+            tok_ids = tok_ids.reshape(-1).long()
+        print(f"  hidden: real dumped verifier_last, {tuple(vlast.shape)} from {os.path.basename(hs_file)}")
+        print(f"  dumped-hidden RMS={vlast.pow(2).mean().sqrt().item():.3f}  "
+              f"(post-norm ~ O(RMS of norm.weight)={norm_w.float().pow(2).mean().sqrt().item():.3f}; "
+              f"a pre-norm residual would be MUCH larger)")
     else:
-        # synthesize a plausible post-norm hidden: rmsnorm of random residual (same statistics)
         torch.manual_seed(0)
-        post_norm_h = rmsnorm(torch.randn(512, H) * 6.0).float()
-        print("  hidden: SYNTHETIC (set HS_FILE=<hs_*.safetensors> for a real one)")
+        vlast = rmsnorm(torch.randn(512, H) * 6.0).float()   # synthetic post-norm-ish
+        print("  hidden: SYNTHETIC (set HS_FILE=<hs_*.safetensors> for the decisive check)")
 
     head = head_w.float()
-    logits_correct = post_norm_h @ head.T                      # verifier_lm_head(h)          — TRUE teacher
-    logits_buggy = rmsnorm(post_norm_h).float() @ head.T       # verifier_lm_head(norm(h))    — what training does
+    logits_A = vlast @ head.T                        # lm_head(vlast)        — correct IF vlast is post-norm
+    logits_B = rmsnorm(vlast).float() @ head.T       # lm_head(norm(vlast))  — what training DOES (F1 = drop this)
 
-    p_c = torch.softmax(logits_correct, -1)
-    p_b = torch.softmax(logits_buggy, -1)
-    tv = 0.5 * (p_c - p_b).abs().sum(-1).mean().item()
-    kl = torch.nn.functional.kl_div(torch.log_softmax(logits_buggy, -1), p_c, reduction="batchmean").item()
-    flip = (logits_correct.argmax(-1) != logits_buggy.argmax(-1)).float().mean().item()
-    print(f"  TV(correct‖buggy)={tv:.4f}   KL={kl:.4f}   argmax-flip={flip:.4%}")
-    print("  READ: flip% = fraction of positions where the DOUBLE-NORM teacher's top token")
-    print("        differs from the real verifier's top token. Non-trivial flip => the TV(1.8)")
-    print("        distillation + the train accept-metric are pointed at a distorted teacher.")
-    print("  FIX : dsv4_dspark/core.py:515 -> verifier_lm_head(verifier_last_hidden_states)  (drop verifier_norm)")
-    print(f"  VERDICT: {'material distortion (fix + retrain)' if flip > 0.01 or tv > 0.02 else 'small (norm weights ~1) — fix anyway for correctness'}")
+    # magnitude of the distortion between the two candidate teachers
+    p_a, p_b = torch.softmax(logits_A, -1), torch.softmax(logits_B, -1)
+    tv = 0.5 * (p_a - p_b).abs().sum(-1).mean().item()
+    flip = (logits_A.argmax(-1) != logits_B.argmax(-1)).float().mean().item()
+    print(f"  A=lm_head(vlast)  vs  B=lm_head(norm(vlast)):  TV={tv:.4f}   argmax-flip={flip:.4%}")
+
+    # ── DECISIVE: which teacher's argmax matches the rollout's NEXT token? (rollout is greedy temp0,
+    #    so the REAL verifier's argmax at pos i == token_ids[i+1]. Whichever of A/B agrees is the real
+    #    verifier distribution — settling pre/post-norm and whether F1 is a real bug, no assumptions.)
+    if tok_ids is not None and tok_ids.numel() >= vlast.shape[0] and vlast.shape[0] >= 2:
+        n = min(vlast.shape[0], tok_ids.numel()) - 1
+        nxt = tok_ids[1:n + 1]
+        agr_A = (logits_A[:n].argmax(-1) == nxt).float().mean().item()
+        agr_B = (logits_B[:n].argmax(-1) == nxt).float().mean().item()
+        print(f"  DECISIVE — next-token agreement (rollout greedy):  A={agr_A:.2%}   B={agr_B:.2%}")
+        if agr_A > agr_B + 0.05:
+            verdict = ("✅ vlast IS post-norm → training's B (lm_head(norm(vlast))) DOUBLE-NORMS → "
+                       "F1 is a REAL bug. Apply the fix + retrain.")
+        elif agr_B > agr_A + 0.05:
+            verdict = ("❌ vlast is PRE-norm → training's B is CORRECT → F1 is NOT a bug. DO NOT kill/retrain "
+                       "for this reason (Claude's double-norm diagnosis would be wrong here).")
+        else:
+            verdict = ("⚠ inconclusive (A≈B, both low?) — check the rollout was greedy + the file's "
+                       "token_ids align with hidden_states; don't act until this is green.")
+        print(f"  VERDICT: {verdict}")
+    else:
+        print("  VERDICT: need a real HS_FILE with token_ids to decide. The magnitude above only shows")
+        print("           A and B DIFFER, not which is correct. Do NOT kill/retrain on magnitude alone.")
+    print("  FIX (if A wins): dsv4_dspark/core.py -> verifier_lm_head(verifier_last_hidden_states) (already welded).")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
