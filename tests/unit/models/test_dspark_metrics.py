@@ -2,7 +2,7 @@
 
 import torch
 
-from speculators.models.dspark.metrics import compute_metrics
+from speculators.models.dspark.metrics import compute_metrics, select_logged_metrics
 from speculators.models.metrics import resolve_loss_config
 
 _DEFAULT_LOSS = resolve_loss_config('{"ce": 0.1, "tv": 0.9}')
@@ -15,6 +15,46 @@ def _ids_to_logits(ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
 
 
 class TestComputeMetrics:
+    def test_logged_metrics_use_compact_shared_schema(self):
+        metrics = {
+            "loss_sum": torch.tensor(1.0),
+            "loss_total": torch.tensor(1.0),
+            "full_acc_sum": torch.tensor(1.0),
+            "accept_len_sum": torch.tensor(1.0),
+            "position_0_acc_sum": torch.tensor(1.0),
+            "confidence_loss_sum": torch.tensor(1.0),
+            "collaboration_accept_len_gain_sum": torch.tensor(1.0),
+            "collaboration_markov_gate_mean_sum": torch.tensor(1.0),
+            "collaboration_markov_change_accuracy_sum": torch.tensor(1.0),
+            "collaboration_markov_harmed_count_sum": torch.tensor(1.0),
+            "rollout_full_acc_sum": torch.tensor(1.0),
+            "rollout_accept_len_sum": torch.tensor(1.0),
+            "accept_rate_sum": torch.tensor(1.0),
+            "ce_loss_sum": torch.tensor(1.0),
+            "correction_logit_rms_sum": torch.tensor(1.0),
+            "collaboration_markov_change_wrong_count_sum": torch.tensor(1.0),
+        }
+
+        selected = select_logged_metrics(metrics)
+
+        assert set(selected) == {
+            "loss_sum",
+            "loss_total",
+            "full_acc_sum",
+            "accept_len_sum",
+            "position_0_acc_sum",
+            "confidence_loss_sum",
+            "collaboration_accept_len_gain_sum",
+            "collaboration_markov_gate_mean_sum",
+            "collaboration_markov_change_accuracy_sum",
+            "collaboration_markov_harmed_count_sum",
+            "rollout_full_acc_sum",
+            "rollout_accept_len_sum",
+        }
+        assert select_logged_metrics(
+            metrics, include_diagnostics=True
+        ) is metrics
+
     def test_perfect_draft_low_loss_high_accept(self):
         # block_size=2; with sample_from_anchor=False, position 0 is the anchor
         # (masked) and position 1 supervised.

@@ -168,7 +168,6 @@ def test_dspark_preprojection_correction_head_cli(monkeypatch):
             "6",
             "--correction-gate-bias",
             "-1.0",
-            "--correction-generated-token-training",
             "--no-correction-rollout-metrics",
             "--correction-base-diagnostics",
             "--confidence-detach-features",
@@ -180,7 +179,7 @@ def test_dspark_preprojection_correction_head_cli(monkeypatch):
     assert args.correction_num_layers == 2
     assert args.correction_num_heads == 6
     assert args.correction_gate_bias == -1.0
-    assert args.correction_generated_token_training is True
+    assert args.correction_generated_token_ratio == 0.0
     assert args.correction_rollout_metrics is False
     assert args.correction_base_diagnostics is True
     assert args.confidence_detach_features is True
@@ -189,7 +188,7 @@ def test_dspark_preprojection_correction_head_cli(monkeypatch):
     assert train_kw == val_kw
 
 
-def test_dspark_correction_teacher_forcing_default_and_generated_opt_in(monkeypatch):
+def test_dspark_correction_generated_token_curriculum_cli(monkeypatch):
     teacher_forced = _parse(
         monkeypatch,
         [
@@ -198,7 +197,7 @@ def test_dspark_correction_teacher_forcing_default_and_generated_opt_in(monkeypa
             "--enable-correction-head",
         ],
     )
-    assert teacher_forced.correction_generated_token_training is False
+    assert teacher_forced.correction_generated_token_ratio == 0.0
 
     generated = _parse(
         monkeypatch,
@@ -206,10 +205,24 @@ def test_dspark_correction_teacher_forcing_default_and_generated_opt_in(monkeypa
             "--speculator-type",
             "dspark",
             "--enable-correction-head",
-            "--correction-generated-token-training",
+            "--correction-generated-token-ratio",
+            "0.25",
+            "--correction-generated-token-warmup",
+            "0.2",
+            "--correction-generated-token-ramp",
+            "0.4",
         ],
     )
-    assert generated.correction_generated_token_training is True
+    assert generated.correction_generated_token_ratio == 0.25
+    assert generated.correction_generated_token_warmup == 0.2
+    assert generated.correction_generated_token_ramp == 0.4
+
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(generated))
+    assert train_kw["correction_generated_token_curriculum"] is True
+    assert train_kw["correction_generated_token_target_ratio"] == 0.25
+    assert train_kw["correction_generated_token_warmup"] == 0.2
+    assert train_kw["correction_generated_token_ramp"] == 0.4
+    assert "correction_generated_token_curriculum" not in val_kw
 
 
 def test_new_dflash_and_collaboration_features_default_off(monkeypatch):

@@ -50,8 +50,11 @@ CORRECTION_GATE_BIAS=0.0
 # (--correction-with-markov) for gated Correction + Markov collaboration.
 CORRECTION_COLLABORATION_ARGS=(--no-correction-with-markov)
 CORRECTION_MARKOV_GATE_BIAS=-2.0
-# Teacher forcing is the default. Add --correction-generated-token-training to
-# CORRECTION_HEAD_ARGS for a generated-token self-feedback experiment.
+# Teacher forcing remains the baseline at ratio 0. A typical curriculum uses
+# ratio=0.25, warmup=0.2, and ramp=0.4.
+CORRECTION_GENERATED_TOKEN_RATIO=0.0
+CORRECTION_GENERATED_TOKEN_WARMUP=0.2
+CORRECTION_GENERATED_TOKEN_RAMP=0.4
 CORRECTION_ROLLOUT_METRICS_ARGS=(--correction-rollout-metrics)
 # Enable only when validation-only base change/gain diagnostics are worth an
 # additional LM-head projection. Correction itself never consumes base logits.
@@ -129,6 +132,9 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --correction-gate-bias "$CORRECTION_GATE_BIAS" \
     "${CORRECTION_COLLABORATION_ARGS[@]}" \
     --correction-markov-gate-bias "$CORRECTION_MARKOV_GATE_BIAS" \
+    --correction-generated-token-ratio "$CORRECTION_GENERATED_TOKEN_RATIO" \
+    --correction-generated-token-warmup "$CORRECTION_GENERATED_TOKEN_WARMUP" \
+    --correction-generated-token-ramp "$CORRECTION_GENERATED_TOKEN_RAMP" \
     "${CORRECTION_ROLLOUT_METRICS_ARGS[@]}" \
     "${CORRECTION_BASE_DIAGNOSTICS_ARGS[@]}" \
     "${DFLASH_FEATURE_ARGS[@]}" \

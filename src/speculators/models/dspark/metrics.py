@@ -31,12 +31,49 @@ from speculators.models.metrics import (
 
 __all__ = [
     "compute_metrics",
+    "select_logged_metrics",
 ]
 
 _EPS = 1e-8
+_CORE_LOGGED_METRICS = frozenset(
+    {
+        "loss",
+        "full_acc",
+        "accept_len",
+        "confidence_loss",
+        "collaboration_accept_len_gain",
+        "collaboration_markov_gate_mean",
+        "collaboration_markov_change_accuracy",
+        "collaboration_markov_harmed_count",
+        "rollout_full_acc",
+        "rollout_accept_len",
+    }
+)
 
 AdaptiveLoss = Literal["none", "cat", "ssal"]
 ConfidenceLossWeighting = Literal["uniform", "match-draft"]
+
+
+def select_logged_metrics(
+    metrics: dict[str, torch.Tensor],
+    *,
+    include_diagnostics: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Keep the compact DSpark train/validation logging schema."""
+    if include_diagnostics:
+        return metrics
+
+    def should_keep(key: str) -> bool:
+        name = key
+        if name.endswith("_sum"):
+            name = name.removesuffix("_sum")
+        elif name.endswith("_total"):
+            name = name.removesuffix("_total")
+        return name in _CORE_LOGGED_METRICS or (
+            name.startswith("position_") and name.endswith("_acc")
+        )
+
+    return {key: value for key, value in metrics.items() if should_keep(key)}
 
 
 def _masked_weighted_mean(

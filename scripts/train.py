@@ -1212,12 +1212,30 @@ def parse_args():
         help="DSpark initial collaboration gate bias (default: -2.0).",
     )
     parser.add_argument(
-        "--correction-generated-token-training",
-        action=argparse.BooleanOptionalAction,
-        default=False,
+        "--correction-generated-token-ratio",
+        type=float,
+        default=0.0,
         help=(
-            "DSpark: train Correction with greedy generated-token feedback "
-            "instead of ground-truth teacher forcing (default: disabled)."
+            "DSpark: target fraction of training steps using generated-token "
+            "feedback instead of teacher forcing (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-generated-token-warmup",
+        type=float,
+        default=0.2,
+        help=(
+            "DSpark: initial training fraction kept at zero generated-token ratio "
+            "(default: 0.2)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-generated-token-ramp",
+        type=float,
+        default=0.4,
+        help=(
+            "DSpark: training fraction used to ramp to the target generated-token "
+            "ratio (default: 0.4)."
         ),
     )
     parser.add_argument(
@@ -1482,13 +1500,24 @@ def parse_args():
                 "--correction-hidden-size must be divisible by "
                 "--correction-num-heads"
             )
+    if args.correction_generated_token_ratio > 0.0 and not args.enable_correction_head:
+        parser.error(
+            "--correction-generated-token-ratio > 0 requires --enable-correction-head"
+        )
+    if not 0.0 <= args.correction_generated_token_ratio <= 1.0:
+        parser.error("--correction-generated-token-ratio must be in [0, 1]")
+    if not 0.0 <= args.correction_generated_token_warmup <= 1.0:
+        parser.error("--correction-generated-token-warmup must be in [0, 1]")
+    if not 0.0 <= args.correction_generated_token_ramp <= 1.0:
+        parser.error("--correction-generated-token-ramp must be in [0, 1]")
     if (
-        args.correction_generated_token_training
-        and not args.enable_correction_head
+        args.correction_generated_token_warmup
+        + args.correction_generated_token_ramp
+        > 1.0
     ):
         parser.error(
-            "--correction-generated-token-training requires "
-            "--enable-correction-head"
+            "--correction-generated-token-warmup + "
+            "--correction-generated-token-ramp must be <= 1"
         )
     if args.correction_with_markov:
         if not args.enable_correction_head:

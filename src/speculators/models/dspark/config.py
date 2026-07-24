@@ -102,12 +102,30 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "Markov logit bias."
         ),
     )
-    correction_generated_token_training: bool = Field(
-        default=False,
+    correction_generated_token_ratio: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
         description=(
-            "During training, feed each greedily generated Correction token into "
-            "the next block position instead of teacher-forcing ground-truth tokens. "
-            "Ignored when Correction is disabled."
+            "Target fraction of training steps that use greedy generated-token "
+            "feedback instead of teacher forcing. Zero preserves the baseline."
+        ),
+    )
+    correction_generated_token_warmup: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of training held at zero generated-token ratio before ramping."
+        ),
+    )
+    correction_generated_token_ramp: float = Field(
+        default=0.4,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of training used to linearly ramp from zero to the target "
+            "generated-token ratio."
         ),
     )
     correction_rollout_metrics: bool = Field(

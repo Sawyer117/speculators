@@ -6,7 +6,7 @@ from transformers import PretrainedConfig
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
-from speculators.models.dspark.metrics import compute_metrics
+from speculators.models.dspark.metrics import compute_metrics, select_logged_metrics
 from speculators.models.dspark.model_definitions import (
     CausalCorrectionHead,
     ConfidenceHead,
@@ -39,6 +39,21 @@ class DSparkDraftModel(DFlashDraftModel):
         super().__init__(config=config)
 
         hidden_size = config.transformer_layer_config.hidden_size
+        if (
+            config.correction_generated_token_ratio > 0.0
+            and not config.enable_correction_head
+        ):
+            raise ValueError(
+                "correction_generated_token_ratio > 0 requires Correction"
+            )
+        if (
+            config.correction_generated_token_warmup
+            + config.correction_generated_token_ramp
+            > 1.0
+        ):
+            raise ValueError(
+                "Correction generated-token warmup + ramp must be <= 1"
+            )
 
         self.markov_head: MarkovHead | None = None
         self.correction_head: CausalCorrectionHead | None = None
@@ -136,8 +151,14 @@ class DSparkDraftModel(DFlashDraftModel):
             correction_markov_gate_bias=kwargs.get(
                 "correction_markov_gate_bias", -2.0
             ),
-            correction_generated_token_training=kwargs.get(
-                "correction_generated_token_training", False
+            correction_generated_token_ratio=kwargs.get(
+                "correction_generated_token_ratio", 0.0
+            ),
+            correction_generated_token_warmup=kwargs.get(
+                "correction_generated_token_warmup", 0.2
+            ),
+            correction_generated_token_ramp=kwargs.get(
+                "correction_generated_token_ramp", 0.4
             ),
             correction_rollout_metrics=kwargs.get(
                 "correction_rollout_metrics", True
@@ -185,6 +206,23 @@ class DSparkDraftModel(DFlashDraftModel):
             "per_position_loss_weight", "fixed-exp-decay"
         )
         dpace_alpha = kwargs.get("dpace_alpha", 0.5)
+        generated_token_ratio = float(
+            kwargs.get("correction_generated_token_ratio", 0.0)
+        )
+        generated_token_warmup = float(
+            kwargs.get("correction_generated_token_warmup", 0.2)
+        )
+        generated_token_ramp = float(
+            kwargs.get("correction_generated_token_ramp", 0.4)
+        )
+        if not 0.0 <= generated_token_ratio <= 1.0:
+            raise ValueError("Generated-token ratio must be in [0, 1]")
+        if not 0.0 <= generated_token_warmup <= 1.0:
+            raise ValueError("Generated-token warmup must be in [0, 1]")
+        if not 0.0 <= generated_token_ramp <= 1.0:
+            raise ValueError("Generated-token ramp must be in [0, 1]")
+        if generated_token_warmup + generated_token_ramp > 1.0:
+            raise ValueError("Generated-token warmup + ramp must be <= 1")
         shared = {
             "loss_config": loss_config,
             "gamma": gamma,
@@ -203,6 +241,13 @@ class DSparkDraftModel(DFlashDraftModel):
             train_kw["ssal_curriculum"] = True
             train_kw["ssal_curriculum_start"] = ssal_curriculum_start
             train_kw["ssal_curriculum_end"] = ssal_curriculum_end
+        if generated_token_ratio > 0.0:
+            train_kw["correction_generated_token_curriculum"] = True
+            train_kw["correction_generated_token_target_ratio"] = (
+                generated_token_ratio
+            )
+            train_kw["correction_generated_token_warmup"] = generated_token_warmup
+            train_kw["correction_generated_token_ramp"] = generated_token_ramp
         return train_kw, dict(shared)
 
     @staticmethod
@@ -377,6 +422,9 @@ class DSparkDraftModel(DFlashDraftModel):
         ssal_decay_weight: torch.Tensor | float = 0.0,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
+        correction_use_generated_tokens: bool = False,
+        correction_generated_token_ratio: torch.Tensor | float = 0.0,
+        correction_generated_token_curriculum_active: bool = False,
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -424,10 +472,7 @@ class DSparkDraftModel(DFlashDraftModel):
         collaboration_base_logits = None
         collaboration_gate = None
         if self.correction_head is not None:
-            if (
-                self.training
-                and self.config.correction_generated_token_training
-            ):
+            if self.training and correction_use_generated_tokens:
                 _, logits_blocks, correction_states = (
                     self._generated_feedback_correction(
                         hidden_blocks,
@@ -569,6 +614,25 @@ class DSparkDraftModel(DFlashDraftModel):
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
         )
+        metrics = select_logged_metrics(
+            metrics,
+            include_diagnostics=(
+                not self.training and self.config.correction_base_diagnostics
+            ),
+        )
+        if (
+            self.training
+            and self.correction_head is not None
+            and correction_generated_token_curriculum_active
+        ):
+            ratio = torch.as_tensor(
+                correction_generated_token_ratio,
+                device=loss.device,
+                dtype=torch.float32,
+            ).detach()
+            one = torch.ones((), device=loss.device, dtype=torch.float32)
+            metrics["correction_generated_token_ratio_sum"] = ratio
+            metrics["correction_generated_token_ratio_total"] = one
         return None, loss, metrics
 
     @torch.compiler.disable
