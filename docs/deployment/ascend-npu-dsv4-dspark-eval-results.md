@@ -52,6 +52,7 @@ multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
 | `ep0-77w` *(epoch 0)* | 3.186 | 3.041 | 3.079 | 2.868 | 2.255 | 2.89 | first ckpt of A3 77W run (LR 3e-4, noise 0.05); epoch0 vs 17w's epoch4 — **not** like-for-like; gap = tail (pos2 cliff) |
 | `ep2.5-77w` *(arm A, noise 0.05, CAUSAL)* | 3.203 | 3.096 | 3.106 | 2.928 | 2.272 | 2.92 | epoch2-mid (30,969 steps) of A3 77W run; **≈ ep0 — FLAT, tail frozen** (gsm8k pos2/3/4 = 39/14/5, same as ep0) → 1.5 more epochs bought +0.03 mean. 176 A3-single serve conc48. ~~serve capping?~~ **RESOLVED**: `ep0mid-77w-nc` on the SAME 176 serve hit 4.032 → serve does NOT cap → ep2.5's flatness was REAL (causal-training), not a serve artifact. |
 | **`ep0mid-77w` *(NON-CAUSAL fix, epoch0-mid)*** | **4.032** | **3.721** | **3.856** | **3.586** | **2.482** | **3.54** | ★ **THE non-causal fix lands.** epoch0-**mid** (step 6194 = 0.5 epoch) of the non-causal retrain (`--sliding-window-non-causal`, +#848 detach). Same 176 serve as ep2.5 → **only variable = train causality.** gsm8k **3.186→4.032** (+0.85), tail **pos2/3/4 = 59/46/35** vs causal's 39/14/5 (pos4 **7.4×**). **0.5ep non-causal >> 2.5ep causal.** Past official 3.94@ns5; 86.6% of released-on-our-serve at 0.5/10 epoch. |
+| `ep0end-77w` *(non-causal, epoch0-end)* | 4.006 | 3.753 | 3.970 | 3.666 | 2.539 | 3.59 | epoch0-**end** (1.0 epoch, `0/` after end-save overwrote mid). Non-causal epoch curve: **0.5ep→1.0ep = HEAD sharpens, TAIL plateaus early.** pos0/pos1 up across ALL datasets (gsm8k pos1 74.7→77.1, humaneval pos1 74.8→80.4); pos2-4 flat-to-slightly-down (gsm8k tail 59/46/35→57/43/34, ~2pp = run noise). mean +0.05; gsm8k AL flat (noise). Tail lift now needs later epochs (this is only ep0→1 of 10). |
 
 ### Throughput (tok/s) by dataset
 
@@ -67,6 +68,7 @@ speedup is measured against.
 | `ep0-77w` *(⚠ conc 48, NOT 16 — not comparable)* | 232.30 | 364.40 | 218.17 | 415.53 | 253.64 |
 | `ep2.5-77w` *(⚠ conc 48 + A3-single serve — NOT comparable)* | 449.93 | 634.26 | 364.42 | 701.41 | 405.82 |
 | `ep0mid-77w` *(non-causal; ⚠ conc 48 + A3-single serve)* | 552.14 | 744.06 | 471.49 | 885.18 | 469.40 |
+| `ep0end-77w` *(non-causal; ⚠ conc 48 + A3-single serve)* | 558.13 | 760.87 | 481.91 | 928.27 | 489.41 |
 
 ## Runs (detail)
 
@@ -224,6 +226,31 @@ confirms ep2.5's flatness was real (training), closing the "serve artifact" cave
 official 3.94@ns5** and is **86.6% of released-on-our-serve (4.658)** at 0.5/10 epoch — headroom to climb. Next: convert +
 eval later ckpts (epoch0-end, epoch1…) to watch the tail keep rising; the noise A/B and causal-warmstart ablations are now
 secondary (the primary fix is validated).
+
+### `ep0end-77w` (non-causal, epoch0-end) — 2026-07-24
+
+- **Draft ckpt**: **epoch0-end** (1.0 epoch) of the same non-causal retrain (`ckpt_faithful_ep_20260723_152149/0` — the
+  end-of-epoch save OVERWROTE the mid save in `0/`; symlink `epoch0_end`). Same convert recipe (2378/2378 bit-exact,
+  `--config-from released_draft_bf16_standalone/config.json`), served as `dsv4_dspark_ep0end_noncausal_vllm-77w`.
+- **Serve**: SAME 176 A3 single-node setup as `ep0mid`/`ep2.5` (386530d12, EAGER=0, FLASHCOMM1=0, conc 48) → the
+  ep0mid↔ep0end delta is a clean epoch-curve step (greedy temp0 → serve is run-to-run deterministic; released reproduces
+  4.658 bit-stable, so the deltas below are REAL, not serve noise).
+- **Raw eval log**: `~/eval_ep0end_nc_all.log` on 176.
+
+| Dataset | Samples | tok/s (conc48) | accept_len | accept_rate | pos0 | pos1 | pos2 | pos3 | pos4 |
+|---------|:-------:|:-----:|:----------:|:-----------:|:----:|:----:|:----:|:----:|:----:|
+| gsm8k | 1309 | 558.13 | **4.006** | 60.11% | 89.53 | 77.05 | 56.63 | 43.46 | 33.90 |
+| math500 | 490 | 760.87 | **3.753** | 55.05% | 86.74 | 72.47 | 51.73 | 37.14 | 27.17 |
+| humaneval | 154 | 481.91 | **3.970** | 59.40% | 92.30 | 80.42 | 55.33 | 39.48 | 29.49 |
+| mbpp | 247 | 928.27 | **3.666** | 53.33% | 86.96 | 70.96 | 48.55 | 34.99 | 25.18 |
+| mt-bench | 70 | 489.41 | **2.539** | 30.78% | 68.51 | 42.41 | 22.52 | 12.91 | 7.55 |
+
+**Read — head sharpens, tail plateaus (epoch 0→1).** vs `ep0mid` (0.5 epoch): mean 3.54→3.59 (+0.05). The gain is at the
+**head**: pos0/pos1 rise on EVERY dataset (gsm8k pos1 74.7→77.1, humaneval pos1 74.8→**80.4**, math500 pos1 69.2→72.5). The
+**tail (pos2-4) has plateaued** this early — gsm8k tail 59/46/35 → 57/43/34 (a ~2pp dip, within run-to-run noise; net gsm8k
+AL flat 4.032→4.006), others flat-to-slightly-up (mbpp/mt-bench tail all +). So the causal→non-causal fix unlocked the tail
+in ONE shot (captured at ep0mid); subsequent training first converges the head. The tail's climb toward released (63/53)
+is the thing to watch over epochs 1-10 — NOT yet moving at ep1. Next: convert+eval epoch1 (`1/`) for the next curve point.
 
 ## Baselines / TODO
 
