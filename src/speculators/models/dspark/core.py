@@ -26,10 +26,11 @@ __all__ = [
 class DSparkDraftModel(DFlashDraftModel):
     """DFlash backbone plus a sequential correction and confidence head.
 
-    The legacy Markov path refines base logits.  The causal Correction path instead
-    refines DFlash hidden states from previous-token, hidden, and block-position
-    features before the sole LM-head projection.  The confidence head predicts each
-    position's acceptance probability.
+    The legacy Markov path refines base logits. The causal Correction path refines
+    DFlash hidden states from previous-token, hidden, and block-position features
+    before the sole LM-head projection. An opt-in collaboration path gates a low-rank
+    Markov bias from Correction state. The confidence head predicts each position's
+    acceptance probability.
     """
 
     config_class: ClassVar[type[DSparkSpeculatorConfig]] = DSparkSpeculatorConfig  # type: ignore[misc,assignment]
@@ -41,6 +42,8 @@ class DSparkDraftModel(DFlashDraftModel):
 
         self.markov_head: MarkovHead | None = None
         self.correction_head: CausalCorrectionHead | None = None
+        self.correction_markov_gate: torch.nn.Linear | None = None
+        self.correction_markov_scale: torch.nn.Parameter | None = None
         if config.enable_correction_head:
             self.correction_head = CausalCorrectionHead(
                 input_hidden_size=hidden_size,
@@ -52,6 +55,32 @@ class DSparkDraftModel(DFlashDraftModel):
                 num_heads=config.correction_num_heads,
                 gate_bias=config.correction_gate_bias,
             )
+            if config.correction_with_markov:
+                if config.markov_rank <= 0:
+                    raise ValueError(
+                        "correction_with_markov=True requires markov_rank > 0"
+                    )
+                if config.markov_head_type == "rnn":
+                    raise ValueError(
+                        "Correction-Markov collaboration supports only vanilla "
+                        "or gated Markov heads"
+                    )
+                self.markov_head = MarkovHead(
+                    verifier_vocab_size=self.verifier_vocab_size,
+                    draft_vocab_size=self.draft_vocab_size,
+                    markov_rank=config.markov_rank,
+                    hidden_size=hidden_size,
+                    head_type=config.markov_head_type,
+                )
+                self.correction_markov_gate = torch.nn.Linear(
+                    config.correction_hidden_size, 1
+                )
+                self.correction_markov_scale = torch.nn.Parameter(torch.zeros(()))
+                torch.nn.init.zeros_(self.correction_markov_gate.weight)
+                torch.nn.init.constant_(
+                    self.correction_markov_gate.bias,
+                    config.correction_markov_gate_bias,
+                )
         elif config.markov_rank > 0:
             self.markov_head = MarkovHead(
                 verifier_vocab_size=self.verifier_vocab_size,
@@ -103,6 +132,10 @@ class DSparkDraftModel(DFlashDraftModel):
             correction_num_layers=kwargs.get("correction_num_layers", 1),
             correction_num_heads=kwargs.get("correction_num_heads", 8),
             correction_gate_bias=kwargs.get("correction_gate_bias", 0.0),
+            correction_with_markov=kwargs.get("correction_with_markov", False),
+            correction_markov_gate_bias=kwargs.get(
+                "correction_markov_gate_bias", -2.0
+            ),
             correction_generated_token_training=kwargs.get(
                 "correction_generated_token_training", False
             ),
@@ -190,6 +223,36 @@ class DSparkDraftModel(DFlashDraftModel):
             [hidden_states, sequential_states.to(hidden_states.dtype)], dim=-1
         )
 
+    def _apply_collaborative_markov(
+        self,
+        correction_logits: torch.Tensor,
+        correction_states: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gate a low-rank Markov bias with Correction's causal state."""
+        if (
+            self.markov_head is None
+            or self.correction_markov_gate is None
+            or self.correction_markov_scale is None
+        ):
+            raise RuntimeError("Correction-Markov collaboration is not enabled")
+        prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
+        markov_bias = self.markov_head.block_bias(
+            prev_token_ids=prev_token_ids,
+            hidden_states=hidden_states,
+            prev_emb=prev_emb,
+        )
+        gate_dtype = self.correction_markov_gate.weight.dtype
+        local_gate = torch.sigmoid(
+            self.correction_markov_gate(correction_states.to(gate_dtype))
+        )
+        gate = torch.tanh(self.correction_markov_scale) * local_gate
+        collaborative_logits = correction_logits + (
+            gate.to(markov_bias.dtype) * markov_bias
+        )
+        return collaborative_logits, gate, prev_emb
+
     @torch.compiler.disable
     def _generated_feedback_correction(
         self,
@@ -259,6 +322,14 @@ class DSparkDraftModel(DFlashDraftModel):
                     corrected_hidden.to(self.lm_head.weight.dtype)
                 )
                 causal_states = causal_states[:, 0]
+                if getattr(self, "markov_head", None) is not None:
+                    final_logits, _, _ = self._apply_collaborative_markov(
+                        final_logits.unsqueeze(1),
+                        causal_states.unsqueeze(1),
+                        previous_ids.unsqueeze(1),
+                        dflash_hidden[:, position : position + 1],
+                    )
+                    final_logits = final_logits[:, 0]
 
             with torch.no_grad():
                 if temperature > 0:
@@ -350,6 +421,8 @@ class DSparkDraftModel(DFlashDraftModel):
         prev_emb = None
         correction_states = None
         rollout_logits = None
+        collaboration_base_logits = None
+        collaboration_gate = None
         if self.correction_head is not None:
             if (
                 self.training
@@ -408,6 +481,19 @@ class DSparkDraftModel(DFlashDraftModel):
                         self.lm_head.weight.dtype
                     )
                 )
+                if self.markov_head is not None:
+                    collaboration_base_logits = logits
+                    collaborative_blocks, collaboration_gate, prev_emb = (
+                        self._apply_collaborative_markov(
+                            logits.view(num_blocks, block, -1),
+                            correction_states,
+                            prev_token_ids,
+                            hidden_blocks,
+                        )
+                    )
+                    logits = collaborative_blocks.reshape(
+                        1, mask_tokens_size, -1
+                    )
 
             # Optional validation-only base projection for change/gain diagnostics.
             # It is never part of the training or inference correction path.
@@ -477,6 +563,8 @@ class DSparkDraftModel(DFlashDraftModel):
                 else None
             ),
             rollout_logits=rollout_logits,
+            collaboration_base_logits=collaboration_base_logits,
+            collaboration_gate=collaboration_gate,
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,

@@ -212,6 +212,36 @@ def test_dspark_correction_teacher_forcing_default_and_generated_opt_in(monkeypa
     assert generated.correction_generated_token_training is True
 
 
+def test_new_dflash_and_collaboration_features_default_off(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "dspark"])
+    assert args.correction_with_markov is False
+    assert args.dflash_context_residual is False
+    assert args.dflash_block_position_embedding is False
+    assert args.dflash_gated_layer_fusion is False
+
+
+def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-with-markov",
+            "--correction-markov-gate-bias",
+            "-1.5",
+            "--dflash-context-residual",
+            "--dflash-block-position-embedding",
+            "--dflash-gated-layer-fusion",
+        ],
+    )
+    assert args.correction_with_markov is True
+    assert args.correction_markov_gate_bias == -1.5
+    assert args.dflash_context_residual is True
+    assert args.dflash_block_position_embedding is True
+    assert args.dflash_gated_layer_fusion is True
+
+
 # ---------------------------------------------------------------------------
 # Per-speculator-type defaults for draft_arch, norm_before_fc, norm_output
 # ---------------------------------------------------------------------------

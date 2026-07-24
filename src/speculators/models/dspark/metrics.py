@@ -147,6 +147,8 @@ def compute_metrics(  # noqa: C901
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
+    collaboration_base_logits: torch.Tensor | None = None,
+    collaboration_gate: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -167,6 +169,18 @@ def compute_metrics(  # noqa: C901
                 raise ValueError("rollout_logits and logits must have the same shape")
             rollout_p = softmax(rollout_logits.float(), dim=-1)
             rollout_accept_rate = torch.minimum(rollout_p, target_p).sum(dim=-1)
+        collaboration_base_accept_rate = None
+        if collaboration_base_logits is not None:
+            if collaboration_base_logits.shape != logits.shape:
+                raise ValueError(
+                    "collaboration_base_logits and logits must have the same shape"
+                )
+            collaboration_base_p = softmax(
+                collaboration_base_logits.float(), dim=-1
+            )
+            collaboration_base_accept_rate = torch.minimum(
+                collaboration_base_p, target_p
+            ).sum(dim=-1)
 
     if per_position_loss_weight == "dpace":
         decay_fn = partial(
@@ -402,6 +416,61 @@ def compute_metrics(  # noqa: C901
                         loss_mask,
                     )
                 )
+
+        if collaboration_base_accept_rate is not None:
+            collaboration_base_blocks = collaboration_base_accept_rate.view(
+                num_blocks, block_size
+            )
+            collaboration_base_prefix = (
+                collaboration_base_blocks[:, start_pos:] * draft_mask
+            ).cumprod(dim=-1)
+            collaboration_base_len = collaboration_base_prefix.sum(dim=-1) + 1.0
+            metrics["correction_only_accept_rate_sum"] = (
+                collaboration_base_accept_rate * mask_f
+            ).sum()
+            metrics["correction_only_accept_rate_total"] = mask_f.sum().clamp_min(
+                1.0
+            )
+            metrics["correction_only_accept_len_sum"] = (
+                collaboration_base_len * block_valid
+            ).sum()
+            metrics["correction_only_accept_len_total"] = block_valid.sum().clamp_min(
+                1.0
+            )
+            metrics["collaboration_accept_rate_gain_sum"] = (
+                (accept_rate - collaboration_base_accept_rate) * mask_f
+            ).sum()
+            metrics["collaboration_accept_rate_gain_total"] = mask_f.sum().clamp_min(
+                1.0
+            )
+            metrics["collaboration_accept_len_gain_sum"] = (
+                (per_block_len - collaboration_base_len) * block_valid
+            ).sum()
+            metrics["collaboration_accept_len_gain_total"] = (
+                block_valid.sum().clamp_min(1.0)
+            )
+            metrics.update(
+                _change_outcome_metrics(
+                    "collaboration_markov",
+                    logits.argmax(dim=-1),
+                    collaboration_base_logits.argmax(dim=-1),
+                    target_ids,
+                    loss_mask,
+                )
+            )
+
+        if collaboration_gate is not None:
+            gate_values = collaboration_gate.float().reshape(1, -1)
+            if gate_values.shape != loss_mask.shape:
+                raise ValueError(
+                    "collaboration_gate must contain one value per draft position"
+                )
+            metrics["collaboration_markov_gate_mean_sum"] = (
+                gate_values * mask_f
+            ).sum()
+            metrics["collaboration_markov_gate_mean_total"] = mask_f.sum().clamp_min(
+                1.0
+            )
 
     pred_ids = torch.argmax(logits, dim=-1)
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(

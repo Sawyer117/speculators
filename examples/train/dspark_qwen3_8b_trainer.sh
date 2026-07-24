@@ -46,6 +46,10 @@ CORRECTION_RANK=256
 CORRECTION_NUM_LAYERS=1
 CORRECTION_NUM_HEADS=8
 CORRECTION_GATE_BIAS=0.0
+# Keep disabled for the existing Correction baseline. Switch to
+# (--correction-with-markov) for gated Correction + Markov collaboration.
+CORRECTION_COLLABORATION_ARGS=(--no-correction-with-markov)
+CORRECTION_MARKOV_GATE_BIAS=-2.0
 # Teacher forcing is the default. Add --correction-generated-token-training to
 # CORRECTION_HEAD_ARGS for a generated-token self-feedback experiment.
 CORRECTION_ROLLOUT_METRICS_ARGS=(--correction-rollout-metrics)
@@ -64,6 +68,12 @@ ADAPTIVE_LOSS="none"                  # none | cat | ssal
 SSAL_CURRICULUM_ARGS=(--no-ssal-curriculum)
 SSAL_CURRICULUM_START=0.1
 SSAL_CURRICULUM_END=0.6
+# Optional DFlash backbone experiments. All are disabled to preserve the baseline.
+DFLASH_FEATURE_ARGS=(
+    --no-dflash-context-residual
+    --no-dflash-block-position-embedding
+    --no-dflash-gated-layer-fusion
+)
 
 # Ascend NPU assignments (online training needs separate devices for vLLM/training)
 VLLM_NPUS="0,1,2,3"
@@ -117,8 +127,11 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --correction-num-layers "$CORRECTION_NUM_LAYERS" \
     --correction-num-heads "$CORRECTION_NUM_HEADS" \
     --correction-gate-bias "$CORRECTION_GATE_BIAS" \
+    "${CORRECTION_COLLABORATION_ARGS[@]}" \
+    --correction-markov-gate-bias "$CORRECTION_MARKOV_GATE_BIAS" \
     "${CORRECTION_ROLLOUT_METRICS_ARGS[@]}" \
     "${CORRECTION_BASE_DIAGNOSTICS_ARGS[@]}" \
+    "${DFLASH_FEATURE_ARGS[@]}" \
     --enable-confidence-head \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \

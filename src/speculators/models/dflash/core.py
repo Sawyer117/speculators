@@ -75,6 +75,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         # Number of draft layers is encoded in transformer_layer_config
         num_draft_layers = tl_config.num_hidden_layers
+        hidden_size = tl_config.hidden_size
+        num_target_layers = len(self.target_layer_ids)
+        self.block_size = config.block_size
         self.layers = nn.ModuleList(
             [
                 Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
@@ -92,26 +95,54 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.sliding_window_non_causal = config.sliding_window_non_causal
 
         self.norm = Qwen3RMSNorm(
-            config.transformer_layer_config.hidden_size,
+            hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
         self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
 
+        self.dflash_gated_layer_fusion = config.dflash_gated_layer_fusion
         self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
-            config.transformer_layer_config.hidden_size,
+            num_target_layers * hidden_size,
+            hidden_size,
             bias=False,
         )
+        self.layer_fusion_norms: nn.ModuleList | None = None
+        self.layer_fusion_score: nn.Linear | None = None
+        self.layer_fusion_proj: nn.Linear | None = None
+        self.layer_fusion_gate: nn.Parameter | None = None
+        if self.dflash_gated_layer_fusion:
+            self.layer_fusion_norms = nn.ModuleList(
+                [
+                    Qwen3RMSNorm(
+                        hidden_size,
+                        eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
+                    )
+                    for _ in range(num_target_layers)
+                ]
+            )
+            self.layer_fusion_score = nn.Linear(hidden_size, 1, bias=False)
+            self.layer_fusion_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.layer_fusion_gate = nn.Parameter(torch.zeros(()))
+
         self.hidden_norm = Qwen3RMSNorm(
-            config.transformer_layer_config.hidden_size,
+            hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
         self.verifier_norm = Qwen3RMSNorm(
-            config.transformer_layer_config.hidden_size,
+            hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
         self.verifier_norm.weight.requires_grad = False
-        self.block_size = config.block_size
+
+        self.context_hidden_proj: nn.Linear | None = None
+        self.context_hidden_gate: nn.Parameter | None = None
+        if config.dflash_context_residual:
+            self.context_hidden_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.context_hidden_gate = nn.Parameter(torch.zeros(()))
+
+        self.block_position_embedding: nn.Embedding | None = None
+        if config.dflash_block_position_embedding:
+            self.block_position_embedding = nn.Embedding(self.block_size, hidden_size)
 
         # Warn if using DFlash with sample_from_anchor=True (may not be supported)
         if type(self).__name__ == "DFlashDraftModel" and config.sample_from_anchor:
@@ -122,6 +153,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         self.post_init()
+        if self.layer_fusion_score is not None:
+            nn.init.zeros_(self.layer_fusion_score.weight)
+        if self.block_position_embedding is not None:
+            nn.init.zeros_(self.block_position_embedding.weight)
 
     @property
     def target_layer_ids(self) -> list[int]:
@@ -211,6 +246,15 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "aux_hidden_state_layer_ids": target_layer_ids,
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
+            "dflash_context_residual": kwargs.get(
+                "dflash_context_residual", False
+            ),
+            "dflash_block_position_embedding": kwargs.get(
+                "dflash_block_position_embedding", False
+            ),
+            "dflash_gated_layer_fusion": kwargs.get(
+                "dflash_gated_layer_fusion", False
+            ),
             "sample_from_anchor": sample_from_anchor,
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
@@ -318,6 +362,91 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
+    def _fuse_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project verifier auxiliary states into the DFlash hidden space."""
+        baseline_projection = self.fc(hidden_states)
+        if not self.dflash_gated_layer_fusion:
+            return self.hidden_norm(baseline_projection)
+
+        if (
+            self.layer_fusion_norms is None
+            or self.layer_fusion_score is None
+            or self.layer_fusion_proj is None
+            or self.layer_fusion_gate is None
+        ):
+            raise RuntimeError("Gated layer fusion modules were not initialized")
+        num_layers = len(self.layer_fusion_norms)
+        hidden_size = self.config.transformer_layer_config.hidden_size
+        expected_size = num_layers * hidden_size
+        if hidden_states.shape[-1] != expected_size:
+            raise ValueError(
+                "Expected concatenated verifier hidden size "
+                f"{expected_size}, got {hidden_states.shape[-1]}"
+            )
+
+        layer_states = hidden_states.reshape(
+            *hidden_states.shape[:-1], num_layers, hidden_size
+        )
+        normalized = torch.stack(
+            [
+                norm(layer_states[..., layer_idx, :])
+                for layer_idx, norm in enumerate(self.layer_fusion_norms)
+            ],
+            dim=-2,
+        )
+        scores = self.layer_fusion_score(normalized).squeeze(-1)
+        weights = torch.softmax(scores.float(), dim=-1).to(normalized.dtype)
+        fused = (normalized * weights.unsqueeze(-1)).sum(dim=-2)
+        fusion_residual = self.layer_fusion_proj(fused)
+        projected = baseline_projection + (
+            torch.tanh(self.layer_fusion_gate) * fusion_residual
+        )
+        return self.hidden_norm(projected)
+
+    def _condition_noise_embedding(
+        self,
+        noise_embedding: torch.Tensor,
+        fused_context: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        document_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply opt-in, inference-safe DFlash block conditioning."""
+        if self.block_position_embedding is not None:
+            slot_ids = torch.arange(
+                self.block_size,
+                dtype=torch.long,
+                device=noise_embedding.device,
+            ).repeat(anchor_positions.numel())
+            noise_embedding = noise_embedding + self.block_position_embedding(
+                slot_ids
+            ).unsqueeze(0).to(noise_embedding.dtype)
+
+        if self.context_hidden_proj is not None:
+            if self.context_hidden_gate is None:
+                raise RuntimeError("Context residual gate was not initialized")
+            context_positions = (anchor_positions - 1).clamp_min(0)
+            last_context = fused_context[:, context_positions, :]
+            last_context = last_context.repeat_interleave(self.block_size, dim=1)
+
+            anchor_docs = document_ids[:, anchor_positions]
+            context_docs = document_ids[:, context_positions]
+            valid_context = (
+                (anchor_positions.unsqueeze(0) > 0)
+                & (anchor_docs == context_docs)
+                & (anchor_docs != -1)
+            )
+            valid_context = valid_context.repeat_interleave(
+                self.block_size, dim=1
+            ).unsqueeze(-1)
+            residual = self.context_hidden_proj(last_context)
+            residual = residual * valid_context.to(residual.dtype)
+            noise_embedding = noise_embedding + (
+                torch.tanh(self.context_hidden_gate)
+                * residual.to(noise_embedding.dtype)
+            )
+
+        return noise_embedding
+
     def _backbone_forward(
         self,
         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
@@ -362,8 +491,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
-        fc_output = self.fc(hidden_states)
-        fc_output = self.hidden_norm(fc_output)
+        fc_output = self._fuse_target_hidden(hidden_states)
+        noise_embedding = self._condition_noise_embedding(
+            noise_embedding,
+            fc_output,
+            anchor_positions,
+            document_ids,
+        )
         # shape: [1, total_seq_len, hidden_size]
 
         mask_position_ids = get_base_indices_for_anchored_blocks(

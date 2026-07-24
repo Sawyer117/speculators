@@ -1116,6 +1116,33 @@ def parse_args():
         default=0.5,
         help="Smoothing constant for D-PACE loss (default: 0.5)",
     )
+    parser.add_argument(
+        "--dflash-context-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: inject the last inference-available verifier hidden "
+            "state into each draft block (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-block-position-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: add zero-initialized block-relative slot embeddings "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-gated-layer-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: use normalized per-token gated auxiliary-layer fusion "
+            "(default: disabled)."
+        ),
+    )
     # DSpark-specific arguments (sequential correction + confidence head).
     parser.add_argument(
         "--markov-rank",
@@ -1134,7 +1161,10 @@ def parse_args():
         "--enable-correction-head",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="DSpark: replace Markov with pre-projection causal hidden correction.",
+        help=(
+            "DSpark: use pre-projection causal hidden correction; it replaces "
+            "Markov unless --correction-with-markov is enabled."
+        ),
     )
     parser.add_argument(
         "--correction-hidden-size",
@@ -1165,6 +1195,21 @@ def parse_args():
         type=float,
         default=0.0,
         help="DSpark initial correction residual-gate bias (default: 0).",
+    )
+    parser.add_argument(
+        "--correction-with-markov",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: jointly add a Correction-gated low-rank Markov bias after "
+            "Correction's single LM-head projection (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-markov-gate-bias",
+        type=float,
+        default=-2.0,
+        help="DSpark initial collaboration gate bias (default: -2.0).",
     )
     parser.add_argument(
         "--correction-generated-token-training",
@@ -1444,6 +1489,25 @@ def parse_args():
         parser.error(
             "--correction-generated-token-training requires "
             "--enable-correction-head"
+        )
+    if args.correction_with_markov:
+        if not args.enable_correction_head:
+            parser.error(
+                "--correction-with-markov requires --enable-correction-head"
+            )
+        if args.markov_rank <= 0:
+            parser.error("--correction-with-markov requires --markov-rank > 0")
+        if args.markov_head_type == "rnn":
+            parser.error(
+                "--correction-with-markov supports only vanilla or gated Markov heads"
+            )
+    if (
+        args.dflash_context_residual
+        or args.dflash_block_position_embedding
+        or args.dflash_gated_layer_fusion
+    ) and args.speculator_type not in ("dflash", "dspark"):
+        parser.error(
+            "DFlash backbone feature flags are only valid for DFlash or DSpark"
         )
     if args.per_position_loss_weight == "dpace":
         if args.loss_fn != "ce":

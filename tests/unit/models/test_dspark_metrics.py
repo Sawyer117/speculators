@@ -372,6 +372,40 @@ class TestComputeMetrics:
         )
         assert float(focal) > float(base)
 
+    def test_collaboration_metrics_compare_against_correction_only(self):
+        target_ids = torch.tensor([[1, 2, 3, 4]])
+        targets = _ids_to_logits(target_ids, 8)
+        joint_logits = targets.clone()
+        correction_only_logits = _ids_to_logits(torch.tensor([[0, 2, 0, 4]]), 8)
+        loss_mask = torch.ones(1, 4)
+        collaboration_gate = torch.full((2, 2, 1), 0.25)
+
+        _, metrics = compute_metrics(
+            joint_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            collaboration_base_logits=correction_only_logits,
+            collaboration_gate=collaboration_gate,
+        )
+
+        accept_gain = (
+            metrics["collaboration_accept_len_gain_sum"]
+            / metrics["collaboration_accept_len_gain_total"]
+        )
+        gate_mean = (
+            metrics["collaboration_markov_gate_mean_sum"]
+            / metrics["collaboration_markov_gate_mean_total"]
+        )
+        assert float(accept_gain) > 1.0
+        assert abs(float(gate_mean) - 0.25) < 1e-6
+        assert (
+            float(metrics["collaboration_markov_change_correct_count_sum"]) == 2.0
+        )
+        assert float(metrics["collaboration_markov_change_wrong_count_sum"]) == 0.0
+
     def test_confidence_length_and_uniform_vs_match_draft(self):
         torch.manual_seed(2)
         logits = torch.randn(1, 4, 8)

@@ -53,7 +53,7 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         ),
     )
 
-    # Pre-projection causal correction head. When enabled it replaces MarkovHead.
+    # Pre-projection causal correction head. By default it replaces MarkovHead.
     enable_correction_head: bool = Field(
         default=False,
         description=(
@@ -85,6 +85,22 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     correction_gate_bias: float = Field(
         default=0.0,
         description="Initial bias of the sigmoid hidden-residual gate.",
+    )
+    correction_with_markov: bool = Field(
+        default=False,
+        description=(
+            "Jointly apply the low-rank Markov logit bias after Correction's single "
+            "full-vocabulary projection. Its global residual scale starts at zero; "
+            "the feature supports vanilla/gated Markov heads and is disabled by "
+            "default for baseline parity."
+        ),
+    )
+    correction_markov_gate_bias: float = Field(
+        default=-2.0,
+        description=(
+            "Initial bias of the Correction-state gate controlling the collaborative "
+            "Markov logit bias."
+        ),
     )
     correction_generated_token_training: bool = Field(
         default=False,

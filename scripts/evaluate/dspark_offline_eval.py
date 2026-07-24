@@ -857,7 +857,13 @@ class DSparkOfflineRunner:
         )
         mask_token_ids[:, 0] = input_ids[:, start]
         noise_embedding = draft.embed_tokens(mask_token_ids)
-        fc_output = draft.hidden_norm(draft.fc(hidden_states))
+        fc_output = draft._fuse_target_hidden(hidden_states)
+        noise_embedding = draft._condition_noise_embedding(
+            noise_embedding,
+            fc_output,
+            anchor_positions,
+            document_ids,
+        )
         base_position_ids = torch.arange(
             total_seq_len,
             dtype=torch.long,
@@ -1427,7 +1433,11 @@ def run(args: argparse.Namespace) -> None:
                 "Loaded checkpoint does not use the pre-projection three-feature "
                 "CorrectionHead"
             )
-        sequential_head = "correction:pre-projection"
+        sequential_head = (
+            f"correction+markov:{draft_config.markov_head_type}"
+            if draft_model.markov_head is not None
+            else "correction:pre-projection"
+        )
     elif draft_model.markov_head is not None:
         sequential_head = f"markov:{draft_config.markov_head_type}"
     else:
