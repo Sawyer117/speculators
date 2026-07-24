@@ -192,48 +192,78 @@ def test_t2_moe_gating():
     w_train = w * R                                    # routed scale 1.5 (ONCE)
     print(f"  TRAIN topk-weight row0 sum={w_train.sum(-1)[0].item():.4f}  (== {R} if renorm+scale once)")
 
-    # --- SERVE op (signature per audit; adapt names to your build if the schema differs)
+    # --- SERVE op. select_experts touches hidden_states.shape, so pass a real dummy (NOT None).
+    #     (signature varies per build — the try/except prints the exact schema error to adapt.)
     try:
-        from vllm_ascend.ops.fused_moe.experts_selector import select_experts  # or the hash op directly
-        w_serve, ids_serve = select_experts(
-            hidden_states=None, router_logits=logits, top_k=K,
-            use_grouped_topk=False, renormalize=True,          # <- training intent
+        from vllm_ascend.ops.fused_moe.experts_selector import select_experts
+        hs = torch.randn(T, 4096).npu().to(logits.dtype)   # dummy; op uses it for shape/device only
+        out = select_experts(
+            hidden_states=hs, router_logits=logits, top_k=K,
+            use_grouped_topk=False, renormalize=True,          # <- training intent (norm_topk_prob)
             e_score_correction_bias=bias, routed_scaling_factor=R,
             scoring_func="sqrtsoftplus",
-        )[:2]
-        print(f"  SERVE topk-weight row0 sum={w_serve.float().sum(-1)[0].item():.4f}")
-        print("  READ: TRAIN row-sum == 1.5. If SERVE row-sum != 1.5:")
-        print("        ~2.25 => routed_scaling applied TWICE (kernel + combine).")
-        print("        != 1.5 and not renormalized (weights are raw sqrt(softplus)) => norm_topk_prob dropped.")
-        print("  Also compare the COMBINED routed output incl. deepseek_v4.py:498 muls_add_triton(...,1.5).")
+        )
+        w_serve = out[0].float()
+        rs = w_serve.sum(-1)[0].item()
+        print(f"  SERVE topk-weight row0 sum={rs:.4f}")
+        print("  READ vs TRAIN row-sum 1.5:")
+        print(f"    ~1.5  => renorm+scale once (MATCH, F2/F3 not biting the gate here)")
+        print(f"    ~2.25 => routed_scaling applied TWICE (kernel + combine) = F2")
+        print(f"    not 1.5 & weights look raw (unnormalized) => norm_topk_prob dropped = F3")
+        print("  (Also inspect the COMBINED routed output: deepseek_v4.py:498 muls_add_triton(...,1.5).)")
     except Exception as e:
-        print(f"  SERVE op call failed / schema differs: {e}")
-        print("  -> call the actual op: torch.ops._C_ascend.moe_gating_top_k_hash(router_logits, k=6,")
-        print("     bias=..., routed_scaling_factor=1.5, renorm=0, norm_type=2, ...) and compare row-sum.")
+        print(f"  select_experts schema differs ({e}); calling the raw op instead:")
+        try:
+            op = torch.ops._C_ascend.moe_gating_top_k_hash
+            r = op(logits, K, bias, None, None, 1, 1, R, 1e-20, 1, 0, 2, False)  # ⚠ arg order best-effort
+            rs = r[0].float().sum(-1)[0].item()
+            print(f"  SERVE (raw op) topk-weight row0 sum={rs:.4f}  (read same as above)")
+        except Exception as e2:
+            print(f"  raw op also failed: {e2}")
+            print("  -> print the op schema on your build: `print(torch.ops._C_ascend.moe_gating_top_k_hash)`")
+            print("     then match arg order (router_logits, k, bias, ..., routed_scaling_factor, renorm, norm_type).")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # T3 — mHC hc_pre/hc_post (Sinkhorn + residual mixing) — CANNOT-DETERMINE from source.
 # ─────────────────────────────────────────────────────────────────────────────
 def test_t3_mhc():
-    _hdr("T3  mHC hc_pre/hc_post  (Sinkhorn iters/order + residual place)")
+    _hdr("T3  mHC hc_pre  (Sinkhorn iters/order + '+eps' placement — the CANNOT-DETERMINE op)")
     try:
         import torch_npu  # noqa: F401
-        from vllm_ascend.models.deepseek_v4 import npu_hc_pre_v2  # or torch.ops._C_ascend.npu_hc_pre_v2
     except Exception as e:
-        print(f"  SKIP: serve op unavailable ({e}). On the box, call:")
-        print("    torch.ops._C_ascend.npu_hc_pre_v2(x[N,hc,H], hc_fn, hc_scale[3], hc_base,")
-        print("       hc_mult=4, hc_sinkhorn_iters=20, norm_eps=1e-6, hc_eps=1e-6) -> (collapsed, post, comb)")
-        print("    torch.ops._C_ascend.npu_hc_post(out[1,N,H], residual[1,N,hc,H], post, comb) -> streams")
-        print("  and diff vs speculators backbone/hyper.py: _hyper_connection_torch + place().")
-        return
+        print(f"  SKIP: no torch_npu ({e})"); return
+    op = getattr(torch.ops._C_ascend, "npu_hc_pre_v2", None)
+    if op is None:
+        print("  SKIP: torch.ops._C_ascend.npu_hc_pre_v2 not registered in this build."); return
     try:
-        from speculators.models.dsv4_dspark.backbone.hyper import _hyper_connection_torch  # noqa: F401
-        print("  TODO: build matched (x, hc_fn, hc_scale, hc_base) from a real draft layer's HC params,")
-        print("        run npu_hc_pre_v2 vs _hyper_connection_torch, _report('hc_pre.collapsed', ...).")
-        print("  Focus: Sinkhorn column-first vs row-first pass + '+eps' placement (the silent divergence).")
+        from speculators.models.dsv4_dspark.backbone.hyper import HyperConnection, _hyper_connection_torch
     except Exception as e:
-        print(f"  train ref import failed: {e}")
+        print(f"  SKIP: `import speculators` failed ({e}) — run `pip install -e .` in this env (needed for the ref).")
+        return
+    import types
+    torch.manual_seed(0)
+    H, hc, N = 256, 4, 8
+    cfg = types.SimpleNamespace(hc_mult=hc, hc_sinkhorn_iters=20, hc_eps=1e-6, rms_norm_eps=1e-6, hidden_size=H)
+    mod = HyperConnection(cfg)
+    with torch.no_grad():
+        mod.fn.normal_(0, 0.02); mod.base.zero_(); mod.scale.fill_(1.0)
+    streams = torch.randn(1, N, hc, H)                     # [B, S, hc, D]
+    post_t, comb_t, collapsed_t = _hyper_connection_torch(mod, streams)   # TRAIN ref -> (post, comb, collapsed)
+    try:
+        x = streams[0].npu().float()                       # serve x: [N, hc, H]
+        collapsed_s, _post_s, _comb_s = op(                # serve op -> (collapsed, post, comb)
+            x, mod.fn.detach().npu().float(), mod.scale.detach().npu().float(),
+            mod.base.detach().npu().float(), hc, 20, 1e-6, 1e-6)
+        d = (collapsed_t[0].float() - collapsed_s.cpu().float()).abs()
+        ok = d.max().item() <= 2e-2
+        print(f"  hc_pre.collapsed:  max|Δ|={d.max().item():.3e}  mean|Δ|={d.mean().item():.3e}  "
+              f"-> {'PASS' if ok else 'FAIL'} (atol=2e-2)")
+        print("  READ: PASS => the compiled Sinkhorn/mixing MATCHES the torch ref (F5 clean).")
+        print("        FAIL => the .so's Sinkhorn (iteration order / '+eps' placement) diverges — the silent mHC gap.")
+    except Exception as e:
+        print(f"  ⚠ serve op call failed ({e}) — arg order/shape/dtype best-effort. On your build inspect it:")
+        print("    print(torch.ops._C_ascend.npu_hc_pre_v2)   # match (x, fn, scale, base, hc_mult, iters, norm_eps, hc_eps)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,19 +306,26 @@ def test_t4_yarn_rope():
 # T5 — sink block attention: serve fused op vs train torch reference.
 # ─────────────────────────────────────────────────────────────────────────────
 def test_t5_sink_attention():
-    _hdr("T5  sink block attention  (serve npu_sparse_attn_sharedkv vs train ref)")
+    _hdr("T5  sink block attention  (train ref sanity — serve op needs the engine, see note)")
     try:
-        from speculators.models.dsv4_dspark.backbone.attention import _sink_block_attention_torch  # noqa: F401
+        from speculators.models.dsv4_dspark.backbone.attention import _sink_block_attention_torch
     except Exception as e:
-        print(f"  train ref import failed: {e}")
-        return
-    print("  Build matched q[N,Sq,Hh,D], k=v[N,Sk,D] (shared KV head), sink[Hh], scale=D**-0.5,")
-    print("  a window+block NON-CAUSAL additive bias, then:")
-    print("    ref  = _sink_block_attention_torch(q,k,v,sink,scale,attn_bias)   (backbone/attention.py)")
-    print("    serve= torch.ops._C_ascend.npu_sparse_attn_sharedkv(q, ori_kv=..., ori_sparse_indices=...,")
-    print("             sinks=sink, softmax_scale=D**-0.5, ori_mask_mode=4, ori_win_left=127, ori_win_right=0)[0]")
-    print("  ★ Drive RoPE BOTH ways (YaRN-off and factor=16) to isolate T4 from the op itself.")
-    print("  Focus: the per-head sink denominator term e^{sink-m} and the window-edge (127 vs 128).")
+        print(f"  SKIP: `import speculators` failed ({e}) — `pip install -e .` in this env."); return
+    torch.manual_seed(0)
+    N, Sq, Sk, Hh, D = 1, 5, 133, 8, 64                    # block γ=5, ctx window 128 + block 5, shared KV head
+    q = torch.randn(N, Sq, Hh, D); k = torch.randn(N, Sk, D); v = torch.randn(N, Sk, D)
+    sink = torch.randn(Hh)
+    try:
+        out = _sink_block_attention_torch(q, k, v, sink, D ** -0.5)
+        print(f"  TRAIN ref ran ✓  out={tuple(out.shape)}  finite={bool(torch.isfinite(out).all())}")
+    except Exception as e:
+        print(f"  TRAIN ref failed: {e}")
+    print("  ⚠ SERVE side NOT run standalone: `npu_sparse_attn_sharedkv` consumes the engine's PAGED KV cache")
+    print("     + block tables + sas_metadata — it does not execute cleanly outside a running serve. Its")
+    print("     train<->serve parity is best measured INSIDE the serve = the T6 harness")
+    print("     (dsv4_dspark_serve_forward_parity.py): a late-slot BASE-logit divergence there IS the")
+    print("     sink/attention (or RoPE) mismatch. Also: dspark_attn_ref_bench.py already validated the")
+    print("     non-causal einsum vs the serve GOLD, so the attention math is corroborated.")
 
 
 TESTS = {"t1": test_t1_double_norm, "t2": test_t2_moe_gating, "t3": test_t3_mhc,
