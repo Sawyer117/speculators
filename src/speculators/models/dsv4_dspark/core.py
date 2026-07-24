@@ -512,9 +512,15 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         )
 
         with torch.no_grad():
-            verifier_logits = self.verifier_lm_head(
-                self.verifier_norm(verifier_last_hidden_states)
-            )
+            # `verifier_last_hidden_states` is ALREADY the verifier's FINAL POST-NORM hidden:
+            # the HS dumper writes `self.norm(...)` output (see docs/deployment/
+            # ascend-npu-dsv4-hs-dumper-planB.md §"verifier-last = final post-norm hidden"), and
+            # data.py:507 feeds it verbatim. Re-applying `verifier_norm` here would DOUBLE-norm it
+            # (norm(norm(h))) — distorting the teacher distribution that the TV/CE distillation AND
+            # the train accept-metric target, so the draft gets pulled toward a wrong verifier and
+            # the train metric decouples from eval. The verifier's true next-token logits are just
+            # lm_head(post_norm_hidden). (train↔serve parity audit 2026-07-24, finding F1.)
+            verifier_logits = self.verifier_lm_head(verifier_last_hidden_states)
             if not self.config.sample_from_anchor:
                 # False: shift right by 1 so slot j predicts the token AT position j
                 # (slot 0 = the given anchor). True (DSpark, matches the vllm-ascend
