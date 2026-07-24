@@ -45,11 +45,13 @@ CORRECTION_HIDDEN_SIZE=512
 CORRECTION_RANK=256
 CORRECTION_NUM_LAYERS=1
 CORRECTION_NUM_HEADS=8
-CORRECTION_TOP_K=8
 CORRECTION_GATE_BIAS=0.0
+# Teacher forcing is the default. Add --correction-generated-token-training to
+# CORRECTION_HEAD_ARGS for a generated-token self-feedback experiment.
 CORRECTION_ROLLOUT_METRICS_ARGS=(--correction-rollout-metrics)
-CORRECTION_CURRICULUM_ARGS=(--correction-curriculum)
-CORRECTION_CURRICULUM_END=0.2
+# Enable only when validation-only base change/gain diagnostics are worth an
+# additional LM-head projection. Correction itself never consumes base logits.
+CORRECTION_BASE_DIAGNOSTICS_ARGS=(--no-correction-base-diagnostics)
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
 CONFIDENCE_LENGTH_ALPHA=0.0
@@ -114,11 +116,9 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --correction-rank "$CORRECTION_RANK" \
     --correction-num-layers "$CORRECTION_NUM_LAYERS" \
     --correction-num-heads "$CORRECTION_NUM_HEADS" \
-    --correction-top-k "$CORRECTION_TOP_K" \
     --correction-gate-bias "$CORRECTION_GATE_BIAS" \
     "${CORRECTION_ROLLOUT_METRICS_ARGS[@]}" \
-    "${CORRECTION_CURRICULUM_ARGS[@]}" \
-    --correction-curriculum-end "$CORRECTION_CURRICULUM_END" \
+    "${CORRECTION_BASE_DIAGNOSTICS_ARGS[@]}" \
     --enable-confidence-head \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \

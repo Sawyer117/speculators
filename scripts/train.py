@@ -1134,7 +1134,7 @@ def parse_args():
         "--enable-correction-head",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="DSpark: replace Markov with logit-aware causal hidden correction.",
+        help="DSpark: replace Markov with pre-projection causal hidden correction.",
     )
     parser.add_argument(
         "--correction-hidden-size",
@@ -1161,16 +1161,19 @@ def parse_args():
         help="DSpark correction-head attention heads (default: 8).",
     )
     parser.add_argument(
-        "--correction-top-k",
-        type=int,
-        default=8,
-        help="DSpark top-k base logits summarized for correction (default: 8).",
-    )
-    parser.add_argument(
         "--correction-gate-bias",
         type=float,
         default=0.0,
         help="DSpark initial correction residual-gate bias (default: 0).",
+    )
+    parser.add_argument(
+        "--correction-generated-token-training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: train Correction with greedy generated-token feedback "
+            "instead of ground-truth teacher forcing (default: disabled)."
+        ),
     )
     parser.add_argument(
         "--correction-rollout-metrics",
@@ -1179,16 +1182,10 @@ def parse_args():
         help="DSpark: measure greedy self-feedback metrics during validation.",
     )
     parser.add_argument(
-        "--correction-curriculum",
+        "--correction-base-diagnostics",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="DSpark: linearly hand off base loss to corrected loss at startup.",
-    )
-    parser.add_argument(
-        "--correction-curriculum-end",
-        type=float,
-        default=0.2,
-        help="Progress fraction reaching pure corrected loss (default: 0.2).",
+        help="DSpark: add a validation-only base projection for change/gain metrics.",
     )
     parser.add_argument(
         "--enable-confidence-head",
@@ -1431,24 +1428,23 @@ def parse_args():
             args.correction_rank,
             args.correction_num_layers,
             args.correction_num_heads,
-            args.correction_top_k,
         ) <= 0:
             parser.error(
-                "DSpark correction sizes, layers, heads, and top-k must be > 0"
+                "DSpark correction sizes, layers, and heads must be > 0"
             )
         if args.correction_hidden_size % args.correction_num_heads != 0:
             parser.error(
                 "--correction-hidden-size must be divisible by "
                 "--correction-num-heads"
             )
-    if args.correction_curriculum:
-        if not args.enable_correction_head:
-            parser.error(
-                "--correction-curriculum requires --enable-correction-head"
-            )
-        if not 0.0 < args.correction_curriculum_end <= 1.0:
-            parser.error("--correction-curriculum-end must be in (0, 1]")
-
+    if (
+        args.correction_generated_token_training
+        and not args.enable_correction_head
+    ):
+        parser.error(
+            "--correction-generated-token-training requires "
+            "--enable-correction-head"
+        )
     if args.per_position_loss_weight == "dpace":
         if args.loss_fn != "ce":
             parser.error("--per-position-loss-weight=dpace requires --loss-fn=ce")

@@ -326,13 +326,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        *,
+        project_logits: bool = True,
         **kwargs,
     ):
-        """Run the anchored-block draft transformer up to the draft logits.
+        """Run the anchored-block draft transformer and optionally project logits.
 
         Returns ``(hidden, logits, targets, aligned_loss_mask,
-        anchored_block_indices)``. DSpark reuses this and adds its Markov and
-        confidence heads before computing its own loss.
+        anchored_block_indices)``. ``logits`` is ``None`` when
+        ``project_logits=False`` so DSpark can correct hidden states before the
+        single draft-vocabulary projection.
         """
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
@@ -402,8 +405,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         hidden = self.norm(noise_embedding)
-        logits = self.lm_head(hidden)
-        # shape: [1, num_anchors*block_size, vocab_size]
+        logits = self.lm_head(hidden) if project_logits else None
+        # shape when projected: [1, num_anchors*block_size, vocab_size]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
         # shape: [1, num_anchors*block_size]
@@ -447,6 +450,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             max_anchors=max_anchors,
             **kwargs,
         )
+        if logits is None:
+            raise RuntimeError("DFlash forward requires projected draft logits")
         loss, metrics = compute_metrics(
             logits,
             targets,

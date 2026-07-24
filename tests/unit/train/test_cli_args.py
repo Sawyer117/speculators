@@ -151,7 +151,7 @@ def test_dspark_adaptive_and_confidence_cli(monkeypatch):
     assert val_kw["ssal_decay_weight"] == 0.0
 
 
-def test_dspark_correction_head_cli_and_curriculum(monkeypatch):
+def test_dspark_preprojection_correction_head_cli(monkeypatch):
     args = _parse(
         monkeypatch,
         [
@@ -166,15 +166,12 @@ def test_dspark_correction_head_cli_and_curriculum(monkeypatch):
             "2",
             "--correction-num-heads",
             "6",
-            "--correction-top-k",
-            "12",
             "--correction-gate-bias",
             "-1.0",
+            "--correction-generated-token-training",
             "--no-correction-rollout-metrics",
+            "--correction-base-diagnostics",
             "--confidence-detach-features",
-            "--correction-curriculum",
-            "--correction-curriculum-end",
-            "0.15",
         ],
     )
     assert args.enable_correction_head is True
@@ -182,17 +179,37 @@ def test_dspark_correction_head_cli_and_curriculum(monkeypatch):
     assert args.correction_rank == 48
     assert args.correction_num_layers == 2
     assert args.correction_num_heads == 6
-    assert args.correction_top_k == 12
     assert args.correction_gate_bias == -1.0
+    assert args.correction_generated_token_training is True
     assert args.correction_rollout_metrics is False
+    assert args.correction_base_diagnostics is True
     assert args.confidence_detach_features is True
 
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
-    assert train_kw["correction_curriculum"] is True
-    assert train_kw["correction_curriculum_end"] == 0.15
-    assert train_kw["correction_base_weight"] == 0.0
-    assert "correction_curriculum" not in val_kw
-    assert val_kw["correction_base_weight"] == 0.0
+    assert train_kw == val_kw
+
+
+def test_dspark_correction_teacher_forcing_default_and_generated_opt_in(monkeypatch):
+    teacher_forced = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+        ],
+    )
+    assert teacher_forced.correction_generated_token_training is False
+
+    generated = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-generated-token-training",
+        ],
+    )
+    assert generated.correction_generated_token_training is True
 
 
 # ---------------------------------------------------------------------------

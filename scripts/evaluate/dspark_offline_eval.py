@@ -459,33 +459,25 @@ def _draft_sample_from_anchor(draft) -> bool:
     return bool(getattr(getattr(draft, "config", None), "sample_from_anchor", False))
 
 
-def _is_logit_aware_correction(draft) -> bool:
-    """Return whether ``draft`` exposes the e2759fa Correction interface."""
+def _is_preprojection_correction(draft) -> bool:
+    """Return whether ``draft`` exposes the three-feature Correction interface."""
     correction = getattr(draft, "correction_head", None)
-    return (
-        correction is not None
-        and hasattr(correction, "logit_context_proj")
-        and hasattr(correction, "logit_stats_proj")
-    )
+    return correction is not None and hasattr(correction, "position_embedding")
 
 
-def _run_logit_aware_correction_rollout(
+def _run_preprojection_correction_rollout(
     draft,
     *,
-    base_logits,
     hidden_states,
     anchor_token_ids,
     temperature: float,
 ):
-    """Run e2759fa's native rollout so logit features match training."""
-    if not _is_logit_aware_correction(draft):
+    """Run the native previous-token/hidden/position Correction rollout."""
+    if not _is_preprojection_correction(draft):
         raise RuntimeError(
-            "This evaluator expects the e2759fa logit-aware CorrectionHead"
+            "This evaluator expects the pre-projection three-feature CorrectionHead"
         )
-    if base_logits is None:
-        raise RuntimeError("Logit-aware Correction requires base DFlash logits")
     return draft.rollout_correction(
-        base_logits,
         hidden_states,
         anchor_token_ids=anchor_token_ids,
         temperature=temperature,
@@ -894,7 +886,12 @@ class DSparkOfflineRunner:
             )
 
         hidden = draft.norm(noise_embedding)
-        return hidden, draft.lm_head(hidden)
+        # Correction modifies DFlash hidden before the only vocabulary projection.
+        # Markov/plain DSpark still consumes the ordinary base logits.
+        base_logits = (
+            None if draft.correction_head is not None else draft.lm_head(hidden)
+        )
+        return hidden, base_logits
 
     def _sample_correction_tokens(
         self,
@@ -902,16 +899,23 @@ class DSparkOfflineRunner:
         hidden_states,
         first_prev_token_id,
     ):
-        """Sample with e2759fa's base-logit-aware causal Correction rollout."""
+        """Sample with the pre-projection three-feature Correction rollout."""
+        del base_logits
         draft = self.draft_model
         temperature = float(self.args.temperature)
-        draft_ids, final_logits = _run_logit_aware_correction_rollout(
+        draft_ids, final_logits = _run_preprojection_correction_rollout(
             draft,
-            base_logits=base_logits,
             hidden_states=hidden_states,
             anchor_token_ids=first_prev_token_id.reshape(-1).long(),
             temperature=temperature,
         )
+
+        # The model returns all block slots.  With sample_from_anchor=False,
+        # slot 0 is reserved and must not be proposed to the verifier.
+        first_slot = self.first_draft_slot
+        last_slot = first_slot + self.max_proposal_tokens
+        draft_ids = draft_ids[:, first_slot:last_slot]
+        final_logits = final_logits[:, first_slot:last_slot]
 
         if draft_ids.shape[1] != self.max_proposal_tokens:
             raise RuntimeError(
@@ -934,6 +938,8 @@ class DSparkOfflineRunner:
                 first_prev_token_id,
             )
 
+        if base_logits is None:
+            raise RuntimeError("Markov/plain DSpark evaluation requires base logits")
         proposed_target_ids: list[int] = []
         draft_probs = []
         prev_token = first_prev_token_id.reshape(1, 1).long()
@@ -1416,12 +1422,12 @@ def run(args: argparse.Namespace) -> None:
     ).to(device).eval()
     _ensure_loaded_vocab_mappings(draft_model, args)
     if draft_model.correction_head is not None:
-        if not _is_logit_aware_correction(draft_model):
+        if not _is_preprojection_correction(draft_model):
             raise RuntimeError(
-                "Loaded checkpoint does not use the e2759fa logit-aware "
+                "Loaded checkpoint does not use the pre-projection three-feature "
                 "CorrectionHead"
             )
-        sequential_head = "correction:logit-aware"
+        sequential_head = "correction:pre-projection"
     elif draft_model.markov_head is not None:
         sequential_head = f"markov:{draft_config.markov_head_type}"
     else:

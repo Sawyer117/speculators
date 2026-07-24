@@ -257,22 +257,14 @@ class TestComputeMetrics:
         assert torch.allclose(mixed, pure_decay)
         assert not torch.allclose(pure_ssal, pure_decay)
 
-    def test_correction_curriculum_and_gain_metrics(self):
+    def test_correction_gain_metrics(self):
         target_ids = torch.tensor([[1, 2, 3, 4]])
         targets = _ids_to_logits(target_ids, 8)
         corrected_logits = targets.clone()
         base_logits = _ids_to_logits(torch.tensor([[5, 6, 7, 0]]), 8)
         loss_mask = torch.ones(1, 4)
 
-        pure_base, _ = compute_metrics(
-            base_logits,
-            targets,
-            None,
-            loss_mask,
-            block_size=2,
-            loss_config=_DEFAULT_LOSS,
-        )
-        base_phase, base_metrics = compute_metrics(
+        corrected_loss, corrected_metrics = compute_metrics(
             corrected_logits,
             targets,
             None,
@@ -280,22 +272,9 @@ class TestComputeMetrics:
             block_size=2,
             loss_config=_DEFAULT_LOSS,
             base_logits=base_logits,
-            correction_base_weight=torch.tensor(1.0),
-        )
-        corrected_phase, corrected_metrics = compute_metrics(
-            corrected_logits,
-            targets,
-            None,
-            loss_mask,
-            block_size=2,
-            loss_config=_DEFAULT_LOSS,
-            base_logits=base_logits,
-            correction_base_weight=torch.tensor(0.0),
         )
 
-        assert torch.allclose(base_phase, pure_base)
-        assert float(corrected_phase) < float(base_phase)
-        assert "base_accept_len_sum" in base_metrics
+        assert float(corrected_loss) < float(corrected_metrics["base_loss_sum"])
         gain = (
             corrected_metrics["correction_accept_len_gain_sum"]
             / corrected_metrics["correction_accept_len_gain_total"]

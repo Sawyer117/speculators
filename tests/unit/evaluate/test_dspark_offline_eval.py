@@ -139,43 +139,35 @@ def test_no_sample_from_anchor_slot_target_positions():
     ]
 
 
-def test_detects_e2759fa_logit_aware_correction():
+def test_detects_preprojection_correction():
     module = _load_module()
 
     draft = SimpleNamespace(
-        correction_head=SimpleNamespace(
-            logit_context_proj=object(),
-            logit_stats_proj=object(),
-        ),
+        correction_head=SimpleNamespace(position_embedding=object()),
     )
 
-    assert module._is_logit_aware_correction(draft)
-    assert not module._is_logit_aware_correction(
+    assert module._is_preprojection_correction(draft)
+    assert not module._is_preprojection_correction(
         SimpleNamespace(correction_head=None)
     )
 
 
-def test_logit_aware_rollout_receives_base_logits_and_hidden_states():
+def test_preprojection_rollout_receives_hidden_states_without_base_logits():
     module = _load_module()
     calls = []
 
     class Draft:
-        correction_head = SimpleNamespace(
-            logit_context_proj=object(),
-            logit_stats_proj=object(),
-        )
+        correction_head = SimpleNamespace(position_embedding=object())
 
         @staticmethod
         def rollout_correction(*args, **kwargs):
             calls.append((args, kwargs))
             return "tokens", "logits"
 
-    base_logits = object()
     hidden_states = object()
     anchor_token_ids = object()
-    result = module._run_logit_aware_correction_rollout(
+    result = module._run_preprojection_correction_rollout(
         Draft(),
-        base_logits=base_logits,
         hidden_states=hidden_states,
         anchor_token_ids=anchor_token_ids,
         temperature=0.7,
@@ -184,7 +176,7 @@ def test_logit_aware_rollout_receives_base_logits_and_hidden_states():
     assert result == ("tokens", "logits")
     assert calls == [
         (
-            (base_logits, hidden_states),
+            (hidden_states,),
             {
                 "anchor_token_ids": anchor_token_ids,
                 "temperature": 0.7,

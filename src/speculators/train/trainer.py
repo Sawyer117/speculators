@@ -214,8 +214,6 @@ class Trainer:
         self._ssal_curriculum = False
         self._ssal_curriculum_start = 0.1
         self._ssal_curriculum_end = 0.6
-        self._correction_curriculum = False
-        self._correction_curriculum_end = 0.2
         self._curriculum_total_steps: int | None = None
         if kwargs and kwargs.pop("ssal_curriculum", False):
             self._ssal_curriculum = True
@@ -223,11 +221,6 @@ class Trainer:
                 kwargs.pop("ssal_curriculum_start", 0.1)
             )
             self._ssal_curriculum_end = float(kwargs.pop("ssal_curriculum_end", 0.6))
-        if kwargs and kwargs.pop("correction_curriculum", False):
-            self._correction_curriculum = True
-            self._correction_curriculum_end = float(
-                kwargs.pop("correction_curriculum_end", 0.2)
-            )
 
     def _curriculum_decay_weight(self, start: float, end: float) -> float:
         """Return a 1-to-0 linear weight over a training-progress interval."""
@@ -476,9 +469,7 @@ class Trainer:
 
         # Capture full-epoch step count before any resume fast-skip mutation.
         num_steps = len(self.train_loader)
-        if (
-            self._ssal_curriculum or self._correction_curriculum
-        ) and self._curriculum_total_steps is None:
+        if self._ssal_curriculum and self._curriculum_total_steps is None:
             self._curriculum_total_steps = self.config.num_epochs * num_steps
 
         # Determine how many batches to skip for mid-epoch resume.
@@ -524,15 +515,6 @@ class Trainer:
                     )
                     call_kwargs["ssal_decay_weight"] = torch.tensor(
                         ssal_weight,
-                        device=batch_device,
-                        dtype=torch.float32,
-                    )
-                if self._correction_curriculum:
-                    correction_weight = self._curriculum_decay_weight(
-                        0.0, self._correction_curriculum_end
-                    )
-                    call_kwargs["correction_base_weight"] = torch.tensor(
-                        correction_weight,
                         device=batch_device,
                         dtype=torch.float32,
                     )

@@ -110,13 +110,12 @@ class _TinyCausalLayer(nn.Module):
 
 
 class CausalCorrectionHead(nn.Module):
-    """Predict a gated hidden-space residual from causal, logit-aware features.
+    """Predict a gated hidden residual before the draft vocabulary projection.
 
-    The caller summarizes the parallel DFlash distribution in the frozen LM-head
-    embedding space.  The correction head combines that summary with the current
-    DFlash hidden state and the previous token, then returns ``delta_hidden``.
-    Reusing the model's frozen LM head to project ``delta_hidden`` keeps the base and
-    correction logits in the same token geometry.
+    Each block position combines the previous-token embedding, the current DFlash
+    hidden state, and a learned block-position embedding.  Causal attention carries
+    those features across the block.  The returned ``delta_hidden`` is added to the
+    DFlash hidden state before the model's single LM-head projection.
     """
 
     def __init__(
@@ -124,11 +123,11 @@ class CausalCorrectionHead(nn.Module):
         *,
         input_hidden_size: int,
         token_embedding_size: int,
+        block_size: int,
         correction_hidden_size: int,
         correction_rank: int,
         num_layers: int = 1,
         num_heads: int = 8,
-        logit_stats_size: int = 3,
         gate_bias: float = 0.0,
     ) -> None:
         super().__init__()
@@ -136,6 +135,8 @@ class CausalCorrectionHead(nn.Module):
             raise ValueError("correction_hidden_size must be positive")
         if correction_rank <= 0:
             raise ValueError("correction_rank must be positive")
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
 
@@ -145,12 +146,7 @@ class CausalCorrectionHead(nn.Module):
         self.token_proj = nn.Linear(
             token_embedding_size, correction_hidden_size, bias=False
         )
-        self.logit_context_proj = nn.Linear(
-            input_hidden_size, correction_hidden_size, bias=False
-        )
-        self.logit_stats_proj = nn.Linear(
-            logit_stats_size, correction_hidden_size, bias=False
-        )
+        self.position_embedding = nn.Embedding(block_size, correction_hidden_size)
         self.layers = nn.ModuleList(
             [
                 _TinyCausalLayer(correction_hidden_size, num_heads)
@@ -165,6 +161,7 @@ class CausalCorrectionHead(nn.Module):
             correction_rank, input_hidden_size, bias=False
         )
         self.residual_gate = nn.Linear(correction_hidden_size, 1)
+        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.correction_up.weight)
         nn.init.zeros_(self.residual_gate.weight)
         nn.init.constant_(self.residual_gate.bias, gate_bias)
@@ -173,8 +170,7 @@ class CausalCorrectionHead(nn.Module):
         self,
         previous_token_embeddings: torch.Tensor,
         dflash_hidden: torch.Tensor,
-        logit_context: torch.Tensor,
-        logit_stats: torch.Tensor,
+        block_positions: torch.Tensor,
         cache: CorrectionCache | None = None,
         *,
         use_cache: bool = False,
@@ -183,10 +179,8 @@ class CausalCorrectionHead(nn.Module):
         prefix_shape = dflash_hidden.shape[:-1]
         if previous_token_embeddings.shape[:-1] != prefix_shape:
             raise ValueError("previous-token embeddings and DFlash hidden must align")
-        if logit_context.shape[:-1] != prefix_shape:
-            raise ValueError("logit context and DFlash hidden must align")
-        if logit_stats.shape[:-1] != prefix_shape:
-            raise ValueError("logit stats and DFlash hidden must align")
+        if block_positions.shape != prefix_shape:
+            raise ValueError("block positions and DFlash hidden must align")
         if cache is not None and len(cache) != len(self.layers):
             raise ValueError(
                 f"Expected {len(self.layers)} cache entries, got {len(cache)}"
@@ -196,8 +190,9 @@ class CausalCorrectionHead(nn.Module):
         hidden_states = (
             self.hidden_proj(dflash_hidden.to(dtype))
             + self.token_proj(previous_token_embeddings.to(dtype))
-            + self.logit_context_proj(logit_context.to(dtype))
-            + self.logit_stats_proj(logit_stats.to(dtype))
+            + self.position_embedding(
+                block_positions.to(device=dflash_hidden.device, dtype=torch.long)
+            ).to(dtype)
         )
         next_cache: CorrectionCache = []
         for layer_idx, layer in enumerate(self.layers):

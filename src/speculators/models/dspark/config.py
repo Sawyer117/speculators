@@ -53,13 +53,13 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         ),
     )
 
-    # Logit-aware causal correction head. When enabled it replaces MarkovHead.
+    # Pre-projection causal correction head. When enabled it replaces MarkovHead.
     enable_correction_head: bool = Field(
         default=False,
         description=(
             "Replace the Markov head with a causal head that predicts a gated "
-            "hidden-space residual from previous-token, hidden, and base-logit "
-            "features. The frozen LM head projects the residual to logits."
+            "hidden-space residual from previous-token, DFlash hidden, and "
+            "block-position embeddings before the single LM-head projection."
         ),
     )
     correction_hidden_size: int = Field(
@@ -82,20 +82,30 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         gt=0,
         description="Attention heads in each correction layer.",
     )
-    correction_top_k: int = Field(
-        default=8,
-        gt=0,
-        description="Top-k base-logit candidates summarized for correction.",
-    )
     correction_gate_bias: float = Field(
         default=0.0,
         description="Initial bias of the sigmoid hidden-residual gate.",
+    )
+    correction_generated_token_training: bool = Field(
+        default=False,
+        description=(
+            "During training, feed each greedily generated Correction token into "
+            "the next block position instead of teacher-forcing ground-truth tokens. "
+            "Ignored when Correction is disabled."
+        ),
     )
     correction_rollout_metrics: bool = Field(
         default=True,
         description=(
             "Measure greedy self-feedback correction metrics during validation. "
             "Disable to reduce validation compute."
+        ),
+    )
+    correction_base_diagnostics: bool = Field(
+        default=False,
+        description=(
+            "During validation only, run an extra base LM-head projection for "
+            "change/gain diagnostics. It is never used by Correction itself."
         ),
     )
 

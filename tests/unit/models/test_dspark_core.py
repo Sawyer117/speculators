@@ -11,69 +11,73 @@ from speculators.models.dspark.core import DSparkDraftModel
 class _RecordingCorrectionHead(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
         self.previous_embeddings: list[torch.Tensor] = []
+        self.block_positions: list[torch.Tensor] = []
 
     def forward(
         self,
         previous_embeddings,
         dflash_hidden,
-        logit_context,
-        logit_stats,
+        block_positions,
         cache=None,
         *,
         use_cache=False,
     ):
-        del logit_context, logit_stats, cache
+        del cache
         self.previous_embeddings.append(previous_embeddings.detach().clone())
+        self.block_positions.append(block_positions.detach().clone())
         states = dflash_hidden.new_zeros(*dflash_hidden.shape[:-1], 4)
+        delta_hidden = torch.nn.functional.one_hot(
+            block_positions, num_classes=dflash_hidden.shape[-1]
+        ).to(dflash_hidden.dtype) * self.scale
         next_cache = [] if use_cache else None
-        return torch.zeros_like(dflash_hidden), states, next_cache
+        return delta_hidden, states, next_cache
 
 
 class _RolloutHarness:
-    _summarize_base_logits = DSparkDraftModel._summarize_base_logits
+    _generated_feedback_correction = (
+        DSparkDraftModel._generated_feedback_correction
+    )
     rollout_correction = DSparkDraftModel.rollout_correction
 
 
-def test_logit_summary_handles_top_k_one():
-    harness = SimpleNamespace(
-        config=SimpleNamespace(correction_top_k=1),
-        lm_head=nn.Linear(3, 4, bias=False),
+class _GeneratedFeedbackHarness:
+    _generated_feedback_correction = (
+        DSparkDraftModel._generated_feedback_correction
     )
-    with torch.no_grad():
-        harness.lm_head.weight.copy_(torch.arange(12).view(4, 3))
-    logits = torch.tensor([[[1.0, 4.0, 2.0, 0.0], [3.0, 1.0, 0.0, 2.0]]])
 
-    context, stats = DSparkDraftModel._summarize_base_logits(harness, logits)
 
-    expected_ids = logits.argmax(dim=-1)
-    assert context.shape == (1, 2, 3)
-    assert stats.shape == (1, 2, 3)
-    assert torch.equal(context, harness.lm_head.weight[expected_ids])
-    assert torch.allclose(stats[..., 0], stats[..., 1])
-    assert torch.allclose(stats[..., 0], stats[..., 2])
+class _CountingLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__(in_features, out_features, bias=False)
+        self.calls = 0
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        return super().forward(value)
 
 
 def test_rollout_uses_generated_token_as_next_feedback():
     harness = _RolloutHarness()
     harness.block_size = 3
-    harness.config = SimpleNamespace(sample_from_anchor=True, correction_top_k=1)
+    harness.config = SimpleNamespace(sample_from_anchor=True)
     harness.correction_head = _RecordingCorrectionHead()
     harness.embed_tokens = nn.Embedding(8, 4)
-    harness.lm_head = nn.Linear(4, 8, bias=False)
+    harness.lm_head = _CountingLinear(4, 8)
     harness.d2t = None
     with torch.no_grad():
         harness.embed_tokens.weight.copy_(
             torch.arange(8, dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
         )
         harness.lm_head.weight.zero_()
+        harness.lm_head.weight[1, 0] = 10.0
+        harness.lm_head.weight[2, 1] = 10.0
+        harness.lm_head.weight[3, 2] = 10.0
 
     chosen_ids = torch.tensor([[1, 2, 3]])
-    base_logits = torch.zeros(1, 3, 8)
-    base_logits.scatter_(-1, chosen_ids.unsqueeze(-1), 10.0)
-    hidden = torch.randn(1, 3, 4)
+    hidden = torch.zeros(1, 3, 4)
     tokens, _ = harness.rollout_correction(
-        base_logits,
         hidden,
         anchor_token_ids=torch.tensor([7]),
     )
@@ -81,6 +85,46 @@ def test_rollout_uses_generated_token_as_next_feedback():
     assert torch.equal(tokens, chosen_ids)
     feedback = torch.cat(harness.correction_head.previous_embeddings, dim=1)
     assert torch.equal(feedback[:, :, 0], torch.tensor([[7.0, 1.0, 2.0]]))
+    positions = torch.cat(harness.correction_head.block_positions, dim=1)
+    assert torch.equal(positions, torch.tensor([[0, 1, 2]]))
+    assert harness.lm_head.calls == harness.block_size
+
+
+def test_generated_feedback_training_retains_gradients_and_generated_tokens():
+    harness = _GeneratedFeedbackHarness()
+    harness.block_size = 3
+    harness.config = SimpleNamespace(
+        sample_from_anchor=True,
+        correction_hidden_size=4,
+    )
+    harness.correction_head = _RecordingCorrectionHead()
+    harness.embed_tokens = nn.Embedding(8, 4)
+    harness.lm_head = _CountingLinear(4, 8)
+    harness.d2t = None
+    with torch.no_grad():
+        harness.embed_tokens.weight.copy_(
+            torch.arange(8, dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+        )
+        harness.lm_head.weight.zero_()
+        harness.lm_head.weight[1, 0] = 10.0
+        harness.lm_head.weight[2, 1] = 10.0
+        harness.lm_head.weight[3, 2] = 10.0
+
+    hidden = torch.zeros(1, 3, 4, requires_grad=True)
+    tokens, logits, states = harness._generated_feedback_correction(
+        hidden,
+        anchor_token_ids=torch.tensor([7]),
+    )
+    logits.sum().backward()
+
+    assert torch.equal(tokens, torch.tensor([[1, 2, 3]]))
+    feedback = torch.cat(harness.correction_head.previous_embeddings, dim=1)
+    assert torch.equal(feedback[:, :, 0], torch.tensor([[7.0, 1.0, 2.0]]))
+    assert logits.shape == (1, 3, 8)
+    assert states.shape == (1, 3, 4)
+    assert harness.correction_head.scale.grad is not None
+    assert hidden.grad is not None
+    assert harness.lm_head.calls == harness.block_size
 
 
 def test_confidence_feature_detach_switch_controls_both_inputs():

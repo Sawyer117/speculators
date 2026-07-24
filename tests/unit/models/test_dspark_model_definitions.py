@@ -16,6 +16,7 @@ class TestCausalCorrectionHead:
         return CausalCorrectionHead(
             input_hidden_size=16,
             token_embedding_size=16,
+            block_size=4,
             correction_hidden_size=12,
             correction_rank=8,
             num_layers=2,
@@ -27,8 +28,7 @@ class TestCausalCorrectionHead:
         return (
             torch.randn(2, seq_len, 16),
             torch.randn(2, seq_len, 16),
-            torch.randn(2, seq_len, 16),
-            torch.randn(2, seq_len, 3),
+            torch.arange(seq_len).expand(2, -1),
         )
 
     def test_shape_and_zero_initialized_residual(self):
@@ -45,10 +45,18 @@ class TestCausalCorrectionHead:
         inputs = list(self._inputs())
         _, states_a, _ = head(*inputs)
         changed = [value.clone() for value in inputs]
-        for value in changed:
+        for value in changed[:2]:
             value[:, 2:] = torch.randn_like(value[:, 2:]) * 100.0
+        changed[2][:, 2:] = torch.flip(changed[2][:, 2:], dims=(1,))
         _, states_b, _ = head(*changed)
         assert torch.allclose(states_a[:, :2], states_b[:, :2], atol=1e-5)
+
+    def test_block_position_embedding_changes_states(self):
+        head = self._head()
+        previous, hidden, positions = self._inputs()
+        _, states_a, _ = head(previous, hidden, positions)
+        _, states_b, _ = head(previous, hidden, torch.zeros_like(positions))
+        assert not torch.allclose(states_a[:, 1:], states_b[:, 1:])
 
     def test_cached_rollout_matches_full_sequence(self):
         head = self._head()

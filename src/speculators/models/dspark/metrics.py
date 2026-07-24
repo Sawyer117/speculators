@@ -144,7 +144,6 @@ def compute_metrics(  # noqa: C901
     ssal_decay_weight: torch.Tensor | float = 0.0,
     base_logits: torch.Tensor | None = None,
     rollout_logits: torch.Tensor | None = None,
-    correction_base_weight: torch.Tensor | float = 0.0,
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
@@ -219,37 +218,28 @@ def compute_metrics(  # noqa: C901
         )
         final_objective = final_objective + first_error_focal_alpha * fe_loss
 
+    loss = final_objective
     base_loss = None
     if base_logits is not None:
-        base_loss, _ = compound_loss(
-            base_logits,
-            targets,
-            loss_mask,
-            pos_idx,
-            loss_config=loss_config,
-            decay_fn=decay_fn,
-        )
-        if first_error_focal_alpha > 0.0:
-            base_fe_loss = _first_error_focal_loss(
-                base_logits,
+        with torch.no_grad():
+            base_loss, _ = compound_loss(
+                base_logits.detach(),
                 targets,
                 loss_mask,
-                block_size,
-                fe_weights,
-                start_pos,
+                pos_idx,
+                loss_config=loss_config,
+                decay_fn=decay_fn,
             )
-            base_loss = base_loss + first_error_focal_alpha * base_fe_loss
-        base_weight = torch.as_tensor(
-            correction_base_weight,
-            device=final_objective.device,
-            dtype=final_objective.dtype,
-        ).clamp(0.0, 1.0)
-        loss = base_weight * base_loss + (1.0 - base_weight) * final_objective
-    else:
-        base_weight = torch.zeros(
-            (), device=final_objective.device, dtype=final_objective.dtype
-        )
-        loss = final_objective
+            if first_error_focal_alpha > 0.0:
+                base_fe_loss = _first_error_focal_loss(
+                    base_logits.detach(),
+                    targets,
+                    loss_mask,
+                    block_size,
+                    fe_weights,
+                    start_pos,
+                )
+                base_loss = base_loss + first_error_focal_alpha * base_fe_loss
 
     num_blocks = seq_len // block_size
     with torch.no_grad():
@@ -265,8 +255,6 @@ def compute_metrics(  # noqa: C901
         metrics["base_loss_total"] = torch.ones((), device=device)
         metrics["corrected_loss_sum"] = final_objective.detach().clone()
         metrics["corrected_loss_total"] = torch.ones((), device=device)
-        metrics["correction_base_weight_sum"] = base_weight.detach().clone()
-        metrics["correction_base_weight_total"] = torch.ones((), device=device)
     if confidence_logits is not None:
         c_star = accept_rate.detach().to(confidence_logits.dtype)
         bce = binary_cross_entropy_with_logits(
