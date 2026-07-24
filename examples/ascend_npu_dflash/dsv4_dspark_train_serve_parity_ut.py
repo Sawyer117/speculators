@@ -192,36 +192,30 @@ def test_t2_moe_gating():
     w_train = w * R                                    # routed scale 1.5 (ONCE)
     print(f"  TRAIN topk-weight row0 sum={w_train.sum(-1)[0].item():.4f}  (== {R} if renorm+scale once)")
 
-    # --- SERVE op. select_experts touches hidden_states.shape, so pass a real dummy (NOT None).
-    #     (signature varies per build — the try/except prints the exact schema error to adapt.)
-    try:
-        from vllm_ascend.ops.fused_moe.experts_selector import select_experts
-        hs = torch.randn(T, 4096).npu().to(logits.dtype)   # dummy; op uses it for shape/device only
-        out = select_experts(
-            hidden_states=hs, router_logits=logits, top_k=K,
-            use_grouped_topk=False, renormalize=True,          # <- training intent (norm_topk_prob)
-            e_score_correction_bias=bias, routed_scaling_factor=R,
-            scoring_func="sqrtsoftplus",
-        )
-        w_serve = out[0].float()
-        rs = w_serve.sum(-1)[0].item()
-        print(f"  SERVE topk-weight row0 sum={rs:.4f}")
-        print("  READ vs TRAIN row-sum 1.5:")
-        print(f"    ~1.5  => renorm+scale once (MATCH, F2/F3 not biting the gate here)")
-        print(f"    ~2.25 => routed_scaling applied TWICE (kernel + combine) = F2")
-        print(f"    not 1.5 & weights look raw (unnormalized) => norm_topk_prob dropped = F3")
-        print("  (Also inspect the COMBINED routed output: deepseek_v4.py:498 muls_add_triton(...,1.5).)")
-    except Exception as e:
-        print(f"  select_experts schema differs ({e}); calling the raw op instead:")
+    # --- SERVE op. This serving build (386530d12) exposes it as torch.ops.npu.npu_moe_gating_top_k
+    #     (NOT the hsdump build's _C_ascend.moe_gating_top_k_hash — different build, different op).
+    #     Call with the training INTENT (renorm on, norm_type=2 sqrtsoftplus, scale 1.5): row-sum should be 1.5.
+    gop = getattr(getattr(torch.ops, "npu", None), "npu_moe_gating_top_k", None)
+    if gop is None:
+        print("  SKIP: torch.ops.npu.npu_moe_gating_top_k not found on this build."); return
+    for desc, kwargs in [
+        ("kw", dict(k=K, bias=bias, k_group=1, group_count=1, group_select_mode=0,
+                    renorm=1, norm_type=2, out_flag=False, routed_scaling_factor=R, eps=1e-20)),
+        ("pos", None),
+    ]:
         try:
-            op = torch.ops._C_ascend.moe_gating_top_k_hash
-            r = op(logits, K, bias, None, None, 1, 1, R, 1e-20, 1, 0, 2, False)  # ⚠ arg order best-effort
-            rs = r[0].float().sum(-1)[0].item()
-            print(f"  SERVE (raw op) topk-weight row0 sum={rs:.4f}  (read same as above)")
-        except Exception as e2:
-            print(f"  raw op also failed: {e2}")
-            print("  -> print the op schema on your build: `print(torch.ops._C_ascend.moe_gating_top_k_hash)`")
-            print("     then match arg order (router_logits, k, bias, ..., routed_scaling_factor, renorm, norm_type).")
+            out = gop(logits, **kwargs) if kwargs is not None else \
+                gop(logits, K, bias, 1, 1, 0, 1, 2, False, R, 1e-20)   # ⚠ positional arg order best-effort
+            w_serve = out[0].float()
+            rs = w_serve.sum(-1)[0].item()
+            print(f"  SERVE npu_moe_gating_top_k (renorm=1,norm_type=2,scale={R}) row0 sum={rs:.4f}  [{desc}]")
+            print(f"  READ vs TRAIN 1.5:  ~1.5 => renorm+scale once = MATCH (op is faithful when asked);")
+            print(f"        ~2.25 => scaled twice = F2;   != 1.5 & unnormalized => renorm not applied = F3.")
+            break
+        except Exception as e:
+            print(f"  [{desc}] call failed: {e}")
+    else:
+        print("  ⚠ both call forms failed — inspect the signature: print(torch.ops.npu.npu_moe_gating_top_k._schemas)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -233,9 +227,11 @@ def test_t3_mhc():
         import torch_npu  # noqa: F401
     except Exception as e:
         print(f"  SKIP: no torch_npu ({e})"); return
-    op = getattr(torch.ops._C_ascend, "npu_hc_pre_v2", None)
+    # serving build (386530d12) exposes it as torch.ops.npu.npu_mhc_pre; hsdump build as _C_ascend.npu_hc_pre_v2
+    op = getattr(getattr(torch.ops, "npu", None), "npu_mhc_pre", None) or \
+        getattr(getattr(torch.ops, "_C_ascend", None), "npu_hc_pre_v2", None)
     if op is None:
-        print("  SKIP: torch.ops._C_ascend.npu_hc_pre_v2 not registered in this build."); return
+        print("  SKIP: neither torch.ops.npu.npu_mhc_pre nor _C_ascend.npu_hc_pre_v2 registered."); return
     try:
         from speculators.models.dsv4_dspark.backbone.hyper import HyperConnection, _hyper_connection_torch
     except Exception as e:
