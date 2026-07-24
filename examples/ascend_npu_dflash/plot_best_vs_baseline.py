@@ -39,7 +39,7 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
 #    are eval'd, APPEND them here so this becomes the non-causal epoch curve toward released.
 RUNS = [
     {
-        "label": "ep0mid-77w (w128, non-causal)",
+        "label": "ep0mid",
         "al": {"gsm8k": 4.032, "math500": 3.721, "humaneval": 3.856, "mbpp": 3.586, "mt-bench": 2.482},
         "pos": {
             "gsm8k":     [88.54, 74.73, 58.88, 46.05, 35.00],
@@ -50,7 +50,7 @@ RUNS = [
         },
     },
     {
-        "label": "ep0end-77w (w128, non-causal)",
+        "label": "ep0end",
         "al": {"gsm8k": 4.006, "math500": 3.753, "humaneval": 3.970, "mbpp": 3.666, "mt-bench": 2.539},
         "pos": {
             "gsm8k":     [89.53, 77.05, 56.63, 43.46, 33.90],
