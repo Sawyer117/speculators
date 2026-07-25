@@ -526,6 +526,12 @@ def build_draft_model(
             # __init__ resolves its own default ("eager") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl
+            # The saved config bakes the ORIGINAL verifier path (e.g. the box where the ckpt was made:
+            # an A3 /mnt/nfs mount). load_verifier_weights reads it verbatim, so on a different box that
+            # path is dead. Override with the CLI --verifier-name-or-path so it resolves on THIS box.
+            _sc = getattr(config, "speculators_config", None)
+            if args.verifier_name_or_path and _sc is not None and getattr(_sc, "verifier", None):
+                _sc.verifier.name_or_path = args.verifier_name_or_path
             # Under expert-parallel (DSPARK_EP=1) the model builds each rank's [n_routed // ep] expert
             # slice, but a saved DSpark ckpt stores the CONSOLIDATED [n_routed] stack. The generic HF
             # loader can't shard, so it errors on the expert size mismatch. Load with
