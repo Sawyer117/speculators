@@ -31,33 +31,34 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
     "mt-bench":  [79.21, 58.55, 41.45, 29.32, 20.87],
 }
 
-# ── OUR trained runs, oldest→newest. ✏️ APPEND a dict here when a new ckpt is eval'd (keep in sync
-#    with the eval-results ledger). Current scoreboard = the NON-CAUSAL 77W run (`--sliding-window-non-causal`).
-#    The old CAUSAL rows (`ep0-77w`, `ep2.5-77w`) were REMOVED — they trained the wrong (causal) attention
-#    task and are a broken baseline, not comparable to the fixed non-causal draft. Raw data for them stays
-#    archived in the eval-results ledger detail sections. As later non-causal ckpts (epoch0-end, epoch1…)
-#    are eval'd, APPEND them here so this becomes the non-causal epoch curve toward released.
+# ── OUR trained runs, oldest→newest = the REPRODUCTION main line: the NON-CAUSAL 77W run with the
+#    SINGLE-norm teacher (reproduction-faithful = the real verifier's distribution, same target as
+#    released). ✏️ APPEND a dict when a new ckpt is eval'd (keep in sync with the eval-results ledger).
+#    NOT shown here (they're "复现之外" / off the main line): the CAUSAL rows (broken attention task),
+#    and the DOUBLE-norm rows (`ep0mid`/`ep0end` = the accidental teacher-sharpening that beat single-norm
+#    early but aims 16% off the real verifier — an optimization, not the reproduction path; single-norm
+#    ep1mid already surpassed the double-norm ep0end). All archived in the eval-results ledger.
 RUNS = [
     {
-        "label": "ep0mid",
-        "al": {"gsm8k": 4.032, "math500": 3.721, "humaneval": 3.856, "mbpp": 3.586, "mt-bench": 2.482},
+        "label": "f1 ep0end (1.0ep)",
+        "al": {"gsm8k": 3.811, "math500": 3.511, "humaneval": 3.680, "mbpp": 3.407, "mt-bench": 2.460},
         "pos": {
-            "gsm8k":     [88.54, 74.73, 58.88, 46.05, 35.00],
-            "math500":   [84.57, 69.23, 52.52, 38.75, 27.05],
-            "humaneval": [88.12, 74.83, 55.05, 40.23, 27.43],
-            "mbpp":      [85.29, 67.76, 48.11, 34.06, 23.40],
-            "mt-bench":  [67.41, 39.89, 21.83, 12.21, 6.86],
+            "gsm8k":     [89.20, 76.24, 51.46, 36.13, 28.11],
+            "math500":   [86.38, 71.11, 43.67, 28.84, 21.07],
+            "humaneval": [92.70, 80.53, 45.47, 29.28, 20.07],
+            "mbpp":      [86.98, 69.49, 40.11, 26.07, 18.09],
+            "mt-bench":  [68.97, 41.96, 19.46, 9.97, 5.62],
         },
     },
     {
-        "label": "ep0end",
-        "al": {"gsm8k": 4.006, "math500": 3.753, "humaneval": 3.970, "mbpp": 3.666, "mt-bench": 2.539},
+        "label": "f1 ep1mid (1.5ep)",
+        "al": {"gsm8k": 4.069, "math500": 3.757, "humaneval": 4.100, "mbpp": 3.674, "mt-bench": 2.549},
         "pos": {
-            "gsm8k":     [89.53, 77.05, 56.63, 43.46, 33.90],
-            "math500":   [86.74, 72.47, 51.73, 37.14, 27.17],
-            "humaneval": [92.30, 80.42, 55.33, 39.48, 29.49],
-            "mbpp":      [86.96, 70.96, 48.55, 34.99, 25.18],
-            "mt-bench":  [68.51, 42.41, 22.52, 12.91, 7.55],
+            "gsm8k":     [90.54, 77.07, 59.39, 44.48, 35.42],
+            "math500":   [87.26, 70.84, 53.46, 36.97, 27.19],
+            "humaneval": [93.86, 81.49, 59.83, 42.43, 32.37],
+            "mbpp":      [88.24, 71.39, 49.57, 33.86, 24.38],
+            "mt-bench":  [70.35, 42.78, 22.64, 12.14, 7.03],
         },
     },
 ]
@@ -116,7 +117,7 @@ def main():
 
     fig, ax = plt.subplots(figsize=(11.5, 0.9 + 0.42 * (len(cell_text) + 1)))
     ax.axis("off")
-    ax.set_title("DSV4-DSpark  —  non-causal 77W run vs released baseline  (accept_len + per-position accept rate %)",
+    ax.set_title("DSV4-DSpark  —  single-norm reproduction (non-causal 77W) vs released baseline  (accept_len + per-position accept rate %)",
                  fontsize=13, fontweight="bold", pad=16)
 
     tbl = ax.table(cellText=cell_text, colLabels=col_labels, cellColours=cell_colors,
@@ -148,7 +149,7 @@ def main():
              "cell shading = our run as % of the released baseline in that cell (green→red).  "
              "per-position = cumulative accept rate S_k (%).  "
              "baseline = released draft, full DATASET=all, #12006 serve, num_spec=5, greedy.  "
-             "ep0mid = 0.5-epoch non-causal ckpt on 176 A3-single serve (serve verified non-capping).  "
+             "f1 = single-norm teacher (reproduction-faithful); ep0end/ep1mid = 1.0/1.5 epoch on 176 A3-single serve.  "
              "Source: docs/deployment/ascend-npu-dsv4-dspark-eval-results.md",
              ha="center", fontsize=6.0, color="0.45")
     fig.savefig(args.out, dpi=150, bbox_inches="tight")
