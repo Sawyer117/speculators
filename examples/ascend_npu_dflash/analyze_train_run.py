@@ -89,6 +89,20 @@ def load(path: str) -> tuple[list[dict], str]:
         if k == "global_step":  # always the last field of a record → flush
             recs.append(cur)
             cur = {}
+    # Derived per-record field: fwd_ms MINUS the align/all-gather straggler barrier. The align barrier
+    # (trainer.py, added between the fetch and fwd marks) makes a serve/HS straggler wait get COUNTED
+    # INSIDE fwd_ms (align_ms ⊂ fwd_ms), where the old breakdown mis-attributed it as a "recompile" fwd
+    # spike. Subtracting align_ms isolates the TRUE draft-forward compute; the removed slice is
+    # re-attributed to the HS-straggler bucket. On logs with no align_ms (pre-diagnostic) this is a
+    # no-op (fwd_compute == fwd). This is the crux of the A2 "recompile 41%" mislabel.
+    for r in recs:
+        if "profile/fwd_ms" in r:
+            try:
+                _fwd = float(r["profile/fwd_ms"])
+                _al = float(r.get("profile/align_ms", 0.0) or 0.0)
+                r["profile/fwd_compute_ms"] = max(0.0, _fwd - _al)
+            except (TypeError, ValueError):
+                pass
     return recs, text
 
 
@@ -246,8 +260,9 @@ def _headline(recs, ckpt_steps, spike_k=3.0) -> dict:
         rr = spike_report(recs, key, spike_k)
         return rr["steady_med"] if rr else None
 
-    fwd_s, fetch_s, step_s = _steady("profile/fwd_ms"), _steady("profile/fetch_ms"), _steady("profile/step_ms")
+    fwd_s, fetch_s, step_s = _steady("profile/fwd_compute_ms"), _steady("profile/fetch_ms"), _steady("profile/step_ms")
     total = sum(col(recs, "profile/step_ms")) or 1.0
+    align_ov = sum(col(recs, "profile/align_ms"))   # HS-straggler barrier wait (all overhead; not spiky)
 
     def _excess(key, steady, only_nonckpt=False):
         if steady is None:
@@ -274,8 +289,9 @@ def _headline(recs, ckpt_steps, spike_k=3.0) -> dict:
         "loss": median(loss) if loss else None,
         "step_ms": step_s,
         "tokens_s": tps,
-        "recompile_pct": 100 * _excess("profile/fwd_ms", fwd_s) / total,
+        "recompile_pct": 100 * _excess("profile/fwd_compute_ms", fwd_s) / total,  # align removed → true fwd
         "hs_pct": 100 * _excess("profile/fetch_ms", fetch_s, only_nonckpt=True) / total,
+        "align_pct": 100 * align_ov / total,   # HS-straggler wait (the ex-"recompile" on A2)
         "span": (min(steps) if steps else 0, max(steps) if steps else 0),
     }
 
@@ -312,6 +328,7 @@ def _print_vs_baseline(recs, ckpt_steps, base_recs, base_ckpt, cur_label, base_l
     _row("step_ms steady","step_ms",        False, "{:.0f}", "ms")
     _row("recompile %",   "recompile_pct",  False, "{:.1f}", "%")
     _row("HS fetch %",    "hs_pct",         False, "{:.1f}", "%")
+    _row("HS straggler %","align_pct",      False, "{:.1f}", "%")
 
 
 def _print_multi_table(runs, spike_k):
@@ -320,7 +337,7 @@ def _print_multi_table(runs, spike_k):
     cols = [("accept_len", "accept_len", "{:.3f}"), ("acc_len_max", "accept_len_max", "{:.3f}"),
             ("loss", "loss", "{:.3f}"), ("tok/s", "tokens_s", "{:.0f}"),
             ("step_ms", "step_ms", "{:.0f}"), ("recompile%", "recompile_pct", "{:.1f}"),
-            ("HS%", "hs_pct", "{:.1f}")]
+            ("HS%", "hs_pct", "{:.1f}"), ("HSstrag%", "align_pct", "{:.1f}")]
     print("\n-- MULTI-RUN COMPARE (row 1 = CURRENT) " + "-" * 38)
     print(f"  {'run':18} {'steps':>11} " + " ".join(f"{c[0]:>11}" for c in cols))
     for lbl, h in hs:
@@ -602,8 +619,10 @@ def main() -> None:
 
     # ---------------- timing (steady-state) ----------------
     print("\n-- TIMING (per stage: STEADY vs EFFECTIVE-avg incl spikes) " + "-" * 16)
-    stages = ["profile/fetch_ms", "profile/fwd_ms", "profile/bwd_ms", "profile/opt_ms", "profile/step_ms"]
-    _labels = {"profile/fetch_ms": "HS fetch", "profile/fwd_ms": "fwd", "profile/bwd_ms": "bwd",
+    stages = ["profile/fetch_ms", "profile/fwd_ms", "profile/fwd_compute_ms", "profile/bwd_ms",
+              "profile/opt_ms", "profile/step_ms"]
+    _labels = {"profile/fetch_ms": "HS fetch", "profile/fwd_ms": "fwd(+align)",
+               "profile/fwd_compute_ms": "fwd compute", "profile/bwd_ms": "bwd",
                "profile/opt_ms": "opt", "profile/step_ms": "step"}
     reps = {s: spike_report(recs, s, args.spike_k) for s in stages}
     def stage_avg(key):
@@ -679,10 +698,13 @@ def main() -> None:
             worst = sorted(spikes, key=lambda t: -t[1])[:5]
             print("  worst steps  : " + ", ".join(f"{s}({v/1000:.1f}s)" for s, v in worst))
 
-    # ---------------- bottleneck breakdown: recompile vs HS vs ckpt (compile-worth-it verdict) ----------------
-    print("\n-- BOTTLENECK BREAKDOWN (where wall-clock goes; recompile = inductor-NPU per-shape codegen) " + "-" * 1)
+    # ---------------- bottleneck breakdown: fwd-compute vs HS-straggler vs HS-fetch vs ckpt ----------------
+    print("\n-- BOTTLENECK BREAKDOWN (where wall-clock goes) " + "-" * 48)
     total = sum(col(recs, "profile/step_ms")) or 1.0
-    fwd_steady = reps["profile/fwd_ms"]["steady_med"] or 0.0
+    # ★ recompile is measured on fwd_compute (= fwd_ms − align_ms). The align/all-gather barrier sits
+    #   INSIDE the fwd_ms window, so an HS straggler (a rank whose serve HS arrived late) inflates fwd_ms
+    #   and USED to be mis-labelled "recompile". align_ms isolates that wait → its own bucket below.
+    fwd_steady = reps["profile/fwd_compute_ms"]["steady_med"] or 0.0
     fetch_steady = reps["profile/fetch_ms"]["steady_med"] or 0.0
     step_steady = reps["profile/step_ms"]["steady_med"] or 0.0
 
@@ -696,34 +718,40 @@ def main() -> None:
                 tot += v - steady
         return tot
 
-    recompile_ov = _excess("profile/fwd_ms", fwd_steady)                     # excess fwd time = grouped-GEMM recompile
-    hs_ov = _excess("profile/fetch_ms", fetch_steady, only_nonckpt=True)     # excess HS-fetch = serve stall (ckpt saves excluded)
+    recompile_ov = _excess("profile/fwd_compute_ms", fwd_steady)             # excess TRUE fwd = grouped-GEMM recompile / AscendC stall
+    align_ov = sum(col(recs, "profile/align_ms"))                            # ALL of it = HS-straggler barrier wait (serve too slow)
+    hs_ov = _excess("profile/fetch_ms", fetch_steady, only_nonckpt=True)     # excess HS-fetch = local H2D / load stall (ckpt saves excluded)
     ckpt_ov = sum(max(0.0, f(r, "profile/step_ms") - step_steady) for r in recs
                   if step_of(r) in ckpt_steps and f(r, "profile/step_ms") is not None)
-    floor = max(0.0, total - recompile_ov - hs_ov - ckpt_ov)
-    print(f"  {'component':26} {'time':>9}   {'% wall-clock':>12}")
-    for label, v in [("steady compute (floor)", floor), ("recompile (fwd excess)", recompile_ov),
-                     ("HS fetch stall (excess)", hs_ov), ("checkpoint saves", ckpt_ov)]:
-        print(f"  {label:26} {v/1000:7.1f}s   {100*v/total:11.1f}%")
-    rc, hs = 100 * recompile_ov / total, 100 * hs_ov / total
+    floor = max(0.0, total - recompile_ov - align_ov - hs_ov - ckpt_ov)
+    print(f"  {'component':30} {'time':>9}   {'% wall-clock':>12}")
+    for label, v in [("steady compute (floor)", floor), ("recompile (true-fwd excess)", recompile_ov),
+                     ("HS straggler (align barrier)", align_ov), ("HS fetch stall (excess)", hs_ov),
+                     ("checkpoint saves", ckpt_ov)]:
+        print(f"  {label:30} {v/1000:7.1f}s   {100*v/total:11.1f}%")
+    rc, hs, al = 100 * recompile_ov / total, 100 * hs_ov / total, 100 * align_ov / total
+    serve = hs_ov + align_ov                     # both trace to the serve/HS pipeline
+    sv = 100 * serve / total
     print("  ── verdict ──")
-    if recompile_ov >= 2 * hs_ov and rc >= 10:
-        print(f"    RECOMPILE-bound (fwd {rc:.0f}% vs HS {hs:.0f}%). ⚠ COMPILING the grouped-GEMM IS THE CAUSE,")
-        print("    not the cure: inductor-NPU codegens a per-shape AscendC kernel per routed-token count.")
-        print("    torchtitan-npu keeps the GMM eager; MindSpeed-LLM defaults --jit-compile=False. FIX =")
-        print(f"    eager grouped-GEMM + torch_npu jit_compile=False (shape-generic aclnn), ~{rc:.0f}% recoverable.")
-        print("    NB this 'recompile' tag is heuristic (fwd>3x steady) — confirm it's NOT an HS straggler")
-        print("    via align_ms~1ms in the raw log, and the true cause via TORCH_LOGS=recompiles.")
-    elif hs_ov >= 2 * recompile_ov and hs >= 10:
-        print(f"    HS/SERVING-bound (HS {hs:.0f}% vs fwd {rc:.0f}%): compile WON'T help — the serve can't dump HS")
-        print(f"    fast enough. Fix the HS pipeline (serve throughput / prefetch), NOT the MoE kernel.")
-    elif max(rc, hs) < 10:
-        print(f"    NEITHER dominates (fwd {rc:.0f}%, HS {hs:.0f}% — both <10%): steady compute is the floor.")
-        print(f"    compile's inductor_npu_ext setup is NOT worth it; bucketing already suffices.")
+    if serve >= 2 * recompile_ov and sv >= 10:
+        print(f"    HS/SERVING-bound (serve {sv:.0f}% = straggler {al:.0f}% + fetch {hs:.0f}%  vs  true-fwd {rc:.0f}%):")
+        print("    compile/kernel work WON'T help — the 115/116 serve can't dump HS fast enough, so the fast")
+        print("    ranks idle at the EP all-gather barrier. Fix the HS PIPELINE: raise serve throughput")
+        print("    (more DP / EAGER=0 graph / bigger batch), prefetch HS, or RAISE --max-anchors so each")
+        print("    training step is heavier and matches the serve's HS rate (trades step time for serve idle).")
+    elif recompile_ov >= 2 * serve and rc >= 10:
+        print(f"    TRUE-FWD-bound (fwd {rc:.0f}% vs serve {sv:.0f}%): a real forward stall, NOT an HS straggler.")
+        print("    With jit_compile=False + eager GMM already in, suspect a per-shape AscendC build in a")
+        print("    DIFFERENT op (npu_moe_token_permute/unpermute, MLA). PIN it: DSPARK_PROFILE_FWD=1")
+        print("    DSPARK_PROFILE_FWD_MS=0 DSPARK_PROFILE_MOE=1 on a SHORT no-RECOMPUTE MAX_ANCHORS=256 run")
+        print("    (the profilers go silent inside the recompute checkpoint), then read the FWD PROFILER below.")
+    elif max(rc, sv) < 10:
+        print(f"    NEITHER dominates (fwd {rc:.0f}%, serve {sv:.0f}% — both <10%): steady compute is the floor.")
+        print("    throughput is bound by the draft MoE fwd/bwd itself — EP / fused grouped-GEMM is the lever.")
     else:
-        print(f"    MIXED (fwd {rc:.0f}%, HS {hs:.0f}%): both matter. Try a bigger DSPARK_MOE_BUCKET (cheap) +")
-        print(f"    check the serve; reach for compile only if recompile stays high AFTER the shape-warmup.")
-    print("  ⚠ run with --skip <N> to drop the first epoch (shape-warmup + resume HS-regen inflate BOTH bars).")
+        print(f"    MIXED (true-fwd {rc:.0f}%, serve {sv:.0f}% [straggler {al:.0f}% + fetch {hs:.0f}%]): both matter.")
+        print("    Attack the bigger bar first; re-check align_ms after each change.")
+    print("  ⚠ run with --skip <N> to drop the first epoch (shape-warmup + resume HS-regen inflate ALL bars).")
 
     # ---------------- HS / memory ----------------
     ff = col(recs, "profile/fetch_frac")
