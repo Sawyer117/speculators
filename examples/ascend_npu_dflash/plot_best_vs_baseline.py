@@ -31,14 +31,35 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
     "mt-bench":  [79.21, 58.55, 41.45, 29.32, 20.87],
 }
 
-# ── OUR trained runs, oldest→newest = the REPRODUCTION main line: the NON-CAUSAL 77W run with the
-#    SINGLE-norm teacher (reproduction-faithful = the real verifier's distribution, same target as
-#    released). ✏️ APPEND a dict when a new ckpt is eval'd (keep in sync with the eval-results ledger).
-#    NOT shown here (they're "复现之外" / off the main line): the CAUSAL rows (broken attention task),
-#    and the DOUBLE-norm rows (`ep0mid`/`ep0end` = the accidental teacher-sharpening that beat single-norm
-#    early but aims 16% off the real verifier — an optimization, not the reproduction path; single-norm
-#    ep1mid already surpassed the double-norm ep0end). All archived in the eval-results ledger.
+# ── OUR trained runs (non-causal 77W). The report comparison: the DOUBLE-norm teacher (accidental
+#    sharpening — beat single-norm early but aims 16% off the real verifier = an optimization, "复现之外")
+#    vs the SINGLE-norm "f1" teacher (reproduction-faithful = the real verifier's distribution, same target
+#    as released). Story: at 1.0ep dnorm>f1 (the surprise regression), but single-norm f1 SCALES and its
+#    1.5ep already passes the dnorm 1.0ep. ✏️ APPEND a dict when a new ckpt is eval'd (sync with the ledger).
+#    (Older CAUSAL rows removed — broken attention task; archived in the ledger.)
 RUNS = [
+    {
+        "label": "dnorm ep0mid (0.5ep)",
+        "al": {"gsm8k": 4.032, "math500": 3.721, "humaneval": 3.856, "mbpp": 3.586, "mt-bench": 2.482},
+        "pos": {
+            "gsm8k":     [88.54, 74.73, 58.88, 46.05, 35.00],
+            "math500":   [84.57, 69.23, 52.52, 38.75, 27.05],
+            "humaneval": [88.12, 74.83, 55.05, 40.23, 27.43],
+            "mbpp":      [85.29, 67.76, 48.11, 34.06, 23.40],
+            "mt-bench":  [67.41, 39.89, 21.83, 12.21, 6.86],
+        },
+    },
+    {
+        "label": "dnorm ep0end (1.0ep)",
+        "al": {"gsm8k": 4.006, "math500": 3.753, "humaneval": 3.970, "mbpp": 3.666, "mt-bench": 2.539},
+        "pos": {
+            "gsm8k":     [89.53, 77.05, 56.63, 43.46, 33.90],
+            "math500":   [86.74, 72.47, 51.73, 37.14, 27.17],
+            "humaneval": [92.30, 80.42, 55.33, 39.48, 29.49],
+            "mbpp":      [86.96, 70.96, 48.55, 34.99, 25.18],
+            "mt-bench":  [68.51, 42.41, 22.52, 12.91, 7.55],
+        },
+    },
     {
         "label": "f1 ep0end (1.0ep)",
         "al": {"gsm8k": 3.811, "math500": 3.511, "humaneval": 3.680, "mbpp": 3.407, "mt-bench": 2.460},
@@ -117,7 +138,7 @@ def main():
 
     fig, ax = plt.subplots(figsize=(11.5, 0.9 + 0.42 * (len(cell_text) + 1)))
     ax.axis("off")
-    ax.set_title("DSV4-DSpark  —  single-norm reproduction (non-causal 77W) vs released baseline  (accept_len + per-position accept rate %)",
+    ax.set_title("DSV4-DSpark 77W  —  double-norm vs single-norm(f1) teacher, epoch curve vs released  (accept_len + per-position accept rate %)",
                  fontsize=13, fontweight="bold", pad=16)
 
     tbl = ax.table(cellText=cell_text, colLabels=col_labels, cellColours=cell_colors,
