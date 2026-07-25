@@ -34,8 +34,10 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
 # ── OUR trained runs (non-causal 77W). The report comparison: the DOUBLE-norm teacher (accidental
 #    sharpening — beat single-norm early but aims 16% off the real verifier = an optimization, "复现之外")
 #    vs the SINGLE-norm "f1" teacher (reproduction-faithful = the real verifier's distribution, same target
-#    as released). Story: at 1.0ep dnorm>f1 (the surprise regression), but single-norm f1 SCALES and its
-#    1.5ep already passes the dnorm 1.0ep. ✏️ APPEND a dict when a new ckpt is eval'd (sync with the ledger).
+#    as released). ⚠ EPOCHS NOT ALIGNED: the ONLY fair same-epoch point is 1.0ep, where dnorm(81%)>f1(76%)
+#    (the surprise regression). f1 scales with data (1.5ep=82%) but dnorm has NO 1.5ep+ data (run killed at
+#    ~1.36ep) — so f1-1.5ep vs dnorm-1.0ep is NOT a fair comparison; do NOT read it as "f1 surpassed dnorm".
+#    To compare trajectories fairly, re-run dnorm to 1.5ep+. ✏️ APPEND a dict when a new ckpt is eval'd.
 #    (Older CAUSAL rows removed — broken attention task; archived in the ledger.)
 RUNS = [
     {
