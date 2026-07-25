@@ -390,6 +390,58 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             sorted(parts), bb.n_draft_layers, list(tids[: bb.n_draft_layers]),
         )
 
+    def load_stacked_experts_ep(self, ckpt_path: str) -> None:
+        """EP-aware expert fill for ``--from-pretrained``. A saved DSpark ckpt stores the routed
+        experts CONSOLIDATED (stacked ``layers.{n}.ffn.experts.w{1,2,3}`` of shape ``[n_routed, ...]``),
+        but under expert-parallel each rank builds only its ``[n_local, ...]`` slice. The generic HF
+        ``from_pretrained`` loader can't shard, so it REINITS the experts on a size mismatch (called
+        with ``ignore_mismatched_sizes=True``). This copies each rank's
+        ``[ep_expert_offset : +n_local]`` slice of the stacked ckpt tensor into its local experts —
+        the SAME slicing ``_init_backbone_params`` does, but the source is the stacked draft ckpt
+        (not the per-expert verifier). No-op for a non-EP model (off 0, n_local n_routed → full copy);
+        skips meta params (non-rank0 under ``--init-on-meta`` — broadcast fills). Does NOT touch any
+        non-expert weight (those loaded correctly through the generic loader)."""
+        import logging  # noqa: PLC0415
+
+        from speculators.utils.loading import load_model_layers  # noqa: PLC0415
+
+        bb = self.backbone_cfg
+        keys = [f"layers.{n}.ffn.experts.{wn}"
+                for n in range(bb.n_draft_layers) for wn in ("w1", "w2", "w3")]
+        src = load_model_layers(keys, str(ckpt_path))
+        off = filled = 0
+        for n in range(bb.n_draft_layers):
+            ffn = self.layers[n].ffn
+            off = int(getattr(ffn, "ep_expert_offset", 0))
+            for wn in ("w1", "w2", "w3"):
+                local = getattr(ffn.experts, wn)
+                if local.is_meta:
+                    continue
+                key = f"layers.{n}.ffn.experts.{wn}"
+                if key not in src:
+                    raise KeyError(f"load_stacked_experts_ep: '{key}' missing in {ckpt_path}")
+                s = src[key]
+                n_local = local.shape[0]
+                if s.shape[0] == n_local:
+                    sl = s                                  # ckpt already this rank's width
+                elif s.shape[0] >= off + n_local:
+                    sl = s[off:off + n_local]               # consolidated stack -> this rank's slice
+                else:
+                    raise ValueError(
+                        f"load_stacked_experts_ep: ckpt {key} expert dim {s.shape[0]} can't supply "
+                        f"local slice [{off}:{off + n_local}]")
+                sl = sl.to(device=local.device, dtype=local.dtype)
+                if tuple(sl.shape) != tuple(local.shape):
+                    raise ValueError(
+                        f"load_stacked_experts_ep: sliced {tuple(sl.shape)} != local "
+                        f"{tuple(local.shape)} for {key}")
+                local.data.copy_(sl)
+                filled += 1
+        logging.getLogger(__name__).info(
+            ">>> [from-pretrained] EP-aware expert fill: %d expert tensors sliced [%d:+n_local] "
+            "per rank from %s", filled, off, ckpt_path,
+        )
+
     def _init_backbone_params(self) -> None:
         """Initialize the freshly-built backbone params (post_init ran on the old
         Qwen3 layers). Uninitialized ``torch.empty`` params (mHC fn) would NaN."""

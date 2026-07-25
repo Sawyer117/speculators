@@ -526,13 +526,25 @@ def build_draft_model(
             # __init__ resolves its own default ("eager") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl
-            return model_class.from_pretrained(
+            # Under expert-parallel (DSPARK_EP=1) the model builds each rank's [n_routed // ep] expert
+            # slice, but a saved DSpark ckpt stores the CONSOLIDATED [n_routed] stack. The generic HF
+            # loader can't shard, so it errors on the expert size mismatch. Load with
+            # ignore_mismatched_sizes (non-expert weights still load strictly; the experts reinit),
+            # then fill each rank's [ep_expert_offset:+n_local] slice EP-aware. Non-EP loads strictly.
+            import os  # noqa: PLC0415
+
+            _ep = os.environ.get("DSPARK_EP") == "1"
+            model = model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,
                 t2d=t2d,
                 d2t=d2t,
                 verifier=args.verifier_name_or_path,
+                ignore_mismatched_sizes=_ep,
             )
+            if _ep and hasattr(model, "load_stacked_experts_ep"):
+                model.load_stacked_experts_ep(args.from_pretrained)
+            return model
         return model_class.from_pretrained(
             args.from_pretrained,
             t2d=t2d,
