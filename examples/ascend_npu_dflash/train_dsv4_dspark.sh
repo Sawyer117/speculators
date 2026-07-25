@@ -244,6 +244,14 @@ if [ "$GROUPED" = "1" ]; then TAG="${TAG}_grouped"; fi
 # if-block (NOT `&&`) so a NONCAUSAL=0 test can't nonzero-abort under set -e.
 NONCAUSAL_FLAG=""
 if [ "$NONCAUSAL" = "1" ]; then NONCAUSAL_FLAG="--sliding-window-non-causal"; fi
+
+# --from-pretrained loads the FULL model definition (num_layers, sliding_window window size) from the
+# ckpt's config.json, so passing the decoder-SHAPING flags conflicts (train.py: "these conflict with it
+# ... --num-layers, --sliding-window"). Drop ONLY those two on warm-start; every non-shaping flag stays
+# (n-routed-experts / block-size / max-anchors / target-layer-ids / loss / noise / ...). Note
+# --sliding-window-non-causal is NOT a shaping flag (train.py reads it from the loaded config), keep it.
+NUMLAYERS_FLAG="--num-layers $LAYERS"; SWA_FLAG="--sliding-window $SWA_WINDOW"
+if [ -n "$FROM_PRETRAINED" ]; then NUMLAYERS_FLAG=""; SWA_FLAG=""; fi
 LOG="$RUN/${TAG}_${TS}.log"
 # Fresh per-run save-path so we DON'T auto-resume a stale (possibly non-EP) checkpoint
 # from ./output. Override SAVE_PATH=<dir> to resume a specific run.
@@ -266,9 +274,9 @@ nohup env \
   HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 $PORTS \
   torchrun --nproc_per_node "$NPROC" "$REPO_ROOT/scripts/train.py" \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
-    --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
+    $NUMLAYERS_FLAG --n-routed-experts "$EXPERTS" \
     --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
-    --dflash-decay-gamma "$DECAY_GAMMA" --sliding-window "$SWA_WINDOW" $NONCAUSAL_FLAG \
+    --dflash-decay-gamma "$DECAY_GAMMA" $SWA_FLAG $NONCAUSAL_FLAG \
     --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" --noise-std "$NOISE_STD" \
     --kd-temperature "$KD_TEMP" \
     --draft-attn-impl sdpa --loss-fn "$LOSS_FN" \
