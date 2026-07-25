@@ -84,6 +84,19 @@ RUNS = [
             "mt-bench":  [70.35, 42.78, 22.64, 12.14, 7.03],
         },
     },
+    {
+        # 2.0ep: first down-tick (−0.067 mean vs 1.5ep). NOT overfit-shaped — gsm8k flat + its tail ROSE;
+        # loss concentrated in math500/humaneval/mbpp. 2.5ep decides the trend (see ledger ep1end-f1-77w).
+        "label": "f1 ep1end (2.0ep)",
+        "al": {"gsm8k": 4.059, "math500": 3.641, "humaneval": 4.007, "mbpp": 3.594, "mt-bench": 2.513},
+        "pos": {
+            "gsm8k":     [89.42, 74.11, 58.83, 46.69, 36.81],
+            "math500":   [85.18, 65.62, 50.43, 36.27, 26.57],
+            "humaneval": [91.41, 77.46, 57.19, 42.77, 31.90],
+            "mbpp":      [85.83, 66.77, 47.71, 34.50, 24.61],
+            "mt-bench":  [68.55, 40.23, 22.42, 12.71, 7.44],
+        },
+    },
 ]
 
 
