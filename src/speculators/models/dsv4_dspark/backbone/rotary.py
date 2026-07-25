@@ -55,16 +55,21 @@ def precompute_freqs_cis(
     def linear_ramp(lo: float, hi: float, n: int) -> torch.Tensor:
         if lo == hi:
             hi += 0.001
-        ramp = (torch.arange(n, dtype=torch.float32) - lo) / (hi - lo)
+        ramp = (torch.arange(n, dtype=torch.float32, device=device) - lo) / (hi - lo)
         return torch.clamp(ramp, 0, 1)
 
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    # ★ device=device (default "cpu") on every arange so freqs_cis is built as a REAL tensor even under
+    # transformers `from_pretrained`'s ambient `with torch.device("meta")` init context (used by the
+    # --from-pretrained warm-start path). Without it the arange inherits the meta default → freqs_cis is
+    # a meta tensor → `.to(device)` below fails "Cannot copy out of meta tensor; no data!". No effect on
+    # the normal path (torch's default device is already cpu there).
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
     if original_seq_len > 0:
         low, high = correction_range(beta_fast, beta_slow)
         smooth = 1 - linear_ramp(low, high, dim // 2)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
-    t = torch.arange(seqlen, dtype=torch.float32)
+    t = torch.arange(seqlen, dtype=torch.float32, device=device)
     angles = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(angles), angles)
     return freqs_cis.to(device)
