@@ -409,13 +409,17 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         keys = [f"layers.{n}.ffn.experts.{wn}"
                 for n in range(bb.n_draft_layers) for wn in ("w1", "w2", "w3")]
         src = load_model_layers(keys, str(ckpt_path))
-        off = filled = 0
+        import torch.distributed as _dist  # noqa: PLC0415
+
+        _rk = _dist.get_rank() if _dist.is_initialized() else 0
+        off = filled = meta_skipped = 0
         for n in range(bb.n_draft_layers):
             ffn = self.layers[n].ffn
             off = int(getattr(ffn, "ep_expert_offset", 0))
             for wn in ("w1", "w2", "w3"):
                 local = getattr(ffn.experts, wn)
                 if local.is_meta:
+                    meta_skipped += 1
                     continue
                 key = f"layers.{n}.ffn.experts.{wn}"
                 if key not in src:
@@ -437,6 +441,21 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                         f"{tuple(local.shape)} for {key}")
                 local.data.copy_(sl)
                 filled += 1
+                if n == 0 and wn == "w1":  # ── DIAGNOSTIC (temporary): per-rank slice sanity
+                    print(f"[EP-FILL r{_rk}] L0.w1 off={off} n_local={n_local} "
+                          f"ckpt_E={s.shape[0]} slice_norm={sl.float().norm().item():.2f} "
+                          f"local_after={local.data.float().norm().item():.2f}", flush=True)
+        # ── DIAGNOSTIC (temporary): flag any param left all-zero / NaN (= it never loaded). If this is
+        #    large, the failure is a BROAD load miss (key mismatch), not the expert slice.
+        _bad = []
+        for _pn, _p in self.named_parameters():
+            if _p.is_meta:
+                continue
+            _pf = _p.data.float()
+            if torch.isnan(_pf).any() or _pf.abs().max().item() == 0.0:
+                _bad.append(_pn)
+        print(f"[EP-FILL r{_rk}] filled={filled} meta_skipped={meta_skipped} "
+              f"degenerate_params={len(_bad)} e.g. {_bad[:6]}", flush=True)
         logging.getLogger(__name__).info(
             ">>> [from-pretrained] EP-aware expert fill: %d expert tensors sliced [%d:+n_local] "
             "per rank from %s", filled, off, ckpt_path,
