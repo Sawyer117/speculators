@@ -512,15 +512,21 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         )
 
         with torch.no_grad():
-            # `verifier_last_hidden_states` is ALREADY the verifier's FINAL POST-NORM hidden:
-            # the HS dumper writes `self.norm(...)` output (see docs/deployment/
-            # ascend-npu-dsv4-hs-dumper-planB.md §"verifier-last = final post-norm hidden"), and
-            # data.py:507 feeds it verbatim. Re-applying `verifier_norm` here would DOUBLE-norm it
-            # (norm(norm(h))) — distorting the teacher distribution that the TV/CE distillation AND
-            # the train accept-metric target, so the draft gets pulled toward a wrong verifier and
-            # the train metric decouples from eval. The verifier's true next-token logits are just
-            # lm_head(post_norm_hidden). (train↔serve parity audit 2026-07-24, finding F1.)
-            verifier_logits = self.verifier_lm_head(verifier_last_hidden_states)
+            # `verifier_last_hidden_states` is ALREADY the verifier's FINAL POST-NORM hidden (the HS
+            # dumper writes `self.norm(...)` output; data.py:507 feeds it verbatim). The verifier's
+            # TRUE next-token logits are `lm_head(post_norm_hidden)` — single norm (DEFAULT, F1,
+            # reproduction-faithful = the real verifier the serve accepts against).
+            #
+            # ★ DSPARK_TEACHER_DOUBLE_NORM=1 re-applies `verifier_norm` → norm(norm(h)) = the accidental
+            # "double-norm bug", made a DELIBERATE knob. 2026-07-25 eval: it BEAT single-norm by ~0.2
+            # accept_len, entirely in the tail. It is NOT a uniform sharpening (that's --kd-temperature):
+            # it's a per-dimension `~w²` RESHAPING of the teacher hidden (flips the teacher argmax ~16%
+            # vs the real verifier — T1). Why the reshaping helps the tail is not understood; empirical.
+            # Off by default (single-norm); set =1 to reproduce/A-B the double-norm win.
+            _teacher_h = verifier_last_hidden_states
+            if os.environ.get("DSPARK_TEACHER_DOUBLE_NORM") == "1":
+                _teacher_h = self.verifier_norm(_teacher_h)
+            verifier_logits = self.verifier_lm_head(_teacher_h)
             if not self.config.sample_from_anchor:
                 # False: shift right by 1 so slot j predicts the token AT position j
                 # (slot 0 = the given anchor). True (DSpark, matches the vllm-ascend

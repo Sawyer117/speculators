@@ -82,10 +82,13 @@ def compute_metrics(
             dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
         )
 
-    # KD teacher-SHARPENING: divide the teacher logits by T<1 to sharpen the distillation
-    # TARGET (a clean version of what the accidental double-norm did — sharper tail signal,
-    # NO argmax defect since argmax(targets/T)==argmax(targets)). T=1 => unchanged. Applied to
-    # the LOSS target only; the accept-rate/argmax metrics below still measure vs the REAL teacher.
+    # KD teacher-SHARPENING: divide the teacher logits by T<1 to sharpen the distillation TARGET
+    # (uniform scaling → sharper distribution, argmax PRESERVED). NOTE: this is a DIFFERENT mechanism
+    # from the double-norm win (DSPARK_TEACHER_DOUBLE_NORM) — that RESHAPES the teacher on the HIDDEN
+    # (per-dim ~w² reweighting, flips argmax ~16%); this only sharpens uniformly (never flips argmax).
+    # A separate, standard technique to try — may or may not capture the double-norm's tail gain.
+    # T=1 => unchanged. Applied to the LOSS target only; the accept-rate/argmax metrics below still
+    # measure vs the REAL teacher.
     targets_loss = targets / kd_temperature if kd_temperature != 1.0 else targets
     loss, term_losses = compound_loss(
         logits, targets_loss, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn

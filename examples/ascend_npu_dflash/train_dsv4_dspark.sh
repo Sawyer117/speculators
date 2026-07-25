@@ -77,13 +77,18 @@ LOSS_FN="${LOSS_FN:-{\"ce\":0.1,\"tv\":1.8}}"  # ce + TVD weights. ★ tv 1.8 (n
                                        # = 1/2 of DeepSpec's L1 (=sum|p-q|=2*TVD, PR #648 chose the standard TVD
                                        # normalization), so tv 1.8 restores DeepSpec's effective ce:dist = 0.1:1.8
                                        # balance. Pure normalization-convention alignment. Set LOSS_FN=... to override.
-KD_TEMP="${KD_TEMPERATURE:-1.0}"        # --kd-temperature: KD teacher-SHARPENING. T<1 sharpens the distill
-                                       # TARGET (teacher/T before softmax) — the CLEAN version of the
-                                       # accidental double-norm win (07-25 eval: double-norm teacher beat
-                                       # single-norm by ~0.2 AL, all tail, via w² sharpening but a 16% argmax
-                                       # defect). T<1 on the CORRECT teacher = the tail-sharpening gain with NO
-                                       # argmax defect. 1.0 = OFF = reproduction-faithful single-norm teacher.
-                                       # ★ ICING, not the main line — leave 1.0 for reproduction; try e.g. 0.5 as an A/B.
+TEACHER_DNORM="${TEACHER_DOUBLE_NORM:-0}"  # DSPARK_TEACHER_DOUBLE_NORM: =1 re-applies verifier_norm to the
+                                       # (already post-norm) teacher hidden → norm(norm(h)) = the accidental
+                                       # "double-norm bug" as a DELIBERATE knob. ★ 07-25 eval: it BEAT the
+                                       # single-norm teacher by ~0.2 accept_len, ALL in the tail. It RESHAPES
+                                       # the teacher on the HIDDEN (per-dim ~w² reweight, flips argmax ~16%) —
+                                       # NOT the same as --kd-temperature (uniform logit sharpening). 0 = OFF
+                                       # (single-norm, reproduction-faithful); set 1 to reproduce/A-B the win.
+KD_TEMP="${KD_TEMPERATURE:-1.0}"        # --kd-temperature: teacher SHARPENING on the LOSS (teacher logits / T
+                                       # before softmax). UNIFORM sharpening, argmax PRESERVED — a DIFFERENT
+                                       # mechanism from TEACHER_DOUBLE_NORM (which reshapes on the hidden). A
+                                       # separate technique to try; may or may not capture the double-norm gain.
+                                       # 1.0 = OFF (default). ★ ICING — leave default for reproduction.
 NOISE_STD="${NOISE_STD:-0.05}"          # --noise-std: uniform ±std noise added to target hidden states (aug).
                                        # 0.05 = current / DFlash-inherited default. ★ A/B knob: NOISE_STD=0 =
                                        # DeepSpec (it trains with ZERO hidden-state noise) — top candidate to
@@ -256,6 +261,7 @@ echo "==================================================================="
 
 nohup env \
   DSPARK_HS_DUMP=1 DSPARK_GROUPED_MOE="$GROUPED" DSPARK_EP="$EP" DSPARK_RECOMPUTE="$RECOMPUTE" DSPARK_COMPILE="$COMPILE" \
+  DSPARK_TEACHER_DOUBLE_NORM="$TEACHER_DNORM" \
   PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}" \
   HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 $PORTS \
   torchrun --nproc_per_node "$NPROC" "$REPO_ROOT/scripts/train.py" \
