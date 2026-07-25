@@ -1334,6 +1334,14 @@ def parse_args():
         default=0.5,
         help="Smoothing constant for D-PACE loss (default: 0.5)",
     )
+    parser.add_argument(
+        "--kd-temperature",
+        type=float,
+        default=1.0,
+        help="DSpark KD teacher-sharpening temperature. T<1 sharpens the distillation TARGET "
+        "(teacher logits / T before softmax) — the clean version of the accidental double-norm "
+        "sharpening, no argmax defect. 1.0 = off (default; the reproduction-faithful single-norm teacher).",
+    )
     # DSV4 DSpark sparse-backbone overrides (default to the released config; used
     # to shrink the draft for a first single-card run, e.g. --n-routed-experts 32).
     parser.add_argument(

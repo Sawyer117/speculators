@@ -57,6 +57,7 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
+    kd_temperature: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs).
 
@@ -81,8 +82,13 @@ def compute_metrics(
             dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
         )
 
+    # KD teacher-SHARPENING: divide the teacher logits by T<1 to sharpen the distillation
+    # TARGET (a clean version of what the accidental double-norm did — sharper tail signal,
+    # NO argmax defect since argmax(targets/T)==argmax(targets)). T=1 => unchanged. Applied to
+    # the LOSS target only; the accept-rate/argmax metrics below still measure vs the REAL teacher.
+    targets_loss = targets / kd_temperature if kd_temperature != 1.0 else targets
     loss, term_losses = compound_loss(
-        logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
+        logits, targets_loss, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
     )
 
     # Analytical per-position acceptance rate = distributional overlap.

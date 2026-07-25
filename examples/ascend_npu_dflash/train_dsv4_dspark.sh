@@ -77,6 +77,13 @@ LOSS_FN="${LOSS_FN:-{\"ce\":0.1,\"tv\":1.8}}"  # ce + TVD weights. ★ tv 1.8 (n
                                        # = 1/2 of DeepSpec's L1 (=sum|p-q|=2*TVD, PR #648 chose the standard TVD
                                        # normalization), so tv 1.8 restores DeepSpec's effective ce:dist = 0.1:1.8
                                        # balance. Pure normalization-convention alignment. Set LOSS_FN=... to override.
+KD_TEMP="${KD_TEMPERATURE:-1.0}"        # --kd-temperature: KD teacher-SHARPENING. T<1 sharpens the distill
+                                       # TARGET (teacher/T before softmax) — the CLEAN version of the
+                                       # accidental double-norm win (07-25 eval: double-norm teacher beat
+                                       # single-norm by ~0.2 AL, all tail, via w² sharpening but a 16% argmax
+                                       # defect). T<1 on the CORRECT teacher = the tail-sharpening gain with NO
+                                       # argmax defect. 1.0 = OFF = reproduction-faithful single-norm teacher.
+                                       # ★ ICING, not the main line — leave 1.0 for reproduction; try e.g. 0.5 as an A/B.
 NOISE_STD="${NOISE_STD:-0.05}"          # --noise-std: uniform ±std noise added to target hidden states (aug).
                                        # 0.05 = current / DFlash-inherited default. ★ A/B knob: NOISE_STD=0 =
                                        # DeepSpec (it trains with ZERO hidden-state noise) — top candidate to
@@ -257,6 +264,7 @@ nohup env \
     --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
     --dflash-decay-gamma "$DECAY_GAMMA" --sliding-window "$SWA_WINDOW" $NONCAUSAL_FLAG \
     --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" --noise-std "$NOISE_STD" \
+    --kd-temperature "$KD_TEMP" \
     --draft-attn-impl sdpa --loss-fn "$LOSS_FN" \
     --scheduler-type "$SCHED_TYPE" --scheduler-warmup-ratio "$WARMUP_RATIO" \
     --optimizer adamw --lr "$LR" --epochs "$EPOCHS" $EXTRA \
