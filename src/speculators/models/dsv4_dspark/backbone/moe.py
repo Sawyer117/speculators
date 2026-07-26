@@ -97,7 +97,9 @@ class Router(nn.Module):
 
         if dist.is_initialized():
             dist.all_reduce(load, op=dist.ReduceOp.SUM)  # -> global per-expert load (same on all ranks)
-        self.bias.add_(self._balance_rate * torch.sign(load.mean() - load).to(self.bias.dtype))
+        delta = self._balance_rate * torch.sign(load.mean() - load)
+        delta = delta - delta.mean()  # zero-mean the step (torchtitan-canonical): keeps the bias CENTERED
+        self.bias.add_(delta.to(self.bias.dtype))  # so it can't drift as a whole over a long run
         self._step_load = None
 
 
