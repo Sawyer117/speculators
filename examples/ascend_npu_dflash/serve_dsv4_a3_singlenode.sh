@@ -96,9 +96,12 @@ export USE_MULTI_BLOCK_POOL=1 USE_MULTI_GROUPS_KV_CACHE=1 VLLM_ASCEND_BALANCE_SC
 # and the fused-MC2 MoE dispatch/combine fast path. WITHOUT these the A3 EP path is wrong or slow.
 export ASCEND_A3_ENABLE="${ASCEND_A3_ENABLE:-1}"
 export VLLM_ASCEND_ENABLE_FUSED_MC2="${VLLM_ASCEND_ENABLE_FUSED_MC2:-1}"
-# EP is ON here, so Flash Comm v1 (which asserts enable_expert_parallel=True) is allowed. If the
-# first bring-up misbehaves, try VLLM_ASCEND_ENABLE_FLASHCOMM1=0.
-export VLLM_ASCEND_ENABLE_FLASHCOMM1="${VLLM_ASCEND_ENABLE_FLASHCOMM1:-1}"
+# FlashComm v1 (sequence-parallel comm) is a throughput win for PLAIN serve / HS-dump. BUT under graph
+# mode it forces cudagraph batch sizes to a multiple of TP, which CONFLICTS with spec-decode's required
+# multiple of (num_speculative_tokens+1) → "Can't determine cudagraph shapes ... disable sequence
+# parallelism" crash. So AUTO-DEFAULT it OFF when a DRAFT (spec-decode) is set, ON otherwise. Explicit
+# VLLM_ASCEND_ENABLE_FLASHCOMM1=... still overrides. (EP is ON here, so FlashComm1 is otherwise allowed.)
+export VLLM_ASCEND_ENABLE_FLASHCOMM1="${VLLM_ASCEND_ENABLE_FLASHCOMM1:-$([ -n "$DRAFT" ] && echo 0 || echo 1)}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 # ★ engine-ready timeout: the API frontend waits VLLM_ENGINE_READY_TIMEOUT_S for the engine cores.
 # Loading the 543 GB bf16 model + KV alloc + warmup takes ~11-12 min (> the 600s default), so a fresh
