@@ -461,22 +461,57 @@ def moe_load_report(text: str) -> None:
     by_layer: dict[int, list] = {}
     for lyr, used, E, dead, top, ent in rows:
         by_layer.setdefault(int(lyr), []).append((int(used), int(E), float(ent)))
+    # hot-expert-ID overlap across prints — the CRUCIAL check: single-step used/entropy is over ONLY
+    # ~180 tokens/rank, so even a balanced router looks sparse PER STEP. What matters is whether the
+    # SAME experts are hot every step (union ~ top-k => a FIXED collapsed subset) or the hot set ROTATES
+    # (union large => different inputs hit different experts => over the dataset ALL experts get used =
+    # not a real collapse, the per-step entropy is a small-batch artifact).
+    hot_by_layer: dict[int, list] = {}
+    for lyr, hs in re.findall(r"\[MOE-LOAD L(\d+)\][^\n]*?hot=\[([\d,\s]*)\]", text):
+        ids = {int(x) for x in hs.replace(" ", "").split(",") if x}
+        if ids:
+            hot_by_layer.setdefault(int(lyr), []).append(ids)
+
     print(f"  {'layer':6} {'#print':>6} {'used/E first->last':>20} {'entropy first->last (min)':>28}")
-    collapsed = False
+    entropy_low = False
     for lyr in sorted(by_layer):
         seq = by_layer[lyr]
         (u0, E, e0), (uL, _, eL) = seq[0], seq[-1]
         emin = min(s[2] for s in seq)
         print(f"  L{lyr:<5} {len(seq):>6} {f'{u0}->{uL}/{E}':>20} {f'{e0:.2f}->{eL:.2f} (min {emin:.2f})':>28}")
         if eL < 0.7 or uL < E * 0.5:
-            collapsed = True
+            entropy_low = True
+
+    fixed_collapse = False
+    rotating = False
+    if hot_by_layer and any(len(v) >= 2 for v in hot_by_layer.values()):
+        print(f"\n  {'layer':6} {'#hot-sets':>9} {'union (distinct ever-hot)':>26} {'always-hot core':>16}")
+        for lyr in sorted(hot_by_layer):
+            sets = hot_by_layer[lyr]
+            union = set().union(*sets)
+            inter = set.intersection(*sets)
+            E = by_layer.get(lyr, [(0, 256, 0)])[0][1]
+            print(f"  L{lyr:<5} {len(sets):>9} {f'{len(union)}/{E}':>26} {len(inter):>16}")
+            k = len(sets[0])  # top-k size
+            if len(union) <= 2 * k:      # hot set barely grew across prints -> FIXED subset
+                fixed_collapse = True
+            elif len(union) >= E * 0.5:  # hot set rotates over half the experts -> dataset coverage OK
+                rotating = True
+
     print("  ── verdict ──")
-    if collapsed:
-        print("    ⛔ COLLAPSED: few experts hog the routing (low entropy / many dead) -> the 256-expert")
-        print("    capacity is largely wasted => caps accept_len + drives the over-train decline. FIX =")
-        print("    noaux_tc load-balance bias update (nudge router bias by per-expert load each step).")
-        print("    ⚠ First rule out DATA-limited vs TRAINING-drift: is entropy already low at step 0 (INIT,")
-        print("    warm-started)? balanced@init then collapsing = drift (the fix helps); low@init = data.")
+    if entropy_low and fixed_collapse:
+        print("    ⛔ TRUE COLLAPSE: low per-step entropy AND the hot set is a FIXED subset (small union,")
+        print("    same experts every step) -> the 256-expert capacity is genuinely wasted => caps")
+        print("    accept_len + drives the over-train decline. FIX = noaux_tc load-balance bias update.")
+        print("    ⚠ Still confirm TRAINING-drift not DATA-limited: is it already low at step 0 (INIT)?")
+    elif entropy_low and rotating:
+        print("    ⚠ PER-STEP SPARSE BUT ROTATING: entropy is low per step, but the hot experts CHANGE")
+        print("    across steps (large union) -> over the dataset most experts DO get used. The low")
+        print("    per-step number is a small-batch artifact, NOT a fixed collapse -> load balancing is")
+        print("    likely NOT the bottleneck; look elsewhere. (Need many [MOE-LOAD] prints to be sure.)")
+    elif entropy_low:
+        print("    low per-step entropy, but too few prints to judge fixed-vs-rotating hot set — run")
+        print("    longer with DSPARK_LOG_EXPERT_LOAD=1 (more [MOE-LOAD] prints) to compute the union.")
     else:
         print("    ✓ balanced (high entropy, most experts used) — load balancing is NOT the bottleneck.")
 
