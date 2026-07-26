@@ -472,38 +472,48 @@ def moe_load_report(text: str) -> None:
         if ids:
             hot_by_layer.setdefault(int(lyr), []).append(ids)
 
-    print(f"  {'layer':6} {'#print':>6} {'used/E first->last':>20} {'entropy first->last (min)':>28}")
+    print(f"  {'layer':6} {'#print':>6} {'used/E first->last':>20} {'entropy first->last (min)':>28} {'eff.experts now':>16}")
     entropy_low = False
     for lyr in sorted(by_layer):
         seq = by_layer[lyr]
         (u0, E, e0), (uL, _, eL) = seq[0], seq[-1]
         emin = min(s[2] for s in seq)
-        print(f"  L{lyr:<5} {len(seq):>6} {f'{u0}->{uL}/{E}':>20} {f'{e0:.2f}->{eL:.2f} (min {emin:.2f})':>28}")
-        if eL < 0.7 or uL < E * 0.5:
+        neff = round(E ** eL)    # effective experts carrying the mass NOW = E^entropy (the honest count, not 'used')
+        print(f"  L{lyr:<5} {len(seq):>6} {f'{u0}->{uL}/{E}':>20} {f'{e0:.2f}->{eL:.2f} (min {emin:.2f})':>28} {f'~{neff}/{E}':>16}")
+        if eL < 0.65:            # eff.experts < ~15% of E -> per-step collapsed ('used' is misleading -> ignore it)
             entropy_low = True
 
     fixed_collapse = False
     rotating = False
     if hot_by_layer and any(len(v) >= 2 for v in hot_by_layer.values()):
-        print(f"\n  {'layer':6} {'#hot-sets':>9} {'union (distinct ever-hot)':>26} {'always-hot core':>16}")
+        print(f"\n  {'layer':6} {'#hot-sets':>9} {'union (ever-hot pool)':>22} {'core':>5} {'pool growth (2nd half)':>24}")
         for lyr in sorted(hot_by_layer):
             sets = hot_by_layer[lyr]
             union = set().union(*sets)
             inter = set.intersection(*sets)
             E = by_layer.get(lyr, [(0, 256, 0)])[0][1]
-            print(f"  L{lyr:<5} {len(sets):>9} {f'{len(union)}/{E}':>26} {len(inter):>16}")
             k = len(sets[0])  # top-k size
-            if len(union) <= 2 * k:      # hot set barely grew across prints -> FIXED subset
-                fixed_collapse = True
-            elif len(union) >= E * 0.5:  # hot set rotates over half the experts -> dataset coverage OK
+            # SATURATION: does the 2nd half of training keep adding NEW experts to the pool (rotating,
+            # heading to full coverage) or has the pool stopped growing (a FIXED subset)? This is the real
+            # fixed-vs-rotating test — a saturated pool of 65 is just as collapsed as one of 16.
+            half = len(sets) // 2
+            u_early = set().union(*sets[:half]) if half else set()
+            new_late = len(union - u_early)   # experts the SECOND half added to the ever-hot pool
+            saturated = len(sets) >= 20 and new_late <= max(3, 0.08 * len(union))
+            growth = f"+{new_late} (SATURATED)" if saturated else f"+{new_late} (still growing)"
+            print(f"  L{lyr:<5} {len(sets):>9} {f'{len(union)}/{E}':>22} {len(inter):>5} {growth:>24}")
+            if len(union) >= E * 0.5:                       # broad pool -> dataset coverage OK (not a collapse)
                 rotating = True
+            elif len(union) <= 2 * k or saturated:          # tiny pool, OR a sub-half pool that STOPPED growing
+                fixed_collapse = True                        # (still-growing small pool -> neither -> keep watching)
 
     print("  ── verdict ──")
     if entropy_low and fixed_collapse:
-        print("    ⛔ TRUE COLLAPSE: low per-step entropy AND the hot set is a FIXED subset (small union,")
-        print("    same experts every step) -> the 256-expert capacity is genuinely wasted => caps")
-        print("    accept_len + drives the over-train decline. FIX = noaux_tc load-balance bias update.")
-        print("    ⚠ Still confirm TRAINING-drift not DATA-limited: is it already low at step 0 (INIT)?")
+        print("    ⛔ TRUE COLLAPSE: low per-step effective-experts AND the ever-hot pool has SATURATED")
+        print("    (a FIXED subset — the 2nd half of training added ~no new experts), so most of the")
+        print("    E-expert capacity is permanently idle => caps accept_len + drives over-train decline.")
+        print("    FIX = noaux_tc load-balance bias (DSPARK_MOE_BALANCE) and/or lower LR (less collapse")
+        print("    pressure). ⚠ Confirm TRAINING-drift not DATA-limited: is it already low at step 0 (INIT)?")
     elif entropy_low and rotating:
         print("    ⚠ PER-STEP SPARSE BUT ROTATING: entropy is low per step, but the hot experts CHANGE")
         print("    across steps (large union) -> over the dataset most experts DO get used. The low")
