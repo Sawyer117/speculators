@@ -563,6 +563,14 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         #    nudge each router's selection bias toward uniform expert load (the all-reduce inside makes the
         #    update identical across ranks). Off by default = frozen bias = the collapse we diagnosed.
         if self.training and getattr(self.layers[0].ffn.router, "_balance", False):
+            if not getattr(self, "_balance_logged", False):
+                self._balance_logged = True
+                import torch.distributed as _d  # noqa: PLC0415
+                if not _d.is_initialized() or _d.get_rank() == 0:
+                    _r0 = self.layers[0].ffn.router
+                    print(f"[MOE-BALANCE] noaux_tc ON: rate={_r0._balance_rate} across "
+                          f"{len(self.layers)} routers (bias updated once/step toward uniform load)",
+                          flush=True)
             for _layer in self.layers:
                 _layer.ffn.router.update_load_balance_bias()
 
