@@ -1022,10 +1022,8 @@ def _plot_moe(text, out, steps_per_epoch=None):
         seq = series[lyr]
         xs = [s for s, _, _, _ in seq]
         neff = [E ** e for _, e, _, _ in seq]         # effective experts = E^normalized-entropy
-        used = [u for _, _, u, _ in seq]              # experts merely touched (>=1 token) — misleading
         c = colors[i % len(colors)]
-        axA.plot(xs, used, lw=0.9, color=c, alpha=0.25, ls=":")
-        axA.plot(xs, neff, lw=2.0, color=c, label=f"layer {lyr}")
+        axA.plot(xs, neff, lw=2.2, color=c, marker="o", ms=3, label=f"layer {lyr}")
         axA.annotate(f"{neff[-1]:.0f}", xy=(xs[-1], neff[-1]),
                      xytext=(5, (i - (len(layers) - 1) / 2) * 9), textcoords="offset points",
                      fontsize=8.5, color=c, va="center", fontweight="bold")
@@ -1048,7 +1046,7 @@ def _plot_moe(text, out, steps_per_epoch=None):
     axA.set_xlabel("training step")
     axA.set_ylabel(f"experts (out of {E})")
     fig.suptitle("MoE — how many of the experts are ACTUALLY working", fontsize=13, fontweight="bold", y=0.995)
-    axA.set_title("bold = effective experts (the honest number)   ·   faint dotted = merely 'touched' (misleads)",
+    axA.set_title(f"effective experts = {E}^entropy — how many really share the load (high = healthy, low = collapsed)",
                   fontsize=8.5, color="0.4")
     axA.grid(alpha=0.3)
     axA.legend(loc="center right", fontsize=8.5)
