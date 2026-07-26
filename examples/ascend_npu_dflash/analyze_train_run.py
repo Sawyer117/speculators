@@ -896,6 +896,7 @@ def main() -> None:
                 }
             _plots(recs, good, pos_keys, reps, ckpt_steps, args.out, cur_label, base,
                    steps_per_epoch=steps_per_epoch)
+        _plot_moe(raw_text, args.out, steps_per_epoch)   # expert-load plot (both modes; silent if no [MOE-LOAD])
     print("=" * 78)
 
 
@@ -973,6 +974,105 @@ def _timing_tag(recs, reps, spe) -> str:
     if spe and steady:
         parts.append(f"~{spe * steady / 3.6e6:.1f} h/epoch  ({spe:,} steps/ep)")
     return "   ·   ".join(parts)
+
+
+def _plot_moe(text, out, steps_per_epoch=None):
+    """MoE expert-load plots from ``[MOE-LOAD]`` prints — built to be read AT A GLANCE by non-experts.
+
+    Panel A: 'effective experts working' = ``E**entropy`` (the honest capacity number) over training,
+    per layer. Bold line = actually working; faint dotted = merely 'touched' by >=1 token (looks fine
+    but misleads). A collapse shows as the bold line sliding toward the red zone.
+    Panel B: a final-state capacity gauge per layer ('18 of 256 working (7%)').
+    Silent if the log has no ``[MOE-LOAD]`` lines (``DSPARK_LOG_EXPERT_LOAD`` was off)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+    except ImportError:
+        return
+    step_re = re.compile(r"global_step=(\d+)")
+    moe_re = re.compile(
+        r"\[MOE-LOAD L(\d+)\]\s+used=(\d+)/(\d+)\s+dead=\d+\s+top\d+=[\d.]+\s+entropy=([\d.]+)")
+    # each [MOE-LOAD] block is printed just BEFORE its step's trainer log -> attach the NEXT global_step.
+    series: dict[int, list] = {}
+    pending: list = []
+    for line in text.splitlines():
+        mm = moe_re.search(line)
+        if mm:
+            pending.append((int(mm.group(1)), int(mm.group(2)), int(mm.group(3)), float(mm.group(4))))
+            continue
+        ms = step_re.search(line)
+        if ms and pending:
+            st = int(ms.group(1))
+            for lyr, used, E, ent in pending:
+                series.setdefault(lyr, []).append((st, ent, used, E))
+            pending = []
+    if not series:
+        return
+    os.makedirs(out, exist_ok=True)
+    layers = sorted(series)
+    colors = ["#2E6CF6", "#1B8A4E", "#D62828", "#7A3FF2", "#E08A1E", "#00A5B5"]
+    E = series[layers[0]][0][3]
+
+    fig, (axA, axB) = plt.subplots(
+        2, 1, figsize=(9.5, 7.4), gridspec_kw={"height_ratios": [2.3, 1.0]})
+
+    # ---- Panel A: effective experts over training ----
+    for i, lyr in enumerate(layers):
+        seq = series[lyr]
+        xs = [s for s, _, _, _ in seq]
+        neff = [E ** e for _, e, _, _ in seq]         # effective experts = E^normalized-entropy
+        used = [u for _, _, u, _ in seq]              # experts merely touched (>=1 token) — misleading
+        c = colors[i % len(colors)]
+        axA.plot(xs, used, lw=0.9, color=c, alpha=0.25, ls=":")
+        axA.plot(xs, neff, lw=2.0, color=c, label=f"layer {lyr}")
+        axA.annotate(f"{neff[-1]:.0f}", xy=(xs[-1], neff[-1]),
+                     xytext=(5, (i - (len(layers) - 1) / 2) * 9), textcoords="offset points",
+                     fontsize=8.5, color=c, va="center", fontweight="bold")
+    axA.axhline(E, ls="--", lw=1.2, color="0.35")
+    axA.annotate(f"all {E} experts sharing the work = ideal", xy=(0.01, E),
+                 xycoords=("axes fraction", "data"), xytext=(0, -3), textcoords="offset points",
+                 fontsize=8, color="0.35", va="top")
+    axA.axhspan(0, E * 0.12, color="#D62828", alpha=0.06)
+    axA.annotate("collapsed — capacity wasted", xy=(0.5, E * 0.06), xycoords=("axes fraction", "data"),
+                 fontsize=8, color="#B02020", ha="center", va="center", alpha=0.85)
+    if steps_per_epoch:
+        xmax = max(s for lyr in layers for s, _, _, _ in series[lyr])
+        ep = 1
+        while ep * steps_per_epoch <= xmax * 1.001:
+            axA.axvline(ep * steps_per_epoch, color="0.6", ls=":", lw=0.8, alpha=0.6)
+            axA.annotate(f"e{ep}", xy=(ep * steps_per_epoch, 1.0), xycoords=("data", "axes fraction"),
+                         xytext=(2, -2), textcoords="offset points", color="0.45", fontsize=7, va="top")
+            ep += 1
+    axA.set_ylim(0, E * 1.10)
+    axA.set_xlabel("training step")
+    axA.set_ylabel(f"experts (out of {E})")
+    fig.suptitle("MoE — how many of the experts are ACTUALLY working", fontsize=13, fontweight="bold", y=0.995)
+    axA.set_title("bold = effective experts (the honest number)   ·   faint dotted = merely 'touched' (misleads)",
+                  fontsize=8.5, color="0.4")
+    axA.grid(alpha=0.3)
+    axA.legend(loc="center right", fontsize=8.5)
+
+    # ---- Panel B: final-state capacity gauge per layer ----
+    finals = [(lyr, E ** series[lyr][-1][1]) for lyr in layers]
+    ypos = list(range(len(finals)))
+    for (lyr, nf), y in zip(finals, ypos):
+        frac = nf / E
+        col = "#D62828" if frac < 0.15 else "#E08A1E" if frac < 0.40 else "#1B8A4E"
+        axB.barh(y, E, color="0.90", height=0.6, zorder=1)          # total capacity (grey)
+        axB.barh(y, nf, color=col, height=0.6, zorder=2)            # working (colored)
+        axB.text(E * 0.985, y, f"{nf:.0f} of {E} working  ({100 * frac:.0f}%)", ha="right", va="center",
+                 fontsize=9.5, color="#1a1a1a", fontweight="bold", zorder=3)
+    axB.set_yticks(ypos); axB.set_yticklabels([f"layer {l}" for l, _ in finals], fontsize=9)
+    axB.set_xlim(0, E); axB.invert_yaxis()
+    axB.set_xlabel(f"experts working (of {E})  —  latest state")
+    axB.set_title("Current expert utilization per layer  (green = healthy, red = collapsed)", fontsize=10)
+    axB.grid(axis="x", alpha=0.25)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.965])
+    fig.savefig(f"{out}/moe_experts.png", dpi=120)
+    plt.close(fig)
+    print(f"  · MoE expert-load plot -> {out}/moe_experts.png")
 
 
 def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=None, steps_per_epoch=None):
