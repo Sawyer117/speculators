@@ -97,6 +97,19 @@ RUNS = [
             "mt-bench":  [68.55, 40.23, 22.42, 12.71, 7.44],
         },
     },
+    {
+        # 2.5ep: REGRESSION CONFIRMED (−0.35 vs 2.0ep, accelerating). Peak was 1.5ep (3.63/82%); 2.5ep=3.21/73%.
+        # Broad drift incl the HEAD (gsm8k pos0 90.5→83.7). Cause = single-norm + LR 3e-4 over-trains. See ledger.
+        "label": "f1 ep2mid (2.5ep)",
+        "al": {"gsm8k": 3.703, "math500": 3.293, "humaneval": 3.552, "mbpp": 3.200, "mt-bench": 2.320},
+        "pos": {
+            "gsm8k":     [83.72, 65.15, 51.10, 39.59, 30.75],
+            "math500":   [78.56, 56.57, 42.68, 30.03, 21.50],
+            "humaneval": [82.94, 64.64, 48.17, 34.17, 25.25],
+            "mbpp":      [78.14, 55.34, 39.40, 27.93, 19.18],
+            "mt-bench":  [62.13, 33.76, 18.90, 10.94, 6.26],
+        },
+    },
 ]
 
 
