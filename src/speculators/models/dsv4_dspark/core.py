@@ -573,11 +573,14 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                     E = _c.shape[0]
                     _cf = _c.float(); _tot = _cf.sum().clamp(min=1); _p = _cf / _tot
                     _used = int((_c > 0).sum()); _tk = min(16, E)
-                    _top = float(_cf.topk(_tk)[0].sum() / _tot)
+                    _tv, _ti = _cf.topk(_tk)
+                    _top = float(_tv.sum() / _tot)
                     _ent = float(-(_p[_p > 0] * _p[_p > 0].log()).sum() / torch.log(torch.tensor(float(E))))
+                    _hot = _ti.tolist()  # the hottest expert IDs — compare across INIT/trained/datasets:
+                    #   same IDs everywhere = router collapse; data-dependent IDs = data drives it.
                     print(f"[MOE-LOAD L{_n}] used={_used}/{E} dead={E - _used} "
-                          f"top{_tk}={_top:.2f} entropy={_ent:.3f}  (entropy 1.0=uniform / low=collapsed)",
-                          flush=True)
+                          f"top{_tk}={_top:.2f} entropy={_ent:.3f}  hot={_hot}  "
+                          f"(entropy 1.0=uniform / low=collapsed)", flush=True)
 
         hidden = self.norm(self.hc_head(streams))  # [1, TB, H]
         logits = self.lm_head(hidden)

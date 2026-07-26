@@ -446,6 +446,41 @@ def fwd_profiler_report(text: str) -> None:
     print("  cross-check the free headline: fetch_ms/align_ms high = HS-fetch stall (not compute).")
 
 
+def moe_load_report(text: str) -> None:
+    """MoE expert-load balance over the run from ``[MOE-LOAD Ln]`` prints (DSPARK_LOG_EXPERT_LOAD=1).
+    Silent if absent. Shows per-layer used/dead experts + normalized entropy EARLY->LATE, so a router
+    COLLAPSE (entropy falling / dead experts growing over training) is visible. entropy 1.0 = uniform
+    (all 256 experts used), low = collapsed to a few -> the 256-expert capacity is wasted."""
+    rows = re.findall(
+        r"\[MOE-LOAD L(\d+)\]\s+used=(\d+)/(\d+)\s+dead=(\d+)\s+top\d+=([\d.]+)\s+entropy=([\d.]+)",
+        text,
+    )
+    if not rows:
+        return  # diagnostic off / older log — stay silent
+    print("\n-- MoE EXPERT-LOAD BALANCE (DSPARK_LOG_EXPERT_LOAD) " + "-" * 27)
+    by_layer: dict[int, list] = {}
+    for lyr, used, E, dead, top, ent in rows:
+        by_layer.setdefault(int(lyr), []).append((int(used), int(E), float(ent)))
+    print(f"  {'layer':6} {'#print':>6} {'used/E first->last':>20} {'entropy first->last (min)':>28}")
+    collapsed = False
+    for lyr in sorted(by_layer):
+        seq = by_layer[lyr]
+        (u0, E, e0), (uL, _, eL) = seq[0], seq[-1]
+        emin = min(s[2] for s in seq)
+        print(f"  L{lyr:<5} {len(seq):>6} {f'{u0}->{uL}/{E}':>20} {f'{e0:.2f}->{eL:.2f} (min {emin:.2f})':>28}")
+        if eL < 0.7 or uL < E * 0.5:
+            collapsed = True
+    print("  ── verdict ──")
+    if collapsed:
+        print("    ⛔ COLLAPSED: few experts hog the routing (low entropy / many dead) -> the 256-expert")
+        print("    capacity is largely wasted => caps accept_len + drives the over-train decline. FIX =")
+        print("    noaux_tc load-balance bias update (nudge router bias by per-expert load each step).")
+        print("    ⚠ First rule out DATA-limited vs TRAINING-drift: is entropy already low at step 0 (INIT,")
+        print("    warm-started)? balanced@init then collapsing = drift (the fix helps); low@init = data.")
+    else:
+        print("    ✓ balanced (high entropy, most experts used) — load balancing is NOT the bottleneck.")
+
+
 def main() -> None:
     args = _build_parser().parse_args()
 
@@ -554,6 +589,7 @@ def main() -> None:
               f" | cumprod_bias {fmt(last_n_med('train/confidence_cumprod_bias'))}")
 
     fwd_profiler_report(raw_text)
+    moe_load_report(raw_text)
 
     # ---------------- recent dynamics (is it STILL learning?) ----------------
     N = args.recent
