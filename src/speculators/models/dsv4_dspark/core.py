@@ -559,6 +559,13 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             else:
                 streams = layer(*layer_args)
 
+        # ── MoE noaux_tc LOAD BALANCING (DSPARK_MOE_BALANCE=1): once per step, after this step's routing,
+        #    nudge each router's selection bias toward uniform expert load (the all-reduce inside makes the
+        #    update identical across ranks). Off by default = frozen bias = the collapse we diagnosed.
+        if self.training and getattr(self.layers[0].ffn.router, "_balance", False):
+            for _layer in self.layers:
+                _layer.ffn.router.update_load_balance_bias()
+
         # ── MoE LOAD-BALANCE diagnostic (DSPARK_LOG_EXPERT_LOAD=1): confirm/deny expert collapse
         #    (a few of the 256 experts hogging the routing). rank0, throttled ~1/20 fwd. Zero cost off.
         if getattr(self.layers[0].ffn.router, "_log_load", False):

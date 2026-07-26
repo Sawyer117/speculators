@@ -44,16 +44,21 @@ class Router(nn.Module):
         self.route_scale = cfg.route_scale
         self.score_func = cfg.score_func
         self.weight = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.hidden_size))
-        # Aux-loss-free load-balancing bias (DeepSeek noaux_tc): shifts the top-k
-        # SELECTION only (never the combine weights), and is nudged by a heuristic
-        # load-balance rule at train time — NOT by backprop. So it carries no
-        # gradient; the trainer updates it separately (or leaves it at 0).
-        self.bias = nn.Parameter(torch.zeros(cfg.n_routed_experts), requires_grad=False)
+        # Aux-loss-free load-balancing bias (DeepSeek noaux_tc): shifts the top-k SELECTION only (never
+        # the combine weights), nudged by a load-balance RULE at train time — NOT by backprop. A
+        # persistent BUFFER (not a Parameter) so FSDP leaves it REPLICATED (not Shard(0)) -> it stays
+        # identical across ranks and is updatable in-place with the all-reduced global load.
+        self.register_buffer("bias", torch.zeros(cfg.n_routed_experts), persistent=True)
         self.n_routed_experts = cfg.n_routed_experts
-        # DSPARK_LOG_EXPERT_LOAD=1 -> stash per-expert selection counts each fwd (for a MoE
-        # load-balance diagnostic; see core.py). Off by default = zero cost.
+        # DSPARK_LOG_EXPERT_LOAD=1 -> stash per-expert selection counts each fwd (diagnostic; core.py).
         self._log_load = os.environ.get("DSPARK_LOG_EXPERT_LOAD") == "1"
+        # DSPARK_MOE_BALANCE=1 -> the noaux_tc bias update (update_load_balance_bias, called per step from
+        # _backbone_forward): b_i += rate * sign(avg_load - load_i). OFF by default = the historical frozen
+        # bias (zero balancing) that let the router COLLAPSE to a few experts. rate via DSPARK_MOE_BALANCE_RATE.
+        self._balance = os.environ.get("DSPARK_MOE_BALANCE") == "1"
+        self._balance_rate = float(os.environ.get("DSPARK_MOE_BALANCE_RATE", "1e-3"))
         self._sel_counts: torch.Tensor | None = None
+        self._step_load: torch.Tensor | None = None
 
     def _score(self, scores: torch.Tensor) -> torch.Tensor:
         if self.score_func == "softmax":
@@ -70,11 +75,30 @@ class Router(nn.Module):
         if self.score_func != "softmax":
             weights = weights / weights.sum(dim=-1, keepdim=True)
         weights = weights * self.route_scale
-        if self._log_load:  # this rank's per-expert selection histogram over N tokens x top-k
-            self._sel_counts = torch.bincount(
-                indices.reshape(-1), minlength=self.n_routed_experts
-            ).detach()
+        if self._log_load or (self._balance and self.training):
+            _cnt = torch.bincount(indices.reshape(-1), minlength=self.n_routed_experts).detach().float()
+            if self._log_load:            # this rank's per-expert selection histogram (diagnostic)
+                self._sel_counts = _cnt
+            if self._balance and self.training:  # stash for the per-step bias update (SET, so a recompute
+                self._step_load = _cnt           # forward just re-sets the same value -> no double count)
         return weights, indices
+
+    @torch.no_grad()
+    def update_load_balance_bias(self) -> None:
+        """DeepSeek noaux_tc load balancing: nudge the (non-grad) selection ``bias`` toward uniform expert
+        load WITHOUT an aux loss. ``b_i += rate * sign(avg_load - load_i)`` (under-loaded up, over-loaded
+        down). Called ONCE per step from ``_backbone_forward``. Under EP the router runs on each rank's
+        DP-shard of tokens, so all-reduce the counts to the GLOBAL load — the bias is REPLICATED and must
+        update identically on every rank. No-op when balancing is off or no load was stashed."""
+        if not self._balance or self._step_load is None:
+            return
+        load = self._step_load
+        import torch.distributed as dist  # noqa: PLC0415
+
+        if dist.is_initialized():
+            dist.all_reduce(load, op=dist.ReduceOp.SUM)  # -> global per-expert load (same on all ranks)
+        self.bias.add_(self._balance_rate * torch.sign(load.mean() - load).to(self.bias.dtype))
+        self._step_load = None
 
 
 class Expert(nn.Module):
