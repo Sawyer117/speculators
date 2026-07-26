@@ -41,6 +41,19 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
 #    (Older CAUSAL rows removed — broken attention task; archived in the ledger.)
 RUNS = [
     {
+        # ⭐ noaux_tc load balance (DSPARK_MOE_BALANCE=1 @ 5e-3) on the f1 recipe. At 0.5ep already >
+        # no-balance f1 1.0ep (3.37) and near its 1.5ep peak (3.63) — clean single-variable A/B. See ledger.
+        "label": "f1+bal5e3 ep0mid (0.5ep)",
+        "al": {"gsm8k": 3.998, "math500": 3.700, "humaneval": 3.885, "mbpp": 3.595, "mt-bench": 2.457},
+        "pos": {
+            "gsm8k":     [87.94, 73.42, 58.15, 45.43, 34.86],
+            "math500":   [84.29, 68.01, 52.00, 38.47, 27.25],
+            "humaneval": [88.90, 74.89, 55.58, 40.42, 28.67],
+            "mbpp":      [84.96, 66.99, 48.69, 34.92, 23.96],
+            "mt-bench":  [66.17, 39.06, 21.45, 12.05, 6.96],
+        },
+    },
+    {
         "label": "dnorm ep0mid (0.5ep)",
         "al": {"gsm8k": 4.032, "math500": 3.721, "humaneval": 3.856, "mbpp": 3.586, "mt-bench": 2.482},
         "pos": {
