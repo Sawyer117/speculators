@@ -18,6 +18,7 @@ the same op key.
 from __future__ import annotations
 
 import contextlib
+import os
 import math
 
 import torch
@@ -48,6 +49,11 @@ class Router(nn.Module):
         # load-balance rule at train time — NOT by backprop. So it carries no
         # gradient; the trainer updates it separately (or leaves it at 0).
         self.bias = nn.Parameter(torch.zeros(cfg.n_routed_experts), requires_grad=False)
+        self.n_routed_experts = cfg.n_routed_experts
+        # DSPARK_LOG_EXPERT_LOAD=1 -> stash per-expert selection counts each fwd (for a MoE
+        # load-balance diagnostic; see core.py). Off by default = zero cost.
+        self._log_load = os.environ.get("DSPARK_LOG_EXPERT_LOAD") == "1"
+        self._sel_counts: torch.Tensor | None = None
 
     def _score(self, scores: torch.Tensor) -> torch.Tensor:
         if self.score_func == "softmax":
@@ -64,6 +70,10 @@ class Router(nn.Module):
         if self.score_func != "softmax":
             weights = weights / weights.sum(dim=-1, keepdim=True)
         weights = weights * self.route_scale
+        if self._log_load:  # this rank's per-expert selection histogram over N tokens x top-k
+            self._sel_counts = torch.bincount(
+                indices.reshape(-1), minlength=self.n_routed_experts
+            ).detach()
         return weights, indices
 
 

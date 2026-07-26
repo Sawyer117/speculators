@@ -559,6 +559,26 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             else:
                 streams = layer(*layer_args)
 
+        # ── MoE LOAD-BALANCE diagnostic (DSPARK_LOG_EXPERT_LOAD=1): confirm/deny expert collapse
+        #    (a few of the 256 experts hogging the routing). rank0, throttled ~1/20 fwd. Zero cost off.
+        if getattr(self.layers[0].ffn.router, "_log_load", False):
+            self._eload_ctr = getattr(self, "_eload_ctr", 0) + 1
+            import torch.distributed as _dist  # noqa: PLC0415
+            _rk = _dist.get_rank() if _dist.is_initialized() else 0
+            if _rk == 0 and self._eload_ctr % 20 == 1:
+                for _n in range(len(self.layers)):
+                    _c = getattr(self.layers[_n].ffn.router, "_sel_counts", None)
+                    if _c is None:
+                        continue
+                    E = _c.shape[0]
+                    _cf = _c.float(); _tot = _cf.sum().clamp(min=1); _p = _cf / _tot
+                    _used = int((_c > 0).sum()); _tk = min(16, E)
+                    _top = float(_cf.topk(_tk)[0].sum() / _tot)
+                    _ent = float(-(_p[_p > 0] * _p[_p > 0].log()).sum() / torch.log(torch.tensor(float(E))))
+                    print(f"[MOE-LOAD L{_n}] used={_used}/{E} dead={E - _used} "
+                          f"top{_tk}={_top:.2f} entropy={_ent:.3f}  (entropy 1.0=uniform / low=collapsed)",
+                          flush=True)
+
         hidden = self.norm(self.hc_head(streams))  # [1, TB, H]
         logits = self.lm_head(hidden)
 
