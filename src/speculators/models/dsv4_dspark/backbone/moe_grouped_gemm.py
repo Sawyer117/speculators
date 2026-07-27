@@ -34,9 +34,11 @@ _MOE_OP = "moe_dispatch"
 # to few shapes (recompiles amortize after the first few). Padding is a few % of the TOKEN dim
 # (NOT per-expert capacity), so the memory/compute waste is small. 0/1 disables bucketing.
 _MOE_BUCKET = int(os.environ.get("DSPARK_MOE_BUCKET", "512"))
-# DSPARK_PROFILE_MOE=1 -> sync+time each MoE sub-op (permute / experts-GEMM / unpermute) and print on any
-# sub-op > 2s. Pins WHICH op does the per-shape AscendC build (the fwd "recompile" spike). Diagnostic only.
+# DSPARK_PROFILE_MOE=1 -> sync+time each MoE sub-op (permute / experts-GEMM / unpermute) and print any sub-op
+# whose time exceeds DSPARK_PROFILE_MOE_MS (default 2000ms; set 0 to print EVERY step). Pins WHICH op does the
+# per-shape AscendC build (the fwd "recompile" spike). Diagnostic only.
 _MOE_PROF = os.environ.get("DSPARK_PROFILE_MOE") == "1"
+_MOE_PROF_MS = float(os.environ.get("DSPARK_PROFILE_MOE_MS", "2000"))
 # Fused Ascend routing ops (npu_moe_token_permute/unpermute AND npu_moe_token_unpermute_grad) FAIL
 # on a 0-row input ("input shape has 0", error 561002). Under EP a rank can receive 0 tokens in a
 # step (all top-k picks miss its 32 experts) -> the local grouped path gets [0, dim] and the unpermute
@@ -182,7 +184,7 @@ def _fused_permute_dispatch_npu(x: torch.Tensor, indices: torch.Tensor, w_flat: 
         torch.npu.synchronize()
         _t3 = _time.perf_counter()
         _pm, _gm, _um = (_t1 - _t0) * 1000, (_t2 - _t1) * 1000, (_t3 - _t2) * 1000
-        if max(_pm, _gm, _um) > 2000.0:  # a spike: report WHICH sub-op built the per-shape kernel
+        if max(_pm, _gm, _um) > _MOE_PROF_MS:  # spike (or EVERY step if DSPARK_PROFILE_MOE_MS=0)
             try:
                 _r = torch.distributed.get_rank()
             except Exception:  # noqa: BLE001
