@@ -124,6 +124,9 @@ INITATTN="${INIT_ATTN:-0}"             # INIT_ATTN=1  -> warm-start MLA core pro
 INITHC="${INIT_HC:-0}"                 # INIT_HC=1    -> warm-start the two hyper-connections (attn_hc/ffn_hc)
 INITNORM="${INIT_NORM:-0}"             # INIT_NORM=1  -> warm-start the two RMSNorms (attn_norm/ffn_norm)
 INITLAYER="${INIT_LAYER:-0}"           # INIT_LAYER=1 -> WHOLE layer = attn+hc+norm+moe (coherent target layer)
+INITNOROUTER="${INIT_MOE_NO_ROUTER:-0}"  # INIT_MOE_NO_ROUTER=1 -> with INIT_MOE/INIT_LAYER, leave the ROUTER at a
+                                       # FRESH random init (experts + shared still warm-started). Un-collapse test:
+                                       # start balanced instead of inheriting the verifier's pre-collapsed routing.
 FROM_PRETRAINED="${FROM_PRETRAINED:-}"  # FROM_PRETRAINED=<dir> -> warm-start ALL draft weights from a saved
                                        # speculator checkpoint (a <N>/ ckpt dir: config.json + model.safetensors),
                                        # FRESH optimizer + FRESH cosine LR (NOT a resume). Takes precedence over
@@ -175,6 +178,7 @@ if [ "$INITATTN" = "1" ]; then EXTRA="$EXTRA --init-attn-from-target"; fi
 if [ "$INITHC" = "1" ]; then EXTRA="$EXTRA --init-hc-from-target"; fi
 if [ "$INITNORM" = "1" ]; then EXTRA="$EXTRA --init-norm-from-target"; fi
 if [ "$INITLAYER" = "1" ]; then EXTRA="$EXTRA --init-layer-from-target"; fi
+if [ "$INITNOROUTER" = "1" ]; then EXTRA="$EXTRA --init-moe-no-router"; fi
 if [ -n "$FROM_PRETRAINED" ]; then EXTRA="$EXTRA --from-pretrained $FROM_PRETRAINED"; fi
 
 # AMP experts: resolve "auto" -> downgrade to bf16 experts ONLY on the faithful+EP=0 path (rank0
