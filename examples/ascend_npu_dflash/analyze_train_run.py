@@ -422,12 +422,27 @@ def fwd_profiler_report(text: str) -> None:
         agg = {}
         for tag, ms in fwd:
             agg.setdefault(tag, []).append(int(ms))
-        rows = sorted(agg.items(), key=lambda kv: sum(kv[1]), reverse=True)
-        print(f"  block sub-ops (DSPARK_PROFILE_FWD): {len(fwd)} spike print(s)")
-        for tag, xs in rows:
-            print(f"    {tag:10} n={len(xs):>4}  max={max(xs):>6}ms  mean={sum(xs) // len(xs):>6}ms  "
-                  f"Σ={sum(xs):>8}ms")
-        print(f"  → dominant fwd sub-op: {rows[0][0]}   (MLA=latent attn, mHC=Sinkhorn hyper-conn, MoE=experts)")
+        # Split each sub-op into STEADY (median) vs SPIKE (prints > 3x steady) and sum the spike
+        # EXCESS-over-steady = the per-shape rebuild tax. Separates the recompile DRIVER (big spikeΣ,
+        # e.g. MoE grouped-GEMM re-building per varying per-expert token count) from a real STEADY
+        # cost (big steady, e.g. MLA eager sink-einsum). Derived from [FWD_PROF] ALONE → works when
+        # [MOE-PROF] is absent (EP/compile path where its hook doesn't fire, or older logs).
+        st = {}
+        for tag, xs in agg.items():
+            med = sorted(xs)[len(xs) // 2]
+            spk = [x for x in xs if med > 0 and x > 3 * med]
+            st[tag] = dict(xs=xs, med=med, nspk=len(spk),
+                           spk=sum(x - med for x in spk), tot=sum(xs))
+        rows = sorted(st.items(), key=lambda kv: kv[1]["tot"], reverse=True)
+        print(f"  block sub-ops (DSPARK_PROFILE_FWD): {len(fwd)} print(s)  "
+              f"[steady=median · spikeΣ=excess-over-steady = the per-shape rebuild tax]")
+        for tag, s in rows:
+            print(f"    {tag:10} n={len(s['xs']):>4}  steady={s['med']:>5}ms  max={max(s['xs']):>6}ms  "
+                  f"spikes={s['nspk']:>3}(>3×)  spikeΣ={s['spk']:>8}ms  Σ={s['tot']:>8}ms")
+        drv = max(st.items(), key=lambda kv: kv[1]["spk"])                       # biggest rebuild tax
+        stdy = max(st.items(), key=lambda kv: kv[1]["med"] * len(kv[1]["xs"]))   # biggest steady*n
+        print(f"  → recompile DRIVER (biggest spikeΣ) = {drv[0]}  |  STEADY-cost leader = {stdy[0]}   "
+              f"(MLA=latent attn · mHC=Sinkhorn hyper-conn · MoE=experts)")
 
     if moe:
         pm = [int(a) for a, _, _ in moe]
