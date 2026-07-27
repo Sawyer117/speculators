@@ -138,6 +138,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="best_vs_baseline.png", help="output PNG (default ./best_vs_baseline.png)")
+    ap.add_argument("--group", choices=["all", "nobalance", "balance"], default="all",
+                    help="which runs to render: all (default) | nobalance (f1 reproduction curve only) | "
+                         "balance (f1+bal only). Run twice for two separate figures.")
     args = ap.parse_args()
 
     try:
@@ -151,10 +154,15 @@ def main():
     rows = DATASETS + ["average"]
     base_al = dict(BASELINE, average=_avg(BASELINE))
     base_pos = dict(BASELINE_POS, average=_avg_pos(BASELINE_POS))
+    # --group filter: a run is "balance" iff its label carries "bal" (f1+bal…); else "nobalance".
+    def _is_bal(r):
+        return "bal" in r["label"]
+    sel = [r for r in RUNS
+           if args.group == "all" or (_is_bal(r) if args.group == "balance" else not _is_bal(r))]
     runs = [{"label": r["label"],
              "al": dict(r["al"], average=_avg(r["al"])),
              "pos": (dict(r["pos"], average=_avg_pos(r["pos"])) if r.get("pos") else None)}
-            for r in RUNS]
+            for r in sel]
     rows_per_group = 1 + len(runs)   # released + one row per run
 
     cmap = plt.get_cmap("RdYlGn")
@@ -185,7 +193,12 @@ def main():
 
     fig, ax = plt.subplots(figsize=(11.5, 0.9 + 0.42 * (len(cell_text) + 1)))
     ax.axis("off")
-    ax.set_title("DSV4-DSpark 77W  —  faithful single-norm(f1) reproduction curve (incl. over-train collapse) + noaux load-balance, vs released  (accept_len + per-position %)",
+    _gtag = {
+        "all": "f1 reproduction curve (incl. over-train collapse) + noaux load-balance",
+        "nobalance": "f1 single-norm reproduction curve (incl. over-train collapse)",
+        "balance": "f1 + noaux load-balance (DSPARK_MOE_BALANCE @ 5e-3)",
+    }[args.group]
+    ax.set_title(f"DSV4-DSpark 77W  —  {_gtag}, vs released  (accept_len + per-position %)",
                  fontsize=12, fontweight="bold", pad=16)
 
     tbl = ax.table(cellText=cell_text, colLabels=col_labels, cellColours=cell_colors,
