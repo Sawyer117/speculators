@@ -572,6 +572,25 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         # mHC streams across the stack; each block attends noise -> [ctx | block].
         hc = self.backbone_cfg.hc_mult
         streams = noise_embedding.unsqueeze(2).repeat(1, 1, hc, 1)  # [1, TB, hc, H]
+
+        # ── MoE noaux_tc LOAD BALANCING (DSPARK_MOE_BALANCE=1): apply the bias nudge from the PREVIOUS
+        #    step's stashed load, BEFORE this step's layers run — so the selection bias stays CONSTANT
+        #    through this forward AND its activation-checkpoint recompute in backward. (Updating it AFTER
+        #    the layers made the AC recompute re-route with a changed bias → CheckpointError shape-mismatch,
+        #    which fires hard with a fresh/uniform router.) One-step lag is negligible; first step
+        #    _step_load is None → no-op; the all-reduce inside makes the update identical across ranks.
+        if self.training and getattr(self.layers[0].ffn.router, "_balance", False):
+            if not getattr(self, "_balance_logged", False):
+                self._balance_logged = True
+                import torch.distributed as _d  # noqa: PLC0415
+                if not _d.is_initialized() or _d.get_rank() == 0:
+                    _r0 = self.layers[0].ffn.router
+                    print(f"[MOE-BALANCE] noaux_tc ON: rate={_r0._balance_rate} across "
+                          f"{len(self.layers)} routers (bias updated PRE-layer from prev-step load; AC-safe)",
+                          flush=True)
+            for _layer in self.layers:
+                _layer.ffn.router.update_load_balance_bias()
+
         for layer_idx, layer in enumerate(self.layers):
             attn_bias = (
                 sliding_window_attn_mask
@@ -589,21 +608,6 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 streams = checkpoint(layer, *layer_args, use_reentrant=False)
             else:
                 streams = layer(*layer_args)
-
-        # ── MoE noaux_tc LOAD BALANCING (DSPARK_MOE_BALANCE=1): once per step, after this step's routing,
-        #    nudge each router's selection bias toward uniform expert load (the all-reduce inside makes the
-        #    update identical across ranks). Off by default = frozen bias = the collapse we diagnosed.
-        if self.training and getattr(self.layers[0].ffn.router, "_balance", False):
-            if not getattr(self, "_balance_logged", False):
-                self._balance_logged = True
-                import torch.distributed as _d  # noqa: PLC0415
-                if not _d.is_initialized() or _d.get_rank() == 0:
-                    _r0 = self.layers[0].ffn.router
-                    print(f"[MOE-BALANCE] noaux_tc ON: rate={_r0._balance_rate} across "
-                          f"{len(self.layers)} routers (bias updated once/step toward uniform load)",
-                          flush=True)
-            for _layer in self.layers:
-                _layer.ffn.router.update_load_balance_bias()
 
         # ── MoE LOAD-BALANCE diagnostic (DSPARK_LOG_EXPERT_LOAD=1): confirm/deny expert collapse
         #    (a few of the 256 experts hogging the routing). rank0, throttled ~1/20 fwd. Zero cost off.
