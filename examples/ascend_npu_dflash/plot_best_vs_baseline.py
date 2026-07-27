@@ -123,6 +123,20 @@ RUNS = [
             "mt-bench":  [68.61, 41.15, 21.25, 11.45, 6.34],
         },
     },
+    {
+        # 1.5ep balance: VERDICT — balance is NOT the lever. Curve 0.5→1.0→1.5ep = 3.53→3.52→3.47
+        # (slow decline from the start, never climbed); at the SAME 1.5ep no-balance f1 PEAK 3.63 wins.
+        # Both arms over-train under LR 3e-4 → decline is LR-driven, not collapse. Next lever = lower LR.
+        "label": "f1+bal 1.5ep ↓",
+        "al": {"gsm8k": 3.963, "math500": 3.675, "humaneval": 3.740, "mbpp": 3.482, "mt-bench": 2.475},
+        "pos": {
+            "gsm8k":     [89.48, 76.93, 53.68, 42.44, 33.77],
+            "math500":   [86.99, 72.58, 47.56, 34.74, 25.64],
+            "humaneval": [91.89, 79.56, 44.66, 33.09, 24.76],
+            "mbpp":      [86.87, 69.87, 41.12, 29.33, 21.00],
+            "mt-bench":  [68.76, 42.15, 19.31, 10.89, 6.41],
+        },
+    },
 ]
 
 
