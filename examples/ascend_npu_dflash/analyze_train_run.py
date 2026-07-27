@@ -100,7 +100,18 @@ def load(path: str) -> tuple[list[dict], str]:
             try:
                 _fwd = float(r["profile/fwd_ms"])
                 _al = float(r.get("profile/align_ms", 0.0) or 0.0)
-                r["profile/fwd_compute_ms"] = max(0.0, _fwd - _al)
+                # EP all-to-all straggler: a rank starved on HS reaches the MoE all-to-all LATE, so the
+                # other ranks (incl rank0, whose record this is) WAIT there — and that wait lands INSIDE
+                # fwd_ms, NOT align_ms. ([MOE-PROF] verdict 2026-07-27: the local GMM is 2-5ms stable; the
+                # fwd "spike" IS the all-to-all wait.) Estimate = how much longer the SLOWEST rank fetched
+                # than this one: max(0, fetch_ms_max − fetch_ms). ~0 on balanced steps, huge on a starved
+                # step (fetch_ms_max 24419 vs own 26). Subtract it too → fwd_compute is the TRUE compute
+                # (else this rank's wait is mislabelled "recompile"). No fetch_ms_max in log → a2a=0 (no-op).
+                _fx = float(r.get("profile/fetch_ms", 0.0) or 0.0)
+                _fxm = float(r.get("profile/fetch_ms_max", 0.0) or 0.0)
+                _a2a = max(0.0, _fxm - _fx)
+                r["profile/a2a_straggler_ms"] = _a2a
+                r["profile/fwd_compute_ms"] = max(0.0, _fwd - _al - _a2a)
             except (TypeError, ValueError):
                 pass
     return recs, text
@@ -262,7 +273,7 @@ def _headline(recs, ckpt_steps, spike_k=3.0) -> dict:
 
     fwd_s, fetch_s, step_s = _steady("profile/fwd_compute_ms"), _steady("profile/fetch_ms"), _steady("profile/step_ms")
     total = sum(col(recs, "profile/step_ms")) or 1.0
-    align_ov = sum(col(recs, "profile/align_ms"))   # HS-straggler barrier wait (all overhead; not spiky)
+    align_ov = sum(col(recs, "profile/align_ms")) + sum(col(recs, "profile/a2a_straggler_ms"))  # HS-straggler: align barrier + EP all-to-all wait
 
     def _excess(key, steady, only_nonckpt=False):
         if steady is None:
@@ -814,19 +825,20 @@ def main() -> None:
                 tot += v - steady
         return tot
 
-    recompile_ov = _excess("profile/fwd_compute_ms", fwd_steady)             # excess TRUE fwd = grouped-GEMM recompile / AscendC stall
-    align_ov = sum(col(recs, "profile/align_ms"))                            # ALL of it = HS-straggler barrier wait (serve too slow)
+    recompile_ov = _excess("profile/fwd_compute_ms", fwd_steady)             # excess TRUE fwd (align + all-to-all straggler already removed) = grouped-GEMM recompile / AscendC stall
+    align_ov = sum(col(recs, "profile/align_ms"))                            # explicit all-gather barrier wait
+    a2a_ov = sum(col(recs, "profile/a2a_straggler_ms"))                      # EP all-to-all wait for an HS-STARVED rank (was mislabelled "recompile" — [MOE-PROF] verdict)
     hs_ov = _excess("profile/fetch_ms", fetch_steady, only_nonckpt=True)     # excess HS-fetch = local H2D / load stall (ckpt saves excluded)
     ckpt_ov = sum(max(0.0, f(r, "profile/step_ms") - step_steady) for r in recs
                   if step_of(r) in ckpt_steps and f(r, "profile/step_ms") is not None)
-    floor = max(0.0, total - recompile_ov - align_ov - hs_ov - ckpt_ov)
+    floor = max(0.0, total - recompile_ov - align_ov - a2a_ov - hs_ov - ckpt_ov)
     print(f"  {'component':30} {'time':>9}   {'% wall-clock':>12}")
     for label, v in [("steady compute (floor)", floor), ("recompile (true-fwd excess)", recompile_ov),
-                     ("HS straggler (align barrier)", align_ov), ("HS fetch stall (excess)", hs_ov),
-                     ("checkpoint saves", ckpt_ov)]:
+                     ("HS straggler (align barrier)", align_ov), ("HS straggler (EP all-to-all)", a2a_ov),
+                     ("HS fetch stall (excess)", hs_ov), ("checkpoint saves", ckpt_ov)]:
         print(f"  {label:30} {v/1000:7.1f}s   {100*v/total:11.1f}%")
-    rc, hs, al = 100 * recompile_ov / total, 100 * hs_ov / total, 100 * align_ov / total
-    serve = hs_ov + align_ov                     # both trace to the serve/HS pipeline
+    rc, hs, al = 100 * recompile_ov / total, 100 * hs_ov / total, 100 * (align_ov + a2a_ov) / total
+    serve = hs_ov + align_ov + a2a_ov            # all trace to the serve/HS pipeline
     sv = 100 * serve / total
     print("  ── verdict ──")
     if serve >= 2 * recompile_ov and sv >= 10:
