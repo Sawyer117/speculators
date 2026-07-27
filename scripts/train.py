@@ -1067,6 +1067,30 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--init-moe-no-router",
+        action="store_true",
+        help=(
+            "With --init-moe-from-target (or --init-layer-from-target): warm-start the "
+            "routed experts + shared expert but leave the ROUTER at a FRESH random init "
+            "(gate.weight ~ N(0, 0.02), bias 0). Avoids importing the verifier's "
+            "pre-concentrated routing, which collapses fast on the draft's NARROWER "
+            "hidden distribution. Pair with DSPARK_MOE_BALANCE to hold balance. "
+            "Supersedes --init-moe-zero-bias when both are set (dsv4_dspark)."
+        ),
+    )
+    parser.add_argument(
+        "--init-moe-zero-bias",
+        action="store_true",
+        help=(
+            "With --init-moe-from-target: warm-start the router gate.weight but NOT the "
+            "verifier's aux-free balance bias — start bias at 0 and let "
+            "DSPARK_MOE_BALANCE rebuild it for the DRAFT distribution instead of "
+            "inheriting the verifier's mis-calibrated (and previously frozen) balance "
+            "solution. Milder than --init-moe-no-router: keeps the semantic routing "
+            "(dsv4_dspark)."
+        ),
+    )
+    parser.add_argument(
         "--init-attn-from-target",
         action="store_true",
         help="Warm-start each draft layer's MLA core projections (wq_a/q_norm/wq_b/wkv/"

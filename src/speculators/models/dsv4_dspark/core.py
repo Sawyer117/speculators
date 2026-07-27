@@ -191,7 +191,11 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         if kwargs.get("init_layer_from_target"):
             parts |= {"attn", "hc", "norm", "moe"}
         if parts:
-            model.load_verifier_layer(parts)
+            model.load_verifier_layer(
+                parts,
+                skip_router=bool(kwargs.get("init_moe_no_router")),
+                zero_bias=bool(kwargs.get("init_moe_zero_bias")),
+            )
         return model
 
     def load_verifier_weights(self) -> None:
@@ -255,7 +259,8 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         """Back-compat shim: warm-start only the MoE. See :meth:`load_verifier_layer`."""
         self.load_verifier_layer({"moe"})
 
-    def load_verifier_layer(self, parts) -> None:
+    def load_verifier_layer(self, parts, *, skip_router: bool = False,
+                            zero_bias: bool = False) -> None:
         """Warm-start the requested PARTS of each draft layer from the matching verifier
         layer: draft layer ``n`` <- verifier layer ``target_layer_ids[n]`` (the layers
         ``main_proj`` conditions on). A draft layer is architecturally a DSV4 target layer,
@@ -269,6 +274,9 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             ``ffn_hc`` <- ``hc_ffn_*``; the sole flat->dotted rename).
           * ``"norm"`` — the two RMSNorms (``attn_norm``, ``ffn_norm``).
           * ``"moe"``  — routed experts (EP-local slice) + router (<- ``ffn.gate``) + shared.
+            ``skip_router`` leaves the router at a fresh random init (experts still warm-
+            started); ``zero_bias`` warm-starts ``gate.weight`` but not the aux-free balance
+            bias (starts at 0 for ``DSPARK_MOE_BALANCE`` to rebuild). See the router-copy site.
 
         EP-aware for experts (the stacked ``GroupedExperts`` weights are still plain per-rank
         tensors at build time — before the ``Shard(0)`` wrap — so each rank copies only its
@@ -365,9 +373,26 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 _copy(_resolve(blk, da), _need(w, vk))
 
             if "moe" in parts:
-                # router (gate): weight trainable; bias is the frozen aux-free balance bias
-                _copy(ffn.router.weight, _need(w, pre + "ffn.gate.weight"))
-                _copy(ffn.router.bias, _need(w, pre + "ffn.gate.bias"))
+                # router (gate): weight trainable; bias is the aux-free balance bias.
+                if skip_router:
+                    # Fresh router (--init-moe-no-router): do NOT import the verifier's
+                    # routing. Its gate.weight was tuned to spread the verifier's DIVERSE
+                    # 61-layer hidden distribution; on the draft's NARROWER hidden states
+                    # (3 layers + injected target-HS) that same W projects everything onto
+                    # a few experts -> fast collapse. A fresh small-normal init routes
+                    # ~uniformly at step 0 (matches _init_backbone_params std); let
+                    # DSPARK_MOE_BALANCE + training find the draft's own routing. bias
+                    # stays at its 0 init. torch.empty at build would be raw garbage here
+                    # (skipped by _init_backbone_params if finite), so re-init explicitly.
+                    nn.init.normal_(ffn.router.weight, std=0.02)
+                else:
+                    _copy(ffn.router.weight, _need(w, pre + "ffn.gate.weight"))
+                    # zero_bias (--init-moe-zero-bias): keep the semantic gate.weight but
+                    # leave the balance bias at its 0 init so DSPARK_MOE_BALANCE rebuilds
+                    # it for the DRAFT distribution, instead of inheriting the verifier's
+                    # mis-calibrated (historically frozen) balance solution.
+                    if not zero_bias:
+                        _copy(ffn.router.bias, _need(w, pre + "ffn.gate.bias"))
                 for wn in ("w1", "w2", "w3"):
                     _copy(getattr(ffn.shared_experts, wn).weight,
                           _need(w, f"{pre}ffn.shared_experts.{wn}.weight"))
@@ -385,9 +410,15 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                             )
                         stacked.data[i].copy_(src)
 
+        router_note = ""
+        if "moe" in parts:
+            if skip_router:
+                router_note = " [router: FRESH random init, not warm-started]"
+            elif zero_bias:
+                router_note = " [router: gate.weight warm-started, balance bias zeroed]"
         logging.getLogger(__name__).info(
-            "init-from-target: warm-started parts %s of %d draft layers from verifier layers %s.",
-            sorted(parts), bb.n_draft_layers, list(tids[: bb.n_draft_layers]),
+            "init-from-target: warm-started parts %s of %d draft layers from verifier layers %s.%s",
+            sorted(parts), bb.n_draft_layers, list(tids[: bb.n_draft_layers]), router_note,
         )
 
     def _init_backbone_params(self) -> None:
