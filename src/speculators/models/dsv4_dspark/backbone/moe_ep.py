@@ -129,9 +129,14 @@ def moe_dispatch_ep(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tenso
     # ---- degenerate: no EP (single rank / unconfigured) == grouped over all local experts ----
     if ep is None or ep.size == 1 or not dist.is_initialized():
         n_local = ep.experts_per_rank if ep is not None else n_routed_experts
-        out = _local_grouped_ffn(x[tok], eid, w, experts, n_local)
+        # Float the input so the NPU fused grouped-GEMM runs (and returns) fp32 -- matching the
+        # EP path (line ~142 `xf = x[tok].float()`) and the CPU ref. Without this the fused NPU
+        # kernel returns bf16 and the fp32 index_add_ below raises a scalar-type mismatch (the
+        # single-card / no-EP NPU path -- e.g. the forward-only router probe -- was the only
+        # caller of this branch, so it went unnoticed).
+        out = _local_grouped_ffn(x[tok].float(), eid, w, experts, n_local)
         y = torch.zeros(T, dim, dtype=torch.float32, device=device)
-        y.index_add_(0, tok, out)
+        y.index_add_(0, tok, out.float())  # belt: no-op when already fp32
         return y
 
     # ---- route each unit to its expert's owner rank, sort by owner ----
