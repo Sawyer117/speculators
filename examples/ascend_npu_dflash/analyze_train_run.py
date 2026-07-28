@@ -552,6 +552,69 @@ def moe_load_report(text: str) -> None:
         print("    ✓ balanced (high entropy, most experts used) — load balancing is NOT the bottleneck.")
 
 
+def hs_split_report(text: str) -> None:
+    """HS-fetch 3-phase split from ``[HS-SPLIT]`` prints (DSPARK_HS_SPLIT=1). Silent if absent.
+    Each SLOW fetch (> DSPARK_HS_SPLIT_MS) is split into: create (the completions.create() round-trip
+    = serve prefill/compute + HTTP), wait (create -> file appears = serve dumper NFS write + dirent
+    visibility), read (load_file of the ~132MB safetensors = trainer NFS read). This PINS a per-rank
+    HS straggler to the SERVE (create/wait) vs the trainer's NFS read (read) — settling the
+    'is it NFS/NUMA or the serve?' question directly instead of guessing topology."""
+    rows = re.findall(
+        r"\[HS-SPLIT\] rank=(\S+) idx=\S+ total=\d+ms create=(\d+) wait=(\d+) read=(\d+)",
+        text,
+    )
+    if not rows:
+        return  # DSPARK_HS_SPLIT off / older log — stay silent
+
+    def _med(a):
+        if not a:
+            return 0
+        s = sorted(a)
+        return int(s[len(s) // 2])
+
+    by_rank: dict[str, dict] = {}
+    all_c: list = []
+    all_w: list = []
+    all_r: list = []
+    for rk, c, w, rd in rows:
+        c, w, rd = int(c), int(w), int(rd)
+        d = by_rank.setdefault(rk, {"create": [], "wait": [], "read": []})
+        d["create"].append(c)
+        d["wait"].append(w)
+        d["read"].append(rd)
+        all_c.append(c)
+        all_w.append(w)
+        all_r.append(rd)
+
+    print("\n-- HS FETCH 3-PHASE SPLIT (DSPARK_HS_SPLIT) " + "-" * 35)
+    print(f"  {len(rows)} slow fetches logged (> DSPARK_HS_SPLIT_MS). medians (ms):")
+    print(f"  {'rank':>5} {'n':>6} {'create':>9} {'wait':>7} {'read':>7}")
+    for rk in sorted(by_rank, key=lambda x: int(x) if x.isdigit() else 99):
+        d = by_rank[rk]
+        print(f"  {rk:>5} {len(d['read']):>6} {_med(d['create']):>9} {_med(d['wait']):>7} {_med(d['read']):>7}")
+    mc, mw, mr = _med(all_c), _med(all_w), _med(all_r)
+    tot = max(1, mc + mw + mr)
+    print(f"  {'ALL':>5} {len(rows):>6} {mc:>9} {mw:>7} {mr:>7}   "
+          f"→ create {100 * mc // tot}% / wait {100 * mw // tot}% / read {100 * mr // tot}%")
+    dom = max((("create", mc), ("wait", mw), ("read", mr)), key=lambda kv: kv[1])[0]
+    print("  ── verdict ──")
+    if dom == "create":
+        print("    ★ SERVE-BOUND: the straggler is `create` = the completions.create() round-trip")
+        print("    (serve prefill/compute + HTTP), NOT NFS I/O (wait/read are tiny). The serve can't")
+        print("    prefill+return HS fast enough — over-subscribed (NPROC*NUM_WORKERS concurrent")
+        print("    prefills vs the serve's max-num-batched-tokens). FIX = serve throughput (more DP /")
+        print("    bigger max-num-batched-tokens / w8a8), fewer concurrent fetchers, or RAISE")
+        print("    --max-anchors (heavier step lets the serve keep up). NUMA-pin does NOTHING here.")
+    elif dom == "wait":
+        print("    SERVE-WRITE-bound: `wait` (create -> file appears) dominates = the serve dumper's")
+        print("    NFS write / dirent-visibility lag. FIX = async dump / stage to local disk + sidecar /")
+        print("    NFS mount tuning (async, larger wsize).")
+    else:
+        print("    NFS-READ-bound: `read` (load_file) dominates = the TRAINER's NFS read of the ~132MB")
+        print("    safetensors is slow (NUMA-far from the NIC / congested NFS). FIX = NUMA-pin the")
+        print("    dataloader workers to the NIC's NUMA node, or read-once + HCCS broadcast.")
+
+
 def main() -> None:
     args = _build_parser().parse_args()
 
@@ -661,6 +724,7 @@ def main() -> None:
 
     fwd_profiler_report(raw_text)
     moe_load_report(raw_text)
+    hs_split_report(raw_text)
 
     # ---------------- recent dynamics (is it STILL learning?) ----------------
     N = args.recent

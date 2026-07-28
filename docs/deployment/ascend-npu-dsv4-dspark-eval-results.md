@@ -263,6 +263,21 @@ AL flat 4.032→4.006), others flat-to-slightly-up (mbpp/mt-bench tail all +). S
 in ONE shot (captured at ep0mid); subsequent training first converges the head. The tail's climb toward released (63/53)
 is the thing to watch over epochs 1-10 — NOT yet moving at ep1. Next: convert+eval epoch1 (`1/`) for the next curve point.
 
+## fresh-router bal1e2 (full un-collapse) — ep1 (1.0 epoch), 2026-07-28 — ★ UN-COLLAPSE HURTS
+
+- **Draft**: `dsv4_dspark_ep1_freshrtr_bal1e2_vllm-77w` — A3 fresh-router (`INIT_MOE_NO_ROUTER` + `DSPARK_MOE_BALANCE` rate **1e-2** → N_eff ~120 on ALL 3 layers, fully un-collapsed), COMPILE=0 resume from CKPT1, 1.0 epoch.
+- **Serve**: A3 single-node bf16 (`serve_dsv4_a3_singlenode`, EAGER=0, FLASHCOMM1=0, num_spec=5, conc 16), `DATASET=all` full.
+
+| Dataset | Samples | tok/s | accept_len | accept_rate | pos0 | pos1 | pos2 | pos3 | pos4 |
+|---------|:-------:|:-----:|:----------:|:-----------:|:----:|:----:|:----:|:----:|:----:|
+| gsm8k | 1309 | 273.71 | **3.045** | 40.91% | 90.00 | 50.56 | 28.07 | 20.29 | 15.62 |
+| math500 | 490 | 361.12 | **2.716** | 34.32% | 87.38 | 41.45 | 20.29 | 13.22 | 9.26 |
+| humaneval | 154 | 216.99 | **2.745** | 34.91% | 91.87 | 40.97 | 19.87 | 13.02 | 8.80 |
+| mbpp | 247 | 399.66 | **2.684** | 33.69% | 87.15 | 39.44 | 20.23 | 13.03 | 8.58 |
+| mt-bench | 70 | 308.93 | **2.117** | 22.33% | 68.73 | 25.03 | 9.94 | 5.15 | 2.81 |
+
+**Read — ★ UN-COLLAPSE HURTS (balance is NEGATIVE, not neutral).** Mean AL ≈ **2.66**, gsm8k **3.045** — well BELOW no-balance-f1 (gsm8k ~3.5-3.63) and released (4.42 / gsm8k 4.658). Forcing full un-collapse (N_eff ~120 on all 3 layers) LOWERS serve accept, esp. the **tail** (gsm8k pos1 50 vs `ep0end-nc` 77, pos2 28 vs 57). ⟹ **SOME specialization/collapse is beneficial** — matches the released draft's gate.bias asymmetry (only layer 0 balanced, mtp.1/2 collapsed → still 4.42). Confound: ep1 (1.0ep) vs the 3.63 at 1.5ep, but the ~0.5 gap is too big to be epoch alone. **CONCLUSION: do NOT balance/un-collapse. The training-proxy "balance ≈ no-balance" (3-way flat ~3.15) UNDERSTATED it — the SERVE eval shows balance is a NET LOSS.**
+
 ## Baselines / TODO
 
 - [x] **released draft — full `DATASET=all`** on our serve → **DONE 2026-07-20** (mean 4.42; gsm8k 4.658
