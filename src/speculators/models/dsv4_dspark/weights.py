@@ -237,6 +237,19 @@ def verify_mapping(released_keys, cfg: DSparkDraftConfig) -> dict:
 # per-expert released key -> our layer/index for stacking into GroupedExperts.
 _EXPERT_RE = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\.weight$")
 
+# map_released_key predates a rename in the live model: the target-hidden conditioning
+# projection/norm the release calls main_proj/main_norm are built by the shared
+# DFlash/DSpark base as ``fc`` / ``hidden_norm`` (core.py: "fc(=main_proj role)"). Remap
+# so the release loads onto the live parameters. (map_released_key + expected_draft_keys
+# are also stale for this; fix them there when the convert path is next touched.)
+_LIVE_RENAME = {
+    "main_proj.weight": "fc.weight",
+    "main_norm.weight": "hidden_norm.weight",
+}
+# our params with no release source that are NOT a problem: the release's confidence head
+# has no bias (ours built one -> left at init; it does not feed routing/backbone).
+_ALLOWED_MISSING = ("confidence_head.proj.bias",)
+
 
 def load_released_draft(model, released_dir, *, verbose: bool = True) -> dict:
     """Load a RELEASED (or standalone-converted) DSpark draft into ``model`` in place.
@@ -290,6 +303,7 @@ def load_released_draft(model, released_dir, *, verbose: bool = True) -> dict:
                 if tgt is None:
                     n_skipped += 1
                     continue
+                tgt = _LIVE_RENAME.get(tgt, tgt)  # main_proj/main_norm -> fc/hidden_norm
                 t = f.get_tensor(k)
                 if t.element_size() == 1:  # fp8 / fp4 block-quant weight (has a .scale)
                     raise ValueError(
@@ -316,7 +330,11 @@ def load_released_draft(model, released_dir, *, verbose: bool = True) -> dict:
     frozen = tuple(
         s for s in ("verifier_lm_head", "verifier_norm", "embed_tokens", "lm_head")
     )
-    surprising = [k for k in missing if not k.startswith(frozen) and "freqs_cis" not in k]
+    surprising = [
+        k for k in missing
+        if not k.startswith(frozen) and "freqs_cis" not in k
+        and k not in _ALLOWED_MISSING
+    ]
     report = {
         "loaded": len(mapped),
         "skipped": n_skipped,
