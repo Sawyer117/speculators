@@ -460,7 +460,7 @@ def _draft_sample_from_anchor(draft) -> bool:
 
 
 def _is_preprojection_correction(draft) -> bool:
-    """Return whether ``draft`` exposes the three-feature Correction interface."""
+    """Return whether ``draft`` exposes the native causal Correction interface."""
     correction = getattr(draft, "correction_head", None)
     return correction is not None and hasattr(correction, "position_embedding")
 
@@ -472,10 +472,10 @@ def _run_preprojection_correction_rollout(
     anchor_token_ids,
     temperature: float,
 ):
-    """Run the native previous-token/hidden/position Correction rollout."""
+    """Run native Correction rollout, including optional previous-logit feedback."""
     if not _is_preprojection_correction(draft):
         raise RuntimeError(
-            "This evaluator expects the pre-projection three-feature CorrectionHead"
+            "This evaluator expects the native causal CorrectionHead"
         )
     return draft.rollout_correction(
         hidden_states,
@@ -892,8 +892,9 @@ class DSparkOfflineRunner:
             )
 
         hidden = draft.norm(noise_embedding)
-        # Correction modifies DFlash hidden before the only vocabulary projection.
-        # Markov/plain DSpark still consumes the ordinary base logits.
+        # Correction rollout performs its own per-position projection so it can
+        # feed generated tokens (and, in logits mode, final logits) forward.
+        # Markov/plain DSpark consumes this ordinary block-level base projection.
         base_logits = (
             None if draft.correction_head is not None else draft.lm_head(hidden)
         )
@@ -905,7 +906,7 @@ class DSparkOfflineRunner:
         hidden_states,
         first_prev_token_id,
     ):
-        """Sample with the pre-projection three-feature Correction rollout."""
+        """Sample with native causal Correction rollout."""
         del base_logits
         draft = self.draft_model
         temperature = float(self.args.temperature)
@@ -1430,13 +1431,13 @@ def run(args: argparse.Namespace) -> None:
     if draft_model.correction_head is not None:
         if not _is_preprojection_correction(draft_model):
             raise RuntimeError(
-                "Loaded checkpoint does not use the pre-projection three-feature "
-                "CorrectionHead"
+                "Loaded checkpoint does not use the native causal CorrectionHead"
             )
         sequential_head = (
-            f"correction+markov:{draft_config.markov_head_type}"
+            f"correction:{draft_config.correction_output_mode}"
+            f"+markov:{draft_config.markov_head_type}"
             if draft_model.markov_head is not None
-            else "correction:pre-projection"
+            else f"correction:{draft_config.correction_output_mode}"
         )
     elif draft_model.markov_head is not None:
         sequential_head = f"markov:{draft_config.markov_head_type}"

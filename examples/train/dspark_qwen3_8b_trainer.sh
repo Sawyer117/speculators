@@ -41,11 +41,21 @@ DRAFT_ATTN_IMPL="sdpa"     # Use eager/sdpa on hardware without flex attention.
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
 CORRECTION_HEAD_ARGS=(--enable-correction-head)
+# hidden: existing single-LM-head hidden residual baseline.
+# logits: feed previous verifier/generated logits and add a Markov-like vocab bias.
+CORRECTION_OUTPUT_MODE="hidden"
 CORRECTION_HIDDEN_SIZE=512
 CORRECTION_RANK=256
 CORRECTION_NUM_LAYERS=1
 CORRECTION_NUM_HEADS=8
 CORRECTION_GATE_BIAS=0.0
+# Optional hidden-state supervision and recurrent corrected-hidden feedback.
+# Both remain off for exact baseline parity.
+CORRECTION_HIDDEN_AUX_ARGS=(--no-correction-hidden-aux-loss)
+CORRECTION_HIDDEN_AUX_WEIGHT=0.1
+CORRECTION_HIDDEN_FEEDBACK_ARGS=(--no-correction-hidden-feedback)
+# In logits mode, enable this for LMHead(h_DFlash + delta_hidden) + delta_logits.
+CORRECTION_PROJECT_HIDDEN_ARGS=(--no-correction-project-corrected-hidden)
 # Keep disabled for the existing Correction baseline. Switch to
 # (--correction-with-markov) for gated Correction + Markov collaboration.
 CORRECTION_COLLABORATION_ARGS=(--no-correction-with-markov)
@@ -56,8 +66,8 @@ CORRECTION_GENERATED_TOKEN_RATIO=0.0
 CORRECTION_GENERATED_TOKEN_WARMUP=0.2
 CORRECTION_GENERATED_TOKEN_RAMP=0.4
 CORRECTION_ROLLOUT_METRICS_ARGS=(--correction-rollout-metrics)
-# Enable only when validation-only base change/gain diagnostics are worth an
-# additional LM-head projection. Correction itself never consumes base logits.
+# Hidden mode: enable only when validation-only base change/gain diagnostics are
+# worth an additional LM-head projection. Logits mode already computes base logits.
 CORRECTION_BASE_DIAGNOSTICS_ARGS=(--no-correction-base-diagnostics)
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
@@ -125,11 +135,16 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --markov-rank "$MARKOV_RANK" \
     --markov-head-type "$MARKOV_HEAD_TYPE" \
     "${CORRECTION_HEAD_ARGS[@]}" \
+    --correction-output-mode "$CORRECTION_OUTPUT_MODE" \
     --correction-hidden-size "$CORRECTION_HIDDEN_SIZE" \
     --correction-rank "$CORRECTION_RANK" \
     --correction-num-layers "$CORRECTION_NUM_LAYERS" \
     --correction-num-heads "$CORRECTION_NUM_HEADS" \
     --correction-gate-bias "$CORRECTION_GATE_BIAS" \
+    "${CORRECTION_HIDDEN_AUX_ARGS[@]}" \
+    --correction-hidden-aux-weight "$CORRECTION_HIDDEN_AUX_WEIGHT" \
+    "${CORRECTION_HIDDEN_FEEDBACK_ARGS[@]}" \
+    "${CORRECTION_PROJECT_HIDDEN_ARGS[@]}" \
     "${CORRECTION_COLLABORATION_ARGS[@]}" \
     --correction-markov-gate-bias "$CORRECTION_MARKOV_GATE_BIAS" \
     --correction-generated-token-ratio "$CORRECTION_GENERATED_TOKEN_RATIO" \

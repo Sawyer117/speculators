@@ -1,5 +1,7 @@
 """Sequential correction, Markov, and confidence heads for DSpark."""
 
+from typing import Literal
+
 import torch
 from torch import nn
 from torch.nn.functional import scaled_dot_product_attention, silu
@@ -110,12 +112,21 @@ class _TinyCausalLayer(nn.Module):
 
 
 class CausalCorrectionHead(nn.Module):
-    """Predict a gated hidden residual before the draft vocabulary projection.
+    """Predict a gated hidden or logit residual for the parallel DFlash output.
 
     Each block position combines the previous-token embedding, the current DFlash
     hidden state, and a learned block-position embedding.  Causal attention carries
-    those features across the block.  The returned ``delta_hidden`` is added to the
-    DFlash hidden state before the model's single LM-head projection.
+    those features across the block.
+
+    ``output_mode="hidden"`` preserves the baseline path: the returned residual is
+    added to the DFlash hidden state before the model's single full LM-head
+    projection. ``output_mode="logits"`` additionally encodes the previous
+    position's target/generated logits and returns a low-rank vocabulary bias that
+    is added to ordinary DFlash base logits, analogous to the Markov head. Optional
+    auxiliary hidden output and corrected-hidden feedback let logit mode retain and
+    propagate a trainable pre-LM representation without changing its token output
+    path. The caller may alternatively project that corrected hidden for the
+    current token before adding the vocabulary residual.
     """
 
     def __init__(
@@ -129,6 +140,10 @@ class CausalCorrectionHead(nn.Module):
         num_layers: int = 1,
         num_heads: int = 8,
         gate_bias: float = 0.0,
+        output_mode: Literal["hidden", "logits"] = "hidden",
+        draft_vocab_size: int | None = None,
+        enable_hidden_auxiliary: bool = False,
+        enable_hidden_feedback: bool = False,
     ) -> None:
         super().__init__()
         if correction_hidden_size <= 0:
@@ -139,7 +154,18 @@ class CausalCorrectionHead(nn.Module):
             raise ValueError("block_size must be positive")
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
+        if output_mode not in ("hidden", "logits"):
+            raise ValueError(f"Unsupported correction output mode: {output_mode!r}")
+        if output_mode == "logits" and (
+            draft_vocab_size is None or draft_vocab_size <= 0
+        ):
+            raise ValueError(
+                "draft_vocab_size must be positive for logit-residual Correction"
+            )
 
+        self.output_mode = output_mode
+        self.draft_vocab_size = draft_vocab_size
+        self.enable_hidden_feedback = enable_hidden_feedback
         self.hidden_proj = nn.Linear(
             input_hidden_size, correction_hidden_size, bias=False
         )
@@ -158,24 +184,86 @@ class CausalCorrectionHead(nn.Module):
             correction_hidden_size, correction_rank, bias=False
         )
         self.correction_up = nn.Linear(
-            correction_rank, input_hidden_size, bias=False
+            correction_rank,
+            input_hidden_size if output_mode == "hidden" else int(draft_vocab_size),
+            bias=False,
         )
+        self.previous_logits_down: nn.Linear | None = None
+        self.previous_logits_proj: nn.Linear | None = None
+        if output_mode == "logits":
+            # Markov-like W1/W2 factorization around the causal head:
+            #   previous probs[V] -> rank -> correction state -> rank -> bias[V].
+            # Keeping W1 separate from the zero-initialized output W2 makes the
+            # previous-logit feature available from the first training step.
+            self.previous_logits_down = nn.Linear(
+                int(draft_vocab_size), correction_rank, bias=False
+            )
+            self.previous_logits_proj = nn.Linear(
+                correction_rank, correction_hidden_size, bias=False
+            )
+        self.hidden_feedback_proj: nn.Linear | None = None
+        if enable_hidden_feedback:
+            self.hidden_feedback_proj = nn.Linear(
+                input_hidden_size, correction_hidden_size, bias=False
+            )
+        self.auxiliary_hidden_up: nn.Linear | None = None
+        self.auxiliary_hidden_gate: nn.Linear | None = None
+        if output_mode == "logits" and (
+            enable_hidden_auxiliary or enable_hidden_feedback
+        ):
+            self.auxiliary_hidden_up = nn.Linear(
+                correction_rank, input_hidden_size, bias=False
+            )
+            self.auxiliary_hidden_gate = nn.Linear(correction_hidden_size, 1)
         self.residual_gate = nn.Linear(correction_hidden_size, 1)
         nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.correction_up.weight)
         nn.init.zeros_(self.residual_gate.weight)
         nn.init.constant_(self.residual_gate.bias, gate_bias)
+        if self.auxiliary_hidden_up is not None:
+            nn.init.zeros_(self.auxiliary_hidden_up.weight)
+        if self.auxiliary_hidden_gate is not None:
+            nn.init.zeros_(self.auxiliary_hidden_gate.weight)
+            nn.init.constant_(self.auxiliary_hidden_gate.bias, gate_bias)
+
+    def auxiliary_hidden_residual(
+        self, causal_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Project Correction states to an auxiliary DFlash-hidden residual."""
+        if self.output_mode == "hidden":
+            return self.correction_up(silu(self.correction_down(causal_states))) * (
+                torch.sigmoid(self.residual_gate(causal_states))
+            )
+        if self.auxiliary_hidden_up is None or self.auxiliary_hidden_gate is None:
+            raise RuntimeError(
+                "Auxiliary hidden residual was not enabled for logit Correction"
+            )
+        delta_hidden = self.auxiliary_hidden_up(
+            silu(self.correction_down(causal_states))
+        )
+        return delta_hidden * torch.sigmoid(
+            self.auxiliary_hidden_gate(causal_states)
+        )
 
     def forward(
         self,
         previous_token_embeddings: torch.Tensor,
         dflash_hidden: torch.Tensor,
         block_positions: torch.Tensor,
+        previous_logits: torch.Tensor | None = None,
+        previous_logits_mask: torch.Tensor | None = None,
+        previous_corrected_hidden: torch.Tensor | None = None,
+        previous_corrected_hidden_mask: torch.Tensor | None = None,
         cache: CorrectionCache | None = None,
         *,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, CorrectionCache | None]:
-        """Return ``(delta_hidden, causal_states, next_cache)``."""
+        """Return ``(delta, causal_states, next_cache)``.
+
+        ``delta`` is hidden-sized in hidden mode and draft-vocabulary-sized in
+        logits mode. The latter requires previous logits plus a validity mask so
+        block position zero can use an explicit no-history feature.
+        """
         prefix_shape = dflash_hidden.shape[:-1]
         if previous_token_embeddings.shape[:-1] != prefix_shape:
             raise ValueError("previous-token embeddings and DFlash hidden must align")
@@ -185,6 +273,52 @@ class CausalCorrectionHead(nn.Module):
             raise ValueError(
                 f"Expected {len(self.layers)} cache entries, got {len(cache)}"
             )
+        if self.hidden_feedback_proj is None:
+            if (
+                previous_corrected_hidden is not None
+                or previous_corrected_hidden_mask is not None
+            ):
+                raise ValueError(
+                    "previous corrected hidden is only valid when hidden feedback "
+                    "is enabled"
+                )
+        else:
+            if (
+                previous_corrected_hidden is None
+                or previous_corrected_hidden_mask is None
+            ):
+                raise ValueError(
+                    "hidden-feedback Correction requires previous corrected hidden "
+                    "and mask"
+                )
+            if previous_corrected_hidden.shape != dflash_hidden.shape:
+                raise ValueError(
+                    "previous corrected hidden and DFlash hidden must align"
+                )
+            if previous_corrected_hidden_mask.shape != prefix_shape:
+                raise ValueError(
+                    "previous corrected hidden mask and DFlash hidden must align"
+                )
+        if self.output_mode == "hidden":
+            if previous_logits is not None or previous_logits_mask is not None:
+                raise ValueError(
+                    "previous logits are only valid for logit-residual Correction"
+                )
+        else:
+            if previous_logits is None or previous_logits_mask is None:
+                raise ValueError(
+                    "logit-residual Correction requires previous logits and mask"
+                )
+            expected_logits_shape = (*prefix_shape, int(self.draft_vocab_size))
+            if previous_logits.shape != expected_logits_shape:
+                raise ValueError(
+                    "Expected previous logits shape "
+                    f"{expected_logits_shape}, got {tuple(previous_logits.shape)}"
+                )
+            if previous_logits_mask.shape != prefix_shape:
+                raise ValueError(
+                    "previous logits mask and DFlash hidden must align"
+                )
 
         dtype = self.hidden_proj.weight.dtype
         hidden_states = (
@@ -194,6 +328,26 @@ class CausalCorrectionHead(nn.Module):
                 block_positions.to(device=dflash_hidden.device, dtype=torch.long)
             ).to(dtype)
         )
+        if self.output_mode == "logits":
+            assert previous_logits is not None  # noqa: S101
+            assert previous_logits_mask is not None  # noqa: S101
+            assert self.previous_logits_down is not None  # noqa: S101
+            assert self.previous_logits_proj is not None  # noqa: S101
+            previous_probs = torch.softmax(previous_logits.float(), dim=-1).to(dtype)
+            previous_rank = self.previous_logits_down(previous_probs)
+            previous_rank = previous_rank * previous_logits_mask.to(
+                device=dflash_hidden.device, dtype=dtype
+            ).unsqueeze(-1)
+            hidden_states = hidden_states + self.previous_logits_proj(previous_rank)
+        if self.hidden_feedback_proj is not None:
+            assert previous_corrected_hidden is not None  # noqa: S101
+            assert previous_corrected_hidden_mask is not None  # noqa: S101
+            feedback_hidden = previous_corrected_hidden.to(dtype)
+            feedback_hidden = feedback_hidden * previous_corrected_hidden_mask.to(
+                device=dflash_hidden.device, dtype=dtype
+            ).unsqueeze(-1)
+            hidden_states = hidden_states + self.hidden_feedback_proj(feedback_hidden)
+
         next_cache: CorrectionCache = []
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = None if cache is None else cache[layer_idx]
@@ -205,9 +359,9 @@ class CausalCorrectionHead(nn.Module):
                 next_cache.append(next_layer_cache)
 
         causal_states = self.output_norm(hidden_states)
-        delta_hidden = self.correction_up(silu(self.correction_down(causal_states)))
-        delta_hidden = delta_hidden * torch.sigmoid(self.residual_gate(causal_states))
-        return delta_hidden, causal_states, next_cache if use_cache else None
+        delta = self.correction_up(silu(self.correction_down(causal_states)))
+        delta = delta * torch.sigmoid(self.residual_gate(causal_states))
+        return delta, causal_states, next_cache if use_cache else None
 
 
 class MarkovHead(nn.Module):

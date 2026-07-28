@@ -85,6 +85,166 @@ class TestCausalCorrectionHead:
             rtol=1e-5,
         )
 
+    def test_logit_residual_shape_and_previous_logit_feature(self):
+        torch.manual_seed(2)
+        head = CausalCorrectionHead(
+            input_hidden_size=16,
+            token_embedding_size=16,
+            block_size=4,
+            correction_hidden_size=12,
+            correction_rank=8,
+            num_layers=2,
+            num_heads=3,
+            output_mode="logits",
+            draft_vocab_size=20,
+        ).eval()
+        previous, hidden, positions = self._inputs()
+        previous_logits = torch.randn(2, 4, 20)
+        previous_logits_mask = positions > 0
+
+        delta, states_a, _ = head(
+            previous,
+            hidden,
+            positions,
+            previous_logits=previous_logits,
+            previous_logits_mask=previous_logits_mask,
+        )
+        assert delta.shape == (2, 4, 20)
+        assert states_a.shape == (2, 4, 12)
+        assert torch.count_nonzero(delta) == 0
+
+        # Position zero explicitly masks the feature, while later positions
+        # consume the previous target distribution from the first step onward.
+        changed_logits = previous_logits.clone()
+        changed_logits[:, 0] = torch.randn_like(changed_logits[:, 0]) * 100.0
+        _, states_b, _ = head(
+            previous,
+            hidden,
+            positions,
+            previous_logits=changed_logits,
+            previous_logits_mask=previous_logits_mask,
+        )
+        assert torch.allclose(states_a[:, 0], states_b[:, 0], atol=1e-5)
+
+        changed_logits[:, 1:] = torch.randn_like(changed_logits[:, 1:]) * 100.0
+        _, states_c, _ = head(
+            previous,
+            hidden,
+            positions,
+            previous_logits=changed_logits,
+            previous_logits_mask=previous_logits_mask,
+        )
+        assert not torch.allclose(states_b[:, 1:], states_c[:, 1:])
+
+    def test_logit_residual_cached_rollout_matches_full_sequence(self):
+        torch.manual_seed(3)
+        head = CausalCorrectionHead(
+            input_hidden_size=16,
+            token_embedding_size=16,
+            block_size=4,
+            correction_hidden_size=12,
+            correction_rank=8,
+            num_layers=2,
+            num_heads=3,
+            output_mode="logits",
+            draft_vocab_size=20,
+        ).eval()
+        previous, hidden, positions = self._inputs()
+        previous_logits = torch.randn(2, 4, 20)
+        previous_logits_mask = positions > 0
+        full_delta, full_states, _ = head(
+            previous,
+            hidden,
+            positions,
+            previous_logits=previous_logits,
+            previous_logits_mask=previous_logits_mask,
+        )
+
+        cache = None
+        step_delta = []
+        step_states = []
+        for position in range(previous.shape[1]):
+            delta, states, cache = head(
+                previous[:, position : position + 1],
+                hidden[:, position : position + 1],
+                positions[:, position : position + 1],
+                previous_logits=previous_logits[:, position : position + 1],
+                previous_logits_mask=previous_logits_mask[
+                    :, position : position + 1
+                ],
+                cache=cache,
+                use_cache=True,
+            )
+            step_delta.append(delta)
+            step_states.append(states)
+
+        assert torch.allclose(
+            full_delta, torch.cat(step_delta, dim=1), atol=1e-5, rtol=1e-5
+        )
+        assert torch.allclose(
+            full_states, torch.cat(step_states, dim=1), atol=1e-5, rtol=1e-5
+        )
+
+    def test_logit_mode_auxiliary_hidden_and_feedback_are_opt_in(self):
+        torch.manual_seed(4)
+        head = CausalCorrectionHead(
+            input_hidden_size=16,
+            token_embedding_size=16,
+            block_size=4,
+            correction_hidden_size=12,
+            correction_rank=8,
+            num_layers=1,
+            num_heads=3,
+            output_mode="logits",
+            draft_vocab_size=20,
+            enable_hidden_auxiliary=True,
+            enable_hidden_feedback=True,
+        ).eval()
+        previous, hidden, positions = self._inputs()
+        previous_logits = torch.randn(2, 4, 20)
+        previous_logits_mask = positions > 0
+        previous_corrected_hidden = torch.randn_like(hidden)
+        previous_corrected_hidden_mask = positions > 0
+
+        delta_logits, states_a, _ = head(
+            previous,
+            hidden,
+            positions,
+            previous_logits=previous_logits,
+            previous_logits_mask=previous_logits_mask,
+            previous_corrected_hidden=previous_corrected_hidden,
+            previous_corrected_hidden_mask=previous_corrected_hidden_mask,
+        )
+        delta_hidden = head.auxiliary_hidden_residual(states_a)
+        assert delta_logits.shape == (2, 4, 20)
+        assert delta_hidden.shape == hidden.shape
+        assert torch.count_nonzero(delta_hidden) == 0
+
+        changed_hidden = previous_corrected_hidden.clone()
+        changed_hidden[:, 0] = torch.randn_like(changed_hidden[:, 0]) * 100.0
+        _, states_b, _ = head(
+            previous,
+            hidden,
+            positions,
+            previous_logits=previous_logits,
+            previous_logits_mask=previous_logits_mask,
+            previous_corrected_hidden=changed_hidden,
+            previous_corrected_hidden_mask=previous_corrected_hidden_mask,
+        )
+        assert torch.allclose(states_a[:, 0], states_b[:, 0], atol=1e-5)
+
+        changed_hidden[:, 1:] = torch.randn_like(changed_hidden[:, 1:]) * 100.0
+        _, states_c, _ = head(
+            previous,
+            hidden,
+            positions,
+            previous_logits=previous_logits,
+            previous_logits_mask=previous_logits_mask,
+            previous_corrected_hidden=changed_hidden,
+            previous_corrected_hidden_mask=previous_corrected_hidden_mask,
+        )
+        assert not torch.allclose(states_b[:, 1:], states_c[:, 1:])
+
 
 class TestMarkovHead:
     def _head(self, head_type="vanilla", r=8, vv=50, dv=20, h=16):

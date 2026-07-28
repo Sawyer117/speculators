@@ -53,13 +53,21 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         ),
     )
 
-    # Pre-projection causal correction head. By default it replaces MarkovHead.
+    # Causal correction head. By default it replaces MarkovHead.
     enable_correction_head: bool = Field(
         default=False,
         description=(
-            "Replace the Markov head with a causal head that predicts a gated "
-            "hidden-space residual from previous-token, DFlash hidden, and "
-            "block-position embeddings before the single LM-head projection."
+            "Replace the Markov head with a causal head. Hidden mode predicts a "
+            "pre-projection hidden residual; logits mode consumes previous target/"
+            "generated logits and predicts a low-rank vocabulary bias."
+        ),
+    )
+    correction_output_mode: Literal["hidden", "logits"] = Field(
+        default="hidden",
+        description=(
+            "Correction output space. 'hidden' preserves the single full LM-head "
+            "baseline. 'logits' adds a Markov-like low-rank bias to DFlash base "
+            "logits and feeds the previous position's logits into Correction."
         ),
     )
     correction_hidden_size: int = Field(
@@ -70,7 +78,7 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     correction_rank: int = Field(
         default=256,
         gt=0,
-        description="Low-rank bottleneck used to produce the hidden residual.",
+        description="Low-rank bottleneck used to produce the correction residual.",
     )
     correction_num_layers: int = Field(
         default=1,
@@ -84,7 +92,35 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     )
     correction_gate_bias: float = Field(
         default=0.0,
-        description="Initial bias of the sigmoid hidden-residual gate.",
+        description="Initial bias of the sigmoid correction-residual gate.",
+    )
+    correction_hidden_aux_loss: bool = Field(
+        default=False,
+        description=(
+            "Add an auxiliary SmoothL1 objective that aligns Correction's "
+            "corrected DFlash hidden state with the aligned verifier pre-LM hidden."
+        ),
+    )
+    correction_hidden_aux_weight: float = Field(
+        default=0.1,
+        ge=0.0,
+        description="Weight of the optional Correction hidden-alignment loss.",
+    )
+    correction_hidden_feedback: bool = Field(
+        default=False,
+        description=(
+            "Feed each corrected DFlash hidden state into the next correction slot. "
+            "This makes teacher-forced Correction sequential and is disabled by "
+            "default for baseline parity."
+        ),
+    )
+    correction_project_corrected_hidden: bool = Field(
+        default=False,
+        description=(
+            "In logits mode, project h_DFlash + delta_hidden through the sole "
+            "LM head before adding delta_logits. Disabled preserves the parallel "
+            "auxiliary-hidden baseline."
+        ),
     )
     correction_with_markov: bool = Field(
         default=False,
@@ -139,7 +175,8 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         default=False,
         description=(
             "During validation only, run an extra base LM-head projection for "
-            "change/gain diagnostics. It is never used by Correction itself."
+            "change/gain diagnostics when hidden mode is active. Logits mode already "
+            "has base logits and does not need the extra projection."
         ),
     )
 

@@ -26,11 +26,13 @@ __all__ = [
 class DSparkDraftModel(DFlashDraftModel):
     """DFlash backbone plus a sequential correction and confidence head.
 
-    The legacy Markov path refines base logits. The causal Correction path refines
-    DFlash hidden states from previous-token, hidden, and block-position features
-    before the sole LM-head projection. An opt-in collaboration path gates a low-rank
-    Markov bias from Correction state. The confidence head predicts each position's
-    acceptance probability.
+    The legacy Markov path refines base logits. The causal Correction path can
+    either refine DFlash hidden states before the sole LM-head projection or
+    consume previous logits and refine base logits with a low-rank vocabulary
+    bias. An opt-in collaboration path gates a further Markov bias from Correction
+    state. Optional hidden alignment and corrected-hidden feedback provide
+    representation-level supervision and recurrence. The confidence head predicts
+    each position's acceptance probability.
     """
 
     config_class: ClassVar[type[DSparkSpeculatorConfig]] = DSparkSpeculatorConfig  # type: ignore[misc,assignment]
@@ -45,6 +47,26 @@ class DSparkDraftModel(DFlashDraftModel):
         ):
             raise ValueError(
                 "correction_generated_token_ratio > 0 requires Correction"
+            )
+        if (
+            config.correction_output_mode != "hidden"
+            and not config.enable_correction_head
+        ):
+            raise ValueError("correction_output_mode='logits' requires Correction")
+        if (
+            config.correction_hidden_aux_loss
+            or config.correction_hidden_feedback
+            or config.correction_project_corrected_hidden
+        ) and not config.enable_correction_head:
+            raise ValueError(
+                "Correction hidden auxiliary features require Correction"
+            )
+        if (
+            config.correction_project_corrected_hidden
+            and config.correction_output_mode != "logits"
+        ):
+            raise ValueError(
+                "correction_project_corrected_hidden requires logits mode"
             )
         if (
             config.correction_generated_token_warmup
@@ -69,6 +91,13 @@ class DSparkDraftModel(DFlashDraftModel):
                 num_layers=config.correction_num_layers,
                 num_heads=config.correction_num_heads,
                 gate_bias=config.correction_gate_bias,
+                output_mode=config.correction_output_mode,
+                draft_vocab_size=self.draft_vocab_size,
+                enable_hidden_auxiliary=(
+                    config.correction_hidden_aux_loss
+                    or config.correction_project_corrected_hidden
+                ),
+                enable_hidden_feedback=config.correction_hidden_feedback,
             )
             if config.correction_with_markov:
                 if config.markov_rank <= 0:
@@ -142,11 +171,24 @@ class DSparkDraftModel(DFlashDraftModel):
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
             enable_correction_head=kwargs.get("enable_correction_head", False),
+            correction_output_mode=kwargs.get("correction_output_mode", "hidden"),
             correction_hidden_size=kwargs.get("correction_hidden_size", 512),
             correction_rank=kwargs.get("correction_rank", 256),
             correction_num_layers=kwargs.get("correction_num_layers", 1),
             correction_num_heads=kwargs.get("correction_num_heads", 8),
             correction_gate_bias=kwargs.get("correction_gate_bias", 0.0),
+            correction_hidden_aux_loss=kwargs.get(
+                "correction_hidden_aux_loss", False
+            ),
+            correction_hidden_aux_weight=kwargs.get(
+                "correction_hidden_aux_weight", 0.1
+            ),
+            correction_hidden_feedback=kwargs.get(
+                "correction_hidden_feedback", False
+            ),
+            correction_project_corrected_hidden=kwargs.get(
+                "correction_project_corrected_hidden", False
+            ),
             correction_with_markov=kwargs.get("correction_with_markov", False),
             correction_markov_gate_bias=kwargs.get(
                 "correction_markov_gate_bias", -2.0
@@ -268,6 +310,25 @@ class DSparkDraftModel(DFlashDraftModel):
             [hidden_states, sequential_states.to(hidden_states.dtype)], dim=-1
         )
 
+    @staticmethod
+    def _hidden_alignment_loss(
+        corrected_hidden: torch.Tensor,
+        verifier_hidden: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Masked SmoothL1 alignment in the shared pre-LM hidden space."""
+        if corrected_hidden.shape != verifier_hidden.shape:
+            raise ValueError("Corrected and verifier hidden states must align")
+        if loss_mask.shape != corrected_hidden.shape[:-1]:
+            raise ValueError("Hidden-alignment mask must match token dimensions")
+        per_token = torch.nn.functional.smooth_l1_loss(
+            corrected_hidden.float(),
+            verifier_hidden.float(),
+            reduction="none",
+        ).mean(dim=-1)
+        mask = loss_mask.to(per_token.dtype)
+        return (per_token * mask).sum() / mask.sum().clamp_min(1.0)
+
     def _apply_collaborative_markov(
         self,
         correction_logits: torch.Tensor,
@@ -299,18 +360,147 @@ class DSparkDraftModel(DFlashDraftModel):
         return collaborative_logits, gate, prev_emb
 
     @torch.compiler.disable
+    def _teacher_forced_hidden_feedback_correction(
+        self,
+        dflash_hidden: torch.Tensor,
+        previous_token_embeddings: torch.Tensor,
+        block_positions: torch.Tensor,
+        base_logits: torch.Tensor | None,
+        previous_target_logits: torch.Tensor | None,
+        previous_target_logits_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run teacher-forced Correction with corrected-hidden recurrence."""
+        if self.correction_head is None:
+            raise RuntimeError("Hidden feedback requires Correction")
+        if not self.config.correction_hidden_feedback:
+            raise RuntimeError("Correction hidden feedback is not enabled")
+
+        num_blocks, block_size, hidden_size = dflash_hidden.shape
+        start_position = 0 if self.config.sample_from_anchor else 1
+        output_states: list[torch.Tensor] = []
+        output_corrected_hidden: list[torch.Tensor] = []
+        output_delta_logits: list[torch.Tensor] = []
+        previous_corrected_hidden = dflash_hidden.new_zeros(
+            num_blocks, 1, hidden_size
+        )
+        previous_corrected_hidden_mask = torch.zeros(
+            num_blocks,
+            1,
+            dtype=torch.bool,
+            device=dflash_hidden.device,
+        )
+        cache = None
+
+        for position in range(block_size):
+            current_hidden = dflash_hidden[:, position]
+            if position < start_position:
+                corrected_current_hidden = current_hidden
+                causal_states = current_hidden.new_zeros(
+                    num_blocks, self.config.correction_hidden_size
+                )
+                if self.correction_head.output_mode == "logits":
+                    delta_logits = dflash_hidden.new_zeros(
+                        num_blocks,
+                        self.draft_vocab_size,
+                        dtype=self.lm_head.weight.dtype,
+                    )
+            else:
+                head_kwargs = {
+                    "previous_corrected_hidden": previous_corrected_hidden,
+                    "previous_corrected_hidden_mask": (
+                        previous_corrected_hidden_mask
+                    ),
+                    "cache": cache,
+                    "use_cache": True,
+                }
+                if self.correction_head.output_mode == "logits":
+                    if (
+                        previous_target_logits is None
+                        or previous_target_logits_mask is None
+                    ):
+                        raise RuntimeError(
+                            "Logit-residual Correction requires previous target logits"
+                        )
+                    delta_logits_step, causal_step, cache = self.correction_head(
+                        previous_token_embeddings[:, position : position + 1],
+                        dflash_hidden[:, position : position + 1],
+                        block_positions[:, position : position + 1],
+                        previous_logits=previous_target_logits[
+                            :, position : position + 1
+                        ],
+                        previous_logits_mask=previous_target_logits_mask[
+                            :, position : position + 1
+                        ],
+                        **head_kwargs,
+                    )
+                    delta_logits = delta_logits_step[:, 0]
+                    delta_hidden = (
+                        self.correction_head.auxiliary_hidden_residual(causal_step)
+                    )
+                else:
+                    delta_hidden, causal_step, cache = self.correction_head(
+                        previous_token_embeddings[:, position : position + 1],
+                        dflash_hidden[:, position : position + 1],
+                        block_positions[:, position : position + 1],
+                        **head_kwargs,
+                    )
+                causal_states = causal_step[:, 0]
+                corrected_current_hidden = current_hidden + delta_hidden[:, 0].to(
+                    current_hidden.dtype
+                )
+
+            output_states.append(causal_states)
+            output_corrected_hidden.append(corrected_current_hidden)
+            if self.correction_head.output_mode == "logits":
+                output_delta_logits.append(delta_logits)
+            previous_corrected_hidden = corrected_current_hidden.unsqueeze(1)
+            previous_corrected_hidden_mask = torch.ones(
+                num_blocks,
+                1,
+                dtype=torch.bool,
+                device=dflash_hidden.device,
+            )
+
+        corrected_hidden = torch.stack(output_corrected_hidden, dim=1)
+        correction_states = torch.stack(output_states, dim=1)
+        if self.correction_head.output_mode == "logits":
+            delta_logits = torch.stack(output_delta_logits, dim=1)
+            if self.config.correction_project_corrected_hidden:
+                projected_logits = self.lm_head(
+                    corrected_hidden.reshape(
+                        1, num_blocks * block_size, hidden_size
+                    ).to(self.lm_head.weight.dtype)
+                ).view(num_blocks, block_size, -1)
+                logits = projected_logits + delta_logits.to(projected_logits.dtype)
+            else:
+                if base_logits is None:
+                    raise RuntimeError(
+                        "Logit-residual Correction requires base logits"
+                    )
+                logits = base_logits + delta_logits.to(base_logits.dtype)
+        else:
+            logits = self.lm_head(
+                corrected_hidden.reshape(1, num_blocks * block_size, -1).to(
+                    self.lm_head.weight.dtype
+                )
+            ).view(num_blocks, block_size, -1)
+        return logits, correction_states, corrected_hidden
+
+    @torch.compiler.disable
     def _generated_feedback_correction(
         self,
         dflash_hidden: torch.Tensor,
         anchor_token_ids: torch.Tensor,
         *,
         temperature: float = 0.0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run a differentiable Correction pass with greedy token self-feedback.
 
         Token selection is discrete, but the per-position logits and causal K/V
         states retain their autograd graph.  The first input is always the real
-        anchor; every later input is generated by the current Correction model.
+        anchor; every later token input is generated by the current Correction
+        model. Logit-residual mode also feeds back the previous final logits,
+        detached across the discrete autoregressive boundary.
         """
         if self.correction_head is None:
             raise RuntimeError(
@@ -333,11 +523,54 @@ class DSparkDraftModel(DFlashDraftModel):
         output_tokens: list[torch.Tensor] = []
         output_logits: list[torch.Tensor] = []
         output_states: list[torch.Tensor] = []
+        output_corrected_hidden: list[torch.Tensor] = []
         start_position = 0 if self.config.sample_from_anchor else 1
+        correction_output_mode = getattr(
+            self.correction_head, "output_mode", "hidden"
+        )
+        hidden_auxiliary_enabled = getattr(
+            self.config, "correction_hidden_aux_loss", False
+        )
+        hidden_feedback_enabled = getattr(
+            self.config, "correction_hidden_feedback", False
+        )
+        project_corrected_hidden = getattr(
+            self.config, "correction_project_corrected_hidden", False
+        )
+        previous_feedback_logits = None
+        previous_feedback_mask = None
+        if correction_output_mode == "logits":
+            previous_feedback_logits = dflash_hidden.new_zeros(
+                dflash_hidden.shape[0],
+                1,
+                self.draft_vocab_size,
+                dtype=self.lm_head.weight.dtype,
+            )
+            previous_feedback_mask = torch.zeros(
+                dflash_hidden.shape[0],
+                1,
+                dtype=torch.bool,
+                device=dflash_hidden.device,
+            )
+        previous_corrected_hidden = None
+        previous_corrected_hidden_mask = None
+        if hidden_feedback_enabled:
+            previous_corrected_hidden = dflash_hidden.new_zeros(
+                dflash_hidden.shape[0],
+                1,
+                dflash_hidden.shape[-1],
+            )
+            previous_corrected_hidden_mask = torch.zeros(
+                dflash_hidden.shape[0],
+                1,
+                dtype=torch.bool,
+                device=dflash_hidden.device,
+            )
 
         for position in range(self.block_size):
             current_hidden = dflash_hidden[:, position]
             if position < start_position:
+                corrected_current_hidden = current_hidden
                 final_logits = self.lm_head(
                     current_hidden.to(self.lm_head.weight.dtype)
                 )
@@ -353,19 +586,70 @@ class DSparkDraftModel(DFlashDraftModel):
                     dtype=torch.long,
                     device=dflash_hidden.device,
                 )
-                delta_hidden, causal_states, cache = self.correction_head(
-                    previous_emb,
-                    dflash_hidden[:, position : position + 1],
-                    block_positions,
-                    cache=cache,
-                    use_cache=True,
-                )
-                corrected_hidden = current_hidden + delta_hidden[:, 0].to(
-                    current_hidden.dtype
-                )
-                final_logits = self.lm_head(
-                    corrected_hidden.to(self.lm_head.weight.dtype)
-                )
+                hidden_feedback_kwargs = {}
+                if hidden_feedback_enabled:
+                    assert previous_corrected_hidden is not None  # noqa: S101
+                    assert previous_corrected_hidden_mask is not None  # noqa: S101
+                    hidden_feedback_kwargs = {
+                        "previous_corrected_hidden": previous_corrected_hidden,
+                        "previous_corrected_hidden_mask": (
+                            previous_corrected_hidden_mask
+                        ),
+                    }
+                if correction_output_mode == "logits":
+                    assert previous_feedback_logits is not None  # noqa: S101
+                    assert previous_feedback_mask is not None  # noqa: S101
+                    delta_logits, causal_states, cache = self.correction_head(
+                        previous_emb,
+                        dflash_hidden[:, position : position + 1],
+                        block_positions,
+                        previous_logits=previous_feedback_logits,
+                        previous_logits_mask=previous_feedback_mask,
+                        cache=cache,
+                        use_cache=True,
+                        **hidden_feedback_kwargs,
+                    )
+                    if (
+                        project_corrected_hidden
+                        or hidden_feedback_enabled
+                        or (hidden_auxiliary_enabled and self.training)
+                    ):
+                        delta_hidden = (
+                            self.correction_head.auxiliary_hidden_residual(
+                                causal_states
+                            )
+                        )
+                        corrected_current_hidden = current_hidden + delta_hidden[
+                            :, 0
+                        ].to(current_hidden.dtype)
+                    else:
+                        corrected_current_hidden = current_hidden
+                    projection_hidden = (
+                        corrected_current_hidden
+                        if project_corrected_hidden
+                        else current_hidden
+                    )
+                    projected_logits = self.lm_head(
+                        projection_hidden.to(self.lm_head.weight.dtype)
+                    )
+                    final_logits = projected_logits + delta_logits[:, 0].to(
+                        projected_logits.dtype
+                    )
+                else:
+                    delta_hidden, causal_states, cache = self.correction_head(
+                        previous_emb,
+                        dflash_hidden[:, position : position + 1],
+                        block_positions,
+                        cache=cache,
+                        use_cache=True,
+                        **hidden_feedback_kwargs,
+                    )
+                    corrected_current_hidden = current_hidden + delta_hidden[
+                        :, 0
+                    ].to(current_hidden.dtype)
+                    final_logits = self.lm_head(
+                        corrected_current_hidden.to(self.lm_head.weight.dtype)
+                    )
                 causal_states = causal_states[:, 0]
                 if getattr(self, "markov_head", None) is not None:
                     final_logits, _, _ = self._apply_collaborative_markov(
@@ -389,7 +673,24 @@ class DSparkDraftModel(DFlashDraftModel):
             output_tokens.append(draft_ids)
             output_logits.append(final_logits)
             output_states.append(causal_states)
+            output_corrected_hidden.append(corrected_current_hidden)
 
+            if correction_output_mode == "logits":
+                previous_feedback_logits = final_logits.detach().unsqueeze(1)
+                previous_feedback_mask = torch.ones(
+                    final_logits.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=final_logits.device,
+                )
+            if hidden_feedback_enabled:
+                previous_corrected_hidden = corrected_current_hidden.unsqueeze(1)
+                previous_corrected_hidden_mask = torch.ones(
+                    corrected_current_hidden.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=corrected_current_hidden.device,
+                )
             if position < start_position:
                 continue
             previous_ids = draft_ids
@@ -400,6 +701,7 @@ class DSparkDraftModel(DFlashDraftModel):
             torch.stack(output_tokens, dim=1),
             torch.stack(output_logits, dim=1),
             torch.stack(output_states, dim=1),
+            torch.stack(output_corrected_hidden, dim=1),
         )
 
     @conditional_torch_compile
@@ -427,6 +729,16 @@ class DSparkDraftModel(DFlashDraftModel):
         correction_generated_token_curriculum_active: bool = False,
         **kwargs,
     ):
+        correction_output_mode = (
+            getattr(self.correction_head, "output_mode", "hidden")
+            if self.correction_head is not None
+            else None
+        )
+        generated_correction_training = (
+            self.training
+            and self.correction_head is not None
+            and correction_use_generated_tokens
+        )
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
             self._backbone_forward(
                 hidden_states,
@@ -436,7 +748,14 @@ class DSparkDraftModel(DFlashDraftModel):
                 document_ids,
                 position_ids,
                 max_anchors=max_anchors,
-                project_logits=self.correction_head is None,
+                project_logits=(
+                    self.correction_head is None
+                    or (
+                        correction_output_mode == "logits"
+                        and not generated_correction_training
+                        and not self.config.correction_project_corrected_hidden
+                    )
+                ),
                 **kwargs,
             )
         )
@@ -464,6 +783,11 @@ class DSparkDraftModel(DFlashDraftModel):
         block_positions = torch.arange(block, device=hidden.device).expand(
             num_blocks, -1
         )
+        base_logits_blocks = (
+            None
+            if base_logits is None
+            else base_logits.view(num_blocks, block, -1)
+        )
 
         confidence_logits = None
         prev_emb = None
@@ -471,9 +795,10 @@ class DSparkDraftModel(DFlashDraftModel):
         rollout_logits = None
         collaboration_base_logits = None
         collaboration_gate = None
+        corrected_hidden = None
         if self.correction_head is not None:
-            if self.training and correction_use_generated_tokens:
-                _, logits_blocks, correction_states = (
+            if generated_correction_training:
+                _, logits_blocks, correction_states, corrected_hidden = (
                     self._generated_feedback_correction(
                         hidden_blocks,
                         anchor_token_ids=block_tokens[:, 0],
@@ -481,33 +806,183 @@ class DSparkDraftModel(DFlashDraftModel):
                 )
                 logits = logits_blocks.reshape(1, mask_tokens_size, -1)
             else:
-                if self.config.sample_from_anchor:
+                if self.config.correction_hidden_feedback:
+                    with torch.no_grad():
+                        prev_gt_emb = self.embed_tokens(prev_token_ids)
+                    previous_target_logits = None
+                    previous_target_mask = None
+                    if correction_output_mode == "logits":
+                        target_blocks = targets.view(num_blocks, block, -1)
+                        previous_target_logits = torch.cat(
+                            [
+                                torch.zeros_like(target_blocks[:, :1]),
+                                target_blocks[:, :-1],
+                            ],
+                            dim=1,
+                        )
+                        previous_target_mask = block_positions > 0
+                    logits_blocks, correction_states, corrected_hidden = (
+                        self._teacher_forced_hidden_feedback_correction(
+                            hidden_blocks,
+                            prev_gt_emb,
+                            block_positions,
+                            base_logits_blocks,
+                            previous_target_logits,
+                            previous_target_mask,
+                        )
+                    )
+                    logits = logits_blocks.reshape(1, mask_tokens_size, -1)
+                elif self.config.sample_from_anchor:
                     with torch.no_grad():
                         prev_gt_emb = self.embed_tokens(block_tokens)
-                    delta_hidden, correction_states, _ = self.correction_head(
-                        prev_gt_emb,
-                        hidden_blocks,
-                        block_positions,
-                    )
-                    corrected_hidden = hidden_blocks + delta_hidden.to(
-                        hidden_blocks.dtype
-                    )
+                    if correction_output_mode == "logits":
+                        if (
+                            base_logits_blocks is None
+                            and not self.config.correction_project_corrected_hidden
+                        ):
+                            raise RuntimeError(
+                                "Logit-residual Correction requires base logits"
+                            )
+                        target_blocks = targets.view(num_blocks, block, -1)
+                        previous_target_logits = torch.cat(
+                            [
+                                torch.zeros_like(target_blocks[:, :1]),
+                                target_blocks[:, :-1],
+                            ],
+                            dim=1,
+                        )
+                        previous_target_mask = block_positions > 0
+                        delta_logits, correction_states, _ = self.correction_head(
+                            prev_gt_emb,
+                            hidden_blocks,
+                            block_positions,
+                            previous_logits=previous_target_logits,
+                            previous_logits_mask=previous_target_mask,
+                        )
+                        if (
+                            self.config.correction_project_corrected_hidden
+                            or self.config.correction_hidden_aux_loss
+                        ):
+                            delta_hidden = (
+                                self.correction_head.auxiliary_hidden_residual(
+                                    correction_states
+                                )
+                            )
+                            corrected_hidden = hidden_blocks + delta_hidden.to(
+                                hidden_blocks.dtype
+                            )
+                        if self.config.correction_project_corrected_hidden:
+                            projected_logits = self.lm_head(
+                                corrected_hidden.reshape(
+                                    1, mask_tokens_size, -1
+                                ).to(self.lm_head.weight.dtype)
+                            )
+                            logits = projected_logits + delta_logits.reshape(
+                                1, mask_tokens_size, -1
+                            ).to(projected_logits.dtype)
+                        else:
+                            assert base_logits_blocks is not None  # noqa: S101
+                            logits = (
+                                base_logits_blocks
+                                + delta_logits.to(base_logits_blocks.dtype)
+                            ).reshape(1, mask_tokens_size, -1)
+                    else:
+                        delta_hidden, correction_states, _ = self.correction_head(
+                            prev_gt_emb,
+                            hidden_blocks,
+                            block_positions,
+                        )
+                        corrected_hidden = hidden_blocks + delta_hidden.to(
+                            hidden_blocks.dtype
+                        )
                 else:
                     with torch.no_grad():
                         prev_gt_emb = self.embed_tokens(block_tokens[:, :-1])
-                    delta_hidden, draft_states, _ = self.correction_head(
-                        prev_gt_emb,
-                        hidden_blocks[:, 1:],
-                        block_positions[:, 1:],
-                    )
-                    corrected_hidden = torch.cat(
-                        [
-                            hidden_blocks[:, :1],
-                            hidden_blocks[:, 1:]
-                            + delta_hidden.to(hidden_blocks.dtype),
-                        ],
-                        dim=1,
-                    )
+                    if correction_output_mode == "logits":
+                        if (
+                            base_logits_blocks is None
+                            and not self.config.correction_project_corrected_hidden
+                        ):
+                            raise RuntimeError(
+                                "Logit-residual Correction requires base logits"
+                            )
+                        target_blocks = targets.view(num_blocks, block, -1)
+                        previous_target_logits = target_blocks[:, :-1]
+                        previous_target_mask = torch.ones(
+                            num_blocks,
+                            block - 1,
+                            dtype=torch.bool,
+                            device=hidden.device,
+                        )
+                        delta_logits, draft_states, _ = self.correction_head(
+                            prev_gt_emb,
+                            hidden_blocks[:, 1:],
+                            block_positions[:, 1:],
+                            previous_logits=previous_target_logits,
+                            previous_logits_mask=previous_target_mask,
+                        )
+                        if (
+                            self.config.correction_project_corrected_hidden
+                            or self.config.correction_hidden_aux_loss
+                        ):
+                            delta_hidden = (
+                                self.correction_head.auxiliary_hidden_residual(
+                                    draft_states
+                                )
+                            )
+                            corrected_hidden = torch.cat(
+                                [
+                                    hidden_blocks[:, :1],
+                                    hidden_blocks[:, 1:]
+                                    + delta_hidden.to(hidden_blocks.dtype),
+                                ],
+                                dim=1,
+                            )
+                        if self.config.correction_project_corrected_hidden:
+                            projected_logits = self.lm_head(
+                                corrected_hidden.reshape(
+                                    1, mask_tokens_size, -1
+                                ).to(self.lm_head.weight.dtype)
+                            )
+                            full_delta_logits = torch.cat(
+                                [
+                                    delta_logits.new_zeros(
+                                        num_blocks, 1, delta_logits.shape[-1]
+                                    ),
+                                    delta_logits,
+                                ],
+                                dim=1,
+                            )
+                            logits = projected_logits + full_delta_logits.reshape(
+                                1, mask_tokens_size, -1
+                            ).to(projected_logits.dtype)
+                        else:
+                            assert base_logits_blocks is not None  # noqa: S101
+                            logits_blocks = torch.cat(
+                                [
+                                    base_logits_blocks[:, :1],
+                                    base_logits_blocks[:, 1:]
+                                    + delta_logits.to(base_logits_blocks.dtype),
+                                ],
+                                dim=1,
+                            )
+                            logits = logits_blocks.reshape(
+                                1, mask_tokens_size, -1
+                            )
+                    else:
+                        delta_hidden, draft_states, _ = self.correction_head(
+                            prev_gt_emb,
+                            hidden_blocks[:, 1:],
+                            block_positions[:, 1:],
+                        )
+                        corrected_hidden = torch.cat(
+                            [
+                                hidden_blocks[:, :1],
+                                hidden_blocks[:, 1:]
+                                + delta_hidden.to(hidden_blocks.dtype),
+                            ],
+                            dim=1,
+                        )
                     correction_states = torch.cat(
                         [
                             draft_states.new_zeros(
@@ -518,14 +993,17 @@ class DSparkDraftModel(DFlashDraftModel):
                         dim=1,
                     )
 
-                # Teacher-forced training/validation can project the full block
-                # together. Generated-token training projects each position once
-                # inside its autoregressive self-feedback loop.
-                logits = self.lm_head(
-                    corrected_hidden.reshape(1, mask_tokens_size, -1).to(
-                        self.lm_head.weight.dtype
+                if (
+                    correction_output_mode == "hidden"
+                    and not self.config.correction_hidden_feedback
+                ):
+                    # Hidden mode projects the corrected block once. Generated-token
+                    # training projects each position inside its feedback loop.
+                    logits = self.lm_head(
+                        corrected_hidden.reshape(1, mask_tokens_size, -1).to(
+                            self.lm_head.weight.dtype
+                        )
                     )
-                )
                 if self.markov_head is not None:
                     collaboration_base_logits = logits
                     collaborative_blocks, collaboration_gate, prev_emb = (
@@ -543,10 +1021,11 @@ class DSparkDraftModel(DFlashDraftModel):
             # Optional validation-only base projection for change/gain diagnostics.
             # It is never part of the training or inference correction path.
             if not self.training and self.config.correction_base_diagnostics:
-                with torch.no_grad():
-                    base_logits = self.lm_head(
-                        hidden.detach().to(self.lm_head.weight.dtype)
-                    )
+                if base_logits is None:
+                    with torch.no_grad():
+                        base_logits = self.lm_head(
+                            hidden.detach().to(self.lm_head.weight.dtype)
+                        )
 
             # Validation keeps the teacher-forced view for comparison and also
             # measures the actual generated-token feedback chain.
@@ -614,6 +1093,39 @@ class DSparkDraftModel(DFlashDraftModel):
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
         )
+        if self.config.correction_hidden_aux_loss:
+            if corrected_hidden is None:
+                raise RuntimeError(
+                    "Hidden auxiliary loss requires corrected DFlash hidden states"
+                )
+            with torch.no_grad():
+                verifier_hidden_targets = self.verifier_norm(
+                    verifier_last_hidden_states.to(self.verifier_norm.weight.dtype)
+                )
+                if not self.config.sample_from_anchor:
+                    verifier_hidden_targets = torch.roll(
+                        verifier_hidden_targets, 1, dims=1
+                    )
+                verifier_hidden_targets = verifier_hidden_targets[
+                    :, anchored_block_indices
+                ].view_as(corrected_hidden)
+            hidden_aux_loss = self._hidden_alignment_loss(
+                corrected_hidden,
+                verifier_hidden_targets,
+                aligned_loss_mask.view(num_blocks, block),
+            )
+            loss = loss + (
+                self.config.correction_hidden_aux_weight * hidden_aux_loss
+            )
+            metrics["loss_sum"] = loss.detach().clone()
+            metrics["correction_hidden_aux_loss_sum"] = (
+                hidden_aux_loss.detach().clone()
+            )
+            metrics["correction_hidden_aux_loss_total"] = torch.ones(
+                (),
+                device=loss.device,
+                dtype=torch.float32,
+            )
         metrics = select_logged_metrics(
             metrics,
             include_diagnostics=(
@@ -645,7 +1157,7 @@ class DSparkDraftModel(DFlashDraftModel):
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressively apply correction using generated-token feedback."""
-        tokens, logits, _ = self._generated_feedback_correction(
+        tokens, logits, _, _ = self._generated_feedback_correction(
             dflash_hidden,
             anchor_token_ids,
             temperature=temperature,

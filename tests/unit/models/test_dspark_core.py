@@ -36,6 +36,82 @@ class _RecordingCorrectionHead(nn.Module):
         return delta_hidden, states, next_cache
 
 
+class _RecordingLogitCorrectionHead(nn.Module):
+    output_mode = "logits"
+
+    def __init__(self, draft_vocab_size: int) -> None:
+        super().__init__()
+        self.draft_vocab_size = draft_vocab_size
+        self.previous_logits: list[torch.Tensor] = []
+        self.previous_logits_masks: list[torch.Tensor] = []
+
+    def forward(
+        self,
+        previous_embeddings,
+        dflash_hidden,
+        block_positions,
+        previous_logits=None,
+        previous_logits_mask=None,
+        cache=None,
+        *,
+        use_cache=False,
+    ):
+        del previous_embeddings, cache
+        assert previous_logits is not None
+        assert previous_logits_mask is not None
+        self.previous_logits.append(previous_logits.detach().clone())
+        self.previous_logits_masks.append(previous_logits_mask.detach().clone())
+        states = dflash_hidden.new_zeros(*dflash_hidden.shape[:-1], 4)
+        token_ids = block_positions + 1
+        delta_logits = 10.0 * torch.nn.functional.one_hot(
+            token_ids, num_classes=self.draft_vocab_size
+        ).to(dflash_hidden.dtype)
+        next_cache = [] if use_cache else None
+        return delta_logits, states, next_cache
+
+    @staticmethod
+    def auxiliary_hidden_residual(causal_states):
+        delta_hidden = causal_states.new_zeros(*causal_states.shape[:-1], 4)
+        delta_hidden[..., 0] = 2.0
+        return delta_hidden
+
+
+class _RecordingHiddenFeedbackCorrectionHead(nn.Module):
+    output_mode = "hidden"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.previous_corrected_hidden: list[torch.Tensor] = []
+        self.previous_corrected_hidden_masks: list[torch.Tensor] = []
+
+    def forward(
+        self,
+        previous_embeddings,
+        dflash_hidden,
+        block_positions,
+        previous_corrected_hidden=None,
+        previous_corrected_hidden_mask=None,
+        cache=None,
+        *,
+        use_cache=False,
+    ):
+        del previous_embeddings, cache
+        assert previous_corrected_hidden is not None
+        assert previous_corrected_hidden_mask is not None
+        self.previous_corrected_hidden.append(
+            previous_corrected_hidden.detach().clone()
+        )
+        self.previous_corrected_hidden_masks.append(
+            previous_corrected_hidden_mask.detach().clone()
+        )
+        states = dflash_hidden.new_zeros(*dflash_hidden.shape[:-1], 4)
+        delta_hidden = torch.nn.functional.one_hot(
+            block_positions, num_classes=dflash_hidden.shape[-1]
+        ).to(dflash_hidden.dtype)
+        next_cache = [] if use_cache else None
+        return delta_hidden, states, next_cache
+
+
 class _RolloutHarness:
     _generated_feedback_correction = (
         DSparkDraftModel._generated_feedback_correction
@@ -124,7 +200,7 @@ def test_generated_feedback_training_retains_gradients_and_generated_tokens():
         harness.lm_head.weight[3, 2] = 10.0
 
     hidden = torch.zeros(1, 3, 4, requires_grad=True)
-    tokens, logits, states = harness._generated_feedback_correction(
+    tokens, logits, states, corrected_hidden = harness._generated_feedback_correction(
         hidden,
         anchor_token_ids=torch.tensor([7]),
     )
@@ -135,9 +211,98 @@ def test_generated_feedback_training_retains_gradients_and_generated_tokens():
     assert torch.equal(feedback[:, :, 0], torch.tensor([[7.0, 1.0, 2.0]]))
     assert logits.shape == (1, 3, 8)
     assert states.shape == (1, 3, 4)
+    assert corrected_hidden.shape == hidden.shape
     assert harness.correction_head.scale.grad is not None
     assert hidden.grad is not None
     assert harness.lm_head.calls == harness.block_size
+
+
+def test_logit_residual_rollout_feeds_back_previous_final_logits():
+    harness = _RolloutHarness()
+    harness.block_size = 3
+    harness.draft_vocab_size = 8
+    harness.config = SimpleNamespace(sample_from_anchor=True)
+    harness.correction_head = _RecordingLogitCorrectionHead(harness.draft_vocab_size)
+    harness.embed_tokens = nn.Embedding(8, 4)
+    harness.lm_head = _CountingLinear(4, harness.draft_vocab_size)
+    harness.d2t = None
+    with torch.no_grad():
+        harness.lm_head.weight.zero_()
+
+    tokens, logits = harness.rollout_correction(
+        torch.zeros(1, 3, 4),
+        anchor_token_ids=torch.tensor([7]),
+    )
+
+    assert torch.equal(tokens, torch.tensor([[1, 2, 3]]))
+    assert logits.shape == (1, 3, harness.draft_vocab_size)
+    masks = torch.cat(harness.correction_head.previous_logits_masks, dim=1)
+    assert torch.equal(masks, torch.tensor([[False, True, True]]))
+    feedback = torch.cat(harness.correction_head.previous_logits, dim=1)
+    assert torch.count_nonzero(feedback[:, 0]) == 0
+    assert torch.equal(feedback[:, 1:], logits[:, :-1].detach())
+    assert harness.lm_head.calls == harness.block_size
+
+
+def test_logit_mode_can_project_corrected_hidden_before_adding_delta_logits():
+    harness = _RolloutHarness()
+    harness.block_size = 2
+    harness.draft_vocab_size = 8
+    harness.config = SimpleNamespace(
+        sample_from_anchor=True,
+        correction_hidden_size=4,
+        correction_hidden_aux_loss=False,
+        correction_hidden_feedback=False,
+        correction_project_corrected_hidden=True,
+    )
+    harness.correction_head = _RecordingLogitCorrectionHead(
+        harness.draft_vocab_size
+    )
+    harness.embed_tokens = nn.Embedding(8, 4)
+    harness.lm_head = _CountingLinear(4, harness.draft_vocab_size)
+    harness.d2t = None
+    with torch.no_grad():
+        harness.lm_head.weight.zero_()
+        harness.lm_head.weight[7, 0] = 3.0
+
+    _, logits, _, corrected_hidden = harness._generated_feedback_correction(
+        torch.zeros(1, 2, 4),
+        anchor_token_ids=torch.tensor([6]),
+    )
+
+    assert torch.equal(corrected_hidden[..., 0], torch.full((1, 2), 2.0))
+    assert torch.equal(logits[..., 7], torch.full((1, 2), 6.0))
+    assert harness.lm_head.calls == harness.block_size
+
+
+def test_corrected_hidden_is_fed_to_the_next_slot_when_enabled():
+    harness = _RolloutHarness()
+    harness.block_size = 3
+    harness.config = SimpleNamespace(
+        sample_from_anchor=True,
+        correction_hidden_size=4,
+        correction_hidden_aux_loss=False,
+        correction_hidden_feedback=True,
+    )
+    harness.correction_head = _RecordingHiddenFeedbackCorrectionHead()
+    harness.embed_tokens = nn.Embedding(8, 4)
+    harness.lm_head = _CountingLinear(4, 8)
+    harness.d2t = None
+
+    _, _, _, corrected_hidden = harness._generated_feedback_correction(
+        torch.zeros(1, 3, 4),
+        anchor_token_ids=torch.tensor([7]),
+    )
+
+    masks = torch.cat(
+        harness.correction_head.previous_corrected_hidden_masks, dim=1
+    )
+    assert torch.equal(masks, torch.tensor([[False, True, True]]))
+    feedback = torch.cat(
+        harness.correction_head.previous_corrected_hidden, dim=1
+    )
+    assert torch.count_nonzero(feedback[:, 0]) == 0
+    assert torch.equal(feedback[:, 1:], corrected_hidden[:, :-1].detach())
 
 
 def test_confidence_feature_detach_switch_controls_both_inputs():
@@ -155,6 +320,18 @@ def test_confidence_feature_detach_switch_controls_both_inputs():
     assert not detached.requires_grad
     assert torch.equal(detached[..., :4], hidden.detach())
     assert torch.equal(detached[..., 4:], sequential.detach())
+
+
+def test_hidden_alignment_loss_is_masked_and_zero_for_matching_states():
+    corrected = torch.tensor([[[1.0, 2.0], [100.0, 100.0]]])
+    verifier = torch.tensor([[[1.0, 2.0], [0.0, 0.0]]])
+    mask = torch.tensor([[1.0, 0.0]])
+
+    loss = DSparkDraftModel._hidden_alignment_loss(
+        corrected, verifier, mask
+    )
+
+    assert torch.equal(loss, torch.zeros_like(loss))
 
 
 def test_collaborative_markov_is_gated_from_correction_state():

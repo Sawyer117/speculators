@@ -41,6 +41,7 @@ _CORE_LOGGED_METRICS = frozenset(
         "full_acc",
         "accept_len",
         "confidence_loss",
+        "correction_hidden_aux_loss",
         "collaboration_accept_len_gain",
         "collaboration_markov_gate_mean",
         "collaboration_markov_change_accuracy",

@@ -1162,8 +1162,19 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "DSpark: use pre-projection causal hidden correction; it replaces "
-            "Markov unless --correction-with-markov is enabled."
+            "DSpark: use causal Correction; it replaces Markov unless "
+            "--correction-with-markov is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--correction-output-mode",
+        type=str,
+        default="hidden",
+        choices=["hidden", "logits"],
+        help=(
+            "DSpark Correction output: 'hidden' adds a pre-LM-head hidden "
+            "residual; 'logits' consumes previous logits and adds a low-rank "
+            "vocabulary bias to DFlash base logits (default: hidden)."
         ),
     )
     parser.add_argument(
@@ -1176,7 +1187,7 @@ def parse_args():
         "--correction-rank",
         type=int,
         default=256,
-        help="DSpark correction hidden-residual bottleneck (default: 256).",
+        help="DSpark correction residual bottleneck (default: 256).",
     )
     parser.add_argument(
         "--correction-num-layers",
@@ -1195,6 +1206,40 @@ def parse_args():
         type=float,
         default=0.0,
         help="DSpark initial correction residual-gate bias (default: 0).",
+    )
+    parser.add_argument(
+        "--correction-hidden-aux-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: align Correction's corrected DFlash hidden with verifier "
+            "pre-LM hidden using an auxiliary SmoothL1 loss (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-hidden-aux-weight",
+        type=float,
+        default=0.1,
+        help="DSpark hidden auxiliary-loss weight (default: 0.1).",
+    )
+    parser.add_argument(
+        "--correction-hidden-feedback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: feed each corrected hidden into the next Correction slot "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-project-corrected-hidden",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark logits mode: compute current logits as "
+            "LMHead(h_DFlash + delta_hidden) + delta_logits while retaining one "
+            "full LM-head projection (default: disabled)."
+        ),
     )
     parser.add_argument(
         "--correction-with-markov",
@@ -1500,6 +1545,28 @@ def parse_args():
                 "--correction-hidden-size must be divisible by "
                 "--correction-num-heads"
             )
+    elif args.correction_output_mode != "hidden":
+        parser.error(
+            "--correction-output-mode=logits requires --enable-correction-head"
+        )
+    if (
+        args.correction_hidden_aux_loss
+        or args.correction_hidden_feedback
+        or args.correction_project_corrected_hidden
+    ) and not args.enable_correction_head:
+        parser.error(
+            "Correction hidden auxiliary features require --enable-correction-head"
+        )
+    if args.correction_hidden_aux_weight < 0.0:
+        parser.error("--correction-hidden-aux-weight must be >= 0")
+    if (
+        args.correction_project_corrected_hidden
+        and args.correction_output_mode != "logits"
+    ):
+        parser.error(
+            "--correction-project-corrected-hidden requires "
+            "--correction-output-mode=logits"
+        )
     if args.correction_generated_token_ratio > 0.0 and not args.enable_correction_head:
         parser.error(
             "--correction-generated-token-ratio > 0 requires --enable-correction-head"

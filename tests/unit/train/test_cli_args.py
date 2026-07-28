@@ -174,6 +174,7 @@ def test_dspark_preprojection_correction_head_cli(monkeypatch):
         ],
     )
     assert args.enable_correction_head is True
+    assert args.correction_output_mode == "hidden"
     assert args.correction_hidden_size == 96
     assert args.correction_rank == 48
     assert args.correction_num_layers == 2
@@ -186,6 +187,43 @@ def test_dspark_preprojection_correction_head_cli(monkeypatch):
 
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw == val_kw
+
+
+def test_dspark_logit_residual_correction_head_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-output-mode",
+            "logits",
+        ],
+    )
+    assert args.enable_correction_head is True
+    assert args.correction_output_mode == "logits"
+
+
+def test_dspark_correction_hidden_auxiliary_features_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-hidden-aux-loss",
+            "--correction-hidden-aux-weight",
+            "0.2",
+            "--correction-hidden-feedback",
+            "--correction-project-corrected-hidden",
+            "--correction-output-mode",
+            "logits",
+        ],
+    )
+    assert args.correction_hidden_aux_loss is True
+    assert args.correction_hidden_aux_weight == 0.2
+    assert args.correction_hidden_feedback is True
+    assert args.correction_project_corrected_hidden is True
 
 
 def test_dspark_correction_generated_token_curriculum_cli(monkeypatch):
