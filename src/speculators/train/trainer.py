@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 import warnings
 from pathlib import Path
@@ -149,6 +150,10 @@ class TrainerConfig(NamedTuple):
     bf16_experts: bool = False
     log_freq: int = 1
     fsdp_shard: bool = False
+    # Forward-only router-load PROBE (no backward / optimizer / scheduler / checkpoint, so ZERO
+    # weight drift). Loads a draft, runs forward over real batches, and reports each MoE router's
+    # GLOBAL per-expert selection histogram. Used to measure a released/trained draft's collapse.
+    forward_only: bool = False
 
 
 def _resolve_scheduler_steps(
@@ -212,7 +217,13 @@ class Trainer:
 
         self.setup_trainer()
         self.setup_model()
-        self.setup_optimizer()
+        if self.config.forward_only:
+            # Probe mode: no training state. Skip building optimizers/schedulers (their fp32
+            # masters would needlessly ~double param memory on the single card).
+            self.optimizers = []
+            self.schedulers = []
+        else:
+            self.setup_optimizer()
 
     def _training_state_path(self, epoch: int) -> Path:
         return self.checkpointer.path / str(epoch) / "training_state.json"
@@ -742,3 +753,79 @@ class Trainer:
 
             if self.is_distributed:
                 dist.barrier()
+
+    @torch.no_grad()
+    def run_forward_probe(self, max_steps: int | None = None) -> None:
+        """Forward-only MoE router-load probe. Runs the model over real batches with NO
+        backward / optimizer / scheduler / checkpoint, so the weights NEVER drift -- it
+        purely observes routing. Each :class:`Router` stashes its per-expert selection
+        histogram (``_sel_counts``, one forward's worth) when ``DSPARK_LOG_EXPERT_LOAD=1``;
+        this ACCUMULATES those across every forward and, at the end, all-reduces to the
+        GLOBAL per-layer histogram (each EP/DP rank sees only its token shard) and reports
+        used/dead experts, top-16 mass, normalized entropy, and the hottest expert IDs.
+
+        Answers "is this draft's router collapsed to a few experts (low entropy, stable hot
+        IDs) or spread out?" for a released or trained checkpoint, without any training.
+        """
+        self.model.eval()
+        routers = [
+            m for _, m in self.model.named_modules()
+            if hasattr(m, "_sel_counts") and hasattr(m, "n_routed_experts")
+        ]
+        if not routers:
+            root_logger.warning(
+                "[probe] no routers expose _sel_counts -- run with DSPARK_LOG_EXPERT_LOAD=1 "
+                "so the router stashes its per-expert selection counts."
+            )
+            return
+        # fp64 accumulators (counts sum over many forwards -> keep them exact).
+        agg = [
+            torch.zeros(r.n_routed_experts, dtype=torch.float64, device=self.local_rank)
+            for r in routers
+        ]
+
+        loader = self.train_loader
+        if self.rank == 0:
+            loader = tqdm(loader, desc="router-probe")  # type: ignore[assignment]
+
+        n_fwd = 0
+        for step, batch in enumerate(loader, 1):
+            gpu_batch = {
+                k: v.to(self.local_rank, non_blocking=True)
+                if isinstance(v, torch.Tensor)
+                else v
+                for k, v in batch.items()
+            }
+            self.model(**gpu_batch, **(self.config.train_call_kwargs or {}))
+            for i, r in enumerate(routers):
+                c = getattr(r, "_sel_counts", None)
+                if c is not None:
+                    agg[i] += c.to(dtype=torch.float64)
+            n_fwd += 1
+            if max_steps is not None and step >= max_steps:
+                break
+
+        root_logger.info("[probe] %d forwards done; reducing router histograms.", n_fwd)
+        for i, counts in enumerate(agg):
+            if self.is_distributed:
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)  # -> GLOBAL per-expert load
+            if self.rank != 0:
+                continue
+            E = counts.numel()
+            total = counts.sum().clamp(min=1)
+            probs = counts / total
+            used = int((counts > 0).sum())
+            topk = min(16, E)
+            top_vals, top_idx = counts.topk(topk)
+            top_mass = float(top_vals.sum() / total)
+            entropy = float(
+                -(probs[probs > 0] * probs[probs > 0].log()).sum()
+                / math.log(E)
+            )
+            print(
+                f"[PROBE-AGG L{i}] fwds={n_fwd} selections={int(total)} "
+                f"used={used}/{E} dead={E - used} top{topk}_mass={top_mass:.3f} "
+                f"entropy={entropy:.3f}  hot={top_idx.tolist()}  "
+                f"(entropy 1.0=uniform / low=collapsed)",
+                flush=True,
+            )

@@ -731,6 +731,20 @@ def main(args: argparse.Namespace):  # noqa: C901
 
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
 
+    # Load a RELEASED (mtp.*) draft on top of the freshly-built model (probe path). Keeps the
+    # verifier-filled frozen parts; overrides the draft layers/heads with the released weights.
+    if args.from_released:
+        if args.speculator_type != "dsv4_dspark":
+            raise ValueError("--from-released is only supported for --speculator-type dsv4_dspark")
+        from speculators.models.dsv4_dspark.weights import load_released_draft  # noqa: PLC0415
+
+        rep = load_released_draft(draft_model, args.from_released)
+        if not rep["ok"] and get_rank() == 0:
+            logger.warning(
+                "[from-released] load imperfect: unexpected=%s surprising_missing=%s",
+                rep["unexpected"][:6], rep["surprising_missing"][:6],
+            )
+
     # Get target layer IDs from the model (resolved at model level)
     num_target_layers = len(draft_model.target_layer_ids)
 
@@ -819,11 +833,16 @@ def main(args: argparse.Namespace):  # noqa: C901
         bf16_experts=args.bf16_experts,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        forward_only=args.forward_only,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
-    # Run training
-    trainer.run_training()
+    # Run training (or a forward-only router-load probe: no backward/opt/ckpt, no drift).
+    if args.forward_only:
+        max_steps = args.forward_only_steps if args.forward_only_steps > 0 else None
+        trainer.run_forward_probe(max_steps=max_steps)
+    else:
+        trainer.run_training()
 
     # Cleanup
     del trainer, draft_model
@@ -955,6 +974,33 @@ def parse_args():
         "--save-path, then exit before training. Useful to validate the config and "
         "weights (e.g. in vLLM) before launching a full run. Can be combined with "
         "--draft-config or --from-pretrained.",
+    )
+    parser.add_argument(
+        "--from-released",
+        type=str,
+        default="",
+        help="Load a RELEASED (mtp.*) DSpark draft dir on top of the freshly-built model "
+        "(dsv4_dspark only): the standalone bf16 dir from build_released_draft_dir.py. "
+        "Maps mtp.*->layers.* and stacks per-expert weights into GroupedExperts. Use with "
+        "--forward-only to probe the released draft's router without converting to our "
+        "on-disk format. Do NOT combine with --from-pretrained.",
+    )
+    parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        default=False,
+        help="PROBE mode: run the model forward over real batches with NO backward / "
+        "optimizer / scheduler / checkpoint (weights never drift), then report each MoE "
+        "router's GLOBAL per-expert selection histogram (used/dead/entropy/hot IDs). "
+        "Set DSPARK_LOG_EXPERT_LOAD=1 so the routers stash their counts. Measures whether "
+        "a draft's router is collapsed. Pair with --from-released or --from-pretrained.",
+    )
+    parser.add_argument(
+        "--forward-only-steps",
+        type=int,
+        default=200,
+        help="Number of forward passes for --forward-only before reporting (default 200). "
+        "0 or negative = run the whole epoch.",
     )
     parser.add_argument(
         "--data-path",

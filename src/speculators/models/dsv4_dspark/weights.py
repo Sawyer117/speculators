@@ -232,3 +232,106 @@ def verify_mapping(released_keys, cfg: DSparkDraftConfig) -> dict:
         "unexpected": sorted(unexpected),
         "collisions": collisions,
     }
+
+
+# per-expert released key -> our layer/index for stacking into GroupedExperts.
+_EXPERT_RE = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\.weight$")
+
+
+def load_released_draft(model, released_dir, *, verbose: bool = True) -> dict:
+    """Load a RELEASED (or standalone-converted) DSpark draft into ``model`` in place.
+
+    ``released_dir`` is a directory holding ``model.safetensors`` (or a sharded set +
+    ``model.safetensors.index.json``) in the release ``mtp.*`` namespace — e.g. the
+    ``released_draft_bf16_standalone`` dir that :mod:`scripts.build_released_draft_dir`
+    produces (mtp.* dequant'd to bf16 + borrowed ``embed`` / ``head``).
+
+    Every tensor is remapped with :func:`map_released_key`; the per-expert
+    ``...ffn.experts.{e}.w{k}.weight`` tensors are STACKED into our
+    :class:`GroupedExperts` layout (``layers.{n}.ffn.experts.w{k}`` shaped
+    ``[E, out, in]``). Loaded non-strict: the frozen shared parts our model already
+    filled from the verifier (``verifier_lm_head`` / ``verifier_norm``, and ``embed`` /
+    ``lm_head`` when the release omits them) are left as-is. Returns the load report.
+
+    Requires torch + safetensors (imported lazily so the analytic helpers above stay
+    torch-free). Raises on an fp8/fp4 release — dequant to bf16 first with
+    ``scripts/build_released_draft_dir.py --dequant-bf16``.
+    """
+    import json  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    import torch  # noqa: PLC0415
+    from safetensors import safe_open  # noqa: PLC0415
+
+    d = Path(released_dir)
+    idx = d / "model.safetensors.index.json"
+    if idx.exists():
+        weight_map = json.loads(idx.read_text())["weight_map"]
+    else:
+        single = d / "model.safetensors"
+        if not single.exists():
+            raise FileNotFoundError(f"no model.safetensors[.index.json] in {d}")
+        with safe_open(str(single), framework="pt") as f:
+            weight_map = {k: "model.safetensors" for k in f.keys()}
+
+    n_draft_layers = len(model.layers)
+    # group per-shard so each file opens once.
+    by_shard: dict[str, list[str]] = {}
+    for k, shard in weight_map.items():
+        by_shard.setdefault(shard, []).append(k)
+
+    mapped: dict[str, "torch.Tensor"] = {}
+    experts: dict[tuple[int, int], dict[int, "torch.Tensor"]] = {}
+    n_skipped = 0
+    for shard, keys in by_shard.items():
+        with safe_open(str(d / shard), framework="pt") as f:
+            for k in keys:
+                tgt = map_released_key(k, n_draft_layers)
+                if tgt is None:
+                    n_skipped += 1
+                    continue
+                t = f.get_tensor(k)
+                if t.element_size() == 1:  # fp8 / fp4 block-quant weight (has a .scale)
+                    raise ValueError(
+                        f"'{k}' is fp8/fp4 ({t.dtype}); this loader wants a bf16 draft. "
+                        "Build one first: scripts/build_released_draft_dir.py --dequant-bf16."
+                    )
+                em = _EXPERT_RE.match(tgt)
+                if em:
+                    layer, e, wk = int(em.group(1)), int(em.group(2)), int(em.group(3))
+                    experts.setdefault((layer, wk), {})[e] = t
+                else:
+                    mapped[tgt] = t
+
+    # stack per-expert -> GroupedExperts [E, out, in] (expert-id order).
+    for (layer, wk), per_e in experts.items():
+        E = len(per_e)
+        stacked = torch.stack([per_e[e] for e in range(E)], dim=0)
+        mapped[f"layers.{layer}.ffn.experts.w{wk}"] = stacked
+
+    incompat = model.load_state_dict(mapped, strict=False)
+    missing = [k for k in incompat.missing_keys]
+    unexpected = list(incompat.unexpected_keys)
+    # the verifier-filled frozen parts are expected to be "missing" from the release.
+    frozen = tuple(
+        s for s in ("verifier_lm_head", "verifier_norm", "embed_tokens", "lm_head")
+    )
+    surprising = [k for k in missing if not k.startswith(frozen) and "freqs_cis" not in k]
+    report = {
+        "loaded": len(mapped),
+        "skipped": n_skipped,
+        "missing": missing,
+        "unexpected": unexpected,
+        "surprising_missing": surprising,
+        "ok": not unexpected and not surprising,
+    }
+    if verbose:
+        print(
+            f"[load_released_draft] loaded {report['loaded']} tensors "
+            f"({len(experts)} stacked expert groups), skipped {n_skipped}; "
+            f"missing={len(missing)} unexpected={len(unexpected)} "
+            f"surprising_missing={surprising[:6]}"
+            f"{' …' if len(surprising) > 6 else ''}  ok={report['ok']}",
+            flush=True,
+        )
+    return report
