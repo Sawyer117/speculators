@@ -237,6 +237,17 @@ _hs_session = None
 # (generate_hidden_states) can't be used; this is its drop-in replacement.
 _HS_DUMP = os.environ.get("DSPARK_HS_DUMP") == "1"
 
+# DSPARK_HS_SPLIT=1: time each HS fetch in 3 phases in _dump_generate_hs —
+#   create = the completions.create() round-trip (serve prefill/compute + HTTP)
+#   wait   = create()->file appears on the FS (serve-side dumper write + NFS dirent visibility)
+#   read   = load_file() of the ~132MB safetensors (TRAINER-side NFS read)
+# and print `[HS-SPLIT] rank= idx= total= create= wait= read=` for any fetch over
+# DSPARK_HS_SPLIT_MS (default 1000). Localises a per-rank straggler to serve (create/wait) vs
+# trainer NFS read (read). Shared-FS only (remote HS_FETCH_BASE keeps the combined loop —
+# path.exists() is always False on the trainer there). OFF by default (zero overhead).
+_HS_SPLIT = os.environ.get("DSPARK_HS_SPLIT") == "1"
+_HS_SPLIT_MS = float(os.environ.get("DSPARK_HS_SPLIT_MS", "1000"))
+
 
 def _hs_fetch_session():
     global _hs_session
@@ -367,6 +378,7 @@ class ArrowDataset(BaseDataset):
         remote mode, so the poll MUST go through the remote-aware loader. Drop-in for the
         connector-based ``generate_hidden_states`` (our serve returns no
         ``kv_transfer_params``)."""
+        _t0 = time.monotonic()
         self.client.completions.create(
             model=self.model,
             prompt=list(input_ids),
@@ -375,15 +387,61 @@ class ArrowDataset(BaseDataset):
             extra_body={"return_token_ids": True},
             timeout=self.request_timeout,
         )
+        _t_create = time.monotonic()
         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        # Poll until the HS are actually LOADABLE via the remote-aware loader:
-        #  * remote (HS_FETCH_BASE): each attempt GETs the sidecar (the file lives on the
-        #    SERVE box; the sidecar waits for the dump to flush, streams it, then deletes
-        #    it). A successful GET consumes the file, so return the loaded dict directly.
-        #  * shared-FS: load_file with the .lock / NFS dirent-vs-data-lag resilience the
-        #    connector's max_retries provides, then apply the rolling-buffer unlink.
         deadline = time.monotonic() + 60.0
         last_err: Exception | None = None
+
+        # DSPARK_HS_SPLIT: split the fetch into create / wait-for-file / read so a per-rank
+        # straggler can be pinned to serve (create+wait) vs trainer NFS read (read). Shared-FS
+        # only; the remote path (below) can't split (path.exists() always False on the trainer).
+        if _HS_SPLIT and not _HS_FETCH_BASE:
+            _t_exist = None
+            while time.monotonic() < deadline:
+                lock_path = str(path) + ".lock"
+                if Path(lock_path).exists():
+                    wait_for_lock(lock_path)
+                if path.exists():
+                    _t_exist = time.monotonic()
+                    break
+                time.sleep(0.1)
+            if _t_exist is None:
+                raise TimeoutError(f"DSPARK_HS_DUMP: {path} never appeared after 60s")
+            loaded_hs = None
+            while time.monotonic() < deadline:  # dirent up but data not yet visible → retry read
+                try:
+                    loaded_hs = load_file(path)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    time.sleep(0.05)
+            if loaded_hs is None:
+                raise TimeoutError(
+                    f"DSPARK_HS_DUMP: {path} exists but unloadable (last error: {last_err})"
+                )
+            _t_read = time.monotonic()
+            if self.on_generate == "delete":
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            _create_ms = (_t_create - _t0) * 1000.0
+            _wait_ms = (_t_exist - _t_create) * 1000.0
+            _read_ms = (_t_read - _t_exist) * 1000.0
+            _total_ms = _create_ms + _wait_ms + _read_ms
+            if _total_ms > _HS_SPLIT_MS:
+                print(
+                    f"[HS-SPLIT] rank={os.environ.get('RANK', '?')} idx={file_idx} "
+                    f"total={_total_ms:.0f}ms create={_create_ms:.0f} "
+                    f"wait={_wait_ms:.0f} read={_read_ms:.0f}",
+                    flush=True,
+                )
+            return loaded_hs
+
+        # Poll until the HS are actually LOADABLE via the remote-aware loader (original path):
+        #  * remote (HS_FETCH_BASE): each attempt GETs the sidecar (the file lives on the SERVE
+        #    box; the sidecar waits for the dump to flush, streams it, then deletes it).
+        #  * shared-FS: load_file with the .lock / NFS dirent-vs-data-lag resilience, then unlink.
         while time.monotonic() < deadline:
             try:
                 loaded_hs = _maybe_load_hs_file(path)
