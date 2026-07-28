@@ -251,7 +251,9 @@ def _load_and_skip(path: str, skip: int, quiet: bool = False):
     are None when there are no metrics / no epoch length is discoverable."""
     recs, raw_text = load(resolve_log(path))
     if not recs:
-        return None, None, None, None
+        # no training metrics (e.g. a forward-only ROUTER-PROBE log) — still hand back the raw
+        # text so main() can run the MoE-load / probe-agg reports parsed from it.
+        return None, None, None, raw_text
     if skip > 0:
         kept = [r for r in recs if step_of(r) >= skip]
         if kept:
@@ -615,12 +617,46 @@ def hs_split_report(text: str) -> None:
         print("    dataloader workers to the NIC's NUMA node, or read-once + HCCS broadcast.")
 
 
+def probe_agg_report(text: str) -> None:
+    """Router-load PROBE aggregate from ``[PROBE-AGG Ln]`` (run_forward_probe, forward-only).
+    Unlike ``[MOE-LOAD]`` (one noisy batch), this is the per-expert histogram ACCUMULATED over ALL
+    forwards + all-reduced GLOBAL — the honest routing distribution of the probed draft. Silent if
+    absent. eff.experts = E^entropy (the mass-carrying count, not 'used'); a reference ladder puts it
+    in context (collapsed ~ E^0.52 vs uniform E)."""
+    rows = re.findall(
+        r"\[PROBE-AGG L(\d+)\]\s+fwds=(\d+)\s+selections=(\d+)\s+used=(\d+)/(\d+)\s+"
+        r"dead=(\d+)\s+top\d+_mass=([\d.]+)\s+entropy=([\d.]+)\s+hot=\[([\d,\s]*)\]",
+        text,
+    )
+    if not rows:
+        return
+    print("\n== ROUTER-PROBE AGGREGATE (accumulated + global) " + "=" * 29)
+    print(f"  {'layer':6} {'used/E':>10} {'dead':>5} {'top16 mass':>11} {'entropy':>8} {'eff.experts':>12}  regime")
+    for lyr, fwds, sel, used, E, dead, top, ent, hot in rows:
+        E, ent = int(E), float(ent)
+        neff = round(E ** ent)
+        regime = ("COLLAPSED" if ent < 0.55 else "moderate" if ent < 0.78
+                  else "broad" if ent < 0.9 else "~uniform")
+        print(f"  L{lyr:<5} {f'{used}/{E}':>10} {dead:>5} {top:>11} {ent:>8.3f} "
+              f"{f'~{neff}/{E}':>12}  {regime}")
+    _f0 = rows[0][1]
+    print(f"  (over {_f0} forwards; eff.experts = E^entropy. Reference ladder for E=256: "
+          f"collapsed ~E^0.52≈18 · moderate ~E^0.65≈30 / E^0.70≈43 · uniform=256.)")
+
+
 def main() -> None:
     args = _build_parser().parse_args()
 
     recs, ckpt_steps, steps_per_epoch, raw_text = _load_and_skip(args.logfile, args.skip)
     if recs is None:
-        print("!! no metric records parsed — is this a trainer.py rich-logger log?")
+        # No training metrics — but a forward-only ROUTER-PROBE log still carries the MoE-load /
+        # probe-agg lines. Surface those instead of bailing.
+        if raw_text and ("[PROBE-AGG" in raw_text or "[MOE-LOAD" in raw_text):
+            probe_agg_report(raw_text)
+            moe_load_report(raw_text)
+            hs_split_report(raw_text)
+        else:
+            print("!! no metric records parsed — is this a trainer.py rich-logger log?")
         return
     cur_label = args.label or _default_label(args.logfile)
 
