@@ -114,9 +114,10 @@ COMPILE="${COMPILE:-0}"                # ★ SEED TECH: torch.compile'd experts 
 # reads are cheap). Override with NUM_WORKERS=.
 if [ -n "${HS_FETCH_BASE:-}" ]; then NUM_WORKERS="${NUM_WORKERS:-4}"; else NUM_WORKERS="${NUM_WORKERS:-12}"; fi
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
-NOVAL="${NO_VAL:-0}"                    # NO_VAL=1 -> cancel the per-epoch validation pass. Val does SERIAL
-                                       # online HS generation for the 10% held-out split (num_workers=0),
-                                       # which dominates the epoch; --no-validation trains on the FULL data.
+NOVAL="${NO_VAL:-1}"                    # ★ WELDED DEFAULT=1 (2026-07-30): cancel the per-epoch validation pass.
+                                       # Val does SERIAL online HS generation for the 10% held-out split
+                                       # (num_workers=0) which dominates the epoch AND wastes 10% of the data;
+                                       # --no-validation trains on the FULL data. Pass NO_VAL=0 to re-enable val.
 INITMOE="${INIT_MOE:-0}"               # INIT_MOE=1 -> warm-start the draft MoE (experts+router+shared) from
                                        # the verifier's target layers (draft n <- target_layer_ids[n]).
                                        # Trainable init; faithful only. A/B vs from-scratch.
