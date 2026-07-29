@@ -115,9 +115,25 @@ def main():
             return True
         return not ('"finish_reason": "stop"' in line or '"finish_reason":"stop"' in line)
 
-    def tail_repetitive(gpt):
-        toks = gpt[-400:].split()
-        return len(toks) >= 20 and len(set(toks[-40:])) <= 5
+    def reconfirm_listed(listed_reason, det, finish):
+        """True if a drop-list row still carries the signal its reason claims — so we
+        only warn about REAL line-number drift, not fuzzy tail-loops. Deterministic
+        categories must re-fire in classify(); tail-loop families just need finish=length
+        (all audited loops are length-truncated), which we don't try to re-detect."""
+        lr = listed_reason
+        if "stray_token_坨" in lr and "tuo" in det:
+            return True
+        if "encoding_artifact" in lr and "encoding" in det:
+            return True
+        if "empty_failed_output" in lr and "empty" in det:
+            return True
+        if "python_code_fence_loop" in lr and "fence" in det:
+            return True
+        _loops = ("tail_ngram", "vertical_bar_tail_loop", "single_token",
+                  "navigation_menu", "regex_fragment")
+        if any(t in lr for t in _loops) and finish == "length":
+            return True
+        return False
 
     n = kept = 0
     cat = Counter()
@@ -139,14 +155,15 @@ def main():
             md = obj.get("metadata", {}) or {}
             gpt = get_turn(conv, ("gpt", "assistant"))
             finish = md.get("finish_reason")
-            reasons = classify(gpt, finish, args.fence_min)
+            det = classify(gpt, finish, args.fence_min)
+            reasons = list(det)
             if listed:
                 listed_seen += 1
                 reasons = reasons + [f"listed:{drop_lines[i]}"]
-                # drift sanity: a listed row should carry SOME signal (a 4-rule hit or a
-                # repetitive tail). If none, the jsonl may have drifted vs the list.
-                if not classify(gpt, finish, args.fence_min) and not tail_repetitive(gpt):
-                    listed_no_signal.append((i, obj.get("id")))
+                # REAL drift only: the row's claimed signal must still hold (deterministic
+                # categories re-fire in classify; tail-loops just need finish=length).
+                if not reconfirm_listed(drop_lines[i], det, finish):
+                    listed_no_signal.append((i, obj.get("id"), drop_lines[i]))
             if not reasons:
                 fout.write(line); kept += 1; continue
             for r in reasons:
