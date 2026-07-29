@@ -61,10 +61,12 @@ def test_optional_features_default_off_preserves_original_helpers():
     assert model.layer_fusion_norms is None
     assert model.layer_fusion_score is None
     assert model.context_hidden_proj is None
+    assert model.verifier_final_hidden_proj is None
     assert model.block_position_embedding is None
     optional_prefixes = (
         "layer_fusion_",
         "context_hidden_",
+        "verifier_final_hidden_",
         "block_position_embedding",
     )
     assert not any(
@@ -138,5 +140,58 @@ def test_context_residual_does_not_cross_document_boundary():
         fused,
         torch.tensor([2]),
         document_ids,
+    )
+    assert torch.equal(conditioned, noise)
+
+
+def test_verifier_final_residual_uses_pre_lm_context_and_starts_at_zero():
+    model = _make_model(dflash_verifier_final_residual=True)
+    assert model.verifier_final_hidden_proj is not None
+    assert model.verifier_final_hidden_gate is not None
+
+    noise = torch.randn(1, 3, 16)
+    fused = torch.randn(1, 4, 16)
+    pre_lm = torch.ones(1, 4, 16)
+    document_ids = torch.zeros(1, 4, dtype=torch.long)
+    initial = model._condition_noise_embedding(
+        noise,
+        fused,
+        torch.tensor([2]),
+        document_ids,
+        verifier_pre_lm_hidden=pre_lm,
+    )
+    assert torch.equal(initial, noise)
+
+    with torch.no_grad():
+        model.verifier_final_hidden_proj.weight.copy_(torch.eye(16))
+        model.verifier_final_hidden_gate.fill_(1.0)
+    conditioned = model._condition_noise_embedding(
+        noise,
+        fused,
+        torch.tensor([2]),
+        document_ids,
+        verifier_pre_lm_hidden=pre_lm,
+    )
+    assert not torch.equal(conditioned, noise)
+
+
+def test_verifier_final_residual_does_not_cross_document_boundary():
+    model = _make_model(dflash_verifier_final_residual=True)
+    assert model.verifier_final_hidden_proj is not None
+    assert model.verifier_final_hidden_gate is not None
+    with torch.no_grad():
+        model.verifier_final_hidden_proj.weight.copy_(torch.eye(16))
+        model.verifier_final_hidden_gate.fill_(1.0)
+
+    noise = torch.zeros(1, 3, 16)
+    fused = torch.zeros(1, 4, 16)
+    pre_lm = torch.ones(1, 4, 16)
+    document_ids = torch.tensor([[0, 0, 1, 1]])
+    conditioned = model._condition_noise_embedding(
+        noise,
+        fused,
+        torch.tensor([2]),
+        document_ids,
+        verifier_pre_lm_hidden=pre_lm,
     )
     assert torch.equal(conditioned, noise)

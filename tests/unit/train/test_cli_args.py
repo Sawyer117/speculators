@@ -267,8 +267,10 @@ def test_new_dflash_and_collaboration_features_default_off(monkeypatch):
     args = _parse(monkeypatch, ["--speculator-type", "dspark"])
     assert args.correction_with_markov is False
     assert args.dflash_context_residual is False
+    assert args.dflash_verifier_final_residual is False
     assert args.dflash_block_position_embedding is False
     assert args.dflash_gated_layer_fusion is False
+    assert args.correction_cross_block_memory is False
 
 
 def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
@@ -281,14 +283,21 @@ def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
             "--correction-with-markov",
             "--correction-markov-gate-bias",
             "-1.5",
+            "--correction-cross-block-memory",
+            "--correction-memory-gate-bias",
+            "-1.0",
             "--dflash-context-residual",
+            "--dflash-verifier-final-residual",
             "--dflash-block-position-embedding",
             "--dflash-gated-layer-fusion",
         ],
     )
     assert args.correction_with_markov is True
     assert args.correction_markov_gate_bias == -1.5
+    assert args.correction_cross_block_memory is True
+    assert args.correction_memory_gate_bias == -1.0
     assert args.dflash_context_residual is True
+    assert args.dflash_verifier_final_residual is True
     assert args.dflash_block_position_embedding is True
     assert args.dflash_gated_layer_fusion is True
 

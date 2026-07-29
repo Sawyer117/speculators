@@ -140,6 +140,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             self.context_hidden_proj = nn.Linear(hidden_size, hidden_size, bias=False)
             self.context_hidden_gate = nn.Parameter(torch.zeros(()))
 
+        self.verifier_final_hidden_proj: nn.Linear | None = None
+        self.verifier_final_hidden_gate: nn.Parameter | None = None
+        if config.dflash_verifier_final_residual:
+            self.verifier_final_hidden_proj = nn.Linear(
+                hidden_size, hidden_size, bias=False
+            )
+            self.verifier_final_hidden_gate = nn.Parameter(torch.zeros(()))
+
         self.block_position_embedding: nn.Embedding | None = None
         if config.dflash_block_position_embedding:
             self.block_position_embedding = nn.Embedding(self.block_size, hidden_size)
@@ -248,6 +256,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
             "dflash_context_residual": kwargs.get(
                 "dflash_context_residual", False
+            ),
+            "dflash_verifier_final_residual": kwargs.get(
+                "dflash_verifier_final_residual", False
             ),
             "dflash_block_position_embedding": kwargs.get(
                 "dflash_block_position_embedding", False
@@ -409,6 +420,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         fused_context: torch.Tensor,
         anchor_positions: torch.Tensor,
         document_ids: torch.Tensor,
+        *,
+        verifier_pre_lm_hidden: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply opt-in, inference-safe DFlash block conditioning."""
         if self.block_position_embedding is not None:
@@ -426,7 +439,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 raise RuntimeError("Context residual gate was not initialized")
             context_positions = (anchor_positions - 1).clamp_min(0)
             last_context = fused_context[:, context_positions, :]
-            last_context = last_context.repeat_interleave(self.block_size, dim=1)
+            residual = self.context_hidden_proj(last_context)
+            residual = residual.repeat_interleave(self.block_size, dim=1)
 
             anchor_docs = document_ids[:, anchor_positions]
             context_docs = document_ids[:, context_positions]
@@ -438,10 +452,40 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             valid_context = valid_context.repeat_interleave(
                 self.block_size, dim=1
             ).unsqueeze(-1)
-            residual = self.context_hidden_proj(last_context)
             residual = residual * valid_context.to(residual.dtype)
             noise_embedding = noise_embedding + (
                 torch.tanh(self.context_hidden_gate)
+                * residual.to(noise_embedding.dtype)
+            )
+
+        if self.verifier_final_hidden_proj is not None:
+            if self.verifier_final_hidden_gate is None:
+                raise RuntimeError(
+                    "Verifier final-hidden residual gate was not initialized"
+                )
+            if verifier_pre_lm_hidden is None:
+                raise ValueError(
+                    "verifier_pre_lm_hidden is required when the verifier "
+                    "final-hidden residual is enabled"
+                )
+            context_positions = (anchor_positions - 1).clamp_min(0)
+            last_context = verifier_pre_lm_hidden[:, context_positions, :]
+            residual = self.verifier_final_hidden_proj(last_context)
+            residual = residual.repeat_interleave(self.block_size, dim=1)
+
+            anchor_docs = document_ids[:, anchor_positions]
+            context_docs = document_ids[:, context_positions]
+            valid_context = (
+                (anchor_positions.unsqueeze(0) > 0)
+                & (anchor_docs == context_docs)
+                & (anchor_docs != -1)
+            )
+            valid_context = valid_context.repeat_interleave(
+                self.block_size, dim=1
+            ).unsqueeze(-1)
+            residual = residual * valid_context.to(residual.dtype)
+            noise_embedding = noise_embedding + (
+                torch.tanh(self.verifier_final_hidden_gate)
                 * residual.to(noise_embedding.dtype)
             )
 
@@ -491,12 +535,18 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
+        with torch.no_grad():
+            verifier_pre_lm_hidden = self.verifier_norm(
+                verifier_last_hidden_states.to(self.verifier_norm.weight.dtype)
+            )
+
         fc_output = self._fuse_target_hidden(hidden_states)
         noise_embedding = self._condition_noise_embedding(
             noise_embedding,
             fc_output,
             anchor_positions,
             document_ids,
+            verifier_pre_lm_hidden=verifier_pre_lm_hidden,
         )
         # shape: [1, total_seq_len, hidden_size]
 
@@ -515,9 +565,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )  # shape: [num_anchors*block_size]
 
         with torch.no_grad():
-            verifier_logits = self.verifier_lm_head(
-                self.verifier_norm(verifier_last_hidden_states)
-            )
+            verifier_logits = self.verifier_lm_head(verifier_pre_lm_hidden)
             if not self.config.sample_from_anchor:
                 # False: shift right by 1 so slot j predicts token at position j
                 verifier_logits = torch.roll(verifier_logits, 1, dims=1)

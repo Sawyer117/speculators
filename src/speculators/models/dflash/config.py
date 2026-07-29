@@ -78,6 +78,14 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    dflash_verifier_final_residual: bool = Field(
+        default=False,
+        description=(
+            "Inject the verifier final/pre-LM hidden state available immediately "
+            "before each anchor into all draft slots through a zero-gated residual."
+        ),
+    )
+
     dflash_block_position_embedding: bool = Field(
         default=False,
         description=(

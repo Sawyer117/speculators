@@ -114,6 +114,21 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "default for baseline parity."
         ),
     )
+    correction_cross_block_memory: bool = Field(
+        default=False,
+        description=(
+            "Carry a gated residual memory between draft blocks. Training builds "
+            "the memory from verifier-confirmed pre-LM context and the current "
+            "anchor token; speculative decoding updates it only after verification."
+        ),
+    )
+    correction_memory_gate_bias: float = Field(
+        default=-2.0,
+        description=(
+            "Initial bias of the gated residual memory update. The default starts "
+            "with a conservative update rate."
+        ),
+    )
     correction_project_corrected_hidden: bool = Field(
         default=False,
         description=(

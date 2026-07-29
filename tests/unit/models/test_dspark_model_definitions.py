@@ -58,6 +58,36 @@ class TestCausalCorrectionHead:
         _, states_b, _ = head(previous, hidden, torch.zeros_like(positions))
         assert not torch.allclose(states_a[:, 1:], states_b[:, 1:])
 
+    def test_block_memory_is_broadcast_across_correction_slots(self):
+        torch.manual_seed(7)
+        head = CausalCorrectionHead(
+            input_hidden_size=16,
+            token_embedding_size=16,
+            block_size=4,
+            correction_hidden_size=12,
+            correction_rank=8,
+            num_layers=1,
+            num_heads=3,
+            block_memory_size=12,
+        ).eval()
+        previous, hidden, positions = self._inputs()
+        zero_memory = torch.zeros(2, 12)
+        nonzero_memory = torch.ones(2, 12)
+
+        _, states_a, _ = head(
+            previous,
+            hidden,
+            positions,
+            block_memory=zero_memory,
+        )
+        _, states_b, _ = head(
+            previous,
+            hidden,
+            positions,
+            block_memory=nonzero_memory,
+        )
+        assert not torch.allclose(states_a, states_b)
+
     def test_cached_rollout_matches_full_sequence(self):
         head = self._head()
         inputs = self._inputs()

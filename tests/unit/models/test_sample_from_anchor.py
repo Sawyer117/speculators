@@ -15,6 +15,7 @@ class TestSampleFromAnchorDFlash:
         config = DFlashSpeculatorConfig(draft_vocab_size=128, block_size=4)
         assert not config.sample_from_anchor
         assert not config.dflash_context_residual
+        assert not config.dflash_verifier_final_residual
         assert not config.dflash_block_position_embedding
         assert not config.dflash_gated_layer_fusion
 
@@ -37,6 +38,7 @@ class TestSampleFromAnchorDSpark:
         assert config.correction_generated_token_ratio == 0.0
         assert config.correction_generated_token_warmup == 0.2
         assert config.correction_generated_token_ramp == 0.4
+        assert not config.correction_cross_block_memory
 
     def test_can_override_to_false(self):
         """DSpark can be configured with sample_from_anchor=False."""

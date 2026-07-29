@@ -471,17 +471,20 @@ def _run_preprojection_correction_rollout(
     hidden_states,
     anchor_token_ids,
     temperature: float,
+    block_memory=None,
 ):
     """Run native Correction rollout, including optional previous-logit feedback."""
     if not _is_preprojection_correction(draft):
         raise RuntimeError(
             "This evaluator expects the native causal CorrectionHead"
         )
-    return draft.rollout_correction(
-        hidden_states,
-        anchor_token_ids=anchor_token_ids,
-        temperature=temperature,
-    )
+    rollout_kwargs = {
+        "anchor_token_ids": anchor_token_ids,
+        "temperature": temperature,
+    }
+    if block_memory is not None:
+        rollout_kwargs["block_memory"] = block_memory
+    return draft.rollout_correction(hidden_states, **rollout_kwargs)
 
 
 def speculative_slots_for_draft(draft) -> int:
@@ -722,7 +725,7 @@ def generate_decoding_sample(
             support_accept_rate_lists=support_accept_rate_lists,
         )
 
-    context = init_context(initial_output=output)
+    context = init_context(initial_output=output, initial_token=initial_token)
     del output
 
     while start < max_length:
@@ -797,6 +800,34 @@ class DSparkOfflineRunner:
         self.sample_from_anchor = _draft_sample_from_anchor(draft_model)
         self.first_draft_slot = first_draft_slot_for_draft(draft_model)
         self.max_proposal_tokens = speculative_slots_for_draft(draft_model)
+        self.uses_verifier_pre_lm_context = bool(
+            draft_model.config.dflash_verifier_final_residual
+            or draft_model.config.correction_cross_block_memory
+        )
+        self._latest_verifier_pre_lm_hidden = None
+        self._verifier_pre_lm_hook = None
+        if self.uses_verifier_pre_lm_context:
+            verifier_lm_head = target_model.get_output_embeddings()
+            if verifier_lm_head is None:
+                raise RuntimeError("Target model does not expose an output LM head")
+            self._verifier_pre_lm_hook = verifier_lm_head.register_forward_pre_hook(
+                self._capture_verifier_pre_lm_hidden
+            )
+
+    def _capture_verifier_pre_lm_hidden(self, _module, inputs) -> None:
+        if not inputs:
+            raise RuntimeError("Verifier LM head did not receive hidden states")
+        self._latest_verifier_pre_lm_hidden = inputs[0].detach()
+
+    def _require_latest_verifier_pre_lm_hidden(self):
+        hidden = self._latest_verifier_pre_lm_hidden
+        if hidden is None:
+            raise RuntimeError("Verifier pre-LM hidden state was not captured")
+        if hidden.ndim != 3:
+            raise RuntimeError(
+                f"Expected rank-3 verifier pre-LM hidden, got {hidden.shape}"
+            )
+        return hidden
 
     def _extract_context_feature(self, hidden_states):
         return torch.cat(
@@ -804,25 +835,78 @@ class DSparkOfflineRunner:
             dim=-1,
         )
 
-    def _init_context(self, *, initial_output, **_kwargs) -> SimpleNamespace:
+    def _init_context(
+        self,
+        *,
+        initial_output,
+        initial_token,
+        **_kwargs,
+    ) -> SimpleNamespace:
+        verifier_pre_lm_hidden = None
+        correction_memory = None
+        if self.uses_verifier_pre_lm_context:
+            verifier_pre_lm_hidden = (
+                self._require_latest_verifier_pre_lm_hidden()
+            )
+        if self.draft_model.config.correction_cross_block_memory:
+            if verifier_pre_lm_hidden is None:
+                raise RuntimeError(
+                    "Cross-block memory requires captured verifier pre-LM hidden"
+                )
+            correction_memory = self.draft_model.update_cross_block_memory(
+                None,
+                verifier_pre_lm_hidden[:, -1, :],
+                initial_token.reshape(-1),
+            )
         return SimpleNamespace(
             target_hidden_states=self._extract_context_feature(
                 initial_output.hidden_states,
             ),
+            target_pre_lm_hidden_states=verifier_pre_lm_hidden,
+            correction_memory=correction_memory,
         )
 
-    def _single_anchor_backbone(self, hidden_states, input_ids, start: int):
+    def _single_anchor_backbone(
+        self,
+        hidden_states,
+        verifier_pre_lm_hidden,
+        input_ids,
+        start: int,
+    ):
         draft = self.draft_model
         block = int(draft.block_size)
-        if hidden_states.shape[1] != start:
+        pre_lm_length = (
+            None
+            if verifier_pre_lm_hidden is None
+            else verifier_pre_lm_hidden.shape[1]
+        )
+        if (
+            hidden_states.shape[1] != start
+            or (
+                verifier_pre_lm_hidden is not None
+                and pre_lm_length != start
+            )
+        ):
             raise ValueError(
-                "DSpark context hidden states must contain exactly the prefix before "
-                f"the current anchor; got {hidden_states.shape[1]} and start={start}."
+                "DSpark context states must contain exactly the prefix before the "
+                "current anchor; got auxiliary/pre-LM lengths "
+                f"{hidden_states.shape[1]}/{pre_lm_length} "
+                f"and start={start}."
             )
         hidden_states = torch.cat(
             [hidden_states, hidden_states.new_zeros(hidden_states[:, :1, :].shape)],
             dim=1,
         )
+        if verifier_pre_lm_hidden is not None:
+            verifier_pre_lm_hidden = torch.cat(
+                [
+                    verifier_pre_lm_hidden,
+                    verifier_pre_lm_hidden.new_zeros(
+                        verifier_pre_lm_hidden[:, :1, :].shape
+                    ),
+                ],
+                dim=1,
+            )
         total_seq_len = hidden_states.shape[1]
         current_ids = input_ids[:, :total_seq_len]
         anchor_positions = torch.tensor([start], dtype=torch.long, device=self.device)
@@ -863,6 +947,7 @@ class DSparkOfflineRunner:
             fc_output,
             anchor_positions,
             document_ids,
+            verifier_pre_lm_hidden=verifier_pre_lm_hidden,
         )
         base_position_ids = torch.arange(
             total_seq_len,
@@ -905,6 +990,7 @@ class DSparkOfflineRunner:
         base_logits,
         hidden_states,
         first_prev_token_id,
+        block_memory,
     ):
         """Sample with native causal Correction rollout."""
         del base_logits
@@ -915,6 +1001,7 @@ class DSparkOfflineRunner:
             hidden_states=hidden_states,
             anchor_token_ids=first_prev_token_id.reshape(-1).long(),
             temperature=temperature,
+            block_memory=block_memory,
         )
 
         # The model returns all block slots.  With sample_from_anchor=False,
@@ -936,13 +1023,20 @@ class DSparkOfflineRunner:
         )
         return proposed_target_ids, logits_to_probs(final_logits, temperature)
 
-    def _sample_dspark_tokens(self, base_logits, hidden_states, first_prev_token_id):
+    def _sample_dspark_tokens(
+        self,
+        base_logits,
+        hidden_states,
+        first_prev_token_id,
+        block_memory,
+    ):
         draft = self.draft_model
         if draft.correction_head is not None:
             return self._sample_correction_tokens(
                 base_logits,
                 hidden_states,
                 first_prev_token_id,
+                block_memory,
             )
 
         if base_logits is None:
@@ -1002,6 +1096,7 @@ class DSparkOfflineRunner:
         del position_ids, stop_token_ids
         hidden, base_logits = self._single_anchor_backbone(
             context.target_hidden_states,
+            context.target_pre_lm_hidden_states,
             output_ids,
             start,
         )
@@ -1009,6 +1104,7 @@ class DSparkOfflineRunner:
             base_logits,
             hidden,
             output_ids[:, start],
+            context.correction_memory,
         )
         verify_input_ids = torch.cat(
             [
@@ -1038,6 +1134,27 @@ class DSparkOfflineRunner:
             [context.target_hidden_states, committed_hidden],
             dim=1,
         )
+        if self.uses_verifier_pre_lm_context:
+            verifier_pre_lm_hidden = (
+                self._require_latest_verifier_pre_lm_hidden()
+            )
+            committed_pre_lm_hidden = verifier_pre_lm_hidden[
+                :, : verification.accepted_draft_tokens + 1, :
+            ]
+            context.target_pre_lm_hidden_states = torch.cat(
+                [context.target_pre_lm_hidden_states, committed_pre_lm_hidden],
+                dim=1,
+            )
+            if self.draft_model.config.correction_cross_block_memory:
+                context.correction_memory = (
+                    self.draft_model.update_cross_block_memory(
+                        context.correction_memory,
+                        verifier_pre_lm_hidden[
+                            :, verification.accepted_draft_tokens, :
+                        ],
+                        verification.next_token.reshape(-1),
+                    )
+                )
 
     def generate_one(self, prompt: str, stop_token_ids: list[int] | None):
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(

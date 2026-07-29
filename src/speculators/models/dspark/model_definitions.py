@@ -125,8 +125,9 @@ class CausalCorrectionHead(nn.Module):
     is added to ordinary DFlash base logits, analogous to the Markov head. Optional
     auxiliary hidden output and corrected-hidden feedback let logit mode retain and
     propagate a trainable pre-LM representation without changing its token output
-    path. The caller may alternatively project that corrected hidden for the
-    current token before adding the vocabulary residual.
+    path. An optional block memory is projected once per head invocation and
+    broadcast across its causal slots. The caller may alternatively project that
+    corrected hidden for the current token before adding the vocabulary residual.
     """
 
     def __init__(
@@ -144,6 +145,7 @@ class CausalCorrectionHead(nn.Module):
         draft_vocab_size: int | None = None,
         enable_hidden_auxiliary: bool = False,
         enable_hidden_feedback: bool = False,
+        block_memory_size: int | None = None,
     ) -> None:
         super().__init__()
         if correction_hidden_size <= 0:
@@ -206,6 +208,13 @@ class CausalCorrectionHead(nn.Module):
             self.hidden_feedback_proj = nn.Linear(
                 input_hidden_size, correction_hidden_size, bias=False
             )
+        self.block_memory_proj: nn.Linear | None = None
+        if block_memory_size is not None:
+            if block_memory_size <= 0:
+                raise ValueError("block_memory_size must be positive")
+            self.block_memory_proj = nn.Linear(
+                block_memory_size, correction_hidden_size, bias=False
+            )
         self.auxiliary_hidden_up: nn.Linear | None = None
         self.auxiliary_hidden_gate: nn.Linear | None = None
         if output_mode == "logits" and (
@@ -254,6 +263,7 @@ class CausalCorrectionHead(nn.Module):
         previous_logits_mask: torch.Tensor | None = None,
         previous_corrected_hidden: torch.Tensor | None = None,
         previous_corrected_hidden_mask: torch.Tensor | None = None,
+        block_memory: torch.Tensor | None = None,
         cache: CorrectionCache | None = None,
         *,
         use_cache: bool = False,
@@ -273,6 +283,25 @@ class CausalCorrectionHead(nn.Module):
             raise ValueError(
                 f"Expected {len(self.layers)} cache entries, got {len(cache)}"
             )
+        if self.block_memory_proj is None:
+            if block_memory is not None:
+                raise ValueError(
+                    "block memory is only valid when cross-block memory is enabled"
+                )
+        else:
+            if block_memory is None:
+                raise ValueError(
+                    "cross-block-memory Correction requires a block memory"
+                )
+            expected_memory_shape = (
+                dflash_hidden.shape[0],
+                self.block_memory_proj.in_features,
+            )
+            if block_memory.shape != expected_memory_shape:
+                raise ValueError(
+                    "Expected block memory shape "
+                    f"{expected_memory_shape}, got {tuple(block_memory.shape)}"
+                )
         if self.hidden_feedback_proj is None:
             if (
                 previous_corrected_hidden is not None
@@ -328,6 +357,11 @@ class CausalCorrectionHead(nn.Module):
                 block_positions.to(device=dflash_hidden.device, dtype=torch.long)
             ).to(dtype)
         )
+        if self.block_memory_proj is not None:
+            assert block_memory is not None  # noqa: S101
+            hidden_states = hidden_states + self.block_memory_proj(
+                block_memory.to(dtype)
+            ).unsqueeze(1)
         if self.output_mode == "logits":
             assert previous_logits is not None  # noqa: S101
             assert previous_logits_mask is not None  # noqa: S101

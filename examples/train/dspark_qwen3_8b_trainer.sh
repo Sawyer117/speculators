@@ -54,6 +54,10 @@ CORRECTION_GATE_BIAS=0.0
 CORRECTION_HIDDEN_AUX_ARGS=(--no-correction-hidden-aux-loss)
 CORRECTION_HIDDEN_AUX_WEIGHT=0.1
 CORRECTION_HIDDEN_FEEDBACK_ARGS=(--no-correction-hidden-feedback)
+# Acceptance-aware cross-block memory. It is trained from verifier-confirmed
+# context and updated only after speculative verification at inference time.
+CORRECTION_CROSS_BLOCK_MEMORY_ARGS=(--no-correction-cross-block-memory)
+CORRECTION_MEMORY_GATE_BIAS=-2.0
 # In logits mode, enable this for LMHead(h_DFlash + delta_hidden) + delta_logits.
 CORRECTION_PROJECT_HIDDEN_ARGS=(--no-correction-project-corrected-hidden)
 # Keep disabled for the existing Correction baseline. Switch to
@@ -84,6 +88,7 @@ SSAL_CURRICULUM_END=0.6
 # Optional DFlash backbone experiments. All are disabled to preserve the baseline.
 DFLASH_FEATURE_ARGS=(
     --no-dflash-context-residual
+    --no-dflash-verifier-final-residual
     --no-dflash-block-position-embedding
     --no-dflash-gated-layer-fusion
 )
@@ -144,6 +149,8 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     "${CORRECTION_HIDDEN_AUX_ARGS[@]}" \
     --correction-hidden-aux-weight "$CORRECTION_HIDDEN_AUX_WEIGHT" \
     "${CORRECTION_HIDDEN_FEEDBACK_ARGS[@]}" \
+    "${CORRECTION_CROSS_BLOCK_MEMORY_ARGS[@]}" \
+    --correction-memory-gate-bias "$CORRECTION_MEMORY_GATE_BIAS" \
     "${CORRECTION_PROJECT_HIDDEN_ARGS[@]}" \
     "${CORRECTION_COLLABORATION_ARGS[@]}" \
     --correction-markov-gate-bias "$CORRECTION_MARKOV_GATE_BIAS" \

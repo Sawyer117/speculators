@@ -185,6 +185,32 @@ def test_preprojection_rollout_receives_hidden_states_without_base_logits():
     ]
 
 
+def test_preprojection_rollout_forwards_cross_block_memory():
+    module = _load_module()
+    calls = []
+
+    class Draft:
+        correction_head = SimpleNamespace(position_embedding=object())
+
+        @staticmethod
+        def rollout_correction(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "tokens", "logits"
+
+    hidden_states = object()
+    anchor_token_ids = object()
+    block_memory = object()
+    module._run_preprojection_correction_rollout(
+        Draft(),
+        hidden_states=hidden_states,
+        anchor_token_ids=anchor_token_ids,
+        temperature=0.0,
+        block_memory=block_memory,
+    )
+
+    assert calls[0][1]["block_memory"] is block_memory
+
+
 def test_shard_records_round_robin():
     module = _load_module()
     records = [{"prompt": str(i)} for i in range(7)]

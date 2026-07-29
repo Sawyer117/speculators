@@ -31,7 +31,8 @@ class DSparkDraftModel(DFlashDraftModel):
     consume previous logits and refine base logits with a low-rank vocabulary
     bias. An opt-in collaboration path gates a further Markov bias from Correction
     state. Optional hidden alignment and corrected-hidden feedback provide
-    representation-level supervision and recurrence. The confidence head predicts
+    representation-level supervision and recurrence. An optional verifier-confirmed
+    gated memory carries information between blocks. The confidence head predicts
     each position's acceptance probability.
     """
 
@@ -56,10 +57,11 @@ class DSparkDraftModel(DFlashDraftModel):
         if (
             config.correction_hidden_aux_loss
             or config.correction_hidden_feedback
+            or config.correction_cross_block_memory
             or config.correction_project_corrected_hidden
         ) and not config.enable_correction_head:
             raise ValueError(
-                "Correction hidden auxiliary features require Correction"
+                "Correction auxiliary/feedback features require Correction"
             )
         if (
             config.correction_project_corrected_hidden
@@ -98,6 +100,11 @@ class DSparkDraftModel(DFlashDraftModel):
                     or config.correction_project_corrected_hidden
                 ),
                 enable_hidden_feedback=config.correction_hidden_feedback,
+                block_memory_size=(
+                    config.correction_hidden_size
+                    if config.correction_cross_block_memory
+                    else None
+                ),
             )
             if config.correction_with_markov:
                 if config.markov_rank <= 0:
@@ -132,6 +139,24 @@ class DSparkDraftModel(DFlashDraftModel):
                 markov_rank=config.markov_rank,
                 hidden_size=hidden_size,
                 head_type=config.markov_head_type,
+            )
+
+        self.cross_block_memory_verifier_proj: torch.nn.Linear | None = None
+        self.cross_block_memory_token_proj: torch.nn.Linear | None = None
+        self.cross_block_memory_gate: torch.nn.Linear | None = None
+        if config.correction_cross_block_memory:
+            memory_size = config.correction_hidden_size
+            self.cross_block_memory_verifier_proj = torch.nn.Linear(
+                hidden_size, memory_size, bias=False
+            )
+            self.cross_block_memory_token_proj = torch.nn.Linear(
+                hidden_size, memory_size, bias=False
+            )
+            self.cross_block_memory_gate = torch.nn.Linear(memory_size, 1)
+            torch.nn.init.zeros_(self.cross_block_memory_gate.weight)
+            torch.nn.init.constant_(
+                self.cross_block_memory_gate.bias,
+                config.correction_memory_gate_bias,
             )
 
         self.confidence_head: ConfidenceHead | None = None
@@ -185,6 +210,12 @@ class DSparkDraftModel(DFlashDraftModel):
             ),
             correction_hidden_feedback=kwargs.get(
                 "correction_hidden_feedback", False
+            ),
+            correction_cross_block_memory=kwargs.get(
+                "correction_cross_block_memory", False
+            ),
+            correction_memory_gate_bias=kwargs.get(
+                "correction_memory_gate_bias", -2.0
             ),
             correction_project_corrected_hidden=kwargs.get(
                 "correction_project_corrected_hidden", False
@@ -359,6 +390,125 @@ class DSparkDraftModel(DFlashDraftModel):
         )
         return collaborative_logits, gate, prev_emb
 
+    def _cross_block_memory_features(
+        self,
+        verifier_pre_lm_hidden: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a verifier/token memory candidate and its scalar update gate."""
+        if (
+            self.cross_block_memory_verifier_proj is None
+            or self.cross_block_memory_token_proj is None
+            or self.cross_block_memory_gate is None
+        ):
+            raise RuntimeError("Correction cross-block memory is not enabled")
+        if verifier_pre_lm_hidden.ndim != 2:
+            raise ValueError("verifier_pre_lm_hidden must be rank-2")
+        if anchor_token_ids.shape != verifier_pre_lm_hidden.shape[:1]:
+            raise ValueError(
+                "anchor token IDs and verifier pre-LM hidden must align"
+            )
+
+        dtype = self.cross_block_memory_verifier_proj.weight.dtype
+        with torch.no_grad():
+            anchor_embeddings = self.embed_tokens(anchor_token_ids.long())
+        candidate = torch.tanh(
+            self.cross_block_memory_verifier_proj(
+                verifier_pre_lm_hidden.detach().to(dtype)
+            )
+            + self.cross_block_memory_token_proj(anchor_embeddings.to(dtype))
+        )
+        update_gate = torch.sigmoid(self.cross_block_memory_gate(candidate))
+        return candidate, update_gate
+
+    def update_cross_block_memory(
+        self,
+        previous_memory: torch.Tensor | None,
+        verifier_pre_lm_hidden: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Update memory after verification from committed context only.
+
+        ``verifier_pre_lm_hidden`` represents the last processed, committed token;
+        ``anchor_token_ids`` is the token that anchors the next proposal.
+        """
+        candidate, update_gate = self._cross_block_memory_features(
+            verifier_pre_lm_hidden,
+            anchor_token_ids,
+        )
+        if previous_memory is None:
+            previous_memory = torch.zeros_like(candidate)
+        if previous_memory.shape != candidate.shape:
+            raise ValueError(
+                "Previous cross-block memory and memory candidate must align"
+            )
+        previous_memory = previous_memory.to(candidate.dtype)
+        return previous_memory + update_gate * (candidate - previous_memory)
+
+    @torch.compiler.disable
+    def _teacher_forced_cross_block_memory(
+        self,
+        verifier_last_hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        document_ids: torch.Tensor,
+        block_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build causal block memories from the verifier-confirmed GT sequence."""
+        if (
+            anchor_positions.ndim != 1
+            or anchor_token_ids.shape != anchor_positions.shape
+        ):
+            raise ValueError("Anchor positions and token IDs must be rank-1 and align")
+        if block_valid.shape != anchor_positions.shape:
+            raise ValueError("Block validity mask and anchor positions must align")
+
+        context_positions = (anchor_positions - 1).clamp_min(0)
+        with torch.no_grad():
+            verifier_pre_lm_hidden = self.verifier_norm(
+                verifier_last_hidden_states[:, context_positions, :].to(
+                    self.verifier_norm.weight.dtype
+                )
+            )[0]
+        candidates, update_gates = self._cross_block_memory_features(
+            verifier_pre_lm_hidden,
+            anchor_token_ids,
+        )
+
+        anchor_docs = document_ids[0, anchor_positions]
+        context_docs = document_ids[0, context_positions]
+        valid_context = (
+            block_valid.bool()
+            & (anchor_positions > 0)
+            & (anchor_docs == context_docs)
+            & (anchor_docs != -1)
+        )
+
+        memory = torch.zeros_like(candidates[:1])
+        memories: list[torch.Tensor] = []
+        previous_valid = torch.zeros(
+            (), dtype=torch.bool, device=anchor_positions.device
+        )
+        previous_doc = anchor_docs.new_full((), -1)
+        previous_anchor = anchor_positions.new_full((), -1)
+        for block_idx in range(anchor_positions.numel()):
+            continues_document = (
+                previous_valid
+                & valid_context[block_idx]
+                & (anchor_docs[block_idx] == previous_doc)
+                & (anchor_positions[block_idx] > previous_anchor)
+            )
+            memory = memory * continues_document.to(memory.dtype)
+            memory = memory + update_gates[block_idx : block_idx + 1] * (
+                candidates[block_idx : block_idx + 1] - memory
+            )
+            memory = memory * valid_context[block_idx].to(memory.dtype)
+            memories.append(memory[0])
+            previous_valid = valid_context[block_idx]
+            previous_doc = anchor_docs[block_idx]
+            previous_anchor = anchor_positions[block_idx]
+        return torch.stack(memories, dim=0)
+
     @torch.compiler.disable
     def _teacher_forced_hidden_feedback_correction(
         self,
@@ -368,6 +518,7 @@ class DSparkDraftModel(DFlashDraftModel):
         base_logits: torch.Tensor | None,
         previous_target_logits: torch.Tensor | None,
         previous_target_logits_mask: torch.Tensor | None,
+        block_memory: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run teacher-forced Correction with corrected-hidden recurrence."""
         if self.correction_head is None:
@@ -413,6 +564,8 @@ class DSparkDraftModel(DFlashDraftModel):
                     "cache": cache,
                     "use_cache": True,
                 }
+                if block_memory is not None:
+                    head_kwargs["block_memory"] = block_memory
                 if self.correction_head.output_mode == "logits":
                     if (
                         previous_target_logits is None
@@ -493,6 +646,7 @@ class DSparkDraftModel(DFlashDraftModel):
         anchor_token_ids: torch.Tensor,
         *,
         temperature: float = 0.0,
+        block_memory: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run a differentiable Correction pass with greedy token self-feedback.
 
@@ -554,6 +708,9 @@ class DSparkDraftModel(DFlashDraftModel):
             )
         previous_corrected_hidden = None
         previous_corrected_hidden_mask = None
+        block_memory_kwargs = (
+            {} if block_memory is None else {"block_memory": block_memory}
+        )
         if hidden_feedback_enabled:
             previous_corrected_hidden = dflash_hidden.new_zeros(
                 dflash_hidden.shape[0],
@@ -607,6 +764,7 @@ class DSparkDraftModel(DFlashDraftModel):
                         previous_logits_mask=previous_feedback_mask,
                         cache=cache,
                         use_cache=True,
+                        **block_memory_kwargs,
                         **hidden_feedback_kwargs,
                     )
                     if (
@@ -642,6 +800,7 @@ class DSparkDraftModel(DFlashDraftModel):
                         block_positions,
                         cache=cache,
                         use_cache=True,
+                        **block_memory_kwargs,
                         **hidden_feedback_kwargs,
                     )
                     corrected_current_hidden = current_hidden + delta_hidden[
@@ -788,6 +947,17 @@ class DSparkDraftModel(DFlashDraftModel):
             if base_logits is None
             else base_logits.view(num_blocks, block, -1)
         )
+        block_memory = None
+        if self.config.correction_cross_block_memory:
+            anchor_positions = anchored_block_indices.view(num_blocks, block)[:, 0]
+            block_valid = aligned_loss_mask.view(num_blocks, block).bool().any(dim=1)
+            block_memory = self._teacher_forced_cross_block_memory(
+                verifier_last_hidden_states,
+                block_tokens[:, 0],
+                anchor_positions,
+                document_ids,
+                block_valid,
+            )
 
         confidence_logits = None
         prev_emb = None
@@ -802,6 +972,7 @@ class DSparkDraftModel(DFlashDraftModel):
                     self._generated_feedback_correction(
                         hidden_blocks,
                         anchor_token_ids=block_tokens[:, 0],
+                        block_memory=block_memory,
                     )
                 )
                 logits = logits_blocks.reshape(1, mask_tokens_size, -1)
@@ -829,6 +1000,7 @@ class DSparkDraftModel(DFlashDraftModel):
                             base_logits_blocks,
                             previous_target_logits,
                             previous_target_mask,
+                            block_memory,
                         )
                     )
                     logits = logits_blocks.reshape(1, mask_tokens_size, -1)
@@ -858,6 +1030,7 @@ class DSparkDraftModel(DFlashDraftModel):
                             block_positions,
                             previous_logits=previous_target_logits,
                             previous_logits_mask=previous_target_mask,
+                            block_memory=block_memory,
                         )
                         if (
                             self.config.correction_project_corrected_hidden
@@ -891,6 +1064,7 @@ class DSparkDraftModel(DFlashDraftModel):
                             prev_gt_emb,
                             hidden_blocks,
                             block_positions,
+                            block_memory=block_memory,
                         )
                         corrected_hidden = hidden_blocks + delta_hidden.to(
                             hidden_blocks.dtype
@@ -920,6 +1094,7 @@ class DSparkDraftModel(DFlashDraftModel):
                             block_positions[:, 1:],
                             previous_logits=previous_target_logits,
                             previous_logits_mask=previous_target_mask,
+                            block_memory=block_memory,
                         )
                         if (
                             self.config.correction_project_corrected_hidden
@@ -974,6 +1149,7 @@ class DSparkDraftModel(DFlashDraftModel):
                             prev_gt_emb,
                             hidden_blocks[:, 1:],
                             block_positions[:, 1:],
+                            block_memory=block_memory,
                         )
                         corrected_hidden = torch.cat(
                             [
@@ -1033,6 +1209,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 _, rollout_blocks = self.rollout_correction(
                     hidden_blocks.detach(),
                     anchor_token_ids=block_tokens[:, 0],
+                    block_memory=block_memory,
                 )
                 rollout_logits = rollout_blocks.reshape(1, mask_tokens_size, -1)
         elif self.markov_head is not None:
@@ -1155,11 +1332,13 @@ class DSparkDraftModel(DFlashDraftModel):
         anchor_token_ids: torch.Tensor,
         *,
         temperature: float = 0.0,
+        block_memory: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressively apply correction using generated-token feedback."""
         tokens, logits, _, _ = self._generated_feedback_correction(
             dflash_hidden,
             anchor_token_ids,
             temperature=temperature,
+            block_memory=block_memory,
         )
         return tokens, logits

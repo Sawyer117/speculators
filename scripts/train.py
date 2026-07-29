@@ -1126,6 +1126,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--dflash-verifier-final-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: inject the last inference-available verifier "
+            "final/pre-LM hidden into each draft block (default: disabled)."
+        ),
+    )
+    parser.add_argument(
         "--dflash-block-position-embedding",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1230,6 +1239,21 @@ def parse_args():
             "DSpark: feed each corrected hidden into the next Correction slot "
             "(default: disabled)."
         ),
+    )
+    parser.add_argument(
+        "--correction-cross-block-memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: carry a verifier-confirmed gated residual memory between "
+            "Correction blocks (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-memory-gate-bias",
+        type=float,
+        default=-2.0,
+        help="DSpark initial cross-block memory update-gate bias (default: -2.0).",
     )
     parser.add_argument(
         "--correction-project-corrected-hidden",
@@ -1552,10 +1576,11 @@ def parse_args():
     if (
         args.correction_hidden_aux_loss
         or args.correction_hidden_feedback
+        or args.correction_cross_block_memory
         or args.correction_project_corrected_hidden
     ) and not args.enable_correction_head:
         parser.error(
-            "Correction hidden auxiliary features require --enable-correction-head"
+            "Correction auxiliary/feedback features require --enable-correction-head"
         )
     if args.correction_hidden_aux_weight < 0.0:
         parser.error("--correction-hidden-aux-weight must be >= 0")
@@ -1599,6 +1624,7 @@ def parse_args():
             )
     if (
         args.dflash_context_residual
+        or args.dflash_verifier_final_residual
         or args.dflash_block_position_embedding
         or args.dflash_gated_layer_fusion
     ) and args.speculator_type not in ("dflash", "dspark"):
