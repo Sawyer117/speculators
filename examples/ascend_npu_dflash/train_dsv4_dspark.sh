@@ -24,7 +24,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"          # the speculators checkout
 
 # ---- paths (A2 shared /share; override via env) ----
 VERIFIER="${VERIFIER:-/share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
-DATA="${DATA:-/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow}"
+DATA="${DATA:-/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow_0720_77w}"  # ★ 77W (775,937). The bare `/…/arrow` is the WRONG 17W default (159,785) — never use it.
 HS_DIR="${HS_DIR:-/share/canada_group_folder/dataset/dsv4_hs_dump}"
 ENDPOINT="${ENDPOINT:-http://80.5.5.115:7000/v1}"
 RUN="${RUN:-/home/a00652497/dspark_austin/run}"
