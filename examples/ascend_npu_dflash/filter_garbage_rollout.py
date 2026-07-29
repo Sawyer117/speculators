@@ -65,14 +65,16 @@ def main():
                     help="min ```python fences (with finish=length) to call a loop. "
                          "30 reproduces the exhaustively-audited 21-row set; lower "
                          "risks catching legit multi-code-block answers.")
-    ap.add_argument("--drop-list", default=None,
-                    help="optional TSV/MD with a jsonl_line column (e.g. the audited "
-                         "garbage_output_indices.consolidated.tsv). Its rows are dropped "
-                         "IN ADDITION to the 4 self-detected rules — this is how the "
-                         "fuzzy tail-loop rows (| | | |, Navigation Menu, S. S. S., "
-                         "repeated n-grams) get removed, since they can't be safely "
-                         "self-detected without re-catching prompt-requested repetition. "
-                         "The union also keeps any deterministic-garbage the list missed.")
+    _co = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "dsv4_rollout_garbage_consolidated.tsv")
+    ap.add_argument("--drop-list", default=(_co if os.path.exists(_co) else None),
+                    help="TSV/MD with a jsonl_line column. DEFAULTS to the co-located, "
+                         "audited dsv4_rollout_garbage_consolidated.tsv (3,275 rows) if "
+                         "present — so you don't need to pass it. Its rows are dropped IN "
+                         "ADDITION to the 4 self-detected rules; this is how the fuzzy "
+                         "tail-loop rows (| | | |, Navigation Menu, S. S. S., repeated "
+                         "n-grams) get removed (they can't be safely self-detected without "
+                         "re-catching prompt-requested repetition). Pass '' to disable.")
     args = ap.parse_args()
 
     d = os.path.dirname(os.path.abspath(args.inp))
@@ -83,6 +85,9 @@ def main():
 
     # optional audited drop-list (jsonl_line -> reason), from a .tsv or .md table.
     drop_lines = {}
+    if args.drop_list and not os.path.exists(args.drop_list):
+        print(f"⚠ --drop-list {args.drop_list} not found — skipping it (self-detect rules only)")
+        args.drop_list = None
     if args.drop_list:
         with open(args.drop_list, encoding="utf-8") as f:
             for row in f:
