@@ -137,6 +137,24 @@ RUNS = [
             "mt-bench":  [68.76, 42.15, 19.31, 10.89, 6.41],
         },
     },
+    # ── (C) current best-per-epoch balance line: fresh-router noaux_tc @ 1e-3, A2 DP8 / LR 2e-4 /
+    #    anchor512, pre-dedup 77W (arrow_0720_77w). A DIFFERENT experiment than the (B) f1+bal @5e-3
+    #    A3 A/B above — do NOT read (B)+(C) as one curve. accept_len is from the ledger; full
+    #    per-position was NOT recorded for this line (only the gsm8k tail) → pos=None renders "—".
+    {
+        # 0.5ep (epoch0-mid, /0 step 12388): BEST balance mean yet (3.56); gsm8k 4.050 top-of-class for
+        # 0.5ep. NB the GLOBAL best across all runs is still no-balance f1 1.5ep (3.63, --group nobalance).
+        "label": "bal1e3 0.5ep ★best-bal",
+        "al": {"gsm8k": 4.050, "math500": 3.784, "humaneval": 3.890, "mbpp": 3.591, "mt-bench": 2.466},
+        "pos": None,
+    },
+    {
+        # 1.0ep (epoch1.0): FLAT vs its own 0.5ep (3.56 → 3.52) over one half-epoch — balance front-loads
+        # then sits flat; the peak is likely still ahead at 1.5ep (the dirty run was killed at 1.0ep).
+        "label": "bal1e3 1.0ep",
+        "al": {"gsm8k": 4.017, "math500": 3.612, "humaneval": 3.938, "mbpp": 3.542, "mt-bench": 2.480},
+        "pos": None,
+    },
 ]
 
 
