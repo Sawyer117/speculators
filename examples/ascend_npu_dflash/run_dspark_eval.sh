@@ -19,6 +19,14 @@ NUM_PROMPTS="${NUM_PROMPTS:-0}"      # 0 = full dataset (1319 for gsm8k, ~2h @ c
 MAX_NEW="${MAX_NEW:-2048}"
 # LOCAL tokenizer dir — --model is the served-name `dsv4` (for the API), NOT a HF repo, so the tokenizer
 # must load from a local path (the bf16 target has tokenizer.json). Override via TOKENIZER=<dir>.
+# Auto-detect the box's ckpt root: A3-176 = /home/canada_group_folder, A2 = /share, A3-nfs = /mnt/nfs.
+if [ -z "${TOKENIZER:-}" ]; then
+  for _d in /home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16 \
+            /share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16 \
+            /mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16; do
+    [ -d "$_d" ] && TOKENIZER="$_d" && break
+  done
+fi
 TOKENIZER="${TOKENIZER:-/share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
 BASE="http://localhost:$PORT"
 export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"   # corp proxy hijacks localhost
