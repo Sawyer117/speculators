@@ -1,10 +1,58 @@
 import json
 import math
+import os
 from collections.abc import Callable
 
 import torch
+import torch.distributed as dist
 
 _EPS = 1e-5
+
+# Opt-in (env DSPARK_GLOBAL_LOSS_REDUCE=1, default OFF = upstream rank-local behavior):
+# normalize the masked loss by the GLOBAL supervised-token count across ranks instead of
+# per-rank, matching DeepSpec (`_all_reduce_loss_denominators`) / SpecForge (`reduce_fn`).
+# Implementation = `local_num / global_den * world_size`, so FSDP/DDP MEAN-averaging of grads
+# reconstructs d(Σ_r num_r)/Σ_r den_r — the true token-weighted global objective. When ranks
+# are token-balanced (our multipack sampler) this is grad-scale-IDENTICAL to the rank-local
+# path, so it can be folded into a resumed run WITHOUT shifting the effective LR; it only
+# changes behavior when the per-rank supervised-token counts are imbalanced.
+_GLOBAL_LOSS_REDUCE = os.environ.get("DSPARK_GLOBAL_LOSS_REDUCE") == "1"
+
+
+_LOGGED_GLOBAL_REDUCE = False
+
+
+def use_global_loss_reduce() -> bool:
+    global _LOGGED_GLOBAL_REDUCE
+    on = (
+        _GLOBAL_LOSS_REDUCE
+        and dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    )
+    if on and not _LOGGED_GLOBAL_REDUCE:
+        _LOGGED_GLOBAL_REDUCE = True
+        if dist.get_rank() == 0:
+            print(
+                "[LOSS-REDUCE] global token-weighted loss normalization ON "
+                f"(DSPARK_GLOBAL_LOSS_REDUCE=1, world_size={dist.get_world_size()})",
+                flush=True,
+            )
+    return on
+
+
+def global_masked_mean(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
+    """Token-weighted GLOBAL masked mean from a per-rank (numerator, denominator).
+
+    ``num``/``den`` are this rank's SCALAR sums (Σ weighted-loss, Σ mask). Returns
+    ``num / global_den * world_size`` so FSDP/DDP mean-averaged grads equal
+    ∂(Σ_r num_r)/Σ_r den_r. The all-reduce is on ``den`` only (detached) — autograd
+    flows through this rank's ``num`` exactly like DeepSpec's scheme.
+    """
+    world = dist.get_world_size()
+    global_den = den.detach().clone()
+    dist.all_reduce(global_den, op=dist.ReduceOp.SUM)
+    return num / (global_den + _EPS) * world
 
 LossConfig = dict[
     str, tuple[Callable[[torch.Tensor, torch.Tensor], torch.Tensor], float]
@@ -524,6 +572,11 @@ def loss_function(
             pos_idx.to(elementwise_loss.dtype), elementwise_loss=elementwise_loss
         )
         elementwise_loss = elementwise_loss * decay_mult
+
+    if use_global_loss_reduce():
+        # Global token-weighted normalization (matches DeepSpec/SpecForge). Scalar sums
+        # over the whole (batch, seq) tensor; den reduced across ranks in global_masked_mean.
+        return global_masked_mean(elementwise_loss.sum(), loss_mask.sum())
 
     denominator = loss_mask.sum(dim=1) + _EPS
 

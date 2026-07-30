@@ -19,6 +19,8 @@ from speculators.models.metrics import (
     compute_accuracy_multi_step,
     dflash_loss_decay,
     dpace_loss_decay,
+    global_masked_mean,
+    use_global_loss_reduce,
 )
 
 __all__ = [
@@ -41,6 +43,8 @@ def _masked_decayed_mean(
         weighted = weighted * decay_fn(
             pos_idx.to(weighted.dtype), elementwise_loss=elementwise
         )
+    if use_global_loss_reduce():
+        return global_masked_mean(weighted.sum(), loss_mask.sum())
     denominator = loss_mask.sum(dim=1) + _EPS
     return (weighted.sum(dim=1) / denominator).mean()
 
