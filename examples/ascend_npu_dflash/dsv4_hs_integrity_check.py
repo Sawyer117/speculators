@@ -64,26 +64,45 @@ def pick_device(want: str) -> str:
     return "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
+def _pick_lm_head_key(keys, override: str | None):
+    """DeepSeek-V4 may not call it 'lm_head.weight' — fuzzy-match: exact override, then the
+    preferred names, then ANY '*lm_head*' key, then a tied 'embed_tokens.weight'."""
+    keys = list(keys)
+    if override:
+        return override if override in keys else None
+    for k in _LM_HEAD_KEYS:
+        if k in keys:
+            return k
+    for k in keys:
+        if "lm_head" in k.lower():
+            return k
+    for k in keys:
+        if k.lower().endswith("embed_tokens.weight"):
+            return k
+    return None
+
+
 def load_lm_head(model_dir: str, override_key: str | None):
-    """Load ONLY the lm_head weight [vocab, H] from a sharded HF checkpoint (no full model)."""
-    keys = (override_key,) if override_key else _LM_HEAD_KEYS
+    """Load ONLY the lm_head weight [vocab, H] from a (sharded) HF checkpoint — no full model."""
+    import glob  # noqa: PLC0415
+
     idx = os.path.join(model_dir, "model.safetensors.index.json")
     if os.path.exists(idx):
         with open(idx) as f:
             wmap = json.load(f)["weight_map"]
-        for k in keys:
-            if k in wmap:
-                with safe_open(os.path.join(model_dir, wmap[k]), framework="pt") as fh:
-                    return k, fh.get_tensor(k)
-    for cand in ("model.safetensors", "pytorch_model.bin"):
-        p = os.path.join(model_dir, cand)
-        if os.path.exists(p) and cand.endswith(".safetensors"):
-            with safe_open(p, framework="pt") as fh:
-                have = set(fh.keys())
-                for k in keys:
-                    if k in have:
-                        return k, fh.get_tensor(k)
-    raise SystemExit(f"lm_head weight not found in {model_dir} (tried {keys}); pass --lm-head-key")
+        k = _pick_lm_head_key(wmap.keys(), override_key)
+        if k:
+            with safe_open(os.path.join(model_dir, wmap[k]), framework="pt") as fh:
+                return k, fh.get_tensor(k)
+        head_like = [x for x in wmap if "head" in x.lower() or "embed" in x.lower()]
+        raise SystemExit(f"lm_head not in index; head/embed keys = {head_like[:12]}; pass --lm-head-key")
+    # no index -> scan shards (safe_open reads only the header, cheap)
+    for p in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+        with safe_open(p, framework="pt") as fh:
+            k = _pick_lm_head_key(fh.keys(), override_key)
+            if k:
+                return k, fh.get_tensor(k)
+    raise SystemExit(f"lm_head weight not found in {model_dir}; pass --lm-head-key")
 
 
 def decile_rates(mism: torch.Tensor, n: int = 10) -> list[float]:
