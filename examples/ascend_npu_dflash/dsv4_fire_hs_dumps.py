@@ -42,6 +42,36 @@ def _load_rows(arrow: str):
     return ds
 
 
+def _dump_dir_candidates(hs_dir: str) -> list:
+    """Where the serve might ACTUALLY dump — the DSPARK_HS_DIR often has a 'dataset/' layer
+    or a different root than assumed. Try the given dir first, then common variants."""
+    hs_dir = hs_dir.rstrip("/")
+    base = os.path.basename(hs_dir)
+    parent = os.path.dirname(hs_dir)
+    cands = [hs_dir, os.path.join(parent, "dataset", base)]
+    for root in ("/share/canada_group_folder", "/mnt/nfs/canada_group_folder", os.path.expanduser("~")):
+        cands += [os.path.join(root, "dataset", base), os.path.join(root, base)]
+    seen, out = set(), []
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _locate_dump_dir(hs_dir: str, first_name: str, timeout: float):
+    """Poll the candidate dirs for the first expected dump file (it exists once the request
+    returns). Returns the dir that has it, or None on timeout."""
+    cands = _dump_dir_candidates(hs_dir)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for d in cands:
+            if os.path.exists(os.path.join(d, first_name)):
+                return d
+        time.sleep(0.3)
+    return None
+
+
 def _row_ids(ds, row: int, col: str) -> list:
     v = ds[row][col]
     if hasattr(v, "tolist"):
@@ -66,7 +96,9 @@ def main() -> None:
     ap.add_argument("--id-base", type=int, default=800000, help="hs_<id-base+i> tag (keep conc levels distinct)")
     ap.add_argument("--start-row", type=int, default=0, help="first Arrow row (use the SAME for each conc level)")
     ap.add_argument("--col", default="input_ids", help="Arrow column holding the token ids")
-    ap.add_argument("--timeout", type=float, default=600.0, help="per-request + poll timeout (s)")
+    ap.add_argument("--timeout", type=float, default=600.0, help="per-request timeout (s)")
+    ap.add_argument("--collect-timeout", type=float, default=90.0,
+                    help="how long to wait for dumped files to appear before failing LOUD (s)")
     args = ap.parse_args()
 
     for req in ("endpoint", "arrow", "hs_dir"):
@@ -109,21 +141,30 @@ def main() -> None:
     fired_s = time.monotonic() - t0
 
     os.makedirs(args.out, exist_ok=True)
+    names = [f"hs_{args.id_base + i}.safetensors" for i in range(args.n)]
+    # The request returns AFTER the serve dumps, so the files exist by now. Auto-locate the
+    # real dump dir (candidates cover the common 'dataset/' layer / root mismatch), fail LOUD
+    # instead of hanging for the whole request timeout on a wrong --hs-dir.
+    src_dir = _locate_dump_dir(args.hs_dir, names[0], args.collect_timeout)
+    if src_dir is None:
+        raise SystemExit(
+            f"\n⚠ 0/{args.n} dumps found within {args.collect_timeout}s. The serve dumps to its OWN "
+            f"DSPARK_HS_DIR, which is NOT --hs-dir={args.hs_dir!r}.\n   Locate it, then pass --hs-dir "
+            f"(or HS_DIR=):\n     find /share /home /mnt/nfs -name '{names[0]}' 2>/dev/null | head")
+    if os.path.abspath(src_dir) != os.path.abspath(args.hs_dir):
+        print(f"  ⚠ serve dumped to {src_dir} (NOT --hs-dir={args.hs_dir}); collecting from there. "
+              f"Use HS_DIR={src_dir} next time.")
     got = 0
-    deadline = time.monotonic() + args.timeout
-    for i in range(args.n):
-        idx = args.id_base + i
-        src = os.path.join(args.hs_dir, f"hs_{idx}.safetensors")
+    deadline = time.monotonic() + args.collect_timeout
+    for name in names:
+        src = os.path.join(src_dir, name)
         while time.monotonic() < deadline and not os.path.exists(src):
             time.sleep(0.2)
         if os.path.exists(src):
-            shutil.copy(src, os.path.join(args.out, f"hs_{idx}.safetensors"))
+            shutil.copy(src, os.path.join(args.out, name))
             got += 1
     print(f"fired {args.n}@conc{args.concurrency} in {fired_s:.1f}s (errors={errs}); "
-          f"collected {got}/{args.n} -> {args.out}")
-    if got == 0:
-        print("  ⚠ no files collected — check HS_DIR is the serve's DSPARK_HS_DIR (shared-FS) and the "
-              "serve has DSPARK_HS_DUMP=1. In remote/sidecar mode the file is deleted after streaming.")
+          f"collected {got}/{args.n} -> {args.out}  (dump dir: {src_dir})")
 
 
 if __name__ == "__main__":

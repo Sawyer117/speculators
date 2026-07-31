@@ -23,13 +23,15 @@
 # env has `datasets` + `openai` + `safetensors` + torch (the training env, e.g. austin).
 #
 # Usage (A2 defaults shown; override any via env):
-#   ENDPOINT=http://<A2-HS-dump-serve>:7000/v1 HS_DIR=/share/canada_group_folder/dsv4_hs_dump \
+#   ENDPOINT=http://80.5.5.115:7000/v1 \
 #     bash examples/ascend_npu_dflash/run_hs_consistency_check.sh
+# HS_DIR defaults to the A2 serve dump dir; the fire step also auto-locates it (handles the
+# 'dataset/' layer) and fails loud if it truly can't find the files, so a wrong HS_DIR won't hang.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 ENDPOINT="${ENDPOINT:?set ENDPOINT=http://<HS-dump-serve-ip>:7000/v1 (the austin dump serve, NOT the eval serve)}"
-HS_DIR="${HS_DIR:?set HS_DIR=<the serve DSPARK_HS_DIR> (must be the SAME dir the serve dumps to)}"
+HS_DIR="${HS_DIR:-/share/canada_group_folder/dataset/dsv4_hs_dump}"   # confirmed A2 serve DSPARK_HS_DIR (note the dataset/ layer)
 ARROW="${ARROW:-/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow_0720_77w}"
 MODEL="${MODEL:-/share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
 N="${N:-8}"                 # sequences for the clean baseline
