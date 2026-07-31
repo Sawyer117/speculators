@@ -48,8 +48,10 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
 
-# lm_head can be a dedicated weight or tied to the input embedding.
-_LM_HEAD_KEYS = ("lm_head.weight", "model.embed_tokens.weight", "embed_tokens.weight")
+# lm_head can be a dedicated weight or tied to the input embedding. DeepSeek-V4-Flash uses
+# bare `head.weight` / `embed.weight` (not lm_head/embed_tokens).
+_LM_HEAD_KEYS = ("lm_head.weight", "head.weight", "model.embed_tokens.weight",
+                 "embed_tokens.weight", "embed.weight")
 
 
 def pick_device(want: str) -> str:
@@ -74,10 +76,12 @@ def _pick_lm_head_key(keys, override: str | None):
         if k in keys:
             return k
     for k in keys:
-        if "lm_head" in k.lower():
+        kl = k.lower()
+        if "lm_head" in kl or kl == "head.weight" or kl.endswith(".head.weight"):
             return k
     for k in keys:
-        if k.lower().endswith("embed_tokens.weight"):
+        kl = k.lower()
+        if kl == "embed.weight" or kl.endswith(".embed.weight") or kl.endswith("embed_tokens.weight"):
             return k
     return None
 
@@ -130,9 +134,17 @@ def next_token_mismatch(pred_next: torch.Tensor, token_ids: torch.Tensor, min_po
 
 
 def logits_argmax(hidden: torch.Tensor, W: torch.Tensor, device: str, chunk: int) -> torch.Tensor:
-    """argmax over vocab of hidden @ W.T, chunked over positions to bound memory."""
+    """argmax over vocab of hidden @ lm_head, chunked over positions. Auto-orients W whether
+    it is stored [vocab, H] (nn.Linear) or [H, vocab]."""
+    H = hidden.shape[1]
+    Wf = W.float().to(device)
+    if Wf.shape[1] == H:      # [vocab, H]
+        Wt = Wf.t()           # -> [H, vocab]
+    elif Wf.shape[0] == H:    # [H, vocab]
+        Wt = Wf
+    else:
+        raise SystemExit(f"lm_head shape {tuple(W.shape)} matches neither [vocab,{H}] nor [{H},vocab]")
     preds = []
-    Wt = W.float().to(device).t()  # [H, vocab]
     for s in range(0, hidden.shape[0], chunk):
         x = hidden[s:s + chunk].float().to(device)  # [c, H]
         preds.append((x @ Wt).argmax(-1).to("cpu"))
