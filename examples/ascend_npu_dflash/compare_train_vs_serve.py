@@ -47,54 +47,77 @@ import re
 _BLOCK = 5  # dspark_block_size; position_0..position_{BLOCK-1}
 
 
-_NUM = r"(-?\d+(?:\.\d+)?(?:[eE]-?\d+)?)"
+# Match analyze_train_run.py EXACTLY: key=value, key may hold '/' and '_', value is a
+# number/nan/inf with a [-+] exponent. Records span MULTIPLE physical lines (terminal
+# wrapping) and `global_step=` is the LAST field of a record -> flush on it. Parsing
+# per physical line (my first cut) misses keys that wrapped onto other lines.
+_PAIR = re.compile(r"([A-Za-z0-9_/]+)=(-?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|nan|inf))")
 
 
-def _one(pat: str, line: str):
-    """First numeric value for a key on a line. Word-boundary-anchored so `accept_len`
-    does NOT match inside `hard_accept_len` (the `_` before it IS a word char)."""
-    m = re.search(r"(?<![\w])" + pat + r"['\"]?\s*[:=]\s*" + _NUM, line)
-    return float(m.group(1)) if m else None
+def _fv(s):
+    try:
+        x = float(s)
+    except (TypeError, ValueError):
+        return None
+    return x if x == x and abs(x) != float("inf") else None
 
 
 def parse_train_log(path: str, last: int, around: int | None, window: int) -> dict:
-    """Line-oriented: each metric_logger.info call is ONE line holding global_step +
-    all the reduced keys. Collect per-step records so we can window by global_step
-    (the served ckpt's step) instead of blindly averaging the over-trained tail."""
-    keys = ["hard_accept_len", "accept_len", "accept_rate"] + [f"position_{k}_acc" for k in range(_BLOCK)]
-    records: list[dict] = []
     with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if "hard_accept_len" not in line:
-                continue
-            rec = {k: _one(k, line) for k in keys}
-            rec["global_step"] = _one("global_step", line)
-            records.append(rec)
+        text = f.read()
+    records: list[dict] = []
+    cur: dict = {}
+    for k, v in _PAIR.findall(text):
+        cur[k] = v
+        if k == "global_step":  # last field of a record -> flush
+            records.append(cur)
+            cur = {}
+    if cur:
+        records.append(cur)
+    # keep only real training-metric records (have the accept block + a step)
+    recs = [r for r in records if "train/accept_len" in r and "global_step" in r]
 
-    if not records:
+    if not recs:
         return {"hard_accept_len": None, "accept_len": None, "accept_rate": None,
-                "pos": [None] * _BLOCK, "_n": 0, "_span": None}
+                "pos": [None] * _BLOCK, "hard_est": None, "_n": 0, "_note": None, "_span": None}
+
+    def gs(r):
+        return _fv(r.get("global_step"))
 
     if around is not None:
-        sel = [r for r in records if r["global_step"] is not None
-               and abs(r["global_step"] - around) <= window]
+        sel = [r for r in recs if gs(r) is not None and abs(gs(r) - around) <= window]
         note = f"±{window} around global_step {around}"
+        if not sel:
+            sel = recs[-last:] if last > 0 else recs
+            note += " (NONE in window -> fell back to last %d)" % len(sel)
     else:
-        sel = records[-last:] if last > 0 else records
+        sel = recs[-last:] if last > 0 else recs
         note = f"last {len(sel)} logged steps (END of log)"
-    if not sel:
-        sel = records[-last:] if last > 0 else records
 
     def _avg(key: str):
-        vals = [r[key] for r in sel if r[key] is not None]
+        vals = [_fv(r.get(key)) for r in sel]
+        vals = [v for v in vals if v is not None]
         return sum(vals) / len(vals) if vals else None
 
-    steps = [r["global_step"] for r in sel if r["global_step"] is not None]
+    pos = [_avg(f"train/position_{k}_acc") for k in range(_BLOCK)]
+    # Independence-proxy HARD accept_len from per-position marginals (a cross-check
+    # for the logged hard_accept_len, which can sit at the 1.0 degenerate floor):
+    #   1 (anchor) + sum_k prod_{j<=k} p_j.  Assumes slot independence (serve has
+    #   survivorship correlation) -> a rough scalar, read alongside per-position.
+    hard_est = None
+    if all(p is not None for p in pos):
+        s, prod = 0.0, 1.0
+        for p in pos:
+            prod *= p
+            s += prod
+        hard_est = 1.0 + s
+    steps = [gs(r) for r in sel if gs(r) is not None]
     return {
-        "hard_accept_len": _avg("hard_accept_len"),
-        "accept_len": _avg("accept_len"),
-        "accept_rate": _avg("accept_rate"),
-        "pos": [_avg(f"position_{k}_acc") for k in range(_BLOCK)],
+        "hard_accept_len": _avg("train/hard_accept_len"),
+        "accept_len": _avg("train/accept_len"),
+        "accept_rate": _avg("train/accept_rate"),
+        "pos": pos,
+        "hard_est": hard_est,
         "_n": len(sel),
         "_note": note,
         "_span": (min(steps), max(steps)) if steps else None,
@@ -152,7 +175,7 @@ def main() -> None:
         tr = parse_train_log(args.train_log, args.last, args.around, args.window)
     else:
         tr = {"hard_accept_len": None, "accept_len": None, "accept_rate": None,
-              "pos": [None] * _BLOCK, "_n": 0, "_note": None, "_span": None}
+              "pos": [None] * _BLOCK, "hard_est": None, "_n": 0, "_note": None, "_span": None}
     if args.train_hard is not None:
         tr["hard_accept_len"] = args.train_hard
     if args.train_soft is not None:
@@ -171,8 +194,12 @@ def main() -> None:
         span = f" (global_step {tr['_span'][0]:.0f}..{tr['_span'][1]:.0f})" if tr.get("_span") else ""
         print(f"  [train = mean of {tr['_n']} steps: {tr.get('_note', '')}{span}]")
     print("-" * 72)
+    hlog = tr["hard_accept_len"]
+    degen = hlog is not None and hlog <= 1.05  # logged hard stuck at the 1.0 floor
     print(f"  soft accept_len  (train, OPTIMISTIC)      : {f(tr['accept_len'])}")
-    print(f"  hard accept_len  (train, serve-equivalent): {f(tr['hard_accept_len'])}")
+    print(f"  hard accept_len  (train, LOGGED)          : {f(hlog)}"
+          + ("   ⚠ at 1.0 degenerate floor — NOT reliable, using per-pos estimate" if degen else ""))
+    print(f"  hard accept_len  (train, est. from per-pos): {f(tr.get('hard_est'))}   [independence proxy]")
     print(f"  accept_len       (SERVE, hard/temp=0)     : {f(serve['accept_len'])}")
     print(f"  accept_rate      train {f(tr['accept_rate'],'{:.3f}')}  |  serve {f(serve['accept_rate'],'{:.3f}')}")
     print("-" * 72)
@@ -181,27 +208,44 @@ def main() -> None:
         print(f"    pos {k}:      {f(tr['pos'][k]):>10}                {f(smarg[k]):>10}            {f(serve['cum'][k])}")
     print("=" * 72)
 
-    th, sv = tr["hard_accept_len"], serve["accept_len"]
+    sv = serve["accept_len"]
+    # Prefer the LOGGED hard accept_len; if it's stuck at the degenerate floor, fall
+    # back to the independence estimate from per-position.
+    th = tr.get("hard_est") if (hlog is None or degen) else hlog
+    th_src = "est-from-per-pos" if (hlog is None or degen) else "logged"
+
+    # The CLEANEST single mismatch test: slot 0. Train position_0_acc and serve pos0
+    # are BOTH unconditional (no accepted-prefix conditioning) on the SAME distribution
+    # -> directly comparable. A gap here is a real train/serve inconsistency at the
+    # very first drafted token, immune to the survivorship that muddies later slots.
+    t0, s0 = tr["pos"][0], serve["cum"][0]
+    if t0 is not None and s0 is not None:
+        print(f"SLOT-0 (cleanest: both unconditional) train {t0:.3f} vs serve {s0:.3f} = {t0 - s0:+.3f}")
+
     if th is None or sv is None:
-        print("VERDICT: missing train hard_accept_len or serve accept_len — "
-              "pass --train-hard / check the log has 'hard_accept_len'.")
+        print("VERDICT: missing train hard/per-pos or serve accept_len — "
+              "check --around window actually hit steps (see _span above) / the log keys.")
         return
     gap = th - sv
-    print(f"HARD gap (train_hard - serve) = {gap:+.3f}")
-    if abs(gap) <= args.gap_eps:
-        print("  => NO train/serve mismatch. The 3.57 was the SOFT metric being")
-        print("     optimistic; hard train ≈ serve. Ceiling = draft QUALITY.")
-        print("     LEVER: data scale / recipe (LR anneal, epochs) / capacity — NOT a serve bug.")
+    print(f"HARD accept_len gap (train[{th_src}] {th:.3f} - serve {sv:.3f}) = {gap:+.3f}")
+    slot0_bad = (t0 is not None and s0 is not None and (t0 - s0) > 0.08)
+    if gap <= args.gap_eps and not slot0_bad:
+        print("  => NO train/serve mismatch. The ~3.57 was the SOFT metric being optimistic;")
+        print("     hard train ≈ serve, slot-0 matches. Ceiling = draft QUALITY.")
+        print("     LEVER: data scale / recipe (LR anneal, EARLY-STOP ~0.5ep where eval peaked)")
+        print("            / capacity — NOT a serve bug.")
         if tr["accept_len"] and th:
             print(f"     (soft-vs-hard train gap alone = {tr['accept_len'] - th:+.3f}, explains the illusion.)")
-    elif gap > args.gap_eps:
-        print("  => REAL train/serve gap on the HARD metric. A per-slot forward")
-        print("     inconsistency (train forward != serve forward). LOCALIZE with the")
-        print("     per-slot parity: dsv4_dspark_serve_forward_parity.py on one real block;")
-        print("     prime suspects = norm convention (double-norm's win points here), RoPE")
-        print("     per-slot offset (#72), block-internal attn/KV base.")
-        print("     Read the per-position table: the slot where train pos_acc stays high but")
-        print("     serve marginal collapses is where the forwards diverge.")
+    elif gap > args.gap_eps or slot0_bad:
+        print("  => REAL train/serve gap (hard scalar and/or slot-0). A per-slot forward or")
+        print("     TARGET/INPUT inconsistency (train != serve). PRIME suspect given train↑/eval↓:")
+        print("       (1) aux-HS INPUT: HS-dump serve (austin build, training) vs eval serve")
+        print("           (serving build, official SupportsEagle3 capture) may compute the")
+        print("           [40,41,42] hidden states differently. released draft works on the")
+        print("           eval serve (4.658) -> its HS is the reference -> diff the two serves'")
+        print("           aux-HS on one prompt.")
+        print("       (2) norm-target (double-norm's win) ; (3) RoPE per-slot (#72).")
+        print("     Localize with dsv4_dspark_serve_forward_parity.py on one real block.")
     else:
         print("  => serve HARDER than train-hard (unexpected). Re-check same distribution / draft.")
 
