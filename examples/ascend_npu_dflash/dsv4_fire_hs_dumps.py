@@ -32,7 +32,26 @@ def _load_rows(arrow: str):
     # arrow_0720_77w is a saved Dataset; guard against a DatasetDict just in case.
     if hasattr(ds, "keys") and not hasattr(ds, "num_rows"):
         ds = ds[next(iter(ds.keys()))]
+    # Force python (not torch) format so a row's input_ids is a plain list[int];
+    # a persisted torch format makes ds[row]["input_ids"] a tensor -> list() on a
+    # 0-d slice raises "iteration over a 0-d tensor".
+    try:
+        ds = ds.with_format(None)
+    except Exception:  # noqa: BLE001
+        pass
     return ds
+
+
+def _row_ids(ds, row: int, col: str) -> list:
+    v = ds[row][col]
+    if hasattr(v, "tolist"):
+        v = v.tolist()
+    if isinstance(v, (int, float)):
+        raise SystemExit(
+            f"row {row} col '{col}' is a scalar {v!r} — wrong column? available: "
+            f"{getattr(ds, 'column_names', '?')} (pass --col)"
+        )
+    return list(v)
 
 
 def main() -> None:
@@ -46,6 +65,7 @@ def main() -> None:
     ap.add_argument("--concurrency", type=int, default=1, help="simultaneous in-flight requests")
     ap.add_argument("--id-base", type=int, default=800000, help="hs_<id-base+i> tag (keep conc levels distinct)")
     ap.add_argument("--start-row", type=int, default=0, help="first Arrow row (use the SAME for each conc level)")
+    ap.add_argument("--col", default="input_ids", help="Arrow column holding the token ids")
     ap.add_argument("--timeout", type=float, default=600.0, help="per-request + poll timeout (s)")
     args = ap.parse_args()
 
@@ -58,14 +78,17 @@ def main() -> None:
     ds = _load_rows(args.arrow)
     client = openai.OpenAI(base_url=args.endpoint, api_key="EMPTY", max_retries=0)
     model = client.models.list().data[0].id
+    _probe = ds[args.start_row][args.col]
     print(f"serve model={model} | firing n={args.n} @ conc={args.concurrency} | id-base={args.id_base} "
-          f"| rows [{args.start_row}, {args.start_row + args.n})")
+          f"| rows [{args.start_row}, {args.start_row + args.n}) "
+          f"| cols={getattr(ds, 'column_names', '?')} | {args.col} type={type(_probe).__name__} "
+          f"shape={getattr(_probe, 'shape', None)}")
 
     def fire(i: int):
         row = args.start_row + i
         client.completions.create(
             model=model,
-            prompt=list(ds[row]["input_ids"]),
+            prompt=_row_ids(ds, row, args.col),
             max_tokens=1,
             extra_headers={"X-Request-Id": f"hs_{args.id_base + i}"},
             extra_body={"return_token_ids": True},
