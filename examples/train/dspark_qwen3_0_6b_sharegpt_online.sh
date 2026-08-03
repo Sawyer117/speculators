@@ -58,7 +58,8 @@ python scripts/prepare_data.py \
     --data "$DATASET" \
     --output "$OUTPUT_DIR" \
     --max-samples "$MAX_SAMPLES" \
-    --seq-length "$SEQ_LENGTH"
+    --seq-length "$SEQ_LENGTH" \
+    --disable-thinking
 
 # Step 2: Launch vLLM server in the background
 echo "=== Step 2: Launching vLLM server ==="

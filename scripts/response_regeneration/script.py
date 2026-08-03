@@ -101,6 +101,20 @@ def parse_args():
             'e.g. \'{"temperature": 0.6, "top_p": 0.95, "seed": 0}\''
         ),
     )
+    thinking_group = parser.add_mutually_exclusive_group()
+    thinking_group.add_argument(
+        "--enable-thinking",
+        dest="enable_thinking",
+        action="store_true",
+        help="Generate target responses with thinking enabled.",
+    )
+    thinking_group.add_argument(
+        "--disable-thinking",
+        dest="enable_thinking",
+        action="store_false",
+        help="Generate target responses in non-thinking mode.",
+    )
+    parser.set_defaults(enable_thinking=None)
     parser.add_argument(
         "--outfile",
         default=None,
@@ -507,6 +521,7 @@ async def regenerate_conversation(
     endpoint: str,
     sampling_params: dict[str, Any],
     samples: list[dict[str, Any]],
+    enable_thinking: bool | None = None,
 ) -> bool:
     """Regenerate one conversation into per-generation boundary samples.
 
@@ -526,6 +541,19 @@ async def regenerate_conversation(
     tool_results = deque(item.get("tool_results") or [])
     conv_id = item["primary_id"]
 
+    effective_sampling_params = dict(sampling_params)
+    if enable_thinking is not None:
+        raw_chat_template_kwargs = effective_sampling_params.get(
+            "chat_template_kwargs"
+        )
+        if raw_chat_template_kwargs is not None and not isinstance(
+            raw_chat_template_kwargs, dict
+        ):
+            raise ValueError("chat_template_kwargs must be a JSON object")
+        chat_template_kwargs = dict(raw_chat_template_kwargs or {})
+        chat_template_kwargs["enable_thinking"] = enable_thinking
+        effective_sampling_params["chat_template_kwargs"] = chat_template_kwargs
+
     prefix: list[dict[str, Any]] = []
     truncated = False
 
@@ -542,7 +570,7 @@ async def regenerate_conversation(
             payload: dict[str, Any] = {
                 # Spread first: the keys below are ours to own and must not be
                 # overridden by user-supplied sampling params.
-                **sampling_params,
+                **effective_sampling_params,
                 "model": model,
                 "messages": prefix,
                 "max_tokens": max_tokens,
@@ -560,7 +588,7 @@ async def regenerate_conversation(
                 sample_index=len(samples),
                 idx=item["idx"],
                 endpoint=endpoint,
-                sampling_params=sampling_params,
+                sampling_params=effective_sampling_params,
             )
             samples.append(sample)
             prefix.append(assistant_msg)
@@ -664,6 +692,7 @@ async def worker(
                 endpoint=endpoint,
                 sampling_params=args.sampling_params,
                 samples=samples,
+                enable_thinking=getattr(args, "enable_thinking", None),
             )
             # Written only after the conversation finishes -- a clean truncation
             # included, since rerunning it would truncate again. An exception

@@ -110,7 +110,8 @@ echo "=== Step 1: Preparing data ==="
 #     --data "$DATASET" \
 #     --output "$OUTPUT_DIR" \
 #     --max-samples "$MAX_SAMPLES" \
-#     --seq-length "$SEQ_LENGTH"
+#     --seq-length "$SEQ_LENGTH" \
+#     --disable-thinking
 
 # Step 3: Train DSpark against the live vLLM server
 LOG_DIR="$OUTPUT_DIR/logs"
@@ -119,6 +120,8 @@ LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"
 PID_FILE="$LOG_DIR/train.pid"
 
 echo "=== Step 3: Training on Ascend NPU(s): $TRAIN_NPUS ==="
+# The Arrow directory below must itself have been regenerated/prepared with
+# --disable-thinking; training consumes its token IDs without re-rendering.
 nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
     scripts/train.py \
