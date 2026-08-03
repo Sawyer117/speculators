@@ -233,12 +233,22 @@ def main():
 
     cfg = DSV4DSparkDraftModel.config_class.from_pretrained(args.ckpt)
     cfg.transformer_layer_config._attn_implementation = "sdpa"
-    # low_cpu_mem_usage=False avoids transformers' meta-init: with the default meta
-    # device-context, __init__'s precompute_freqs_cis buffer is built on meta and
-    # `freqs_cis.to(device)` throws "Cannot copy out of meta tensor". False → normal CPU
-    # init (the draft + verifier embed/lm_head fit in RAM), so the buffer has real data.
+    # transformers >=4.5x builds the skeleton under a torch.device("meta") context inside
+    # from_pretrained (low_cpu_mem_usage no longer gates it — that's why =False didn't help).
+    # __init__'s precompute_freqs_cis is a persistent=False COMPUTED buffer: it's NOT in the
+    # state_dict, so it's never materialized from weights — under meta its torch.arange lands
+    # on meta and `freqs_cis.to("cpu")` throws "Cannot copy out of meta tensor". Force JUST
+    # that buffer onto real CPU by wrapping the call in an INNER device context (innermost
+    # device-context wins), so the arange/polar build real data regardless of the outer meta.
+    import speculators.models.dsv4_dspark.core as _dsv4_core
+    _orig_precompute = _dsv4_core.precompute_freqs_cis
+    def _precompute_on_cpu(*a, **k):
+        with torch.device("cpu"):
+            return _orig_precompute(*a, **k)
+    _orig_precompute.cache_clear()  # drop any meta-cached entry (lru_cache is device-blind)
+    _dsv4_core.precompute_freqs_cis = _precompute_on_cpu
     model = DSV4DSparkDraftModel.from_pretrained(
-        args.ckpt, config=cfg, verifier=args.verifier, low_cpu_mem_usage=False,
+        args.ckpt, config=cfg, verifier=args.verifier,
     )
     model = model.to(dev, dtype).eval()
     assert model.block_size == block, f"ckpt block_size {model.block_size} != dump {block}"
