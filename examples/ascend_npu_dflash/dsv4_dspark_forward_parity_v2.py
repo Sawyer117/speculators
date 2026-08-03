@@ -233,7 +233,13 @@ def main():
 
     cfg = DSV4DSparkDraftModel.config_class.from_pretrained(args.ckpt)
     cfg.transformer_layer_config._attn_implementation = "sdpa"
-    model = DSV4DSparkDraftModel.from_pretrained(args.ckpt, config=cfg, verifier=args.verifier)
+    # low_cpu_mem_usage=False avoids transformers' meta-init: with the default meta
+    # device-context, __init__'s precompute_freqs_cis buffer is built on meta and
+    # `freqs_cis.to(device)` throws "Cannot copy out of meta tensor". False → normal CPU
+    # init (the draft + verifier embed/lm_head fit in RAM), so the buffer has real data.
+    model = DSV4DSparkDraftModel.from_pretrained(
+        args.ckpt, config=cfg, verifier=args.verifier, low_cpu_mem_usage=False,
+    )
     model = model.to(dev, dtype).eval()
     assert model.block_size == block, f"ckpt block_size {model.block_size} != dump {block}"
 
