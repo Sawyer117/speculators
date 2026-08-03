@@ -75,11 +75,74 @@ def _fingerprint_dir(path):
     return fps, n, n_expert
 
 
+def _nonexpert_match_rate(fa, fb):
+    """fraction of A's NON-expert tensors whose value-fingerprint appears in B."""
+    fb_avail = dict(fb)
+    ne_total = ne_match = 0
+    for fp, cnt in fa.items():
+        numel = fp[0]
+        is_expert = any(numel % e == 0 and numel >= e * 1024 for e in (256, 128, 64, 32))
+        for _ in range(cnt):
+            if is_expert:
+                continue
+            ne_total += 1
+            if fb_avail.get(fp, 0) > 0:
+                ne_match += 1
+                fb_avail[fp] -= 1
+    return ne_match, ne_total
+
+
+def _scan(draft_dir, glob_pat):
+    """Fingerprint the converted DRAFT once, then rank every candidate train ckpt by how
+    well its non-expert tensors match — i.e. WHICH train ckpt this draft was converted from."""
+    print(f">>> reference (converted draft) = {draft_dir}")
+    fdraft, nd, ed = _fingerprint_dir(draft_dir)
+    print(f">>> draft: {nd} tensors ({ed} expert-like)\n")
+    cands = sorted(d for d in glob.glob(glob_pat) if os.path.isdir(d))
+    if not cands:
+        sys.exit(f"no candidate dirs match glob: {glob_pat}")
+    rows = []
+    for c in cands:
+        try:
+            fc, ncand, _ = _fingerprint_dir(c)
+        except SystemExit:
+            continue
+        m, t = _nonexpert_match_rate(fc, fdraft)
+        rows.append((m / t if t else 0.0, m, t, ncand, c))
+    rows.sort(reverse=True)
+    print(">>> candidates ranked by non-expert match to the draft:")
+    print("    match%   matched/total   #tensors   dir")
+    for rate, m, t, ncand, c in rows:
+        flag = "  ← SOURCE" if rate >= 0.95 else ""
+        print(f"    {rate:6.1%}   {m:>5}/{t:<5}      {ncand:>5}   {c}{flag}")
+    best = rows[0]
+    print("\n" + "=" * 70)
+    if best[0] >= 0.95:
+        print(f"VERDICT: ✅ SOURCE FOUND → {best[4]}")
+        print("  ⇒ use THIS as the parity --ckpt (it IS the weights the ep4p5 serve ran).")
+    else:
+        print(f"VERDICT: ❌ no train ckpt matches (best {best[0]:.1%} @ {best[4]}).")
+        print("  ⇒ the train-format source is likely gone (mid-epoch dir overwritten after convert),")
+        print("     or lives outside the scanned glob / on another machine. Widen --scan or check 176.")
+    sys.exit(0)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("a", help="checkpoint dir A (e.g. the parity --ckpt, TRAIN format)")
-    ap.add_argument("b", help="checkpoint dir B (e.g. the served CONVERTED draft dir)")
+    ap.add_argument("a", nargs="?", help="checkpoint dir A (e.g. the parity --ckpt, TRAIN format)")
+    ap.add_argument("b", nargs="?", help="checkpoint dir B (e.g. the served CONVERTED draft dir)")
+    ap.add_argument("--draft", help="SCAN MODE: the converted served draft to trace back to its train source")
+    ap.add_argument("--scan", help="SCAN MODE: glob of candidate train ckpt dirs (e.g. "
+                                   "'/home/a00652497/dspark_austin/run/ckpt_faithful_ep_*/[0-9]*')")
     args = ap.parse_args()
+
+    if args.draft or args.scan:
+        if not (args.draft and args.scan):
+            sys.exit("scan mode needs BOTH --draft <converted dir> and --scan '<glob>'")
+        _scan(args.draft, args.scan)
+        return
+    if not (args.a and args.b):
+        sys.exit("pairwise mode needs two dirs: <A> <B>  (or use --draft/--scan)")
 
     print(f">>> A = {args.a}")
     print(f">>> B = {args.b}")
