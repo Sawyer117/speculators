@@ -25,6 +25,11 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         description="Model architectures that can load these weights",
     )
 
+    block_size: int = Field(
+        default=7,
+        description="DSpark paper proposal length (gamma).",
+    )
+
     sample_from_anchor: bool = Field(
         default=True,
         description=(
@@ -93,6 +98,41 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     correction_gate_bias: float = Field(
         default=0.0,
         description="Initial bias of the sigmoid correction-residual gate.",
+    )
+    correction_moe: bool = Field(
+        default=False,
+        description=(
+            "Replace Correction's final low-rank path with one always-on shared "
+            "expert plus a Top-1 selected expert. Logits mode fuses both experts "
+            "before one shared vocabulary projection."
+        ),
+    )
+    correction_moe_shared_rank: int = Field(
+        default=128,
+        gt=0,
+        description="Low-rank width of the always-on Correction shared expert.",
+    )
+    correction_moe_expert_rank: int = Field(
+        default=64,
+        gt=0,
+        description="Low-rank width of each routed Correction expert.",
+    )
+    correction_moe_num_experts: int = Field(
+        default=4,
+        gt=0,
+        description="Number of Top-1 routed Correction experts.",
+    )
+    correction_moe_load_balance_weight: float = Field(
+        default=0.01,
+        ge=0.0,
+        description="Weight of the Switch-style Correction router balance loss.",
+    )
+    correction_moe_logit_routing: bool = Field(
+        default=False,
+        description=(
+            "Condition only the MoE router and residual gate on detached previous-"
+            "logit entropy, top-1 probability, and top-1/top-2 margin."
+        ),
     )
     correction_hidden_aux_loss: bool = Field(
         default=False,
@@ -180,10 +220,10 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         ),
     )
     correction_rollout_metrics: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Measure greedy self-feedback correction metrics during validation. "
-            "Disable to reduce validation compute."
+            "Disabled by default because it is not part of the DSpark baseline."
         ),
     )
     correction_base_diagnostics: bool = Field(

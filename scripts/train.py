@@ -52,6 +52,10 @@ DRAFT_ARCH_CONFIGS: dict[str, type] = {
     "qwen3": Qwen3Config,
 }
 MROPE_INVERSE_TOLERANCE = 1e-6
+DSPARK_PAPER_LOSS_FN = '{"ce": 0.1, "tv": 0.9}'
+DSPARK_PAPER_BLOCK_SIZE = 7
+DSPARK_PAPER_NUM_LAYERS = 5
+DSPARK_PAPER_EPOCHS = 10
 
 
 def set_seed(seed: int, deterministic: bool = False):
@@ -904,7 +908,12 @@ def parse_args():
         ),
     )
     parser.add_argument("--save-path", type=str, default="./output/checkpoints")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=20,
+        help="Training epochs (default: 20; DSpark paper default: 10).",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--train-data-ratio", type=float, default=0.9)
     parser.add_argument("--no-resume-from-checkpoint", action="store_true")
@@ -926,7 +935,12 @@ def parse_args():
     )
     parser.add_argument("--log-dir", type=str, default="./logs")
     parser.add_argument("--run-name", type=str, default=None)
-    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=1,
+        help="Draft decoder layers (default: 1; DSpark paper default: 5).",
+    )
     parser.add_argument(
         "--draft-arch",
         type=str,
@@ -1005,7 +1019,8 @@ def parse_args():
         help=(
             "Loss function specification. Pass a name for a single loss "
             "(kl_div, rkl, jsd, ce, tv, nla, lk_hybrid) or a JSON dict for a weighted "
-            'combination, e.g. \'{"ce": 0.1, "tv": 0.9}\'.'
+            'combination, e.g. \'{"ce": 0.1, "tv": 0.9}\'. The DSpark default '
+            "is the paper's CE=0.1, TV=0.9 combination."
         ),
     )
     parser.add_argument(
@@ -1080,7 +1095,7 @@ def parse_args():
         "--block-size",
         type=int,
         default=8,
-        help="Block size for DFlash model (default: 8)",
+        help="Draft block size (default: 8; DSpark paper default: 7).",
     )
     parser.add_argument(
         "--sample-from-anchor",
@@ -1100,7 +1115,10 @@ def parse_args():
         "--dflash-decay-gamma",
         type=float,
         default=4.0,
-        help="Decay gamma for DFlash/DSpark loss weighting (default: 4.0)",
+        help=(
+            "Decay gamma for DFlash/DSpark loss weighting (default: 4.0; "
+            "DSpark paper default: its block size)."
+        ),
     )
     # D-Pace specific arguments (loss weight option + smoothing)
     parser.add_argument(
@@ -1217,6 +1235,50 @@ def parse_args():
         help="DSpark initial correction residual-gate bias (default: 0).",
     )
     parser.add_argument(
+        "--correction-moe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark Correction: use one shared low-rank expert plus a Top-1 "
+            "selected expert; logits mode shares one final vocabulary projection "
+            "across experts (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-moe-shared-rank",
+        type=int,
+        default=128,
+        help="DSpark Correction shared-expert rank (default: 128).",
+    )
+    parser.add_argument(
+        "--correction-moe-expert-rank",
+        type=int,
+        default=64,
+        help="DSpark Correction selected-expert rank (default: 64).",
+    )
+    parser.add_argument(
+        "--correction-moe-num-experts",
+        type=int,
+        default=4,
+        help="DSpark Correction selected-expert count (default: 4).",
+    )
+    parser.add_argument(
+        "--correction-moe-load-balance-weight",
+        type=float,
+        default=0.01,
+        help="DSpark Correction router balance-loss weight (default: 0.01).",
+    )
+    parser.add_argument(
+        "--correction-moe-logit-routing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: condition only the Correction MoE router and gate on "
+            "detached previous-logit uncertainty statistics "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
         "--correction-hidden-aux-loss",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1310,8 +1372,11 @@ def parse_args():
     parser.add_argument(
         "--correction-rollout-metrics",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="DSpark: measure greedy self-feedback metrics during validation.",
+        default=False,
+        help=(
+            "DSpark Correction: measure greedy self-feedback metrics during "
+            "validation (default: disabled for DSpark baseline parity)."
+        ),
     )
     parser.add_argument(
         "--correction-base-diagnostics",
@@ -1353,10 +1418,10 @@ def parse_args():
     parser.add_argument(
         "--confidence-loss-weighting",
         type=str,
-        default="uniform",
+        default="match-draft",
         choices=["uniform", "match-draft"],
         help="DSpark: how to weight confidence BCE over positions "
-        "(default: uniform).",
+        "(default: match-draft, matching the DSpark objective).",
     )
     parser.add_argument(
         "--first-error-focal-alpha",
@@ -1538,6 +1603,29 @@ def parse_args():
 
     args = parser.parse_args()
 
+    # Preserve the shared CLI defaults for every other algorithm while making a
+    # bare ``--speculator-type dspark`` reproduce the paper training recipe.
+    dspark_default_dests = {
+        "block_size",
+        "dflash_decay_gamma",
+        "epochs",
+        "loss_fn",
+        "num_layers",
+    }
+    dspark_provided = explicitly_provided_dests(parser, dspark_default_dests)
+    if args.speculator_type == "dspark":
+        if "block_size" not in dspark_provided:
+            args.block_size = DSPARK_PAPER_BLOCK_SIZE
+        if "dflash_decay_gamma" not in dspark_provided:
+            # The paper uses the proposal length gamma in w_k=exp(-(k-1)/gamma).
+            args.dflash_decay_gamma = float(args.block_size)
+        if "epochs" not in dspark_provided:
+            args.epochs = DSPARK_PAPER_EPOCHS
+        if "loss_fn" not in dspark_provided:
+            args.loss_fn = DSPARK_PAPER_LOSS_FN
+        if "num_layers" not in dspark_provided:
+            args.num_layers = DSPARK_PAPER_NUM_LAYERS
+
     is_eagle3 = args.speculator_type == "eagle3"
     if args.draft_arch is None:
         args.draft_arch = "llama" if is_eagle3 else "qwen3"
@@ -1573,6 +1661,19 @@ def parse_args():
         parser.error(
             "--correction-output-mode=logits requires --enable-correction-head"
         )
+    if args.correction_moe:
+        if not args.enable_correction_head:
+            parser.error("--correction-moe requires --enable-correction-head")
+        if min(
+            args.correction_moe_shared_rank,
+            args.correction_moe_expert_rank,
+            args.correction_moe_num_experts,
+        ) <= 0:
+            parser.error("Correction MoE ranks and expert count must be > 0")
+        if args.correction_moe_load_balance_weight < 0.0:
+            parser.error("--correction-moe-load-balance-weight must be >= 0")
+    elif args.correction_moe_logit_routing:
+        parser.error("--correction-moe-logit-routing requires --correction-moe")
     if (
         args.correction_hidden_aux_loss
         or args.correction_hidden_feedback

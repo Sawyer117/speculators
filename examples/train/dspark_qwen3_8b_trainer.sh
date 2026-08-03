@@ -23,24 +23,27 @@ OUTPUT_DIR="./output/dspark_qwen3_8b_sharegpt_ascend"
 VLLM_PORT=8000
 MAX_SAMPLES=5000
 SEQ_LENGTH=8192
-EPOCHS=5
+EPOCHS=10
 LR=6e-4
 LOGGER="tensorboard"
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
-BLOCK_SIZE=8
+BLOCK_SIZE=7
 MAX_ANCHORS=512
 NUM_LAYERS=5
 DRAFT_VOCAB_SIZE=32000
 TARGET_LAYER_IDS="1 9 17 25 33"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
 DRAFT_ATTN_IMPL="sdpa"     # Use eager/sdpa on hardware without flex attention.
 
-# Correction + confidence head settings. Use an empty CORRECTION_HEAD_ARGS array
-# to fall back to the legacy Markov head.
+# ---- Sequential head selection ------------------------------------------------
+# The paper baseline uses the Markov head. Set this to
+# (--enable-correction-head) only for an explicit Correction experiment.
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
-CORRECTION_HEAD_ARGS=(--enable-correction-head)
+CORRECTION_HEAD_ARGS=()
+
+# ---- Correction core ----------------------------------------------------------
 # hidden: existing single-LM-head hidden residual baseline.
 # logits: feed previous verifier/generated logits and add a Markov-like vocab bias.
 CORRECTION_OUTPUT_MODE="hidden"
@@ -49,34 +52,62 @@ CORRECTION_RANK=256
 CORRECTION_NUM_LAYERS=1
 CORRECTION_NUM_HEADS=8
 CORRECTION_GATE_BIAS=0.0
+
+# ---- Correction MoE -----------------------------------------------------------
+# Conditional Correction capacity. Keep both arrays negative for the exact
+# non-MoE baseline. Set CORRECTION_MOE_ARGS=(--correction-moe) to enable one
+# shared expert plus one Top-1 selected expert. Logits mode fuses both experts
+# at CORRECTION_RANK before its single shared vocabulary projection.
+CORRECTION_MOE_ARGS=(--no-correction-moe)
+CORRECTION_MOE_SHARED_RANK=128
+CORRECTION_MOE_EXPERT_RANK=64
+CORRECTION_MOE_NUM_EXPERTS=4
+CORRECTION_MOE_LOAD_BALANCE_WEIGHT=0.01
+# Set this to (--correction-moe-logit-routing) to additionally feed detached
+# entropy/top-1/margin statistics only to the MoE router and correction gate.
+# It works with both hidden and logits output modes.
+CORRECTION_MOE_LOGIT_ROUTING_ARGS=(--no-correction-moe-logit-routing)
+
+# ---- Representation supervision and recurrence -------------------------------
 # Optional hidden-state supervision and recurrent corrected-hidden feedback.
 # Both remain off for exact baseline parity.
 CORRECTION_HIDDEN_AUX_ARGS=(--no-correction-hidden-aux-loss)
 CORRECTION_HIDDEN_AUX_WEIGHT=0.1
 CORRECTION_HIDDEN_FEEDBACK_ARGS=(--no-correction-hidden-feedback)
+
+# ---- Cross-block memory and output composition --------------------------------
 # Acceptance-aware cross-block memory. It is trained from verifier-confirmed
 # context and updated only after speculative verification at inference time.
 CORRECTION_CROSS_BLOCK_MEMORY_ARGS=(--no-correction-cross-block-memory)
 CORRECTION_MEMORY_GATE_BIAS=-2.0
 # In logits mode, enable this for LMHead(h_DFlash + delta_hidden) + delta_logits.
 CORRECTION_PROJECT_HIDDEN_ARGS=(--no-correction-project-corrected-hidden)
+
+# ---- Correction-Markov collaboration -----------------------------------------
 # Keep disabled for the existing Correction baseline. Switch to
 # (--correction-with-markov) for gated Correction + Markov collaboration.
 CORRECTION_COLLABORATION_ARGS=(--no-correction-with-markov)
 CORRECTION_MARKOV_GATE_BIAS=-2.0
+
+# ---- Feedback curriculum and validation --------------------------------------
 # Teacher forcing remains the baseline at ratio 0. A typical curriculum uses
 # ratio=0.25, warmup=0.2, and ramp=0.4.
 CORRECTION_GENERATED_TOKEN_RATIO=0.0
 CORRECTION_GENERATED_TOKEN_WARMUP=0.2
 CORRECTION_GENERATED_TOKEN_RAMP=0.4
-CORRECTION_ROLLOUT_METRICS_ARGS=(--correction-rollout-metrics)
+# Enable only for Correction validation; it adds a self-feedback rollout pass.
+CORRECTION_ROLLOUT_METRICS_ARGS=(--no-correction-rollout-metrics)
 # Hidden mode: enable only when validation-only base change/gain diagnostics are
 # worth an additional LM-head projection. Logits mode already computes base logits.
 CORRECTION_BASE_DIAGNOSTICS_ARGS=(--no-correction-base-diagnostics)
+
+# ---- Confidence and loss ------------------------------------------------------
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
+CONFIDENCE_HEAD_ARGS=(--enable-confidence-head)
+CONFIDENCE_SEQUENTIAL_FEATURE_ARGS=(--confidence-head-with-markov)
 CONFIDENCE_HEAD_ALPHA=1.0
 CONFIDENCE_LENGTH_ALPHA=0.0
-CONFIDENCE_LOSS_WEIGHTING="uniform"   # uniform | match-draft
+CONFIDENCE_LOSS_WEIGHTING="match-draft"   # DSpark paper default; uniform is ablation
 # Use --confidence-detach-features to keep confidence fully auxiliary.
 CONFIDENCE_DETACH_FEATURES_ARGS=(--no-confidence-detach-features)
 FIRST_ERROR_FOCAL_ALPHA=0.0
@@ -85,13 +116,13 @@ ADAPTIVE_LOSS="none"                  # none | cat | ssal
 SSAL_CURRICULUM_ARGS=(--no-ssal-curriculum)
 SSAL_CURRICULUM_START=0.1
 SSAL_CURRICULUM_END=0.6
+
+# ---- DFlash backbone experiments ---------------------------------------------
 # Optional DFlash backbone experiments. All are disabled to preserve the baseline.
-DFLASH_FEATURE_ARGS=(
-    --no-dflash-context-residual
-    --no-dflash-verifier-final-residual
-    --no-dflash-block-position-embedding
-    --no-dflash-gated-layer-fusion
-)
+DFLASH_CONTEXT_RESIDUAL_ARGS=(--no-dflash-context-residual)
+DFLASH_VERIFIER_FINAL_RESIDUAL_ARGS=(--no-dflash-verifier-final-residual)
+DFLASH_BLOCK_POSITION_ARGS=(--no-dflash-block-position-embedding)
+DFLASH_GATED_LAYER_FUSION_ARGS=(--no-dflash-gated-layer-fusion)
 
 # Ascend NPU assignments (online training needs separate devices for vLLM/training)
 VLLM_NPUS="0,1,2,3"
@@ -149,6 +180,12 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --correction-num-layers "$CORRECTION_NUM_LAYERS" \
     --correction-num-heads "$CORRECTION_NUM_HEADS" \
     --correction-gate-bias "$CORRECTION_GATE_BIAS" \
+    "${CORRECTION_MOE_ARGS[@]}" \
+    --correction-moe-shared-rank "$CORRECTION_MOE_SHARED_RANK" \
+    --correction-moe-expert-rank "$CORRECTION_MOE_EXPERT_RANK" \
+    --correction-moe-num-experts "$CORRECTION_MOE_NUM_EXPERTS" \
+    --correction-moe-load-balance-weight "$CORRECTION_MOE_LOAD_BALANCE_WEIGHT" \
+    "${CORRECTION_MOE_LOGIT_ROUTING_ARGS[@]}" \
     "${CORRECTION_HIDDEN_AUX_ARGS[@]}" \
     --correction-hidden-aux-weight "$CORRECTION_HIDDEN_AUX_WEIGHT" \
     "${CORRECTION_HIDDEN_FEEDBACK_ARGS[@]}" \
@@ -162,9 +199,12 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --correction-generated-token-ramp "$CORRECTION_GENERATED_TOKEN_RAMP" \
     "${CORRECTION_ROLLOUT_METRICS_ARGS[@]}" \
     "${CORRECTION_BASE_DIAGNOSTICS_ARGS[@]}" \
-    "${DFLASH_FEATURE_ARGS[@]}" \
-    --enable-confidence-head \
-    --confidence-head-with-markov \
+    "${DFLASH_CONTEXT_RESIDUAL_ARGS[@]}" \
+    "${DFLASH_VERIFIER_FINAL_RESIDUAL_ARGS[@]}" \
+    "${DFLASH_BLOCK_POSITION_ARGS[@]}" \
+    "${DFLASH_GATED_LAYER_FUSION_ARGS[@]}" \
+    "${CONFIDENCE_HEAD_ARGS[@]}" \
+    "${CONFIDENCE_SEQUENTIAL_FEATURE_ARGS[@]}" \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
     --confidence-length-alpha "$CONFIDENCE_LENGTH_ALPHA" \

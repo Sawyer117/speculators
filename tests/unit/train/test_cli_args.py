@@ -96,14 +96,61 @@ def test_peagle_explicit_ce(monkeypatch):
     assert "ce" in val_kw["loss_config"]
 
 
-def test_dspark_default_uses_kl(monkeypatch):
-    args = _parse(monkeypatch, [])
+def test_dspark_defaults_match_paper_weighting(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "dspark"])
+    assert args.block_size == 7
+    assert args.dflash_decay_gamma == 7.0
+    assert args.num_layers == 5
+    assert args.epochs == 10
+    assert args.enable_correction_head is False
+    assert args.correction_moe is False
+    assert args.correction_rollout_metrics is False
+    assert args.dflash_context_residual is False
+    assert args.dflash_verifier_final_residual is False
+    assert args.dflash_block_position_embedding is False
+    assert args.dflash_gated_layer_fusion is False
+    assert args.enable_confidence_head is True
+    assert args.confidence_head_with_markov is True
+    assert args.confidence_detach_features is False
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
-    assert "kl_div" in train_kw["loss_config"]
-    assert train_kw["loss_config"]["kl_div"][0] is kl_div_loss
-    assert "kl_div" in val_kw["loss_config"]
+    assert train_kw["loss_config"]["ce"] == (ce_loss, 0.1)
+    assert train_kw["loss_config"]["tv"] == (tv_loss_fused_or_eager, 0.9)
+    assert val_kw["loss_config"]["ce"] == (ce_loss, 0.1)
+    assert val_kw["loss_config"]["tv"] == (tv_loss_fused_or_eager, 0.9)
+    assert train_kw["gamma"] == 7.0
+    assert val_kw["gamma"] == 7.0
     assert train_kw["confidence_head_alpha"] == 1.0
     assert val_kw["confidence_head_alpha"] == 1.0
+    assert train_kw["confidence_loss_weighting"] == "match-draft"
+    assert val_kw["confidence_loss_weighting"] == "match-draft"
+
+
+def test_dspark_explicit_recipe_overrides_win(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--block-size",
+            "8",
+            "--dflash-decay-gamma",
+            "4",
+            "--num-layers",
+            "3",
+            "--epochs",
+            "2",
+            "--loss-fn",
+            "kl_div",
+            "--confidence-loss-weighting",
+            "uniform",
+        ],
+    )
+    assert args.block_size == 8
+    assert args.dflash_decay_gamma == 4.0
+    assert args.num_layers == 3
+    assert args.epochs == 2
+    assert args.loss_fn == "kl_div"
+    assert args.confidence_loss_weighting == "uniform"
 
 
 def test_dspark_compound_loss(monkeypatch):
@@ -202,6 +249,51 @@ def test_dspark_logit_residual_correction_head_cli(monkeypatch):
     )
     assert args.enable_correction_head is True
     assert args.correction_output_mode == "logits"
+
+
+def test_dspark_logit_correction_moe_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-output-mode",
+            "logits",
+            "--correction-moe",
+            "--correction-moe-logit-routing",
+        ],
+    )
+    assert args.correction_output_mode == "logits"
+    assert args.correction_moe is True
+    assert args.correction_moe_logit_routing is True
+
+
+def test_dspark_hidden_correction_moe_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-moe",
+            "--correction-moe-shared-rank",
+            "128",
+            "--correction-moe-expert-rank",
+            "64",
+            "--correction-moe-num-experts",
+            "4",
+            "--correction-moe-load-balance-weight",
+            "0.005",
+            "--correction-moe-logit-routing",
+        ],
+    )
+    assert args.correction_moe is True
+    assert args.correction_moe_shared_rank == 128
+    assert args.correction_moe_expert_rank == 64
+    assert args.correction_moe_num_experts == 4
+    assert args.correction_moe_load_balance_weight == 0.005
+    assert args.correction_moe_logit_routing is True
 
 
 def test_dspark_correction_hidden_auxiliary_features_cli(monkeypatch):

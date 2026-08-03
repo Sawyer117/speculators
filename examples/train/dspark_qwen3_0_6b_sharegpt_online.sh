@@ -28,14 +28,14 @@ OUTPUT_DIR="./output/dspark_qwen3_0_6b_sharegpt"
 VLLM_PORT=8000
 MAX_SAMPLES=5000
 SEQ_LENGTH=4096
-EPOCHS=5
+EPOCHS=10
 LR=3e-4
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
-BLOCK_SIZE=8
+BLOCK_SIZE=7
 MAX_ANCHORS=3072
-NUM_LAYERS=3
+NUM_LAYERS=5
 DRAFT_VOCAB_SIZE=32000
 TARGET_LAYER_IDS="2 14 25"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
 
@@ -44,6 +44,7 @@ MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
+CONFIDENCE_LOSS_WEIGHTING="match-draft"
 
 # GPU assignments (online training needs separate GPUs for vLLM and training)
 VLLM_GPUS="0"
@@ -106,6 +107,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
+    --confidence-loss-weighting "$CONFIDENCE_LOSS_WEIGHTING" \
     --on-missing generate \
     --on-generate delete
 

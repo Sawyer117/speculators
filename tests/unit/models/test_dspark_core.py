@@ -15,12 +15,16 @@ class _RecordingCorrectionHead(nn.Module):
         self.scale = nn.Parameter(torch.tensor(1.0))
         self.previous_embeddings: list[torch.Tensor] = []
         self.block_positions: list[torch.Tensor] = []
+        self.previous_logits: list[torch.Tensor] = []
+        self.previous_logits_masks: list[torch.Tensor] = []
 
     def forward(
         self,
         previous_embeddings,
         dflash_hidden,
         block_positions,
+        previous_logits=None,
+        previous_logits_mask=None,
         cache=None,
         *,
         use_cache=False,
@@ -28,6 +32,12 @@ class _RecordingCorrectionHead(nn.Module):
         del cache
         self.previous_embeddings.append(previous_embeddings.detach().clone())
         self.block_positions.append(block_positions.detach().clone())
+        if previous_logits is not None:
+            assert previous_logits_mask is not None
+            self.previous_logits.append(previous_logits.detach().clone())
+            self.previous_logits_masks.append(
+                previous_logits_mask.detach().clone()
+            )
         states = dflash_hidden.new_zeros(*dflash_hidden.shape[:-1], 4)
         delta_hidden = torch.nn.functional.one_hot(
             block_positions, num_classes=dflash_hidden.shape[-1]
@@ -70,7 +80,12 @@ class _RecordingLogitCorrectionHead(nn.Module):
         return delta_logits, states, next_cache
 
     @staticmethod
-    def auxiliary_hidden_residual(causal_states):
+    def auxiliary_hidden_residual(
+        causal_states,
+        previous_logits=None,
+        previous_logits_mask=None,
+    ):
+        del previous_logits, previous_logits_mask
         delta_hidden = causal_states.new_zeros(*causal_states.shape[:-1], 4)
         delta_hidden[..., 0] = 2.0
         return delta_hidden
@@ -215,6 +230,36 @@ def test_generated_feedback_training_retains_gradients_and_generated_tokens():
     assert harness.correction_head.scale.grad is not None
     assert hidden.grad is not None
     assert harness.lm_head.calls == harness.block_size
+
+
+def test_hidden_moe_logit_routing_uses_previous_generated_logits():
+    harness = _GeneratedFeedbackHarness()
+    harness.block_size = 3
+    harness.config = SimpleNamespace(
+        sample_from_anchor=True,
+        correction_hidden_size=4,
+        correction_moe_logit_routing=True,
+    )
+    harness.correction_head = _RecordingCorrectionHead()
+    harness.embed_tokens = nn.Embedding(8, 4)
+    harness.lm_head = _CountingLinear(4, 8)
+    harness.d2t = None
+    with torch.no_grad():
+        harness.embed_tokens.weight.copy_(
+            torch.arange(8, dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+        )
+        harness.lm_head.weight.normal_()
+
+    _, logits, _, _ = harness._generated_feedback_correction(
+        torch.zeros(1, 3, 4),
+        anchor_token_ids=torch.tensor([7]),
+    )
+
+    masks = torch.cat(harness.correction_head.previous_logits_masks, dim=1)
+    feedback = torch.cat(harness.correction_head.previous_logits, dim=1)
+    assert torch.equal(masks, torch.tensor([[False, True, True]]))
+    assert torch.count_nonzero(feedback[:, 0]) == 0
+    assert torch.equal(feedback[:, 1:], logits[:, :-1].detach())
 
 
 def test_logit_residual_rollout_feeds_back_previous_final_logits():
