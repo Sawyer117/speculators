@@ -251,6 +251,18 @@ def main():
         args.ckpt, config=cfg, verifier=args.verifier,
     )
     model = model.to(dev, dtype).eval()
+    # CRITICAL: model.to(<real dtype>) casts the COMPLEX freqs_cis buffer to real and
+    # DISCARDS the imaginary part (torch_npu warns "Casting complex values to real...").
+    # original_seq_len=65536 → the forward's _rope_at NEVER rebuilds it (draft positions
+    # are tiny), so the corrupted real buffer would silently break RoPE (rotation collapses
+    # to a cos-only scale) → uniform garbage at every slot. Rebuild it as complex on-device
+    # (the lru_cache still holds __init__'s untouched complex tensor for these same args).
+    bb = model.backbone_cfg
+    model.freqs_cis = _dsv4_core.precompute_freqs_cis(
+        model._rope_dim, bb.original_seq_len or 1, 0, bb.rope_theta,
+        bb.rope_factor, bb.beta_fast, bb.beta_slow,
+    ).to(dev)
+    assert model.freqs_cis.is_complex(), "freqs_cis must stay complex (RoPE rotation)"
     assert model.block_size == block, f"ckpt block_size {model.block_size} != dump {block}"
 
     base_recs, final_recs = [], []
