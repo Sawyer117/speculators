@@ -206,7 +206,10 @@ def main():
     ap.add_argument("--verifier", required=True, help="verifier dir (embed/lm_head/verifier_norm reloaded from here)")
     ap.add_argument("--atol", type=float, default=2e-2, help="max|Δ| PASS tolerance (bf16 ~2e-2)")
     ap.add_argument("--topk", type=int, default=5)
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--device", default="auto",
+                    help="auto (npu if present else cpu), or cpu/npu/cuda. NPU+bfloat16 is the "
+                         "FAITHFUL setting — same bf16 NPU kernels as the serve, so the only "
+                         "remaining difference is monolithic-vs-incremental attention.")
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     ap.add_argument("--limit", type=int, default=0, help="cap #blocks (0=all)")
     args = ap.parse_args()
@@ -216,6 +219,20 @@ def main():
     except ImportError:
         sys.exit("need torch — run in the training env (or any torch env).")
     from speculators.models.dsv4_dspark.core import DSV4DSparkDraftModel
+
+    # Resolve device. Prefer NPU: it runs the SAME bf16 kernels as the serve (kills the
+    # CPU-fp32↔NPU-bf16 confound — incl. MoE top-k routing flips from precision). This ARM
+    # CPU has no bf16 matmul (mkldnn falls over), so bf16 REQUIRES npu.
+    if args.device == "auto":
+        try:
+            import torch_npu  # noqa: F401  (registers the "npu" backend)
+            args.device = "npu" if torch.npu.is_available() else "cpu"
+        except Exception:
+            args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device == "cpu" and args.dtype == "bfloat16":
+        sys.exit("bf16 matmul isn't supported on this CPU — run on NPU (default auto picks it) "
+                 "or use --dtype float32 for a CPU structural check.")
+    print(f">>> device={args.device} dtype={args.dtype}")
 
     files = ([args.dumps] if args.dumps.endswith(".pt")
              else sorted(glob.glob(os.path.join(args.dumps, "serve_block_*.pt")),
