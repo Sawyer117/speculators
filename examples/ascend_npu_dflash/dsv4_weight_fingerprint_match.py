@@ -75,6 +75,42 @@ def _fingerprint_dir(path):
     return fps, n, n_expert
 
 
+def _small_fps(path, max_numel):
+    """FAST probe: value-fingerprint ONLY the small tensors (numel <= max_numel), reading
+    each tensor's SHAPE from the safetensors header first so the huge per-expert MoE blocks
+    are skipped without ever loading them. norms/biases/proj/markov/mHC are plenty to identify
+    a training state. Returns dict fp->count."""
+    from safetensors import safe_open
+    files = ([path] if path.endswith(".safetensors")
+             else sorted(glob.glob(os.path.join(path, "*.safetensors"))))
+    if not files:
+        # .bin fallback: no cheap shape peek, load it all (rare path)
+        fps = {}
+        for k, t in _iter_safetensors(path):
+            if 0 < t.numel() <= max_numel:
+                tf = t.detach().float()
+                fp = (t.numel(), round(float(tf.sum()), 2),
+                      round(float(tf.abs().sum()), 2), round(float(tf.abs().max()), 4))
+                fps[fp] = fps.get(fp, 0) + 1
+        return fps
+    fps = {}
+    for f in files:
+        with safe_open(f, framework="pt", device="cpu") as sf:
+            for k in sf.keys():
+                shape = sf.get_slice(k).get_shape()
+                numel = 1
+                for d in shape:
+                    numel *= d
+                if numel == 0 or numel > max_numel:
+                    continue
+                tf = sf.get_tensor(k).detach().float()
+                fp = (numel, round(float(tf.sum().item()), 2),
+                      round(float(tf.abs().sum().item()), 2),
+                      round(float(tf.abs().max().item()), 4))
+                fps[fp] = fps.get(fp, 0) + 1
+    return fps
+
+
 def _nonexpert_match_rate(fa, fb):
     """fraction of A's NON-expert tensors whose value-fingerprint appears in B."""
     fb_avail = dict(fb)
@@ -92,38 +128,43 @@ def _nonexpert_match_rate(fa, fb):
     return ne_match, ne_total
 
 
-def _scan(draft_dir, glob_pat):
-    """Fingerprint the converted DRAFT once, then rank every candidate train ckpt by how
-    well its non-expert tensors match — i.e. WHICH train ckpt this draft was converted from."""
+def _scan(draft_dir, glob_pat, max_numel=2_000_000):
+    """FAST source-trace: fingerprint ONLY the draft's small tensors once, then walk candidate
+    train ckpts NEWEST→OLDEST, probing each on its small tensors. Stop at the first ≥95% match
+    (that's the source). Big per-expert MoE blocks are never loaded (shape-peek skip)."""
     print(f">>> reference (converted draft) = {draft_dir}")
-    fdraft, nd, ed = _fingerprint_dir(draft_dir)
-    print(f">>> draft: {nd} tensors ({ed} expert-like)\n")
-    cands = sorted(d for d in glob.glob(glob_pat) if os.path.isdir(d))
+    fdraft = _small_fps(draft_dir, max_numel)
+    print(f">>> draft small-tensor fingerprints (numel<= {max_numel:,}): {sum(fdraft.values())}\n")
+    cands = [d for d in glob.glob(glob_pat) if os.path.isdir(d)]
     if not cands:
         sys.exit(f"no candidate dirs match glob: {glob_pat}")
-    rows = []
+    cands.sort(key=lambda d: os.path.getmtime(d), reverse=True)  # newest first
+    print(">>> probing newest→oldest (small tensors only); stop at first ≥95%:")
+    print("    match%   matched/total   mtime                dir")
+    best = (0.0, 0, 0, None)
+    import datetime as _dt
     for c in cands:
         try:
-            fc, ncand, _ = _fingerprint_dir(c)
-        except SystemExit:
+            fc = _small_fps(c, max_numel)
+        except Exception as e:  # noqa: BLE001
+            print(f"    (skip {c}: {e})")
             continue
         m, t = _nonexpert_match_rate(fc, fdraft)
-        rows.append((m / t if t else 0.0, m, t, ncand, c))
-    rows.sort(reverse=True)
-    print(">>> candidates ranked by non-expert match to the draft:")
-    print("    match%   matched/total   #tensors   dir")
-    for rate, m, t, ncand, c in rows:
-        flag = "  ← SOURCE" if rate >= 0.95 else ""
-        print(f"    {rate:6.1%}   {m:>5}/{t:<5}      {ncand:>5}   {c}{flag}")
-    best = rows[0]
+        rate = m / t if t else 0.0
+        ts = _dt.datetime.fromtimestamp(os.path.getmtime(c)).strftime("%Y-%m-%d %H:%M")
+        hit = rate >= 0.95
+        print(f"    {rate:6.1%}   {m:>5}/{t:<5}      {ts}    {c}{'  ← SOURCE' if hit else ''}")
+        if rate > best[0]:
+            best = (rate, m, t, c)
+        if hit:
+            print("\n" + "=" * 70)
+            print(f"VERDICT: ✅ SOURCE FOUND → {c}")
+            print("  ⇒ use THIS as the parity --ckpt (it IS the weights the ep4p5 serve ran).")
+            sys.exit(0)
     print("\n" + "=" * 70)
-    if best[0] >= 0.95:
-        print(f"VERDICT: ✅ SOURCE FOUND → {best[4]}")
-        print("  ⇒ use THIS as the parity --ckpt (it IS the weights the ep4p5 serve ran).")
-    else:
-        print(f"VERDICT: ❌ no train ckpt matches (best {best[0]:.1%} @ {best[4]}).")
-        print("  ⇒ the train-format source is likely gone (mid-epoch dir overwritten after convert),")
-        print("     or lives outside the scanned glob / on another machine. Widen --scan or check 176.")
+    print(f"VERDICT: ❌ no train ckpt matches (best {best[0]:.1%} @ {best[3]}).")
+    print("  ⇒ train-format source likely gone (mid-epoch dir overwritten after convert),")
+    print("     or outside this glob / on another machine. Widen --scan or check 176.")
     sys.exit(0)
 
 
