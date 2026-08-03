@@ -15,6 +15,7 @@ import csv
 import json
 import logging
 import os
+import random
 import subprocess
 import sys
 import time
@@ -49,6 +50,10 @@ RESULT_COLUMNS = [
     "requests_per_second",
     "output_tokens_per_second",
     "total_output_tokens",
+    "base_elapsed_s",
+    "base_output_tokens_per_second",
+    "base_total_output_tokens",
+    "speedup_vs_base",
     "num_proposals",
     "num_proposed_draft_tokens",
     "num_accepted_draft_tokens",
@@ -63,6 +68,20 @@ RESULT_COLUMNS = [
     "position_accepted_counts",
     "position_proposed_counts",
 ]
+
+# Keep the default offline-evaluation workload aligned with DeepSpec-Ascend's
+# top-level eval.py. An explicit --max-samples overrides these per-dataset caps.
+DEEPSPEC_EVAL_SAMPLE_LIMITS = {
+    "gsm8k": 500,
+    "math500": 500,
+    "aime25": 30,
+    "humaneval": 164,
+    "mbpp": 256,
+    "livecodebench": 500,
+    "mt-bench": 80,
+    "alpaca": 500,
+    "arena-hard-v2": 500,
+}
 
 
 @dataclass
@@ -247,6 +266,12 @@ def sample_from_probs(probs):
     return sampled.reshape(*probs.shape[:-1])
 
 
+def sample_from_logits(logits, temperature: float):
+    if temperature <= 0:
+        return torch.argmax(logits, dim=-1)
+    return sample_from_probs(logits_to_probs(logits, temperature))
+
+
 def gather_token_probs(probs, token_ids):
     return torch.gather(probs, dim=-1, index=token_ids.unsqueeze(-1)).squeeze(-1)
 
@@ -305,6 +330,41 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"{path}:{line_no}: expected JSON object")
             records.append(item)
     return records
+
+
+def _canonical_dataset_name(name: str) -> str:
+    normalized = name.strip().lower().replace("_", "-")
+    aliases = {
+        "aime-25": "aime25",
+        "human-eval": "humaneval",
+        "live-code-bench": "livecodebench",
+        "math-500": "math500",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _select_eval_records(
+    records: list[dict[str, Any]],
+    *,
+    dataset_name: str,
+    max_samples: int | None,
+    seed: int,
+) -> list[dict[str, Any]]:
+    limit = (
+        int(max_samples)
+        if max_samples is not None
+        else DEEPSPEC_EVAL_SAMPLE_LIMITS.get(
+            _canonical_dataset_name(dataset_name)
+        )
+    )
+    if limit is None or len(records) <= limit:
+        return records
+    if limit < 0:
+        raise ValueError("--max-samples must be >= 0")
+
+    selected = list(records)
+    random.Random(int(seed)).shuffle(selected)
+    return selected[:limit]
 
 
 def _string_turns(value: Any) -> list[str] | None:
@@ -790,6 +850,71 @@ def generate_decoding_sample(
     )
 
 
+def generate_base_model_sample(
+    *,
+    target_model,
+    input_ids,
+    max_new_tokens: int,
+    temperature: float,
+    stop_token_ids: list[int] | None,
+) -> SimpleNamespace:
+    """Generate autoregressively with only the verifier and its KV cache."""
+    num_input_tokens = input_ids.shape[1]
+    max_new_tokens = int(max_new_tokens)
+    if max_new_tokens <= 0:
+        return SimpleNamespace(
+            output_ids=input_ids.clone(),
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=0,
+        )
+
+    device = input_ids.device
+    max_length = num_input_tokens + max_new_tokens
+    output_ids = torch.empty(
+        (1, max_length),
+        dtype=torch.long,
+        device=device,
+    )
+    output_ids[:, :num_input_tokens] = input_ids
+    position_ids = torch.arange(max_length, device=device).unsqueeze(0)
+    past_key_values = DynamicCache()
+
+    output = target_model(
+        input_ids=input_ids,
+        position_ids=position_ids[:, :num_input_tokens],
+        past_key_values=past_key_values,
+        use_cache=True,
+    )
+    next_token = sample_from_logits(
+        output.logits[:, -1:, :],
+        float(temperature),
+    )
+    end = num_input_tokens
+
+    while end < max_length:
+        output_ids[:, end : end + 1] = next_token
+        end += 1
+        if has_stop_token(next_token, stop_token_ids) or end >= max_length:
+            break
+        output = target_model(
+            input_ids=next_token,
+            position_ids=position_ids[:, end - 1 : end],
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        next_token = sample_from_logits(
+            output.logits[:, -1:, :],
+            float(temperature),
+        )
+
+    output_ids = output_ids[:, :end]
+    return SimpleNamespace(
+        output_ids=output_ids,
+        num_input_tokens=num_input_tokens,
+        num_output_tokens=end - num_input_tokens,
+    )
+
+
 class DSparkOfflineRunner:
     def __init__(self, target_model, draft_model, tokenizer, args) -> None:
         self.target_model = target_model
@@ -1174,6 +1299,42 @@ class DSparkOfflineRunner:
             )
 
 
+class BaseModelOfflineRunner:
+    def __init__(self, target_model, tokenizer, args) -> None:
+        self.target_model = target_model
+        self.tokenizer = tokenizer
+        self.args = args
+        self.device = next(target_model.parameters()).device
+
+    def generate_one(self, prompt: str, stop_token_ids: list[int] | None):
+        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(
+            self.device
+        )
+        with torch.inference_mode():
+            return generate_base_model_sample(
+                target_model=self.target_model,
+                input_ids=input_ids,
+                max_new_tokens=int(self.args.max_new_tokens),
+                temperature=float(self.args.temperature),
+                stop_token_ids=stop_token_ids,
+            )
+
+
+def _synchronize_device(device) -> None:
+    backend = getattr(torch, device.type, None)
+    synchronize = getattr(backend, "synchronize", None)
+    if synchronize is not None:
+        synchronize(device)
+
+
+def _timed_generate(runner, prompt: str, stop_token_ids: list[int] | None):
+    _synchronize_device(runner.device)
+    start_time = time.perf_counter()
+    response = runner.generate_one(prompt, stop_token_ids)
+    _synchronize_device(runner.device)
+    return response, time.perf_counter() - start_time
+
+
 def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     position_proposed_counts: list[int] = []
     position_accepted_counts: list[int] = []
@@ -1225,7 +1386,29 @@ def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         position_support_accept_rate_sums=position_support_accept_rate_sums,
     )
     num_requests = sum(int(row["num_requests"]) for row in rows)
-    return _summary_row(dataset, num_requests, stats)
+    summary = _summary_row(dataset, num_requests, stats)
+    base_elapsed_s = max(
+        (float(row.get("base_elapsed_s", 0.0)) for row in rows),
+        default=0.0,
+    )
+    if base_elapsed_s:
+        base_total_output_tokens = sum(
+            int(row.get("base_total_output_tokens", 0)) for row in rows
+        )
+        base_tps = base_total_output_tokens / base_elapsed_s
+        summary.update(
+            {
+                "base_elapsed_s": base_elapsed_s,
+                "base_output_tokens_per_second": base_tps,
+                "base_total_output_tokens": base_total_output_tokens,
+                "speedup_vs_base": (
+                    summary["output_tokens_per_second"] / base_tps
+                    if base_tps
+                    else 0.0
+                ),
+            }
+        )
+    return summary
 
 
 def _summary_row(dataset: str, num_requests: int, stats: EvalStats) -> dict[str, Any]:
@@ -1238,6 +1421,10 @@ def _summary_row(dataset: str, num_requests: int, stats: EvalStats) -> dict[str,
             stats.total_output_tokens / stats.elapsed_s if stats.elapsed_s else 0
         ),
         "total_output_tokens": stats.total_output_tokens,
+        "base_elapsed_s": 0.0,
+        "base_output_tokens_per_second": 0.0,
+        "base_total_output_tokens": 0,
+        "speedup_vs_base": 0.0,
         "num_proposals": stats.num_proposals,
         "num_proposed_draft_tokens": stats.num_proposed_draft_tokens,
         "num_accepted_draft_tokens": stats.num_accepted_draft_tokens,
@@ -1262,12 +1449,26 @@ def _evaluate_dataset(
     *,
     path: Path,
     runner: DSparkOfflineRunner,
+    base_runner: BaseModelOfflineRunner | None,
     args: argparse.Namespace,
     stop_token_ids: list[int] | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     records = _load_jsonl(path)
-    if args.max_samples is not None:
-        records = records[: args.max_samples]
+    total_records = len(records)
+    records = _select_eval_records(
+        records,
+        dataset_name=path.stem,
+        max_samples=args.max_samples,
+        seed=args.seed,
+    )
+    if len(records) != total_records:
+        logger.info(
+            "[%s] selected %d/%d samples with seed=%d",
+            path.stem,
+            len(records),
+            total_records,
+            int(args.seed),
+        )
     indexed_records = _shard_records(
         records,
         shard_index=getattr(args, "worker_shard_index", None),
@@ -1276,6 +1477,32 @@ def _evaluate_dataset(
 
     stats = EvalStats()
     artifacts: list[dict[str, Any]] = []
+    base_elapsed_s = 0.0
+    base_total_output_tokens = 0
+
+    if base_runner is not None:
+        warmup_samples = int(args.throughput_warmup_samples)
+        if warmup_samples < 0:
+            raise ValueError("--throughput-warmup-samples must be >= 0")
+        warmup_records = indexed_records[:warmup_samples]
+        if warmup_records:
+            logger.info(
+                "[%s] warming up DSpark and base model with %d sample(s)",
+                path.stem,
+                len(warmup_records),
+            )
+        for idx, record in warmup_records:
+            prompt = _prompt_from_record(
+                record,
+                runner.tokenizer,
+                source=f"{path}:{idx}",
+                args=args,
+            )
+            runner.generate_one(prompt, stop_token_ids)
+            base_runner.generate_one(prompt, stop_token_ids)
+        _synchronize_device(runner.device)
+        torch.manual_seed(args.seed)
+
     start_time = time.perf_counter()
     iterator = indexed_records
     if tqdm is not None and not args.no_progress:
@@ -1293,7 +1520,22 @@ def _evaluate_dataset(
             source=f"{path}:{idx}",
             args=args,
         )
-        response = runner.generate_one(prompt, stop_token_ids)
+        if base_runner is None:
+            response = runner.generate_one(prompt, stop_token_ids)
+        else:
+            response, dspark_elapsed = _timed_generate(
+                runner,
+                prompt,
+                stop_token_ids,
+            )
+            base_response, base_elapsed = _timed_generate(
+                base_runner,
+                prompt,
+                stop_token_ids,
+            )
+            stats.elapsed_s += dspark_elapsed
+            base_elapsed_s += base_elapsed
+            base_total_output_tokens += int(base_response.num_output_tokens)
         stats.add_response(response)
         if not args.skip_artifacts:
             artifacts.append(
@@ -1309,20 +1551,62 @@ def _evaluate_dataset(
             or processed % args.log_every == 0
             or processed == len(indexed_records)
         ):
-            elapsed = time.perf_counter() - start_time
-            out_tps = stats.total_output_tokens / elapsed if elapsed else 0.0
-            logger.info(
-                "[%s] %d/%d samples | out_tok=%d | tok/s=%.2f | acc_len=%.3f",
-                path.stem,
-                processed,
-                len(indexed_records),
-                stats.total_output_tokens,
-                out_tps,
-                stats.acceptance_length,
+            elapsed = (
+                stats.elapsed_s
+                if base_runner is not None
+                else time.perf_counter() - start_time
             )
+            out_tps = stats.total_output_tokens / elapsed if elapsed else 0.0
+            if base_runner is None:
+                logger.info(
+                    "[%s] %d/%d samples | out_tok=%d | tok/s=%.2f | "
+                    "acc_len=%.3f",
+                    path.stem,
+                    processed,
+                    len(indexed_records),
+                    stats.total_output_tokens,
+                    out_tps,
+                    stats.acceptance_length,
+                )
+            else:
+                base_tps = (
+                    base_total_output_tokens / base_elapsed_s
+                    if base_elapsed_s
+                    else 0.0
+                )
+                speedup = out_tps / base_tps if base_tps else 0.0
+                logger.info(
+                    "[%s] %d/%d samples | DSpark=%.2f tok/s | "
+                    "base=%.2f tok/s | speedup=%.3fx | acc_len=%.3f",
+                    path.stem,
+                    processed,
+                    len(indexed_records),
+                    out_tps,
+                    base_tps,
+                    speedup,
+                    stats.acceptance_length,
+                )
 
-    stats.elapsed_s = time.perf_counter() - start_time
-    return _summary_row(path.stem, len(indexed_records), stats), artifacts
+    if base_runner is None:
+        stats.elapsed_s = time.perf_counter() - start_time
+    row = _summary_row(path.stem, len(indexed_records), stats)
+    if base_runner is not None:
+        base_tps = (
+            base_total_output_tokens / base_elapsed_s if base_elapsed_s else 0.0
+        )
+        row.update(
+            {
+                "base_elapsed_s": base_elapsed_s,
+                "base_output_tokens_per_second": base_tps,
+                "base_total_output_tokens": base_total_output_tokens,
+                "speedup_vs_base": (
+                    row["output_tokens_per_second"] / base_tps
+                    if base_tps
+                    else 0.0
+                ),
+            }
+        )
+    return row, artifacts
 
 
 def _write_outputs(
@@ -1385,6 +1669,8 @@ def _worker_command(
         str(args.max_new_tokens),
         "--temperature",
         str(args.temperature),
+        "--seed",
+        str(args.seed),
         "--enable-thinking",
         args.enable_thinking,
         "--raw-prompt-mode",
@@ -1415,6 +1701,14 @@ def _worker_command(
         cmd.append("--trust-remote-code")
     if args.sample_from_anchor is not None:
         cmd.extend(["--sample-from-anchor", str(args.sample_from_anchor).lower()])
+    if args.measure_base_speedup:
+        cmd.extend(
+            [
+                "--measure-base-speedup",
+                "--throughput-warmup-samples",
+                str(args.throughput_warmup_samples),
+            ]
+        )
     return cmd
 
 
@@ -1457,13 +1751,16 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
             _read_worker_row(shard_output_dir) for _, shard_output_dir, _ in processes
         ]
         row = _aggregate_rows(dataset_path.stem, shard_rows)
-        row["elapsed_s"] = time.perf_counter() - dataset_start
-        row["requests_per_second"] = (
-            row["num_requests"] / row["elapsed_s"] if row["elapsed_s"] else 0
-        )
-        row["output_tokens_per_second"] = (
-            row["total_output_tokens"] / row["elapsed_s"] if row["elapsed_s"] else 0
-        )
+        if not args.measure_base_speedup:
+            row["elapsed_s"] = time.perf_counter() - dataset_start
+            row["requests_per_second"] = (
+                row["num_requests"] / row["elapsed_s"] if row["elapsed_s"] else 0
+            )
+            row["output_tokens_per_second"] = (
+                row["total_output_tokens"] / row["elapsed_s"]
+                if row["elapsed_s"]
+                else 0
+            )
         rows.append(row)
         if not args.skip_artifacts:
             artifacts = []
@@ -1574,6 +1871,16 @@ def run(args: argparse.Namespace) -> None:
     )
 
     runner = DSparkOfflineRunner(target_model, draft_model, tokenizer, args)
+    base_runner = (
+        BaseModelOfflineRunner(target_model, tokenizer, args)
+        if args.measure_base_speedup
+        else None
+    )
+    if base_runner is not None and float(args.temperature) > 0:
+        logger.warning(
+            "Base speedup at temperature > 0 compares sampled output throughput; "
+            "use --temperature 0 for identical greedy output paths."
+        )
     stop_token_ids = resolve_stop_token_ids(target_model, tokenizer)
     dataset_paths = _discover_datasets(
         args.datasets_root,
@@ -1585,6 +1892,7 @@ def run(args: argparse.Namespace) -> None:
         row, artifacts = _evaluate_dataset(
             path=path,
             runner=runner,
+            base_runner=base_runner,
             args=args,
             stop_token_ids=stop_token_ids,
         )
@@ -1604,10 +1912,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets-root", type=Path, required=True)
     parser.add_argument("--datasets", default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("dspark_offline_eval"))
-    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help=(
+            "Override the DeepSpec per-dataset sample cap. When unset, known "
+            "DeepSpec datasets use the limits from DeepSpec-Ascend/eval.py."
+        ),
+    )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=980406)
     parser.add_argument(
         "--enable-thinking",
         choices=["false", "true", "default"],
@@ -1627,6 +1943,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--measure-base-speedup",
+        action="store_true",
+        help=(
+            "Also run verifier-only autoregressive decoding and report measured "
+            "DSpark output-throughput speedup."
+        ),
+    )
+    parser.add_argument(
+        "--throughput-warmup-samples",
+        type=int,
+        default=1,
+        help="Warmup prompts per dataset before paired throughput timing.",
+    )
     parser.add_argument("--skip-artifacts", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--d2t-path", type=Path, default=None)

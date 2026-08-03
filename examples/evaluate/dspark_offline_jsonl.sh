@@ -18,7 +18,7 @@
 #
 # Optional:
 #   DATASETS=aime24,gsm8k       # Only run selected JSONL files or stems.
-#   MAX_SAMPLES=32              # Limit samples per dataset for smoke tests.
+#   MAX_SAMPLES=32              # Override DeepSpec's per-dataset sample cap.
 #   MAX_NEW_TOKENS=1024         # Max generated tokens per request.
 #   TEMPERATURE=0.0             # 0.0 is greedy; >0 samples target and draft.
 #   ASCEND_DEVICES=0,1,2,3      # Data-parallel evaluation across NPUs.
@@ -47,7 +47,7 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
 # Generation controls.
 : "${MAX_NEW_TOKENS:=512}"
 : "${TEMPERATURE:=0.0}"
-: "${SEED:=0}"
+: "${SEED:=980406}"
 
 # Runtime controls. For multi-NPU evaluation set ASCEND_DEVICES and keep
 # DEVICE=npu:0; each worker receives one visible device internally.

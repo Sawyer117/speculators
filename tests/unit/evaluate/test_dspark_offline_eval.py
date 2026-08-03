@@ -105,6 +105,58 @@ def test_discover_datasets_filters_by_stem(tmp_path: Path):
     assert paths == [keep]
 
 
+def test_deepspec_dataset_sample_limits_match_eval_py():
+    module = _load_module()
+
+    assert module.DEEPSPEC_EVAL_SAMPLE_LIMITS == {
+        "gsm8k": 500,
+        "math500": 500,
+        "aime25": 30,
+        "humaneval": 164,
+        "mbpp": 256,
+        "livecodebench": 500,
+        "mt-bench": 80,
+        "alpaca": 500,
+        "arena-hard-v2": 500,
+    }
+
+
+def test_deepspec_sample_selection_is_seeded_before_truncation():
+    module = _load_module()
+    records = [{"id": idx} for idx in range(600)]
+
+    selected = module._select_eval_records(
+        records,
+        dataset_name="gsm8k",
+        max_samples=None,
+        seed=980406,
+    )
+    repeated = module._select_eval_records(
+        records,
+        dataset_name="gsm8k",
+        max_samples=None,
+        seed=980406,
+    )
+
+    assert len(selected) == 500
+    assert selected == repeated
+    assert selected != records[:500]
+
+
+def test_explicit_max_samples_overrides_deepspec_limit():
+    module = _load_module()
+    records = [{"id": idx} for idx in range(600)]
+
+    selected = module._select_eval_records(
+        records,
+        dataset_name="gsm8k",
+        max_samples=17,
+        seed=980406,
+    )
+
+    assert len(selected) == 17
+
+
 def test_sample_from_anchor_slot_target_positions():
     module = _load_module()
     draft = SimpleNamespace(
@@ -283,3 +335,38 @@ def test_aggregate_rows_recomputes_weighted_lengths():
     assert row["draft_length"] == 5.2
     assert row["acceptance_length"] == 3.6
     assert row["accepted_draft_length"] == 2.6
+
+
+def test_aggregate_rows_recomputes_measured_base_speedup():
+    module = _load_module()
+
+    row = module._aggregate_rows(
+        "sample",
+        [
+            {
+                "num_requests": 2,
+                "elapsed_s": 4.0,
+                "total_output_tokens": 20,
+                "base_elapsed_s": 7.0,
+                "base_total_output_tokens": 20,
+                "num_proposals": 2,
+                "num_proposed_draft_tokens": 8,
+                "num_accepted_draft_tokens": 4,
+            },
+            {
+                "num_requests": 3,
+                "elapsed_s": 5.0,
+                "total_output_tokens": 40,
+                "base_elapsed_s": 8.0,
+                "base_total_output_tokens": 28,
+                "num_proposals": 3,
+                "num_proposed_draft_tokens": 18,
+                "num_accepted_draft_tokens": 9,
+            },
+        ],
+    )
+
+    assert row["output_tokens_per_second"] == 12.0
+    assert row["base_elapsed_s"] == 8.0
+    assert row["base_output_tokens_per_second"] == 6.0
+    assert row["speedup_vs_base"] == 2.0

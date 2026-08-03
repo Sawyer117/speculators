@@ -20,7 +20,7 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
 # both target distributions and draft proposals.
 : "${MAX_NEW_TOKENS:=512}"
 : "${TEMPERATURE:=0.0}"
-: "${SEED:=0}"
+: "${SEED:=980406}"
 
 # Prompt handling.
 : "${ENABLE_THINKING:=false}"
@@ -34,6 +34,10 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
 : "${ASCEND_DEVICES:=}"
 : "${SKIP_ARTIFACTS:=0}"
 : "${TRUST_REMOTE_CODE:=1}"
+# Set MEASURE_BASE_SPEEDUP=1 to run paired verifier-only decoding and report
+# measured DSpark/base output-throughput speedup. Warmup is excluded from timing.
+: "${MEASURE_BASE_SPEEDUP:=0}"
+: "${THROUGHPUT_WARMUP_SAMPLES:=1}"
 
 cmd=(
   python3 scripts/evaluate/dspark_offline_eval.py
@@ -65,6 +69,12 @@ if [[ "$SKIP_ARTIFACTS" == "1" ]]; then
 fi
 if [[ "$TRUST_REMOTE_CODE" == "1" ]]; then
   cmd+=(--trust-remote-code)
+fi
+if [[ "$MEASURE_BASE_SPEEDUP" == "1" ]]; then
+  cmd+=(
+    --measure-base-speedup
+    --throughput-warmup-samples "$THROUGHPUT_WARMUP_SAMPLES"
+  )
 fi
 
 exec "${cmd[@]}"
