@@ -635,6 +635,35 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         hidden = self.norm(self.hc_head(streams))  # [1, TB, H]
         logits = self.lm_head(hidden)
 
+        # ── DSPARK_TRAIN_PARITY_DUMP=1: one-shot, rank0 — write the FIRST anchor's block in the
+        #    EXACT serve-dump format (dsv4_dspark_forward_parity_v2.py's PIECE 1 schema) so the SAME
+        #    parity script can replay it. This VALIDATES run_train_block: fed this train-produced aux,
+        #    run_train_block MUST reproduce these base_logits (≈0). If it does, the harness faithfully
+        #    reproduces training → any gap vs the SERVE dump is a REAL train/serve inconsistency. If it
+        #    does NOT, run_train_block's single-block rebuild is the bug (mask/anchor/context layout).
+        if os.environ.get("DSPARK_TRAIN_PARITY_DUMP") == "1" and not getattr(self, "_train_parity_dumped", False):
+            import torch.distributed as _pd  # noqa: PLC0415
+            if not _pd.is_initialized() or _pd.get_rank() == 0:
+                self._train_parity_dumped = True
+                _ap = anchor_positions.reshape(-1)
+                if int(_ap.numel()) > 0:
+                    _a0 = int(_ap[0]); _bs = self.block_size
+                    _dp = (int(position_ids[0, _a0]) + torch.arange(_bs)).long()
+                    _dir = os.environ.get("DSPARK_TRAIN_PARITY_DIR", os.path.expanduser("~/dspark_train_parity"))
+                    os.makedirs(_dir, exist_ok=True)
+                    torch.save({
+                        "aux": hidden_states[0, :_a0].detach().float().cpu(),
+                        "ctx_positions": position_ids[0, :_a0].detach().cpu(),
+                        "anchor_token": int(input_ids[0, _a0]),
+                        "draft_positions": _dp.cpu(),
+                        "serve_base_logits": logits[0, 0:_bs].detach().float().cpu(),  # TRAIN base logits
+                        "drafted": logits[0, 0:_bs].argmax(-1).detach().cpu(),
+                        "block_size": int(_bs),
+                        "dspark_noise_token_id": int(self.mask_token_id),
+                    }, os.path.join(_dir, "serve_block_0.pt"))
+                    print(f">>> [DSPARK_TRAIN_PARITY_DUMP] wrote serve_block_0.pt (a0={_a0}, "
+                          f"ctx_len={_a0}, block={_bs}) to {_dir}", flush=True)
+
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
         aligned_loss_mask = aligned_loss_mask * (
             anchor_valid.repeat_interleave(self.block_size).unsqueeze(0).to(
