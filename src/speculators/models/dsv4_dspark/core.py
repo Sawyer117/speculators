@@ -573,6 +573,13 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         hc = self.backbone_cfg.hc_mult
         streams = noise_embedding.unsqueeze(2).repeat(1, 1, hc, 1)  # [1, TB, hc, H]
 
+        # ── DSPARK_SATDUMP=1: one-shot per-stage capture mirroring the serve model.forward dump
+        #    (deepseek_v4_dspark.py), so the two can be bisected layer-by-layer to the FIRST
+        #    diverging stage. run_train_block triggers this on its first block.
+        _sat = os.environ.get("DSPARK_SATDUMP") == "1" and not getattr(self, "_satdumped", False)
+        _rec = {"embed": noise_embedding.detach().float().cpu(),
+                "streams_in": streams.detach().float().cpu(), "layers": []} if _sat else None
+
         # ── MoE noaux_tc LOAD BALANCING (DSPARK_MOE_BALANCE=1): apply the bias nudge from the PREVIOUS
         #    step's stashed load, BEFORE this step's layers run — so the selection bias stays CONSTANT
         #    through this forward AND its activation-checkpoint recompute in backward. (Updating it AFTER
@@ -608,6 +615,8 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 streams = checkpoint(layer, *layer_args, use_reentrant=False)
             else:
                 streams = layer(*layer_args)
+            if _sat:
+                _rec["layers"].append(streams.detach().float().cpu())
 
         # ── MoE LOAD-BALANCE diagnostic (DSPARK_LOG_EXPERT_LOAD=1): confirm/deny expert collapse
         #    (a few of the 256 experts hogging the routing). rank0, throttled ~1/20 fwd. Zero cost off.
@@ -631,6 +640,15 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                     print(f"[MOE-LOAD L{_n}] used={_used}/{E} dead={E - _used} "
                           f"top{_tk}={_top:.2f} entropy={_ent:.3f}  hot={_hot}  "
                           f"(entropy 1.0=uniform / low=collapsed)", flush=True)
+
+        if _sat:
+            self._satdumped = True
+            _rec["hc_head_out"] = self.hc_head(streams).detach().float().cpu()
+            _sdir = os.environ.get("DSPARK_SATDUMP_DIR", os.path.expanduser("~/dspark_sat"))
+            os.makedirs(_sdir, exist_ok=True)
+            torch.save(_rec, os.path.join(_sdir, "train_sat.pt"))
+            print(f">>> [DSPARK_SATDUMP] train: embed + {len(_rec['layers'])} layers + hc_head "
+                  f"→ {_sdir}/train_sat.pt", flush=True)
 
         hidden = self.norm(self.hc_head(streams))  # [1, TB, H]
         logits = self.lm_head(hidden)
