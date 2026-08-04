@@ -63,6 +63,52 @@ def save_paths_of(log: str) -> set[str]:
     return {p for p in paths if p}
 
 
+def _first_gs(path: str) -> int | None:
+    m = re.search(r"global_step=(\d+)", open(path, errors="ignore").read(256 * 1024))
+    return int(m.group(1)) if m else None
+
+
+def _last_gs(path: str) -> int | None:
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - 256 * 1024))
+        tail = fh.read().decode("utf-8", "ignore")
+    ms = re.findall(r"global_step=(\d+)", tail)
+    return int(ms[-1]) if ms else None
+
+
+def discover_chain(run_dir: str, pattern: str, exclude: set[str]) -> list[str]:
+    """Reconstruct ONE resume line by walking global_step backward from the deepest-reaching log.
+
+    Seed = the log with the highest max global_step. Predecessor = the (unused) log whose max
+    global_step is CLOSEST to the current chain's min (i.e. the segment it resumed from), tolerating
+    the small resume overlap and bridging gaps. Stops at a from-scratch segment (min≈0) or when no
+    predecessor is left. Returns paths oldest→newest. Robust to the fact that several from-scratch
+    lines share global_step 0..N — only the ONE line that reaches the top is followed."""
+    OVERLAP = 3000  # resume boundary can re-log a few thousand steps
+    cands = []
+    for p in glob.glob(os.path.join(run_dir, pattern)):
+        ap = os.path.abspath(p)
+        if ap in exclude:
+            continue
+        lo, hi = _first_gs(p), _last_gs(p)
+        if lo is None or hi is None:
+            continue
+        cands.append({"path": ap, "lo": lo, "hi": hi})
+    if not cands:
+        return []
+    cur = max(cands, key=lambda c: c["hi"])           # deepest endpoint = seed
+    chain, used = [cur], {cur["path"]}
+    while cur["lo"] > OVERLAP:
+        preds = [c for c in cands if c["path"] not in used and c["hi"] <= cur["lo"] + OVERLAP]
+        if not preds:
+            break
+        cur = min(preds, key=lambda c: abs(c["hi"] - cur["lo"]))  # ends nearest the current start
+        chain.insert(0, cur)
+        used.add(cur["path"])
+    return [c["path"] for c in chain]
+
+
 def ckpt_epoch_dirs(save_path: str) -> list[tuple[int, str]]:
     """(numeric_index, abspath) for each real integer ckpt dir under save_path (skip symlinks)."""
     out = []
@@ -127,15 +173,37 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("Usage")[-1],
     )
-    ap.add_argument("logs", nargs="+", help="the line's segment log files (any order; sorted by mtime)")
+    ap.add_argument("logs", nargs="*", help="the line's segment log files (any order; sorted by mtime)")
+    ap.add_argument("--auto-chain", action="store_true",
+                    help="AUTO-discover the line: walk global_step back from the deepest-reaching log "
+                         "(no need to list segments). Excludes the newest log (your live run) unless --include-newest.")
+    ap.add_argument("--glob", default="faithful_ep_*.log", help="--auto-chain scan glob (default: faithful_ep_*.log)")
+    ap.add_argument("--include-newest", action="store_true",
+                    help="with --auto-chain, do NOT exclude the newest log (use if the live run is not running)")
     ap.add_argument("--name", help="output folder name (default: auto-derived from the recipe)")
     ap.add_argument("--out-base", default=".", help="parent dir for the consolidated folder (default: cwd)")
-    ap.add_argument("--run-dir", default=None, help="dir holding ckpt_*/ (default: first log's dir)")
+    ap.add_argument("--run-dir", default=None, help="dir holding the logs + ckpt_*/ (default: cwd / first log's dir)")
     ap.add_argument("--force", action="store_true", help="overwrite an existing consolidated folder's links/log")
     args = ap.parse_args()
 
-    logs = sorted({os.path.abspath(p) for p in args.logs}, key=os.path.getmtime)
-    run_dir = args.run_dir or os.path.dirname(logs[0])
+    run_dir = args.run_dir or (os.path.dirname(os.path.abspath(args.logs[0])) if args.logs else ".")
+    if args.auto_chain:
+        exclude = set()
+        if not args.include_newest:
+            alllogs = glob.glob(os.path.join(run_dir, args.glob))
+            if alllogs:
+                exclude.add(os.path.abspath(max(alllogs, key=os.path.getmtime)))  # the live run
+        chain = discover_chain(run_dir, args.glob, exclude)
+        if not chain:
+            ap.error(f"--auto-chain found no metric logs under {run_dir}/{args.glob}")
+        print(">>> auto-chain discovered (oldest→newest):", file=sys.stderr)
+        for p in chain:
+            print(f"     {os.path.basename(p)}  gs {_first_gs(p)}..{_last_gs(p)}", file=sys.stderr)
+        logs = chain
+    elif args.logs:
+        logs = sorted({os.path.abspath(p) for p in args.logs}, key=os.path.getmtime)
+    else:
+        ap.error("pass segment logs, or --auto-chain to discover them")
 
     # ---- stitch the logs (global_step-ordered, later segment wins on overlap) ----
     merged: dict[int, dict] = {}
