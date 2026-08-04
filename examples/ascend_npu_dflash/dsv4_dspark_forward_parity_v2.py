@@ -212,6 +212,10 @@ def main():
                          "remaining difference is monolithic-vs-incremental attention.")
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     ap.add_argument("--limit", type=int, default=0, help="cap #blocks (0=all)")
+    ap.add_argument("--proper-rope", action="store_true",
+                    help="RoPE test: keep freqs_cis COMPLEX + do exact complex rotary on CPU (rest "
+                         "on-device). If attn_out then aligns with serve, the training real-cast "
+                         "freqs (scale-only, no rotation) is the sink-attention divergence.")
     args = ap.parse_args()
 
     try:
@@ -277,6 +281,35 @@ def main():
     # separate train/serve question this parity is meant to surface, not something to "fix" here.)
     print(f">>> freqs_cis dtype after cast: {model.freqs_cis.dtype} "
           f"({'complex' if model.freqs_cis.is_complex() else 'REAL — training-faithful'})")
+
+    if args.proper_rope:
+        # DECISIVE RoPE TEST — restore PROPER rotation: keep freqs_cis complex and do the exact
+        # complex rotary on CPU (NPU aclnn can't index/mul complex64), everything else stays
+        # on-device. If L0.attn_out now aligns with the serve, training's real-cast freqs
+        # (complex×real = scale-only, NO rotation) is the sink-attention divergence.
+        import types
+        import speculators.models.dsv4_dspark.backbone.attention as _attn_mod
+        bb = model.backbone_cfg
+        model.freqs_cis = _dsv4_core.precompute_freqs_cis(
+            model._rope_dim, bb.original_seq_len or 1, 0, bb.rope_theta,
+            bb.rope_factor, bb.beta_fast, bb.beta_slow).cpu()  # complex64 on CPU
+        def _rope_at_cpu(self, positions):
+            pos = positions.detach().cpu()
+            fc = self.freqs_cis
+            if pos.numel() and int(pos.max()) >= fc.shape[0]:
+                fc = _dsv4_core.precompute_freqs_cis(
+                    self._rope_dim, int(pos.max()) + 1, 0, self.backbone_cfg.rope_theta,
+                    self.backbone_cfg.rope_factor, self.backbone_cfg.beta_fast,
+                    self.backbone_cfg.beta_slow).cpu()
+                self.freqs_cis = fc
+            return fc[pos]  # complex freqs on CPU
+        model._rope_at = types.MethodType(_rope_at_cpu, model)
+        _orig_apply = _attn_mod.apply_rotary_emb
+        def _apply_rotary_cpu(x, freqs_cis, inverse=False):
+            return _orig_apply(x.detach().to("cpu"), freqs_cis.to("cpu"), inverse).to(x.device)
+        _attn_mod.apply_rotary_emb = _apply_rotary_cpu
+        print(">>> --proper-rope: exact COMPLEX RoPE on CPU (proper rotation), rest on-device")
+
     assert model.block_size == block, f"ckpt block_size {model.block_size} != dump {block}"
 
     base_recs, final_recs = [], []
