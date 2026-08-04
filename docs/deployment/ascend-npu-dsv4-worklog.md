@@ -396,3 +396,46 @@ to our warm-start).
 - **[DONE 07-17] Two train↔serve conventions fixed + serve-validated:** decay slot 0 (`928ea32`) + Markov
   prev_token (`373deae`). Orthogonal (slot 0 vs slots 1–4). Decay PR branch staged (`8a564c3`), held pending e2e.
 - **Deferred:** track #12006 to merge or keep the pinned snapshot; extract track on vLLM 0.24 stays deferred.
+
+---
+
+## 2026-08-04 — ★ CANONICAL REPRODUCIBLE COMMANDS (keep updated: best + last) + RoPE-fix from-scratch launch
+
+**Why this section exists:** the per-ckpt `train_command.txt` (trainer writes it into every ckpt dir) captures the `train.py` **argparse ONLY** — it does NOT record the `DSPARK_*` **env vars** (`DSPARK_EP / RECOMPUTE / COMPILE / MOE_BALANCE(+RATE) / TEACHER_DOUBLE_NORM`, plus the `BF16_EXPERTS` force) that the launcher sets via `env … torchrun`. Recover those from the run log's `patch_getenv` INFO lines (`get env DSPARK_X = Y`) + the `[MOE-BALANCE]` echo. **Complete recipe = train_command.txt + those env lines.** Both resolved below.
+
+### LAST run — `ckpt_faithful_ep_20260729_092941` (ep4p5; a RESUME of the bal-1e3 / fresh-router / dedup line)
+Git SHA `da064ea` · speculators 0.5.0.dev448 · transformers 5.13.1 · torch 2.12.0+cpu · world_size 8 (EP8).
+- **env (from log `patch_getenv`):** `DSPARK_EP=1  DSPARK_RECOMPUTE=1  DSPARK_COMPILE=0  DSPARK_MOE_BALANCE=1  DSPARK_MOE_BALANCE_RATE=1e-3  DSPARK_TEACHER_DOUBLE_NORM=0  DSPARK_HS_DUMP=1  BF16_EXPERTS=1` (forced → `--bf16-experts` even under EP=1, because A2 64G can't fit EP option-A fp32 experts).
+- **argparse (`train_command.txt`, verbatim):**
+  ```
+  scripts/train.py --speculator-type dsv4_dspark --served-model-name dsv4 \
+    --num-layers 3 --n-routed-experts 256 --block-size 5 --target-layer-ids 40 41 42 \
+    --max-anchors 512 --dflash-decay-gamma 4.0 --sliding-window 128 --sliding-window-non-causal \
+    --total-seq-len 3072 --mask-token-id 128799 --noise-std 0.05 --kd-temperature 1.0 \
+    --draft-attn-impl sdpa --loss-fn '{"ce":0.1,"tv":1.8}' \
+    --scheduler-type cosine --scheduler-warmup-ratio 0.04 --optimizer adamw --lr 2e-4 --epochs 5 \
+    --checkpoint-freq 0.5 --no-validation --bf16-experts --on-missing generate --on-generate delete \
+    --num-workers 12 --prefetch-factor 4 \
+    --hidden-states-path /share/canada_group_folder/dataset/dsv4_hs_dump \
+    --vllm-endpoint http://80.5.5.115:7000/v1 \
+    --verifier-name-or-path /share/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16 \
+    --data-path /share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow_0730_77w_dedup \
+    --save-path …/ckpt_faithful_ep_20260729_092941 --log-dir …/run
+  ```
+  ⚠ this run was a **RESUME** (`--save-path`=existing dir, **no `--init-*` flags**). The line's from-scratch INIT = `--init-layer-from-target --init-moe-no-router` (box-wide `train_command.txt` count: 23× `--init-layer-from-target`, 5× `+--init-moe-no-router`).
+
+### BEST draft so far — `ep1mid-f1-77w` (single-norm "f1", 1.5ep, mean **3.63** = 82% of released 4.42)
+⚠ **verbatim recipe = TODO** (its trainer ckpt was overwritten; only converted weights survive). Pull its exact command from the run LOG banner + `patch_getenv` next time on the box (need the f1 run's `faithful_ep_<TS>.log` TS). Known from the eval ledger: single-norm (`TEACHER_DOUBLE_NORM=0`), **NO balance**, non-causal, anchor576, noise0.05, LR3e-4, A3 `launch_a3` (DP16/EP16, `INIT_LAYER=1`).
+
+### ★ RoPE-fix FROM-SCRATCH launch (= LAST line's recipe + real cos/sin RoPE `feb0066`/`8db8f75`)
+On 109 (A2, env `dspark-dsv4-compile`), with 115/116 HS serve up:
+```
+cd /home/a00652497/dspark_austin/speculators && git pull
+DSPARK_EP=1 BF16_EXPERTS=1 RECOMPUTE=1 COMPILE=0 \
+DSPARK_MOE_BALANCE=1 DSPARK_MOE_BALANCE_RATE=1e-3 \
+INIT_LAYER=1 INIT_MOE_NO_ROUTER=1 \
+LR=2e-4 EPOCHS=5 MAX_ANCHORS=512 CKPT_FREQ=0.5 \
+DATA=/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow_0730_77w_dedup \
+  bash examples/ascend_npu_dflash/train_dsv4_dspark.sh faithful
+```
+Only changes vs the LAST line: **proper RoPE** (was degenerate scale-only), **from-scratch** (re-adds the init flags the resume lacked), fresh save-path. A/B target = beat the degenerate line's plateau (0.5ep 3.56 → 4.5ep 3.45); **tail pos2-4 is the tell**.
