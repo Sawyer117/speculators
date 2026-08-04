@@ -489,16 +489,26 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         ignored_ids = {id(p) for p in self.fsdp_ignored_params()}
         return {name for name, p in self.named_parameters() if id(p) in ignored_ids}
 
+    def _rebuild_freqs(self, seqlen: int) -> None:
+        self.freqs_cis = torch.view_as_real(precompute_freqs_cis(
+            self._rope_dim, seqlen, 0, self.backbone_cfg.rope_theta,
+            self.backbone_cfg.rope_factor, self.backbone_cfg.beta_fast,
+            self.backbone_cfg.beta_slow,
+        )).contiguous().to(self.freqs_cis.device)
+
     def _rope_at(self, positions: torch.Tensor) -> torch.Tensor:
         """Interleaved rotary cache at the given absolute positions -> REAL [len, rope_dim//2, 2]
         (cos in [...,0], sin in [...,1]). Indexing the REAL view is NPU-safe (aclnn rejects
-        complex64); the buffer already holds view_as_real(freqs). See apply_rotary_emb."""
+        complex64); the buffer holds view_as_real(freqs). See apply_rotary_emb."""
+        # from_pretrained's meta-init zeroes persistent=False FLOATING buffers via to_empty()
+        # (it doesn't re-run __init__ and freqs_cis isn't in the state_dict) -> rebuild once.
+        # (Training builds via from_training_args, no meta, so this is a one-shot no-op there.)
+        if not getattr(self, "_freqs_ok", False):
+            self._freqs_ok = True
+            if not bool(self.freqs_cis.any()):
+                self._rebuild_freqs(self.freqs_cis.shape[0])
         if positions.numel() and int(positions.max()) >= self.freqs_cis.shape[0]:
-            self.freqs_cis = torch.view_as_real(precompute_freqs_cis(
-                self._rope_dim, int(positions.max()) + 1, 0, self.backbone_cfg.rope_theta,
-                self.backbone_cfg.rope_factor, self.backbone_cfg.beta_fast,
-                self.backbone_cfg.beta_slow,
-            )).contiguous().to(self.freqs_cis.device)
+            self._rebuild_freqs(int(positions.max()) + 1)
         return self.freqs_cis.to(positions.device)[positions]
 
     def _backbone_forward(  # noqa: C901
