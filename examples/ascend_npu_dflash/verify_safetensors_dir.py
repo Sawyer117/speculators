@@ -85,6 +85,9 @@ def main() -> None:
     ap.add_argument("--manifest", metavar="HF_TREE_JSON",
                     help="HF tree listing (…/api/models/<repo>/tree/main?recursive=true) for authoritative diff")
     ap.add_argument("--sha256", action="store_true", help="also print each shard's SHA-256")
+    ap.add_argument("--include-cache", action="store_true",
+                    help="also scan .cache/ and .git/ (skipped by default — HF downloader lock/.incomplete "
+                         "files there are zero-byte by design and are NOT model content)")
     args = ap.parse_args()
     d = os.path.abspath(args.model_dir)
     if not os.path.isdir(d):
@@ -92,9 +95,11 @@ def main() -> None:
 
     problems: list[str] = []
 
-    # ---- recurse every file ----
+    # ---- recurse every file (prune downloader/vcs internals unless --include-cache) ----
+    PRUNE = set() if args.include_cache else {".cache", ".git", ".huggingface"}
     files = []  # (relpath, abspath, size)
-    for dp, _dns, fns in os.walk(d):
+    for dp, dns, fns in os.walk(d):
+        dns[:] = [x for x in dns if x not in PRUNE]  # don't descend into HF/git internals
         for fn in fns:
             ap_ = os.path.join(dp, fn)
             try:
