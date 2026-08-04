@@ -73,17 +73,33 @@ def precompute_freqs_cis(
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
-    """Rotate ``x`` (``[B, S, ..., rope_dim]``) by ``freqs_cis`` (``[S, rope_dim//2]``).
+    """Rotate ``x`` (``[B, S, ..., rope_dim]``) with REAL interleaved cos/sin.
 
-    Interleaved pairing; out-of-place. ``inverse`` conjugates (de-rotation).
+    ``freqs_cis`` is the interleaved rotary cache as a REAL tensor ``[S, rope_dim//2, 2]``
+    (``[...,0]``=cos, ``[...,1]``=sin); a complex ``[S, rope_dim//2]`` is accepted and
+    converted via ``view_as_real``. The rotation uses cos/sin (``x·cos + rotate_half(x)·sin``)
+    — NOT ``complex×real``. This is a PROPER rotation and stays NPU-safe: NPU aclnn rejects
+    complex64 (index AND mul), and casting a complex cache to real bf16 silently drops the
+    imaginary part → ``complex×real`` degenerates to a scale-only op (no rotation), which is
+    exactly the train↔serve RoPE divergence this fixes. Matches vLLM-Ascend
+    (``inplace_partial_rotary_mul``) / MindSpeed (``npu_rotary_position_embedding`` mode=1) /
+    torchtitan-npu (``npu_rope`` converter). Interleaved:
+    ``out_2k = x_2k·cos_k − x_2k+1·sin_k``, ``out_2k+1 = x_2k·sin_k + x_2k+1·cos_k``.
+    ``inverse`` negates sin (de-rotation, K=V shared rotation).
     """
-    xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    if freqs_cis.is_complex():
+        freqs_cis = torch.view_as_real(freqs_cis)
+    cos = freqs_cis[..., 0].repeat_interleave(2, dim=-1)  # [S, rope_dim]
+    sin = freqs_cis[..., 1].repeat_interleave(2, dim=-1)
     if inverse:
-        freqs_cis = freqs_cis.conj()
-    # Broadcast freqs over batch + any head dims: shape [1, S, (1,)*extra, rope//2].
-    seq_len = xc.shape[1]
-    extra = xc.ndim - 2  # dims between the seq axis and the rope axis
-    view_shape = (1, seq_len, *([1] * (extra - 1)), xc.shape[-1]) if extra >= 1 else (1, seq_len, xc.shape[-1])
-    freqs_cis = freqs_cis.view(*view_shape)
-    rotated = torch.view_as_real(xc * freqs_cis).flatten(-2)
-    return rotated.to(x.dtype)
+        sin = -sin
+    # Broadcast cos/sin over batch + any head dims: shape [1, S, (1,)*extra, rope_dim].
+    seq_len = x.shape[1]
+    extra = x.ndim - 2  # dims between the seq axis and the rope axis
+    view_shape = (1, seq_len, *([1] * (extra - 1)), x.shape[-1]) if extra >= 1 else (1, seq_len, x.shape[-1])
+    cos = cos.reshape(*view_shape).float()
+    sin = sin.reshape(*view_shape).float()
+    xf = x.float()
+    pair = xf.unflatten(-1, (-1, 2))  # [..., rope//2, 2]
+    rotate_half = torch.stack((-pair[..., 1], pair[..., 0]), dim=-1).flatten(-2)  # interleaved
+    return (xf * cos + rotate_half * sin).to(x.dtype)

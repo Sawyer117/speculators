@@ -142,15 +142,18 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         self.layers = nn.ModuleList(MhcDecoderBlock(bb) for _ in range(bb.n_draft_layers))
         self.hc_head = HyperHead(bb)
 
-        # Our interleaved DSV4 RoPE frequencies, indexed by absolute position
-        # (YaRN off on the sliding path -> original_seq_len=0).
+        # Our interleaved DSV4 RoPE cache, indexed by absolute position (YaRN off on the sliding
+        # path -> original_seq_len=0). Stored as a REAL [seqlen, rope//2, 2] tensor (view_as_real
+        # of the complex freqs): NPU aclnn can't index/mul complex64, and casting a complex buffer
+        # to bf16 (trainer AMP) drops the imag part -> scale-only, no rotation. Real cos/sin is
+        # NPU-index-safe AND survives the bf16 cast losslessly (proper rotation). See apply_rotary_emb.
         self._rope_dim = bb.rope_head_dim
         self.register_buffer(
             "freqs_cis",
-            precompute_freqs_cis(
+            torch.view_as_real(precompute_freqs_cis(
                 bb.rope_head_dim, bb.original_seq_len or 1, 0, bb.rope_theta,
                 bb.rope_factor, bb.beta_fast, bb.beta_slow,
-            ),
+            )).contiguous(),
             persistent=False,
         )
         self._init_backbone_params()
@@ -487,13 +490,15 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         return {name for name, p in self.named_parameters() if id(p) in ignored_ids}
 
     def _rope_at(self, positions: torch.Tensor) -> torch.Tensor:
-        """freqs_cis at the given absolute positions -> [len, rope_dim//2]."""
+        """Interleaved rotary cache at the given absolute positions -> REAL [len, rope_dim//2, 2]
+        (cos in [...,0], sin in [...,1]). Indexing the REAL view is NPU-safe (aclnn rejects
+        complex64); the buffer already holds view_as_real(freqs). See apply_rotary_emb."""
         if positions.numel() and int(positions.max()) >= self.freqs_cis.shape[0]:
-            self.freqs_cis = precompute_freqs_cis(
+            self.freqs_cis = torch.view_as_real(precompute_freqs_cis(
                 self._rope_dim, int(positions.max()) + 1, 0, self.backbone_cfg.rope_theta,
                 self.backbone_cfg.rope_factor, self.backbone_cfg.beta_fast,
                 self.backbone_cfg.beta_slow,
-            ).to(self.freqs_cis.device)
+            )).contiguous().to(self.freqs_cis.device)
         return self.freqs_cis.to(positions.device)[positions]
 
     def _backbone_forward(  # noqa: C901
