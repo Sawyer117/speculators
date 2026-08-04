@@ -35,6 +35,10 @@ import time as _time
 _FWD_PROF = _os.environ.get("DSPARK_PROFILE_FWD") == "1"
 _FWD_PROF_MS = float(_os.environ.get("DSPARK_PROFILE_FWD_MS", "2000"))
 
+# DSPARK_SATDUMP intra-layer capture: _backbone_forward sets this to a list during its
+# (one-shot) satdump window; each block then appends its per-sub-stage tensors. None elsewhere.
+_SAT_SUB = None
+
 
 def _prof(tag, fn):
     if not _FWD_PROF:
@@ -73,15 +77,26 @@ class MhcDecoderBlock(nn.Module):
 
         ``context_x [N, W, dim]`` is the shared target-hidden context (``main_x``).
         """
+        _sub = {} if _SAT_SUB is not None else None
         residual = streams
         post, comb, x = _prof("mHC.attn", lambda: self.attn_hc(streams))
+        if _sub is not None: _sub["hc_pre_attn"] = x.detach().float().cpu()
         x = self.attn_norm(x)
+        if _sub is not None: _sub["attn_norm"] = x.detach().float().cpu()
         x = _prof("MLA.attn", lambda: self.attn(x, context_x, block_freqs, context_freqs, attn_bias))
+        if _sub is not None: _sub["attn_out"] = x.detach().float().cpu()
         streams = place(x, residual, post, comb)
+        if _sub is not None: _sub["post_attn"] = streams.detach().float().cpu()
 
         residual = streams
         post, comb, x = _prof("mHC.ffn", lambda: self.ffn_hc(streams))
+        if _sub is not None: _sub["hc_pre_ffn"] = x.detach().float().cpu()
         x = self.ffn_norm(x)
+        if _sub is not None: _sub["ffn_norm"] = x.detach().float().cpu()
         x = _prof("MoE.ffn", lambda: self.ffn(x))
+        if _sub is not None: _sub["moe_out"] = x.detach().float().cpu()
         streams = place(x, residual, post, comb)
+        if _sub is not None:
+            _sub["layer_out"] = streams.detach().float().cpu()
+            _SAT_SUB.append(_sub)
         return streams

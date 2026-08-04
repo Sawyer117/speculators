@@ -579,6 +579,9 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         _sat = os.environ.get("DSPARK_SATDUMP") == "1" and not getattr(self, "_satdumped", False)
         _rec = {"embed": noise_embedding.detach().float().cpu(),
                 "streams_in": streams.detach().float().cpu(), "layers": []} if _sat else None
+        if _sat:
+            from speculators.models.dsv4_dspark.backbone import block as _blkmod  # noqa: PLC0415
+            _blkmod._SAT_SUB = []  # arm per-sub-stage capture for the draft layers
 
         # ── MoE noaux_tc LOAD BALANCING (DSPARK_MOE_BALANCE=1): apply the bias nudge from the PREVIOUS
         #    step's stashed load, BEFORE this step's layers run — so the selection bias stays CONSTANT
@@ -644,11 +647,13 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         if _sat:
             self._satdumped = True
             _rec["hc_head_out"] = self.hc_head(streams).detach().float().cpu()
+            _rec["substages"] = _blkmod._SAT_SUB
+            _blkmod._SAT_SUB = None
             _sdir = os.environ.get("DSPARK_SATDUMP_DIR", os.path.expanduser("~/dspark_sat"))
             os.makedirs(_sdir, exist_ok=True)
             torch.save(_rec, os.path.join(_sdir, "train_sat.pt"))
-            print(f">>> [DSPARK_SATDUMP] train: embed + {len(_rec['layers'])} layers + hc_head "
-                  f"→ {_sdir}/train_sat.pt", flush=True)
+            print(f">>> [DSPARK_SATDUMP] train: embed + {len(_rec['layers'])} layers "
+                  f"({len(_rec['substages'])} sub-staged) + hc_head → {_sdir}/train_sat.pt", flush=True)
 
         hidden = self.norm(self.hc_head(streams))  # [1, TB, H]
         logits = self.lm_head(hidden)

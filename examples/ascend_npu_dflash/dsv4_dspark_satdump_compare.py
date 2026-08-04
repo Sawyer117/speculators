@@ -66,15 +66,24 @@ def main():
 
     s, t = _load(args.serve), _load(args.train)
     ns, nt = len(s.get("layers", [])), len(t.get("layers", []))
-    print(f">>> serve: embed + {ns} layers + hc_head | train: embed + {nt} layers + hc_head")
+    ss, ts = s.get("substages") or [], t.get("substages") or []
+    print(f">>> serve: embed + {ns} layers ({len(ss)} sub-staged) + hc_head | "
+          f"train: embed + {nt} layers ({len(ts)} sub-staged) + hc_head")
     if ns != nt:
         print(f"  ⚠ layer count differs (serve {ns} vs train {nt}) — comparing min({ns},{nt})")
 
+    # fine sub-stage walk within each layer; falls back to coarse layer-boundary if no substages
+    _SUBORDER = ["hc_pre_attn", "attn_norm", "attn_out", "post_attn",
+                 "hc_pre_ffn", "ffn_norm", "moe_out", "layer_out"]
     rows = []
     _cmp("embed", s.get("embed"), t.get("embed"), args.atol, rows)
     _cmp("streams_in", s.get("streams_in"), t.get("streams_in"), args.atol, rows)
     for i in range(min(ns, nt)):
-        _cmp(f"layer[{i}]", s["layers"][i], t["layers"][i], args.atol, rows)
+        if i < len(ss) and i < len(ts):
+            for key in _SUBORDER:
+                _cmp(f"L{i}.{key}", ss[i].get(key), ts[i].get(key), args.atol, rows)
+        else:
+            _cmp(f"layer[{i}]", s["layers"][i], t["layers"][i], args.atol, rows)
     _cmp("hc_head_out", s.get("hc_head_out"), t.get("hc_head_out"), args.atol, rows)
 
     print("\n  stage           max|Δ|      detail")
@@ -89,15 +98,24 @@ def main():
     if first is None:
         print("VERDICT: ✅ every stage matches — train ≡ serve block forward. The gap is NOT here.")
         print("  ⇒ re-examine the CONTEXT-KV path (precompute_and_store_context_kv) or the dump pairing.")
-    else:
-        print(f"VERDICT: 🎯 first divergence at → {first}")
-        if first in ("embed", "streams_in"):
-            print("  ⇒ before any layer: token ids / embed weights / QuaRot / hc-repeat or stream ORDER differ.")
-        elif first == "hc_head_out":
-            print("  ⇒ layers all match but the final mHC collapse differs (hc_head weights/scale).")
-        else:
-            print(f"  ⇒ {first} is the culprit layer. Its attention(sink)/mHC/MoE computes different math")
-            print("     train-side vs serve-side. Instrument that layer's sub-stages next (attn out / place / MoE).")
+        sys.exit(0)
+    print(f"VERDICT: 🎯 first divergence at → {first}")
+    _sub = first.split(".", 1)[1] if "." in first else first
+    _READ = {
+        "embed": "before any layer: token ids / embed weights / QuaRot / hc-repeat differ.",
+        "streams_in": "before any layer: the hc-stream repeat or stream ORDER differs.",
+        "hc_pre_attn": "the ATTN mHC hyper-connection (HyperConnection pre/collapse) — hc_attn weights/scale/base or input_norm.",
+        "attn_norm": "the pre-attn RMSNorm (input_layernorm vs attn_norm) — eps or weight.",
+        "attn_out": "★ the SINK ATTENTION — sink term / scale / rope / MLA proj / KV assembly differ. Top suspect.",
+        "post_attn": "the ATTN mHC placement (place: post/comb, Sinkhorn) — hc_post vs place.",
+        "hc_pre_ffn": "the FFN mHC hyper-connection (collapse) — hc_ffn weights/scale/base.",
+        "ffn_norm": "the pre-MoE RMSNorm (post_attention_layernorm vs ffn_norm).",
+        "moe_out": "★ the MoE — routing (noaux_tc bias / topk / renorm / routed_scaling) or expert GEMM differ.",
+        "layer_out": "the FFN mHC placement (place after MoE).",
+        "hc_head_out": "layers match; the final mHC collapse differs (hc_head weights/scale).",
+    }
+    print(f"  ⇒ {_READ.get(_sub, 'inspect this op on both sides.')}")
+    print("  (attn_norm/ffn_norm should be identical RMSNorm; a jump THERE with clean inputs = eps/weight mismatch.)")
     sys.exit(0)
 
 
