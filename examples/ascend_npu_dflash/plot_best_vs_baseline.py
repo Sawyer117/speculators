@@ -320,8 +320,11 @@ def main():
     ax.set_title(f"DSV4-DSpark 77W  —  {_gtag}, vs released  (accept_len + per-position %)",
                  fontsize=12, fontweight="bold", pad=16)
 
+    # Explicit column widths: the Run column holds the longest strings ("current best 2.5ep"),
+    # and matplotlib's default equal widths clip it under the neighbouring accept_len cell.
+    _w = [0.115, 0.185, 0.150] + [0.0925] * 5          # Dataset, Run, accept_len, pos0..pos4
     tbl = ax.table(cellText=cell_text, colLabels=col_labels, cellColours=cell_colors,
-                   cellLoc="center", loc="center")
+                   colWidths=_w, cellLoc="center", loc="center")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(9.5)
     tbl.scale(1, 1.55)
@@ -345,13 +348,23 @@ def main():
             thick = (r > 0 and (r - 1) % rows_per_group == 0)
             cell.set_linewidth(2.0 if thick else 0.5)
 
-    fig.text(0.5, 0.03,
-             "FAITHFUL runs only — double-norm(dnorm) + causal experiments EXCLUDED (archived in ledger).  "
-             "cell shading = our run as % of released in that cell (green→red).  per-position = cumulative accept rate S_k (%); \"—\" = not recorded.  "
-             "baseline = released draft, full DATASET=all, #12006 serve, num_spec=5, greedy.  "
-             "f1 = single-norm teacher (reproduction-faithful); curve peaks 1.5ep then over-trains to 3.0ep (shown as-is).  bal5e3 = +DSPARK_MOE_BALANCE.  176 A3-single serve.  "
-             "Source: docs/deployment/ascend-npu-dsv4-dspark-eval-results.md",
-             ha="center", fontsize=5.6, color="0.45")
+    # Footnote: --latest is the shareable summary figure, so it carries only what the figure needs
+    # to be read. The full scoreboard keeps the provenance notes about which run groups are shown.
+    if args.latest:
+        _note = (
+            "cell shading = our run as % of the released draft in that cell.  "
+            "per-position = cumulative accept rate S_k (%).  "
+            "baseline = released DSpark draft, full DATASET=all, num_spec=5, greedy, same serve."
+        )
+    else:
+        _note = (
+            "FAITHFUL runs only — double-norm(dnorm) + causal experiments EXCLUDED (archived in ledger).  "
+            "cell shading = our run as % of released in that cell (green→red).  per-position = cumulative accept rate S_k (%); \"—\" = not recorded.  "
+            "baseline = released draft, full DATASET=all, #12006 serve, num_spec=5, greedy.  "
+            "f1 = single-norm teacher (reproduction-faithful); curve peaks 1.5ep then over-trains to 3.0ep (shown as-is).  bal5e3 = +DSPARK_MOE_BALANCE.  176 A3-single serve.  "
+            "Source: docs/deployment/ascend-npu-dsv4-dspark-eval-results.md"
+        )
+    fig.text(0.5, 0.03, _note, ha="center", fontsize=6.4, color="0.45")
     fig.savefig(args.out, dpi=150, bbox_inches="tight")
     print(f"saved: {args.out}")
     for run in runs:
