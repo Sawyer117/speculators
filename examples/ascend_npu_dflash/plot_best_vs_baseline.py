@@ -47,9 +47,10 @@ RUNS = [
     #    released. Same recipe as the degenerate bal1e3 line (only variable = RoPE). STILL CLIMBING:
     #    0.5ep 3.84 → 1.5ep 4.18 (94.6% of released); gsm8k 1.5ep 4.628 = 99.4% of released. Use
     #    `--group ropefix` for a clean "released vs current" figure. Source = the ropefix rows + the
-    #    saved eval logs (eval_ep{0p5,1p5}_ropefix_all.txt).
+    #    saved eval logs (eval_ep{0p5,1p5}_ropefix_all.txt). Rendered as the "current best" line
+    #    (default `--group best`); the title says "current best", not "RoPE-fix".
     {
-        "label": "ropefix 0.5ep",
+        "label": "current best 0.5ep",
         "al": {"gsm8k": 4.309, "math500": 4.068, "humaneval": 4.298, "mbpp": 3.908, "mt-bench": 2.627},
         "pos": {
             "gsm8k":     [90.41, 78.54, 65.59, 53.64, 42.76],
@@ -60,7 +61,7 @@ RUNS = [
         },
     },
     {
-        "label": "ropefix 1.5ep ★best",
+        "label": "current best 1.5ep",
         "al": {"gsm8k": 4.628, "math500": 4.408, "humaneval": 4.706, "mbpp": 4.300, "mt-bench": 2.865},
         "pos": {
             "gsm8k":     [92.23, 82.56, 72.36, 62.47, 53.14],
@@ -210,9 +211,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="best_vs_baseline.png", help="output PNG (default ./best_vs_baseline.png)")
-    ap.add_argument("--group", choices=["all", "ropefix", "nobalance", "balance"], default="ropefix",
-                    help="which runs to render: ropefix (default — the real-RoPE current-best line vs "
-                         "released) | all (full historical scoreboard) | nobalance (f1 reproduction curve) | "
+    ap.add_argument("--group", choices=["all", "best", "nobalance", "balance"], default="best",
+                    help="which runs to render: best (default — the current-best line vs released) | "
+                         "all (full historical scoreboard) | nobalance (f1 reproduction curve) | "
                          "balance (f1+bal only). Run with different values for separate figures.")
     args = ap.parse_args()
 
@@ -229,8 +230,8 @@ def main():
     base_pos = dict(BASELINE_POS, average=_avg_pos(BASELINE_POS))
     # --group filter: ropefix (real-RoPE line) | balance (label carries "bal") | nobalance | all.
     def _grp(r):
-        if "ropefix" in r["label"]:
-            return "ropefix"
+        if "current best" in r["label"]:
+            return "best"
         return "balance" if "bal" in r["label"] else "nobalance"
     sel = [r for r in RUNS if args.group == "all" or _grp(r) == args.group]
     runs = [{"label": r["label"],
@@ -268,8 +269,8 @@ def main():
     fig, ax = plt.subplots(figsize=(11.5, 0.9 + 0.42 * (len(cell_text) + 1)))
     ax.axis("off")
     _gtag = {
-        "ropefix": "★ RoPE-fix line (real cos/sin rotary, feb0066) — current best, STILL climbing",
-        "all": "f1 reproduction curve (incl. over-train collapse) + noaux load-balance + RoPE-fix",
+        "best": "current best",
+        "all": "f1 reproduction curve (incl. over-train collapse) + noaux load-balance + current best",
         "nobalance": "f1 single-norm reproduction curve (incl. over-train collapse)",
         "balance": "f1 + noaux load-balance (DSPARK_MOE_BALANCE @ 5e-3)",
     }[args.group]
