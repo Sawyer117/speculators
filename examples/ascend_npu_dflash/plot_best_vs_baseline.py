@@ -238,6 +238,9 @@ def main():
                     help="which runs to render: best (default — the current-best line vs released) | "
                          "all (full historical scoreboard) | nobalance (f1 reproduction curve) | "
                          "balance (f1+bal only). Run with different values for separate figures.")
+    ap.add_argument("--latest", action="store_true",
+                    help="render ONLY the last checkpoint of the selected group (released vs one row) "
+                         "— the short summary figure for a report's first page.")
     args = ap.parse_args()
 
     try:
@@ -257,6 +260,9 @@ def main():
             return "best"
         return "balance" if "bal" in r["label"] else "nobalance"
     sel = [r for r in RUNS if args.group == "all" or _grp(r) == args.group]
+    if args.latest:
+        # RUNS is authored oldest→newest within a group, so the last entry is the newest ckpt.
+        sel = sel[-1:]
     runs = [{"label": r["label"],
              "al": dict(r["al"], average=_avg(r["al"])),
              "pos": (dict(r["pos"], average=_avg_pos(r["pos"])) if r.get("pos") else None)}
@@ -297,6 +303,8 @@ def main():
         "nobalance": "f1 single-norm reproduction curve (incl. over-train collapse)",
         "balance": "f1 + noaux load-balance (DSPARK_MOE_BALANCE @ 5e-3)",
     }[args.group]
+    if args.latest and runs:
+        _gtag = f"{_gtag} ({runs[0]['label'].split(maxsplit=2)[-1]})"
     ax.set_title(f"DSV4-DSpark 77W  —  {_gtag}, vs released  (accept_len + per-position %)",
                  fontsize=12, fontweight="bold", pad=16)
 
