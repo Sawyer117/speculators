@@ -82,6 +82,18 @@ RUNS = [
             "mt-bench":  [73.22, 48.24, 31.21, 20.48, 13.38],
         },
     },
+    {
+        # 2.0ep: gsm8k 4.701 passes released 4.658; mean 4.25 = 96.3%. Climb decelerating.
+        "label": "current best 2.0ep",
+        "al": {"gsm8k": 4.701, "math500": 4.431, "humaneval": 4.745, "mbpp": 4.412, "mt-bench": 2.980},
+        "pos": {
+            "gsm8k":     [92.60, 83.67, 73.96, 64.58, 55.30],
+            "math500":   [89.94, 79.35, 68.37, 57.77, 47.64],
+            "humaneval": [93.97, 85.44, 74.84, 65.03, 55.25],
+            "mbpp":      [90.57, 79.83, 67.68, 56.62, 46.50],
+            "mt-bench":  [74.51, 51.09, 34.11, 22.94, 15.32],
+        },
+    },
     # ── (A) f1 single-norm reproduction curve (peak @1.5ep, then over-train decline) ──
     {
         "label": "f1 1.0ep",
