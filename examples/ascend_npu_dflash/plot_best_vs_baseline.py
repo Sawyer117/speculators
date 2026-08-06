@@ -94,6 +94,18 @@ RUNS = [
             "mt-bench":  [74.51, 51.09, 34.11, 22.94, 15.32],
         },
     },
+    {
+        # 2.5ep: mean 4.29 = 97.2%; gsm8k 4.753 = 102.0% of released. Non-chat 4 avg = 98.3%.
+        "label": "current best 2.5ep",
+        "al": {"gsm8k": 4.753, "math500": 4.485, "humaneval": 4.818, "mbpp": 4.428, "mt-bench": 2.988},
+        "pos": {
+            "gsm8k":     [92.73, 84.16, 75.14, 66.08, 57.16],
+            "math500":   [90.29, 79.79, 69.49, 59.41, 49.54],
+            "humaneval": [94.35, 86.74, 76.65, 67.18, 56.85],
+            "mbpp":      [90.91, 79.77, 67.90, 56.99, 47.19],
+            "mt-bench":  [75.20, 51.49, 34.10, 22.70, 15.28],
+        },
+    },
     # ── (A) f1 single-norm reproduction curve (peak @1.5ep, then over-train decline) ──
     {
         "label": "f1 1.0ep",
