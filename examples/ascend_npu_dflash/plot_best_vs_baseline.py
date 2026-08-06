@@ -43,6 +43,33 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
 #      (B) f1 + noaux_tc load balance (DSPARK_MOE_BALANCE=1 @ 5e-3): 0.5ep, 1.0ep.
 #    ✏️ APPEND a dict when a new ckpt is eval'd. Source: docs/deployment/ascend-npu-dsv4-dspark-eval-results.md
 RUNS = [
+    # ── (D) ★ RoPE-FIX line (real cos/sin rotary, feb0066) — the current best, near-parity with
+    #    released. Same recipe as the degenerate bal1e3 line (only variable = RoPE). STILL CLIMBING:
+    #    0.5ep 3.84 → 1.5ep 4.18 (94.6% of released); gsm8k 1.5ep 4.628 = 99.4% of released. Use
+    #    `--group ropefix` for a clean "released vs current" figure. Source = the ropefix rows + the
+    #    saved eval logs (eval_ep{0p5,1p5}_ropefix_all.txt).
+    {
+        "label": "ropefix 0.5ep",
+        "al": {"gsm8k": 4.309, "math500": 4.068, "humaneval": 4.298, "mbpp": 3.908, "mt-bench": 2.627},
+        "pos": {
+            "gsm8k":     [90.41, 78.54, 65.59, 53.64, 42.76],
+            "math500":   [87.65, 74.57, 60.74, 47.80, 36.04],
+            "humaneval": [92.39, 80.65, 65.76, 51.79, 39.26],
+            "mbpp":      [87.35, 72.01, 56.38, 43.25, 31.85],
+            "mt-bench":  [68.95, 42.98, 25.90, 15.51, 9.33],
+        },
+    },
+    {
+        "label": "ropefix 1.5ep ★best",
+        "al": {"gsm8k": 4.628, "math500": 4.408, "humaneval": 4.706, "mbpp": 4.300, "mt-bench": 2.865},
+        "pos": {
+            "gsm8k":     [92.23, 82.56, 72.36, 62.47, 53.14],
+            "math500":   [89.96, 79.17, 67.92, 57.05, 46.66],
+            "humaneval": [94.43, 85.35, 74.31, 64.33, 52.15],
+            "mbpp":      [89.77, 77.90, 65.28, 53.79, 43.21],
+            "mt-bench":  [73.22, 48.24, 31.21, 20.48, 13.38],
+        },
+    },
     # ── (A) f1 single-norm reproduction curve (peak @1.5ep, then over-train decline) ──
     {
         "label": "f1 1.0ep",
@@ -183,9 +210,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="best_vs_baseline.png", help="output PNG (default ./best_vs_baseline.png)")
-    ap.add_argument("--group", choices=["all", "nobalance", "balance"], default="all",
-                    help="which runs to render: all (default) | nobalance (f1 reproduction curve only) | "
-                         "balance (f1+bal only). Run twice for two separate figures.")
+    ap.add_argument("--group", choices=["all", "ropefix", "nobalance", "balance"], default="ropefix",
+                    help="which runs to render: ropefix (default — the real-RoPE current-best line vs "
+                         "released) | all (full historical scoreboard) | nobalance (f1 reproduction curve) | "
+                         "balance (f1+bal only). Run with different values for separate figures.")
     args = ap.parse_args()
 
     try:
@@ -199,11 +227,12 @@ def main():
     rows = DATASETS + ["average"]
     base_al = dict(BASELINE, average=_avg(BASELINE))
     base_pos = dict(BASELINE_POS, average=_avg_pos(BASELINE_POS))
-    # --group filter: a run is "balance" iff its label carries "bal" (f1+bal…); else "nobalance".
-    def _is_bal(r):
-        return "bal" in r["label"]
-    sel = [r for r in RUNS
-           if args.group == "all" or (_is_bal(r) if args.group == "balance" else not _is_bal(r))]
+    # --group filter: ropefix (real-RoPE line) | balance (label carries "bal") | nobalance | all.
+    def _grp(r):
+        if "ropefix" in r["label"]:
+            return "ropefix"
+        return "balance" if "bal" in r["label"] else "nobalance"
+    sel = [r for r in RUNS if args.group == "all" or _grp(r) == args.group]
     runs = [{"label": r["label"],
              "al": dict(r["al"], average=_avg(r["al"])),
              "pos": (dict(r["pos"], average=_avg_pos(r["pos"])) if r.get("pos") else None)}
@@ -239,7 +268,8 @@ def main():
     fig, ax = plt.subplots(figsize=(11.5, 0.9 + 0.42 * (len(cell_text) + 1)))
     ax.axis("off")
     _gtag = {
-        "all": "f1 reproduction curve (incl. over-train collapse) + noaux load-balance",
+        "ropefix": "★ RoPE-fix line (real cos/sin rotary, feb0066) — current best, STILL climbing",
+        "all": "f1 reproduction curve (incl. over-train collapse) + noaux load-balance + RoPE-fix",
         "nobalance": "f1 single-norm reproduction curve (incl. over-train collapse)",
         "balance": "f1 + noaux load-balance (DSPARK_MOE_BALANCE @ 5e-3)",
     }[args.group]
