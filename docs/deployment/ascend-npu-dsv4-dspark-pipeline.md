@@ -19,6 +19,66 @@ The rollout produces an Arrow dataset (row `i` = one prompt+response with `loss_
 driven prefill-only over each row's `input_ids`, dumps `hs_<i>.safetensors`; the trainer reads
 Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states from the HS file).
 
+## ⚡ Shortest reproduction path
+
+Six steps from nothing to the current result (**mean accept_len 4.25 = 96.3% of the released draft, with
+gsm8k 4.701 surpassing released 4.658**). Paths below are the A2 layout (`/share` shared storage, 115/116 =
+serve, 109 = train); on A3 substitute `/home/canada_group_folder` (see [box-path note](#status-at-a-glance)).
+Each step links the stage that explains it.
+
+```bash
+# 0) Two envs, once per node.  train (no vLLM) + serve (vLLM 0.23.0 + vllm-ascend).
+bash examples/ascend_npu_dflash/install_npu_env_dspark.sh        # train env  (SSOT)
+bash examples/ascend_npu_dflash/setup_dsv4_env.sh                # serve env  (per node)
+
+# 1) Rollout the verifier over a prompt set (greedy, temp=0) -> jsonl -> Arrow.
+bash examples/ascend_npu_dflash/rollout_shard.sh                 # -> rollout jsonl   [stage 2]
+python scripts/prepare_data.py ...                               # jsonl -> Arrow dataset
+
+# 2) Start the HS producer: a PLAIN bf16 serve with HS_DUMP=1  (BOTH nodes; env = "austin").
+#    DSPARK_HS_DIR must be SHARED storage and must equal the trainer's --hidden-states-path.
+HS_DUMP=1 nohup bash examples/ascend_npu_dflash/serve_dsv4_bf16_dualnode.sh head   > ~/hs_head.log 2>&1 &
+HS_DUMP=1 nohup bash examples/ascend_npu_dflash/serve_dsv4_bf16_dualnode.sh worker > ~/hs_worker.log 2>&1 &
+
+# 3) Train the draft (8×A2, EP8).  THE canonical command — every knob here matters.  [stage 4]
+DSPARK_EP=1 BF16_EXPERTS=1 RECOMPUTE=1 COMPILE=0 \
+DSPARK_MOE_BALANCE=1 DSPARK_MOE_BALANCE_RATE=1e-3 DSPARK_LOG_EXPERT_LOAD=1 \
+INIT_LAYER=1 INIT_MOE_NO_ROUTER=1 \
+LR=2e-4 EPOCHS=5 MAX_ANCHORS=512 CKPT_FREQ=0.5 \
+DATA=/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow_0730_77w_dedup \
+  bash examples/ascend_npu_dflash/train_dsv4_dspark.sh faithful
+
+# 4) Convert a checkpoint  layers.* -> mtp.*  and verify bit-exactness (expect 2378/2378).  [stage 5]
+CKPT=<run>/ckpt_faithful_ep_<TS>/<N>          # <N> = integer epoch dir; mid-epoch saves are OVERWRITTEN
+OUT=/share/canada_group_folder/ckpt/dsv4_dspark_drafts/<name>
+python scripts/convert_dspark_to_vllm.py --in "$CKPT" --inspect       # dry run first
+python scripts/convert_dspark_to_vllm.py --in "$CKPT" --out "$OUT" \
+  --config-from /share/canada_group_folder/ckpt/released_draft_bf16_standalone/config.json
+python scripts/verify_dspark_conversion.py --in "$CKPT" --out "$OUT"
+
+# 5) Serve verifier + draft, then evaluate all 5 datasets in the SAME terminal.
+DRAFT="$OUT" nohup bash examples/ascend_npu_dflash/serve_dsv4_a3_singlenode.sh > ~/serve.log 2>&1 &
+TOKENIZER=<ckpt_root>/DeepSeek-V4-Flash-bf16 DATASET=all CONCURRENCY=48 PORT=7000 \
+  bash examples/ascend_npu_dflash/run_dspark_eval.sh 2>&1 | tee ~/eval_<name>_all.txt
+```
+
+**Five things that will bite you if skipped** (each cost us a run):
+
+1. **`INIT_LAYER=1 INIT_MOE_NO_ROUTER=1`** — warm-start the whole draft layer from verifier layers
+   [40,41,42] but leave the **router freshly random**. Inheriting the verifier's router collapses it; forcing
+   it uniform is worse still (see the MoE section of the worklog).
+2. **`BF16_EXPERTS=1` on A2** — the launcher's `auto` picks fp32 experts under `DSPARK_EP=1` (A3-sized) and
+   **OOMs a 64 GB A2 at the first backward**. Watch startup for `>>> AMP: option B (experts stay bf16)`.
+3. **`RECOMPUTE=1` is mandatory at `MAX_ANCHORS=512`** on 64 GB, else OOM inside the tv-loss softmax.
+4. **Mid-epoch checkpoints are overwritten** by the epoch-end save into the *same* integer dir — convert a
+   0.5 / 1.5 ep checkpoint **promptly** or it is gone.
+5. **The trainer's `--hidden-states-path` must equal the serve's `DSPARK_HS_DIR`**, and if the dataset
+   changed you must `rm -f $HS_DIR/hs_*.safetensors*` first — HS files are keyed by Arrow **row index**, so a
+   re-indexed dataset silently pairs the wrong sample (it errors, it does not regenerate).
+
+Expected trajectory (so you can tell early whether your run is on track):
+**0.5ep 3.84 → 1.0ep 4.06 → 1.5ep 4.18 → 2.0ep 4.25** (mean over the 5 datasets).
+
 ## The chain
 
 | # | Stage | What it does | Archived doc | Script(s) |
