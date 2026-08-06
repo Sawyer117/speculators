@@ -45,6 +45,15 @@ Unless a run says otherwise, all numbers below share:
 Headline `accept_len` per run. `mean` is the unweighted 5-dataset average (mt-bench, being
 multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
 
+> **★★★ 2026-08-05 — read the PRE-ropefix rows as historical.** The `~3.5 plateau`, `train↑/eval↓
+> divergence`, `gap = tail / data / exposure`, and `best draft = f1-1.5ep 3.63` framing in the older rows
+> below is **SUPERSEDED**: the cause was **degenerate training-RoPE** (complex freqs cast to bf16 = scale-only,
+> no rotation), root-caused + fixed (`feb0066`/`8db8f75`). The `ep0p5-ropefix-77w` row (top of the matrix) is
+> the **new best across everything at just 0.5ep (mean 3.84)** and confirms **eval now tracks train** — the
+> divergence is resolved. Prior "next = data-cleaning / TTT / KD-temp / lower-LR / balance" plans were pursued
+> BEFORE RoPE was found; they're now secondary. Details: [`…-rope-degenerate-root-cause`] in memory / the
+> pipeline top bullet.
+
 | Run | gsm8k | math500 | humaneval | mbpp | mt-bench | mean | notes |
 |-----|:-----:|:-------:|:---------:|:----:|:--------:|:----:|-------|
 | **released draft** *(bar)* | 4.658 | 4.661 | 4.942 | 4.535 | 3.294 | **4.42** | official 3.94 @ ns5; full-all on our serve ✓ |

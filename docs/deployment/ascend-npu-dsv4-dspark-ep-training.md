@@ -6,9 +6,16 @@
 > expert-parallel MoE refactor (DTensor-native, torchtitan-aligned), the tuning decisions, and
 > the environment/run scripts (linked). Reports live under `docs/` (not `examples/`).
 >
-> One honest gap: §6 accept-length numbers are the **targets/baseline**; the converged draft
-> numbers are pending a full training-to-eval pass (the last run was still LR-warming at
-> accept_len ≈ 1.19). Everything else is measured.
+> One honest gap (2026-07-14): §6 accept-length numbers are the **targets/baseline**; the converged draft
+> numbers are pending a full training-to-eval pass (the last run was still LR-warming at accept_len ≈ 1.19).
+>
+> **★ UPDATE 2026-08-05 — that gap is CLOSED and §6's "eval low = serve bug, weights vindicated, no retrain"
+> conclusion is SUPERSEDED.** The eval gap was ultimately OUR training, root-caused through a chain of retrains:
+> `sample_from_anchor` off-by-one → CAUSAL-train-vs-NONCAUSAL-serve → **degenerate training-RoPE** (complex
+> freqs cast to bf16 = scale-only, no rotation; `feb0066`/`8db8f75`). The RoPE-fixed retrain evals at 0.5ep to
+> **mean 3.84 = new best**, eval now tracks train. See the append-only ledger
+> `ascend-npu-dsv4-dspark-eval-results.md` (`ep0p5-ropefix` row). Treat §6's "no retrain / serve is the bug"
+> text below as historical.
 
 ## 0. Scope & audience
 
@@ -365,6 +372,12 @@ The bar to match/beat is the **released DeepSeek DSV4-Flash DSpark draft**, meas
 (`Evaluator.py @ a3c41a6`), or non-first-dataset accept lengths read low.
 
 ### 6.1 First train→eval pass (2026-07-16) — training side healthy; eval blocked on a SERVE bug, not the draft
+
+> **★ OVERTAKEN BY EVENTS (2026-08-05) — this "serve bug, weights vindicated, no retrain" read was WRONG as
+> the final word.** The serve WAS then fixed (#12006), and on the fixed serve the eval gap turned out to be
+> OUR TRAINING after all — root-caused through `sample_from_anchor` → causal-vs-noncausal → **degenerate RoPE**
+> (`feb0066`), each needing a retrain. The RoPE-fixed retrain hits **mean 3.84 @ 0.5ep = new best** (ledger
+> `ep0p5-ropefix`). The 1.36 here reflects the *old broken* serve; the section is historical.
 
 epoch-1 ckpt `/home/a00652497/dspark_austin/run/ckpt_faithful_ep_20260715_213847/0` (faithful EP8,
 arrow_0715, **`INIT_LAYER=1` (whole-layer warm-start — the chosen best; MoE-only `INIT_MOE` was worse/unstable)**, lr 2e-4, block 6):

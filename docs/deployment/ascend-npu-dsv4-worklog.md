@@ -424,8 +424,12 @@ Git SHA `da064ea` · speculators 0.5.0.dev448 · transformers 5.13.1 · torch 2.
   ```
   ⚠ this run was a **RESUME** (`--save-path`=existing dir, **no `--init-*` flags**). The line's from-scratch INIT = `--init-layer-from-target --init-moe-no-router` (box-wide `train_command.txt` count: 23× `--init-layer-from-target`, 5× `+--init-moe-no-router`).
 
-### BEST draft so far — `ep1mid-f1-77w` (single-norm "f1", 1.5ep, mean **3.63** = 82% of released 4.42)
-⚠ **verbatim recipe = TODO** (its trainer ckpt was overwritten; only converted weights survive). Pull its exact command from the run LOG banner + `patch_getenv` next time on the box (need the f1 run's `faithful_ep_<TS>.log` TS). Known from the eval ledger: single-norm (`TEACHER_DOUBLE_NORM=0`), **NO balance**, non-causal, anchor576, noise0.05, LR3e-4, A3 `launch_a3` (DP16/EP16, `INIT_LAYER=1`).
+### BEST draft — `ep0p5-ropefix-77w` (RoPE-fix, 0.5ep, mean **3.84**) ★ NEW BEST (2026-08-05)
+The RoPE-fix retrain is the new best across everything (ledger `ep0p5-ropefix` row); recipe = the LAST-run
+recipe above **+ real-RoPE `feb0066`/`8db8f75`** (bal1e3 / fresh-router / dedup / lr2e-4 / anchor512 / EP8).
+- *(prev best, now #2)* `ep1mid-f1-77w` (single-norm "f1", 1.5ep, mean **3.63** = 82% of released 4.42) — its
+  trainer ckpt was overwritten; recipe known from the ledger: single-norm, NO balance, non-causal, anchor576,
+  noise0.05, LR3e-4, A3 `launch_a3` (DP16/EP16, `INIT_LAYER=1`).
 
 ### ★ RoPE-fix FROM-SCRATCH launch (= LAST line's recipe + real cos/sin RoPE `feb0066`/`8db8f75`)
 On 109 (A2, env `dspark-dsv4-compile`), with 115/116 HS serve up:
@@ -439,3 +443,20 @@ DATA=/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow_073
   bash examples/ascend_npu_dflash/train_dsv4_dspark.sh faithful
 ```
 Only changes vs the LAST line: **proper RoPE** (was degenerate scale-only), **from-scratch** (re-adds the init flags the resume lacked), fresh save-path. A/B target = beat the degenerate line's plateau (0.5ep 3.56 → 4.5ep 3.45); **tail pos2-4 is the tell**.
+
+---
+
+## 2026-08-05 — ★★★ RoPE-fix RESULT: eval-validated, NEW BEST (the A/B lands)
+
+The from-scratch RoPE-fixed run (`ckpt_faithful_ep_20260804_165215`, the recipe above) converted at **0.5ep**
+(`dsv4_dspark_ep0p5_ropefix_vllm-77w`, 2378/2378 bit-exact) and served on 176 (A3-single, ns5, conc48):
+
+**mean accept_len 3.84 = NEW BEST across everything** — beats the prior best `ep1mid-f1` (3.63 @ 1.5ep) at 1/3
+the epochs; = 86.9% of released 4.42. **ALL 5 datasets up vs the same-recipe degenerate `ep0p5-bal1e3`** (the
+clean single-variable A/B — ONLY change is RoPE): gsm8k 4.050→**4.309**, math500 3.784→**4.068**, humaneval
+3.890→**4.298**, mbpp 3.591→**3.908**, mt-bench 2.466→**2.627** (mean 3.56→3.84, +0.28). The gain is the
+**TAIL** (gsm8k cumul pos2/3/4 59.8/46.3/35.0→65.6/53.6/42.8; conditional accept to pos4 stays ~80%) and the
+diagnosed **`train↑/eval↓` divergence is RESOLVED — eval now tracks train.** ⟹ RoPE was THE remaining
+train↔serve mismatch; the "gap = data/recipe/tail" and "serve bug / no retrain" reads across the older docs are
+superseded (they've been annotated). Full row + per-position in the eval-results ledger. Trajectory (1.0ep `/0`,
+1.5ep `/1`, …) being converted+evaled to see if it keeps climbing toward 4.42 or plateaus at a much higher level.

@@ -23,14 +23,25 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
 
 | # | Stage | What it does | Archived doc | Script(s) |
 |---|---|---|---|---|
-| 1 | **Env build** | Two conda envs: **train** (speculators editable + transformers) and **serve** (vLLM 0.23.0 + vllm-ascend `feat/dsv4-hs-dumper`). Corrected toolchain, numpy 2.3.5 pinned last. | [`ascend-npu-dsv4-dspark-w8a8-inference.md`](./ascend-npu-dsv4-dspark-w8a8-inference.md) §3–4 (toolchain/env notes; **w8a8 track, archived**) | `install_npu_env_dspark.sh` (train, SSOT) · `setup_dsv4_env.sh` (serve, per-node) |
+| 1 | **Env build** | **3 roles / 2 build-types**: (a) **train-compute** (speculators editable + transformers + torch_npu, **no vLLM**); (b) **serve** = ONE vllm-ascend build, run `HS_DUMP=1` → HS producer (stage 3) **or** `DRAFT=` → eval spec-decode (stage 5). numpy 2.3.5 pinned last. *(Physically one conda env per machine; the two serve envs `austin`/`serving` can later collapse to a single HS_DUMP-gated build — **deferred, don't touch the working stack**.)* | env-build scripts = the Script column. Toolchain gotchas only: [`w8a8-inference.md`](./ascend-npu-dsv4-dspark-w8a8-inference.md) §3–4 (system-gcc-not-conda-clang, exit-127 `patch`) — *archived track, notes only.* | **train:** `install_npu_env_dspark.sh` (SSOT) · `setup_dsv4_train_compile.sh` (A3 torch-2.12) · **serve:** `setup_dsv4_serve_a3.sh` (A3 #12006) · `setup_dsv4_env.sh` (per-node) |
 | 2 | **Data generation** | Rollout the target over a prompt set (greedy, temp=0, max-tokens 3072) → prompt+response+`loss_mask` → **Arrow dataset**. Sharded across nodes; tuning keeps short/numeric answers, drops only garbage. | [`ascend-npu-dsv4-rollout-data.md`](./ascend-npu-dsv4-rollout-data.md) (pipeline) · [`ascend-npu-dsv4-a3-rollout-handoff.md`](./ascend-npu-dsv4-a3-rollout-handoff.md) (A3 runbook) · [`ascend-npu-dsv4-rollout-benchmark.md`](./ascend-npu-dsv4-rollout-benchmark.md) (throughput/time) | `rollout_shard.sh` · `rollout_a3_shard.sh` · `rollout_stats.py` · `gen_tiny_dsv4_dataset.py` |
-| 3 | **Serving (verifier + HS producer)** | DeepSeek-V4-Flash bf16 served (A2 two-node TP8/DP2 **EP off**, or A3 single-node). With `HS_DUMP=1` a plain serve becomes a hidden-state producer (Plan B dumper) — no PD-disagg, no `HiddenStateCacheSpec`. | [`ascend-npu-dsv4-bf16-dualnode-benchmark.md`](./ascend-npu-dsv4-bf16-dualnode-benchmark.md) (A2) · [`ascend-npu-dsv4-a3-singlenode-benchmark.md`](./ascend-npu-dsv4-a3-singlenode-benchmark.md) (A3) · [`ascend-npu-dsv4-hs-dumper-planB.md`](./ascend-npu-dsv4-hs-dumper-planB.md) (**HS extraction: two schemes, why Plan B**) · [`ascend-npu-dsv4-supports-eagle3-issue.md`](./ascend-npu-dsv4-supports-eagle3-issue.md) (native-extract path, paused) | `serve_dsv4_bf16_dualnode.sh` · `serve_dsv4_a3_singlenode.sh` · `hs_dump_driver.py` · `hs_dump_smoke.py` |
-| 4 | **Draft training** | Faithful DSV4-native DSpark draft (3×[MLA+sink+256-MoE+mHC]+Markov/confidence heads), `speculators` FSDP2 **+ EP8 grouped-GEMM MoE**. Reads Arrow + rolling HS buffer. | [`ascend-npu-dsv4-dspark-ep-training.md`](./ascend-npu-dsv4-dspark-ep-training.md) (**design decisions + results + §9 validation matrix**) · [`ascend-npu-dsv4-dspark-training-port.md`](./ascend-npu-dsv4-dspark-training-port.md) (Plan 甲, faithful port spec) · [`ascend-npu-dsv4-dspark-compile-recompile.md`](./ascend-npu-dsv4-dspark-compile-recompile.md) (**WIP: throughput — anchor/recompute + recompile→compile**) | `train_dsv4_dspark.sh` · `scripts/train.py` · `test_compile_grouped_mm.py` |
-| 5 | **Evaluation** | Serve verifier + trained draft; measure accept length / throughput vs the released-draft baseline (**num_spec=5, AL 3.94**, PR #11196). Reset-aware metrics poller. | [**`ascend-npu-dsv4-dspark-eval-results.md`**](./ascend-npu-dsv4-dspark-eval-results.md) (**append-only results ledger** — accept_len matrix + per-dataset/per-position detail per run/baseline) · EP-training doc §6 (design rationale) | `run_dspark_eval.sh` · `Evaluator.py` |
+| 3 | **Serving (verifier + HS producer)** | DeepSeek-V4-Flash bf16 served. **A3 single-node (current): expert-parallel ON** (`ENABLE_EP=1` — intra-node EP works). *A2 two-node (deprecated): EP OFF — cross-node EP all-gather DEADLOCKS on Ascend A2 (hard-won lesson).* ⚠️ this is the **verifier-serve's** EP, distinct from **training's EP8**. With `HS_DUMP=1` a plain serve becomes a hidden-state producer (Plan B dumper) — no PD-disagg, no `HiddenStateCacheSpec`. | [`ascend-npu-dsv4-bf16-dualnode-benchmark.md`](./ascend-npu-dsv4-bf16-dualnode-benchmark.md) (A2) · [`ascend-npu-dsv4-a3-singlenode-benchmark.md`](./ascend-npu-dsv4-a3-singlenode-benchmark.md) (A3) · [`ascend-npu-dsv4-hs-dumper-planB.md`](./ascend-npu-dsv4-hs-dumper-planB.md) (**HS extraction: two schemes, why Plan B**) · [`ascend-npu-dsv4-supports-eagle3-issue.md`](./ascend-npu-dsv4-supports-eagle3-issue.md) (native-extract path, paused) | `serve_dsv4_bf16_dualnode.sh` · `serve_dsv4_a3_singlenode.sh` · `hs_dump_driver.py` · `hs_dump_smoke.py` |
+| 4 | **Draft training** | Faithful DSV4-native DSpark draft (3×[MLA+sink+256-MoE+mHC]+Markov/confidence heads), `speculators` FSDP2 **+ EP8 grouped-GEMM MoE**. Reads Arrow + rolling HS buffer. | **[`ascend-npu-dsv4-dspark-ep-training.md`](./ascend-npu-dsv4-dspark-ep-training.md) — THE canonical training doc** (design decisions + results + §9 validation matrix). Detail companions: [`…-training-port.md`](./ascend-npu-dsv4-dspark-training-port.md) (Plan 甲 faithful **arch spec**) · [`…-compile-recompile.md`](./ascend-npu-dsv4-dspark-compile-recompile.md) (**throughput axis** — anchor/recompute + recompile→compile, WIP). | `train_dsv4_dspark.sh` · `scripts/train.py` · `test_compile_grouped_mm.py` |
+| 5 | **Evaluation** | Serve verifier + trained draft; measure accept length / throughput vs the released draft. **Primary bar = released-on-OUR-serve `DATASET=all` mean 4.42 (gsm8k 4.658 reproduced)**; official 3.94 @ num_spec=5 (PR #11196) = the cross-stack sanity floor only. Reset-aware metrics poller. | [**`ascend-npu-dsv4-dspark-eval-results.md`**](./ascend-npu-dsv4-dspark-eval-results.md) (**append-only results ledger** — accept_len matrix + per-dataset/per-position detail per run/baseline) · EP-training doc §6 (design rationale) | `run_dspark_eval.sh` · `Evaluator.py` |
 
 ## Status at a glance
 
+- **★★★ RoPE root-caused, fixed, and EVAL-VALIDATED (2026-08-05).** The long-standing accept-length
+  gap was **degenerate training-RoPE**: the draft's `freqs_cis` was complex64, NPU aclnn can't handle
+  complex so the trainer cast the model to bf16 which dropped the imaginary part → `apply_rotary_emb`'s
+  complex×real went from a real ROTATION to a **scale-only** op, while the serve rotated properly = the
+  train↔serve divergence. Fixed to real cos/sin interleaved (`feb0066`+`8db8f75`, matches
+  vLLM-Ascend/MindSpeed/torchtitan-npu). **A from-scratch RoPE-fixed run — same recipe as the degenerate
+  `ep0p5-bal1e3`, ONLY variable = RoPE — evals at just 0.5ep to mean 3.84 = NEW BEST across everything**
+  (beats the prior best `f1-1.5ep` 3.63 at 1/3 the epochs; 87% of the released bar 4.42; ALL 5 datasets up
+  +0.16…+0.41). The gain is the **tail** (later block slots finally rotate) and the diagnosed
+  **`train↑/eval↓` divergence is RESOLVED — eval now tracks train.** Full row + per-position in the stage-5
+  ledger. ⟹ the earlier "gap = data/recipe/tail / serve bug / no retrain" conclusions below are SUPERSEDED.
 - **A3 two-box move + eval baselines locked (2026-07-20).** New topology: **182 = A3 inference + training-HS
   producer**, **176 = A3 training on the torch-2.12 COMPILE stack** (data/weights migrating A3
   `/home/canada_group_folder` → A2 `/share`). One-shot env builds: `setup_dsv4_serve_a3.sh` (#12006 serve, now
@@ -41,7 +52,8 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
   A3 stack** — `Sawyer117/vllm-ascend@dspark-dsv4-v3-hsdump` (zero-risk: #12006 already exposes
   `get_mtp_target_hidden_states()`; pure-python, no rebuild), enabled by `serve_dsv4_a3_singlenode.sh HS_DUMP=1`.
   **Eval baselines** now in the append-only ledger (stage 5): released draft full-`DATASET=all` **mean 4.42**
-  (gsm8k 4.658 reproduced); our best `epoch4-17w` **mean 3.08 = 70%** (gap = the pos3/pos4 tail). Static
+  (gsm8k 4.658 reproduced); our best-at-the-time `epoch4-17w` **mean 3.08 = 70%** (gap then blamed on the
+  pos3/pos4 tail — ⟹ **SUPERSEDED: the tail gap was degenerate RoPE; new best = `ep0p5-ropefix` 3.84**, see the top bullet). Static
   scoreboard `plot_best_vs_baseline.py`; `analyze_train_run.py` overlays the 3 released refs. **77W** dataset
   (775,965 deduped, the newest/most-complete — supersedes 17W/45W) registered (§3.1) + being prepped to
   `arrow_0720_77w` for the next retrain. See the **2026-07-20 worklog section** for the live bring-up detail.
@@ -53,7 +65,9 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
   divergence loss, #759 metric double-reduction, #711 checkpointer dtype). Fixes 1–2 are serve-validated against
   the DSV4 proposer (slot k prev = pos p+k = raw block_tokens); the two are ORTHOGONAL (decay=slot 0,
   Markov=slots 1–4). A smoke run caught + fixed a latent complex64 `freqs_cis` crash from the AMP selective cast;
-  re-smoke clean (no NaN, mem ~56 GB, fits). Watch: `position_0_acc` past lr-peak + **`hard_accept_len` breaking
+  re-smoke clean (no NaN, mem ~56 GB, fits). **⟹ that same complex64→bf16 cast is exactly the
+  degenerate-RoPE mechanism later root-caused (2026-08-05, `feb0066`): casting the complex rotary to
+  bf16 silently drops the imaginary part → scale-only, no rotation. Fixed there; see the top bullet.** Watch: `position_0_acc` past lr-peak + **`hard_accept_len` breaking
   the killed run's ~2.4**; AMP proof = norm-changed-vs-verifier at the 1st ckpt. Detail: the **2026-07-18 worklog
   section**. (torch-2.12 compile env for the recompile bottleneck = a parallel later track.)
 - **Serve FIXED, then root-caused OUR draft (2026-07-17, REVERSES the earlier "serve bug, no retrain").**

@@ -1,5 +1,11 @@
 # DSpark-on-DeepSeek-V4-Flash — training-port spec for `speculators` (Plan 甲, faithful)
 
+> **Role:** this is the faithful **architecture / port spec** — the "how the draft is built" companion to the
+> canonical training doc [`ascend-npu-dsv4-dspark-ep-training.md`](./ascend-npu-dsv4-dspark-ep-training.md)
+> (design decisions + results + validation matrix). For pipeline overview see
+> [`ascend-npu-dsv4-dspark-pipeline.md`](./ascend-npu-dsv4-dspark-pipeline.md) stage 4. Architecture facts here
+> are current; for STATUS/RESULTS always defer to ep-training + the eval-results ledger.
+
 Goal: reproduce **DeepSeek's DSpark draft TRAINING for DeepSeek-V4-Flash** inside the `speculators`
 framework, faithful to the released `deepseek-ai/DeepSeek-V4-Flash-DSpark` checkpoint (Plan 甲 —
 project decision, non-negotiable). Sources: the checkpoint weight index (`/workspace/dspark_extract/`),
