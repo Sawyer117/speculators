@@ -460,3 +460,85 @@ diagnosed **`train↑/eval↓` divergence is RESOLVED — eval now tracks train.
 train↔serve mismatch; the "gap = data/recipe/tail" and "serve bug / no retrain" reads across the older docs are
 superseded (they've been annotated). Full row + per-position in the eval-results ledger. Trajectory (1.0ep `/0`,
 1.5ep `/1`, …) being converted+evaled to see if it keeps climbing toward 4.42 or plateaus at a much higher level.
+
+---
+
+## 2026-08-06 — RoPE-fix line: full 0.5→2.0ep trajectory, gsm8k passes released; tooling; upstream PR #942
+
+### Eval trajectory (the RoPE-fixed from-scratch run `ckpt_faithful_ep_20260804_165215`)
+
+Every point is the SAME line (recipe = the LAST-run recipe in the canonical block above **+ real cos/sin
+RoPE** `feb0066`/`8db8f75`; fresh router + `DSPARK_MOE_BALANCE=1 @1e-3`, LR 2e-4, anchor512, EP8,
+dedup 77W). Converted with `convert_dspark_to_vllm.py` (each 2378/2378 bit-exact), served on 176 A3-single
+`num_spec=5`, `DATASET=all` conc48.
+
+| ckpt dir | epoch | gsm8k | math500 | humaneval | mbpp | mt-bench | **mean** | % of released |
+|---|---|---|---|---|---|---|---|---|
+| `/0` (epoch0_step12388) | 0.5 | 4.309 | 4.068 | 4.298 | 3.908 | 2.627 | **3.84** | 87.0% |
+| `/0` (epoch0_end)       | 1.0 | 4.493 | 4.241 | 4.585 | 4.167 | 2.796 | **4.06** | 91.8% |
+| `/1` (epoch1_step12448) | 1.5 | 4.628 | 4.408 | 4.706 | 4.300 | 2.865 | **4.18** | 94.6% |
+| `/1` (epoch1_end)       | 2.0 | **4.701** | 4.431 | 4.745 | 4.412 | 2.980 | **4.25** | **96.3%** |
+
+- **Monotonic** (Δ +0.22 / +0.12 / +0.07 — decelerating). The degenerate lines had already turned DOWN by
+  2.0ep (3.56→3.45); this one has not.
+- **gsm8k 4.701 > released 4.658 (100.9%)** — first dataset past the bar.
+- **Conditional accept now matches/beats released**: gsm8k c0–c4 = 0.926/0.904/0.884/0.873/0.856 vs released
+  0.928/0.892/0.885/0.868/0.842 ⟹ pos1–4 at or above. Residual gap = pos0 (−0.2pt) and **mt-bench (90.5%)**,
+  which is a DATA-distribution issue (our rollout is 99.96% single-turn), not a bug.
+- **Next lever for the last ~4% = anneal LR→0** (the DeepSpec full-anneal we have never run), not more
+  epochs at constant LR.
+
+### MoE routing — the official regime, reproduced
+
+- **Official draft, static:** `mtp.0.ffn.gate.bias` non-zero (≈10 ± 0.09) but the ≈10 is a routing-IRRELEVANT
+  uniform shift (top-k is shift-invariant) — the real signal is the ~0.74 spread; `mtp.1`/`mtp.2` are
+  **exactly 0**. **Dynamic probe (200 fwd):** N_eff **L0 ~70 / L1 ~55 / L2 ~47**, entropy 0.70–0.77,
+  **rotating** (union still growing) ⟹ `gate.bias = 0` does **not** mean collapsed; the spread comes from the
+  trained router weights. Official target regime = **moderate ~47–70 + rotating**.
+- **This run reproduces it:** N_eff **L0 62 / L1 73 / L2 81**, entropy 0.60→0.74–0.79, union **252–256/256
+  SATURATED** ⟹ analyzer verdict "✓ balanced — load balancing is NOT the bottleneck".
+- **Definitions (so the numbers are reproducible):** `[MOE-LOAD]` entropy = normalized Shannon entropy
+  `-(p·log p).sum()/log(E)`, E=256 (`core.py`); the analyzer's `eff.experts` = `E**entropy` = `exp(H)` = the
+  load distribution's **perplexity** = mass-weighted effective expert count (`analyze_train_run.py`). N_eff
+  measures **per-step** sparsity only — "fixed collapse vs rotating" needs the **union** column.
+- **Balance A/B (⚠ all from the DEGENERATE-RoPE era — compare only within the table, never against the 4.25
+  above):** no-balance ~18 fixed → **3.63**; warm+5e-3 ~20 → 3.47; fresh+1e-2 ~120 → **2.66** (tail collapse:
+  gsm8k pos1 77%→50%, pos2 57%→28%). ⟹ **forced un-collapse is harmful; the goal is moderate sparsity +
+  rotation, not uniformity.**
+
+### Tooling added (all git-tracked under `examples/ascend_npu_dflash/`)
+
+- `stitch_train_logs.py` — merge the logs of a kill+resume run into ONE continuous `global_step` curve
+  (de-dupes the resume overlap, reports gaps). Parses exactly like `analyze_train_run.py`.
+- `consolidate_run.py` — `--auto-chain` walks `global_step` back from the deepest log to reconstruct a whole
+  resume LINE, then writes one recipe-named dir: `train_full.log` + `recipe.txt` (argparse **and** the
+  resolved `DSPARK_*` env) + `MANIFEST.txt` + **symlinks to every real trainer checkpoint**.
+- `verify_safetensors_dir.py` — verify a downloaded model dir is complete/intact (shard count from the
+  `-of-N` naming, per-shard header-vs-size, JSON parse, zero-byte files; skips `.cache/` downloader
+  internals; `--manifest` diffs against the HF file tree incl. LFS sha256).
+- `plot_best_vs_baseline.py` — gained the RoPE-fix line as **"current best"** + `--group best` (default) and
+  **`--latest`** (released vs the newest ckpt only = the report front-page figure).
+
+### Upstream PR
+
+- **[vllm-project/speculators#942](https://github.com/vllm-project/speculators/pull/942)** —
+  `fix(loss): normalize training loss by global (cross-rank) token count`. `loss_function` normalized by the
+  **per-rank** supervised-token count; under DDP/FSDP grad mean-averaging that makes the objective a
+  rank-local mean of ratios instead of the token-weighted one. Packing does NOT prevent it: the multipack
+  sampler balances **total** tokens against a budget and never inspects `loss_mask`. Fix = all-reduce the
+  (detached) denominator to the global count and scale by `world_size`; **gradient-identical when ranks are
+  token-balanced**. +11 lines in `metrics.py` + a 2-rank gloo test. DeepSpec's `_build_loss` does the
+  identical math. ⚠ **SpecForge is NOT a precedent** (its `reduce_metrics` reduces over the **SP group**,
+  differentiably, on num AND den; the base adapter doesn't reduce at all) — that citation was removed before
+  submitting. Status: DCO green (needs `git commit -s`), CodeRabbit/docs green, blocked only on the
+  approved-reviewer list. Related upstream PR #871 (Ulysses SP) touches the same lines for a DIFFERENT
+  problem (SP-group reassembly) — noted in a PR comment, will rebase if #871 lands first.
+
+### Doc hygiene done this day
+
+Index (`ascend-npu-dsv4-dspark-pipeline.md`) gained a **"Cross-cutting docs & tooling"** section — the
+worklog, the acceptance-troubleshooting tree, run-comparison, the serve-rebuild and Mooncake docs were all
+reachable only by knowing they existed. Stage 5 was renamed **Convert → Serve → Eval** and now names
+`convert_dspark_to_vllm.py` / `verify_dspark_conversion.py`: a trainer checkpoint **cannot** be served
+directly, and that step was missing from the index — the single most likely place for someone reproducing
+this to get stuck.
