@@ -81,11 +81,16 @@ class MarkovHead(nn.Module):
 
 
 class ConfidenceHead(nn.Module):
-    """Per-position acceptance-probability predictor (linear -> scalar logit)."""
+    """Per-position acceptance-probability predictor (linear -> scalar logit).
+
+    ``bias=False`` matches the released DSpark ``mtp.*`` layout, which carries only
+    ``confidence_head.proj.weight`` (see ``dsv4_dspark/weights.py::expected_draft_keys``).
+    A bias here would train fine but could never be serialized into that layout.
+    """
 
     def __init__(self, input_dim: int) -> None:
         super().__init__()
-        self.proj = nn.Linear(input_dim, 1)
+        self.proj = nn.Linear(input_dim, 1, bias=False)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.proj(features).squeeze(-1)

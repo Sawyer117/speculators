@@ -134,6 +134,8 @@ def main() -> None:
         skey, _ = expected_source_key(mkey, last)
         if skey:
             covered.add(skey)
+    # confidence_head.proj.bias: LEGACY checkpoints only. ConfidenceHead is now bias-free
+    # (the released mtp.* layout has no such key); kept so pre-fix checkpoints still verify.
     droppable = [k for k in src if not k.startswith(("verifier_", "freqs")) and k not in covered
                  and not re.fullmatch(r"(confidence_head\.proj\.bias)", k)]
     if droppable:
