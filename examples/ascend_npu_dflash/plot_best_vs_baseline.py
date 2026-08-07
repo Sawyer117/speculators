@@ -45,7 +45,7 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
 RUNS = [
     # ── (D) ★ RoPE-FIX line (real cos/sin rotary, feb0066) — the current best, near-parity with
     #    released. Same recipe as the degenerate bal1e3 line (only variable = RoPE). STILL CLIMBING:
-    #    0.5ep 3.84 → 1.5ep 4.18 (94.6% of released); gsm8k 1.5ep 4.628 = 99.4% of released. Use
+    #    0.5ep 3.84 → 3.0ep 4.35 (98.4% of released); gsm8k 3.0ep 4.796 = 103.0% of released. Use
     #    `--group ropefix` for a clean "released vs current" figure. Source = the ropefix rows + the
     #    saved eval logs (eval_ep{0p5,1p5}_ropefix_all.txt). Rendered as the "current best" line
     #    (default `--group best`); the title says "current best", not "RoPE-fix".
@@ -96,6 +96,8 @@ RUNS = [
     },
     {
         # 2.5ep: mean 4.29 = 97.2%; gsm8k 4.753 = 102.0% of released. Non-chat 4 avg = 98.3%.
+        # 3.0ep (below): mean 4.35 = 98.4%; non-chat 4 avg 4.671 = 99.4%; gsm8k conditional c0-c4 ALL
+        # above released for the first time. Climb did NOT flatten: deltas +0.22/+0.12/+0.07/+0.04/+0.06.
         "label": "current best 2.5ep",
         "al": {"gsm8k": 4.753, "math500": 4.485, "humaneval": 4.818, "mbpp": 4.428, "mt-bench": 2.988},
         "pos": {
@@ -104,6 +106,17 @@ RUNS = [
             "humaneval": [94.35, 86.74, 76.65, 67.18, 56.85],
             "mbpp":      [90.91, 79.77, 67.90, 56.99, 47.19],
             "mt-bench":  [75.20, 51.49, 34.10, 22.70, 15.28],
+        },
+    },
+    {
+        "label": "current best 3.0ep",
+        "al": {"gsm8k": 4.796, "math500": 4.519, "humaneval": 4.855, "mbpp": 4.512, "mt-bench": 3.046},
+        "pos": {
+            "gsm8k":     [93.28, 84.98, 75.96, 67.03, 58.34],
+            "math500":   [90.56, 80.45, 70.20, 60.12, 50.62],
+            "humaneval": [94.12, 86.92, 77.05, 68.29, 59.09],
+            "mbpp":      [91.49, 81.06, 69.60, 59.30, 49.79],
+            "mt-bench":  [75.66, 52.63, 35.47, 24.22, 16.66],
         },
     },
     # ── (A) f1 single-norm reproduction curve (peak @1.5ep, then over-train decline) ──

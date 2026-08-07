@@ -592,3 +592,57 @@ DSV4, since the module is shared with the Qwen3 DSpark model.
 (`/share/canada_group_folder/ckpt/released_draft_bf16_standalone`) and list keys containing
 `confidence` — decides whether released is `proj.weight`-only (⟹ just flip `bias=False`) or has no
 confidence head at all (⟹ the head is entirely ours and was never part of the served contract).
+
+### 3.0ep eval — mean **4.35 = 98.4% of released**; non-chat **99.4%**; the plateau call is retracted
+
+`dsv4_dspark_ep3p0_ropefix_vllm-77w`, 176 A3-single, conc48, ns5, `DATASET=all`, log
+`~/eval_ep3p0_ropefix_all.txt`.
+
+| dataset | 2.5ep | **3.0ep** | Δ | released | % |
+|---|---:|---:|---:|---:|---:|
+| gsm8k | 4.753 | **4.796** | +0.043 | 4.658 | **103.0%** |
+| math500 | 4.485 | **4.519** | +0.034 | 4.661 | 97.0% |
+| humaneval | 4.818 | **4.855** | +0.037 | 4.942 | 98.2% |
+| mbpp | 4.428 | **4.512** | +0.084 | 4.535 | **99.5%** |
+| mt-bench | 2.988 | **3.046** | +0.058 | 3.294 | 92.5% |
+| **mean** | 4.29 | **4.35** | +0.05 | 4.42 | **98.4%** |
+| **non-chat (4)** | 4.621 | **4.671** | +0.050 | 4.699 | **99.4%** |
+
+Three things this run changes:
+
+1. **"Approaching plateau" is RETRACTED.** Deltas per half-epoch: +0.22 / +0.12 / +0.07 / +0.04 / **+0.06**.
+   The 2.0→2.5ep step (+0.04) was read as the onset of a plateau and produced the "next lever = anneal
+   LR→0, not more epochs" call in the `ep2p0-ropefix` ledger row. **The 2.5→3.0ep step is LARGER.** At this
+   scale that could still be run-to-run noise, but there is no flattening in the data, so that call does not
+   stand on the evidence. Keep running to 5.0ep before deciding on annealing.
+2. **Per-position is fully at/above released.** gsm8k conditional c0–c4 = **0.933 / 0.911 / 0.894 / 0.882 /
+   0.870** vs released 0.928 / 0.892 / 0.885 / 0.868 / 0.842 — **c0 crosses for the first time** (it was
+   0.927, −0.1pt, at 2.5ep). ⟹ nothing about the per-slot mechanism is behind any more.
+3. **The residual gap is one dataset.** Non-chat 99.4%; mt-bench 92.5%. That is the rollout distribution
+   (99.96% single-turn), not a model defect — the lever is multi-turn rollout data, not the recipe.
+
+⚠ **`~/eval_ep2p5_ropefix_all.txt` was destroyed.** The 3.0ep eval was first launched with the *2.5ep* `tee`
+target and aborted at the smoke test; `tee` truncates on open, so that file now holds only the aborted
+header. The 2.5ep numbers survive only as the ledger transcription. **Rule: the `tee` target is part of the
+command — change it before re-running, not after.**
+
+### `ConfidenceHead` → `bias=False`
+
+Acting on the finding above, `models/dspark/model_definitions.py:88` is now
+`nn.Linear(input_dim, 1, bias=False)`, so our module matches the released `mtp.*` layout (and its own
+`expected_draft_keys` contract). Existing checkpoints are unaffected: `train/checkpointer.py:311` already
+loads with `strict=False`, so a legacy `confidence_head.proj.bias` is reported unexpected and ignored —
+verified. The exemption in `verify_dspark_conversion.py` is kept and annotated as legacy-only.
+
+**A/B on the full unit suite** (to prove the change is inert): pristine HEAD = **18 failed / 476 passed**,
+with the change = **16 failed / 479 passed**. **New failures introduced: zero.** The two that flipped green
+are `test_dspark_metrics.py::{test_perfect_draft_low_loss_high_accept, test_confidence_cumprod_bias_sign}`,
+which were **already red** — they encoded the OLD `sample_from_anchor=False` convention and were never
+updated when the default flipped. Fixed to the production convention (all-ones mask → accept_len 3.0 at
+block_size=2; full mismatch → cumprod bias 1.0) and a new `test_perfect_draft_accept_len_anchor_convention`
+pins the legacy convention explicitly at 2.0, so the two can no longer silently swap.
+
+The remaining **16 pre-existing failures** are unrelated to this line and are recorded here so nobody
+re-diagnoses them: `train/test_draft_config_init.py` ×7 (fake args lack `init_on_meta`),
+`models/test_mtp_model.py` ×5, `models/test_mtp_attention.py`, `models/test_mtp_frozen_weights.py`,
+`convert/test_eagle3_converter.py`, `train/test_data.py` ×1 each.
