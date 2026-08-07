@@ -542,3 +542,53 @@ reachable only by knowing they existed. Stage 5 was renamed **Convert → Serve 
 `convert_dspark_to_vllm.py` / `verify_dspark_conversion.py`: a trainer checkpoint **cannot** be served
 directly, and that step was missing from the index — the single most likely place for someone reproducing
 this to get stuck.
+
+---
+
+## 2026-08-07 — 3.0ep checkpoint converted; ★ the confidence head is trained but NEVER served
+
+### 3.0ep (`epoch2_end`) landed and converted
+
+`ckpt_faithful_ep_20260804_165215/2` → `dsv4_dspark_ep3p0_ropefix_vllm-77w`, **2378/2378 bit-exact**.
+Save grid confirmed exactly: `step_interval = 12448` = 0.5 epoch, so one epoch = 24,896 steps and
+**74,688 = 3 × 24,896** — the trainer printed `Training epoch 3/5 completed` at `global_step=74,692`.
+This save **overwrote** the 2.5ep mid-epoch weights in the same `/2` dir (2.5ep had already been
+converted + evaluated, so nothing was lost — but this is the standing hazard, convert promptly).
+
+**Measured end-to-end rate: 3.17–3.18 s/step**, twice independently (71,504→73,167 over 88 min;
+73,167→74,144 over 51m34s). The log's `profile/step_ms ≈ 1.95–1.98e3` is ~60% optimistic — the
+difference is time outside the step timer (`--on-missing generate` waiting on the HS serve,
+dataloader stalls, checkpoint writes). **Use 3.17 s/step for ETAs, not `step_ms`.**
+
+### ★ Finding: `1 skipped: confidence_head.proj.bias` — chased down, three facts
+
+`convert_dspark_to_vllm.py` reports `1 skipped (target-only/buffers): ['confidence_head.proj.bias']`
+on every checkpoint (input 84 tensors → output 2378, identical for all six converted ckpts). Chased:
+
+1. **The serve drops the WHOLE head, not just the bias.**
+   `vllm_ascend/models/deepseek_v4_draft.py::_remap_dspark_name`:
+   `if rest.startswith("confidence_head."): return None`. Neither `proj.weight` nor `proj.bias` is
+   ever loaded. **The confidence head is dead code at inference today.**
+2. **Training detaches its inputs**, `src/speculators/models/dspark/core.py:181-187`:
+   `conf_features = cat([hidden_blocks.detach(), prev_emb.detach()...])`. The BCE gradient updates
+   **only** `confidence_head.proj.{weight,bias}` and can never reach the backbone.
+   ⟹ **Zero effect on every accept_len number in the ledger** — structurally, not "small". It does
+   enter the reported `train/loss` (`0.1×ce + 1.8×tv + conf` = `0.1156+0.405+0.312 = 0.832`, matches
+   the log) and the global grad-norm; at `grad_norm ≈ 0.61` no clipping fires, so no second-order
+   coupling either.
+3. **Architecture drift:** our `ConfidenceHead` is `nn.Linear(input_dim, 1)`
+   (`models/dspark/model_definitions.py:88`) = `bias=True`, but the released `mtp.*` layout has no
+   bias — `dsv4_dspark/weights.py::expected_draft_keys` lists only `confidence_head.proj.weight`, so
+   that key set is itself inconsistent with the model it claims to describe.
+
+**When it bites:** the day adaptive / dynamic draft length lands (stage 1 of the adaptive-speculation
+proposal). Then confidence actually gates drafting, and both the missing serve wiring and the bias
+mismatch become real work. **Cost to fix is low** — because the features are detached, the head can be
+re-fit on a FROZEN backbone in minutes; no retrain. Fix = `nn.Linear(input_dim, 1, bias=False)`, either
+outright (load old ckpts `strict=False`) or behind a `confidence_head_bias` flag defaulting False for
+DSV4, since the module is shared with the Qwen3 DSpark model.
+
+**Still open:** read the released draft's safetensors header
+(`/share/canada_group_folder/ckpt/released_draft_bf16_standalone`) and list keys containing
+`confidence` — decides whether released is `proj.weight`-only (⟹ just flip `bias=False`) or has no
+confidence head at all (⟹ the head is entirely ours and was never part of the served contract).
