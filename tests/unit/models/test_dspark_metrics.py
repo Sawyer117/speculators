@@ -16,11 +16,12 @@ def _ids_to_logits(ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
 
 class TestComputeMetrics:
     def test_perfect_draft_low_loss_high_accept(self):
-        # block_size=2; position 0 is the anchor (masked), position 1 supervised.
+        # DSpark drafts every block slot (sample_from_anchor=True, the default), so
+        # all block_size positions are supervised.
         ids = torch.tensor([[0, 1, 0, 2]])
         logits = _ids_to_logits(ids, 8)
         targets = logits.clone()
-        loss_mask = torch.tensor([[0, 1, 0, 1]], dtype=torch.float32)
+        loss_mask = torch.tensor([[1, 1, 1, 1]], dtype=torch.float32)
         loss, metrics = compute_metrics(
             logits,
             targets,
@@ -35,7 +36,28 @@ class TestComputeMetrics:
         assert float(loss) < 1e-2
         accept = metrics["accept_rate_sum"] / metrics["accept_rate_total"]
         assert float(accept) > 0.99
-        # One draft slot per block accepted w.p. ~1, plus the anchor token -> ~2.
+        # block_size=2 slots accepted w.p. ~1, plus the anchor token -> ~3.
+        accept_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
+        assert abs(float(accept_len) - 3.0) < 1e-2
+
+    def test_perfect_draft_accept_len_anchor_convention(self):
+        # sample_from_anchor=False treats slot 0 as the GIVEN anchor rather than a
+        # drafted slot, so a perfect draft yields block_size-1 slots + the anchor -> ~2.
+        # Pinned so the two conventions cannot silently swap again.
+        ids = torch.tensor([[0, 1, 0, 2]])
+        logits = _ids_to_logits(ids, 8)
+        targets = logits.clone()
+        loss_mask = torch.tensor([[0, 1, 0, 1]], dtype=torch.float32)
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            2,
+            gamma=4.0,
+            loss_config=_DEFAULT_LOSS,
+            sample_from_anchor=False,
+        )
         accept_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
         assert abs(float(accept_len) - 2.0) < 1e-2
 
@@ -90,12 +112,12 @@ class TestComputeMetrics:
         assert float(loss_conf) > float(loss_no_conf)
 
     def test_confidence_cumprod_bias_sign(self):
-        # Draft != target so accept rate is ~0; an over-confident head (predicts
-        # accept ~1) must show a positive cumulative-product calibration bias.
+        # Draft != target at EVERY slot so accept rate is ~0; an over-confident head
+        # (predicts accept ~1) must show a positive cumulative-product calibration bias.
         ids = torch.tensor([[0, 1, 0, 2]])
         logits = _ids_to_logits(ids, 8)
-        targets = _ids_to_logits(torch.tensor([[0, 3, 0, 4]]), 8)
-        loss_mask = torch.tensor([[0, 1, 0, 1]], dtype=torch.float32)
+        targets = _ids_to_logits(torch.tensor([[5, 3, 6, 4]]), 8)
+        loss_mask = torch.tensor([[1, 1, 1, 1]], dtype=torch.float32)
         confidence_logits = torch.full((1, 4), 20.0)  # sigmoid ~ 1.0
         _, metrics = compute_metrics(
             logits,
