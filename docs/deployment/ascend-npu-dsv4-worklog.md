@@ -486,7 +486,9 @@ dedup 77W). Converted with `convert_dspark_to_vllm.py` (each 2378/2378 bit-exact
   0.928/0.892/0.885/0.868/0.842 ⟹ pos1–4 at or above. Residual gap = pos0 (−0.2pt) and **mt-bench (90.5%)**,
   which is a DATA-distribution issue (our rollout is 99.96% single-turn), not a bug.
 - **Next lever for the last ~4% = anneal LR→0** (the DeepSpec full-anneal we have never run), not more
-  epochs at constant LR.
+  epochs at constant LR. ⚠ **RETRACTED 2026-08-07 — see the 3.5ep entry**: this run was already
+  annealing (`--scheduler-type cosine` over 5 epochs → exactly 0 at the last step; predicted
+  `lr(gs=87138)=4.444e-05` matches the logged `4.45e-05`). The LR was never constant.
 
 ### MoE routing — the official regime, reproduced
 
