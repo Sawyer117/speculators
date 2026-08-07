@@ -646,3 +646,49 @@ The remaining **16 pre-existing failures** are unrelated to this line and are re
 re-diagnoses them: `train/test_draft_config_init.py` ×7 (fake args lack `init_on_meta`),
 `models/test_mtp_model.py` ×5, `models/test_mtp_attention.py`, `models/test_mtp_frozen_weights.py`,
 `convert/test_eagle3_converter.py`, `train/test_data.py` ×1 each.
+
+### 3.5ep eval — mean **4.36 = 98.7%**; the climb IS flattening; ★ the LR was already annealing all along
+
+`dsv4_dspark_ep3p5_ropefix_vllm-77w` (ckpt `/3`, `global_step` 87,136), 176 A3-single, conc48, ns5,
+log `~/eval_ep3p5_ropefix_all.txt`.
+
+| dataset | n | 3.0ep | **3.5ep** | Δ | released | % |
+|---|---:|---:|---:|---:|---:|---:|
+| gsm8k | 1309 | 4.796 | **4.822** | +0.026 | 4.658 | **103.5%** |
+| math500 | 490 | 4.519 | **4.548** | +0.029 | 4.661 | 97.6% |
+| humaneval | 154 | 4.855 | **4.832** | **−0.023** | 4.942 | 97.8% |
+| mbpp | 247 | 4.512 | **4.504** | **−0.008** | 4.535 | 99.3% |
+| mt-bench | 70 | 3.046 | **3.107** | +0.061 | 3.294 | 94.3% |
+| **mean** | | 4.346 | **4.363** | **+0.017** | 4.418 | **98.7%** |
+| **non-chat (4)** | | 4.671 | **4.677** | +0.006 | 4.699 | **99.5%** |
+
+1. **The plateau call is back on, and this time the data supports it.** Deltas
+   +0.22/+0.12/+0.07/+0.04/+0.06/**+0.02**. The +0.06 at 3.0ep — which made me retract "approaching
+   plateau" — now reads as jitter around a decelerating trend, not a re-acceleration. **Non-chat is
+   static (+0.006).** The only real gain is **mt-bench +0.061** (90.7% → 92.5% → 94.3% over the last
+   three checkpoints): the laggard is closing while everything else has converged.
+2. **Two datasets moved DOWN** — humaneval −0.023, mbpp −0.008. They are the two SMALLEST sample sets
+   (154 / 247). Greedy temp0 makes a *given* draft reproducible, so these are real draft-to-draft
+   differences rather than serve noise; but at n=154 a −0.02 is not worth acting on.
+3. gsm8k conditional c0–c4 = 0.934/0.912/0.897/0.888/0.871, still above released at every position.
+
+### ★ Correction: "anneal LR→0" is not a future lever — this run has been annealing since step 4,979
+
+The `ep2p0-ropefix` ledger row concluded "**next lever for the last ~4%: anneal LR→0 (the DeepSpec
+full-anneal we have never run)**". That is **wrong**. The run's own launcher passes
+`--scheduler-type cosine --scheduler-warmup-ratio 0.04` over `EPOCHS=5`, i.e. a cosine decay to
+**exactly zero** at the final step. Verified against the log rather than assumed:
+
+```
+TOT = 5 x 24,896 = 124,480    warmup = round(0.04 x TOT) = 4,979
+lr(gs) = 2e-4 * 0.5 * (1 + cos(pi * (gs-4979)/(124480-4979)))
+lr(87,138) = 4.444e-05        <-- log at that step prints lr=4.45e-05   MATCH
+```
+
+so the remaining schedule is **4.44e-5 (3.5ep) → 2.07e-5 (4.0ep) → 5.31e-6 (4.5ep) → 0 (5.0ep)**.
+⟹ **the last 1.5 epochs ARE the full anneal.** There is no anneal-or-not decision to make; the
+correct action is to let the run finish. Whatever the anneal is worth will show up in the 4.0 / 4.5 /
+5.0ep checkpoints, and *that* is the number to compare against the 3.5ep plateau.
+
+Remaining: 4.0ep @ gs 99,584 (~11 h), 4.5ep @ 112,032, 5.0ep @ 124,480 (~33 h at the measured
+3.17 s/step). Three checkpoints left, not one — the run writes two saves per integer epoch dir.

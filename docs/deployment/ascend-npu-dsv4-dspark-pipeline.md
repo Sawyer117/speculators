@@ -21,8 +21,8 @@ Arrow row `i` **and** `hs_<i>` together (`loss_mask` from Arrow, hidden states f
 
 ## ⚡ Shortest reproduction path
 
-Six steps from nothing to the current result (**mean accept_len 4.35 = 98.4% of the released draft — 99.4%
-over the four non-chat datasets — with gsm8k 4.796 surpassing released 4.658**). Paths below are the A2 layout (`/share` shared storage, 115/116 =
+Six steps from nothing to the current result (**mean accept_len 4.36 = 98.7% of the released draft — 99.5%
+over the four non-chat datasets — with gsm8k 4.822 surpassing released 4.658**). Paths below are the A2 layout (`/share` shared storage, 115/116 =
 serve, 109 = train); on A3 substitute `/home/canada_group_folder` (see [box-path note](#status-at-a-glance)).
 Each step links the stage that explains it.
 
@@ -77,7 +77,7 @@ TOKENIZER=<ckpt_root>/DeepSeek-V4-Flash-bf16 DATASET=all CONCURRENCY=48 PORT=700
    re-indexed dataset silently pairs the wrong sample (it errors, it does not regenerate).
 
 Expected trajectory (so you can tell early whether your run is on track):
-**0.5ep 3.84 → 1.0ep 4.06 → 1.5ep 4.18 → 2.0ep 4.25 → 2.5ep 4.29 → 3.0ep 4.35** (mean over the 5 datasets).
+**0.5ep 3.84 → 1.0 4.06 → 1.5 4.18 → 2.0 4.25 → 2.5 4.29 → 3.0 4.35 → 3.5 4.36** (mean over the 5 datasets).
 
 ## The chain
 
@@ -114,18 +114,20 @@ Expected trajectory (so you can tell early whether your run is on track):
   vLLM-Ascend/MindSpeed/torchtitan-npu). A from-scratch RoPE-fixed run — same recipe as the degenerate
   `ep0p5-bal1e3`, **ONLY variable = RoPE** — now climbs **monotonically**:
 
-  | epoch | 0.5 | 1.0 | 1.5 | 2.0 | 2.5 | **3.0** |
-  |---|---|---|---|---|---|---|
-  | mean accept_len | 3.84 | 4.06 | 4.18 | 4.25 | 4.29 | **4.35** |
-  | % of released 4.42 | 87.0% | 91.8% | 94.6% | 96.3% | 97.2% | **98.4%** |
+  | epoch | 0.5 | 1.0 | 1.5 | 2.0 | 2.5 | 3.0 | **3.5** |
+  |---|---|---|---|---|---|---|---|
+  | mean accept_len | 3.84 | 4.06 | 4.18 | 4.25 | 4.29 | 4.35 | **4.36** |
+  | % of released 4.42 | 87.0% | 91.8% | 94.6% | 96.3% | 97.2% | 98.4% | **98.7%** |
 
-  **At 3.0ep gsm8k = 4.796, which SURPASSES the released draft's 4.658 (103.0%)**, and the per-position
+  **At 3.5ep gsm8k = 4.822, which SURPASSES the released draft's 4.658 (103.5%)**, and the per-position
   *conditional* accept is **above released at every position pos0–pos4**. The gain is the **tail** (later
   block slots finally rotate) and the diagnosed **`train↑/eval↓` divergence is RESOLVED — eval now tracks
   train** (the degenerate lines had already turned DOWN by 2.0ep: 3.56→3.45). Over the four **non-chat**
-  datasets the mean is **4.671 vs released 4.699 = 99.4%**, so the residual headline gap is essentially all
-  mt-bench (92.5%) = multi-turn chat, a rollout **data-distribution** issue (99.96% single-turn).
-  Per-half-epoch deltas +0.22/+0.12/+0.07/+0.04/**+0.06** — the climb has **not** flattened.
+  datasets the mean is **4.677 vs released 4.699 = 99.5%**, so the residual headline gap is essentially all
+  mt-bench (94.3%) = multi-turn chat, a rollout **data-distribution** issue (99.96% single-turn).
+  Per-half-epoch deltas +0.22/+0.12/+0.07/+0.04/+0.06/**+0.02** — the climb is now flattening, and at
+  3.5ep the only dataset still gaining is mt-bench. Note the LR is **already annealing**: the cosine
+  schedule over 5 epochs reaches exactly 0 at 5.0ep, so the last 1.5 epochs are a full anneal.
   Full rows + per-position in the stage-5 ledger. ⟹ the earlier "gap = data/recipe/tail / serve bug /
   no retrain" conclusions below are SUPERSEDED.
 - **A3 two-box move + eval baselines locked (2026-07-20).** New topology: **182 = A3 inference + training-HS
@@ -139,7 +141,7 @@ Expected trajectory (so you can tell early whether your run is on track):
   `get_mtp_target_hidden_states()`; pure-python, no rebuild), enabled by `serve_dsv4_a3_singlenode.sh HS_DUMP=1`.
   **Eval baselines** now in the append-only ledger (stage 5): released draft full-`DATASET=all` **mean 4.42**
   (gsm8k 4.658 reproduced); our best-at-the-time `epoch4-17w` **mean 3.08 = 70%** (gap then blamed on the
-  pos3/pos4 tail — ⟹ **SUPERSEDED: the tail gap was degenerate RoPE; current best = the RoPE-fix line at 3.0ep, mean 4.35**, see the top bullet). Static
+  pos3/pos4 tail — ⟹ **SUPERSEDED: the tail gap was degenerate RoPE; current best = the RoPE-fix line at 3.5ep, mean 4.36**, see the top bullet). Static
   scoreboard `plot_best_vs_baseline.py`; `analyze_train_run.py` overlays the 3 released refs. **77W** dataset
   (775,965 deduped, the newest/most-complete — supersedes 17W/45W) registered (§3.1) + being prepped to
   `arrow_0720_77w` for the next retrain. See the **2026-07-20 worklog section** for the live bring-up detail.
