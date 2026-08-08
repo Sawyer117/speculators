@@ -45,7 +45,7 @@ BASELINE_POS = {  # per-position CUMULATIVE accept rate S_k (%), pos0..pos4
 RUNS = [
     # ── (D) ★ RoPE-FIX line (real cos/sin rotary, feb0066) — the current best, near-parity with
     #    released. Same recipe as the degenerate bal1e3 line (only variable = RoPE). STILL CLIMBING:
-    #    0.5ep 3.84 → 3.5ep 4.36 (98.7% of released); gsm8k 3.5ep 4.822 = 103.5% of released. Use
+    #    0.5ep 3.84 → 4.0ep 4.39 (99.4%); NON-CHAT 4.726 vs released 4.699 = 100.6% (passed). Use
     #    `--group ropefix` for a clean "released vs current" figure. Source = the ropefix rows + the
     #    saved eval logs (eval_ep{0p5,1p5}_ropefix_all.txt). Rendered as the "current best" line
     #    (default `--group best`); the title says "current best", not "RoPE-fix".
@@ -130,6 +130,20 @@ RUNS = [
             "humaneval": [94.28, 86.81, 76.35, 68.11, 57.70],
             "mbpp":      [91.22, 80.96, 69.49, 59.14, 49.57],
             "mt-bench":  [76.43, 53.64, 36.76, 25.69, 18.15],
+        },
+    },
+    {
+        # 4.0ep: mean 4.39 = 99.4%; NON-CHAT 4.726 PASSES released 4.699 (100.6%). gsm8k 103.7%,
+        # mbpp 100.9%. The 3.5ep "plateau" was small-sample bounce -- humaneval/mbpp/mt-bench
+        # alternate and cancel; gsm8k (n=1309) and math500 (n=490) rise monotonically throughout.
+        "label": "current best 4.0ep",
+        "al": {"gsm8k": 4.831, "math500": 4.573, "humaneval": 4.924, "mbpp": 4.574, "mt-bench": 3.062},
+        "pos": {
+            "gsm8k":     [93.56, 85.34, 76.48, 67.93, 59.75],
+            "math500":   [90.95, 81.17, 71.40, 61.63, 52.15],
+            "humaneval": [95.16, 88.46, 78.25, 69.95, 60.55],
+            "mbpp":      [91.93, 81.94, 71.07, 60.91, 51.57],
+            "mt-bench":  [75.99, 52.74, 36.00, 24.64, 16.83],
         },
     },
     # ── (A) f1 single-norm reproduction curve (peak @1.5ep, then over-train decline) ──

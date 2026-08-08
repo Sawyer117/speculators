@@ -694,3 +694,54 @@ correct action is to let the run finish. Whatever the anneal is worth will show 
 
 Remaining: 4.0ep @ gs 99,584 (~11 h), 4.5ep @ 112,032, 5.0ep @ 124,480 (~33 h at the measured
 3.17 s/step). Three checkpoints left, not one — the run writes two saves per integer epoch dir.
+
+### 4.0ep eval — ★ the non-chat average PASSES the released draft (100.6%); the 3.5ep plateau was noise
+
+`dsv4_dspark_ep4p0_ropefix_vllm-77w` (ckpt `/3` = epoch3_end, `global_step` 99,584), 176 A3-single,
+conc48, ns5, log `~/eval_ep4p0_ropefix_all.txt`. 2378/2378 bit-exact.
+
+| dataset | n | 3.5ep | **4.0ep** | Δ | released | % |
+|---|---:|---:|---:|---:|---:|---:|
+| gsm8k | 1309 | 4.822 | **4.831** | +0.009 | 4.658 | **103.7%** |
+| math500 | 490 | 4.548 | **4.573** | +0.025 | 4.661 | 98.1% |
+| humaneval | 154 | 4.832 | **4.924** | +0.092 | 4.942 | 99.6% |
+| mbpp | 247 | 4.504 | **4.574** | +0.070 | 4.535 | **100.9%** |
+| mt-bench | 70 | 3.107 | **3.062** | −0.045 | 3.294 | 93.0% |
+| **mean** | | 4.363 | **4.393** | +0.030 | 4.418 | **99.4%** |
+| **non-chat (4)** | | 4.677 | **4.726** | +0.049 | 4.699 | ★ **100.6%** |
+
+**Two datasets now exceed the released draft** (gsm8k 103.7%, mbpp 100.9%) and humaneval is at 99.6%.
+**The four non-chat datasets average ABOVE released for the first time.** The whole remaining headline
+gap is mt-bench, i.e. multi-turn chat = a rollout data-distribution problem, not a model one.
+
+### ★ Retraction: the 3.5ep "the climb IS flattening" call was over-reading one point
+
+Written at 3.5ep: *"The plateau call is back on, and this time the data supports it."* It did not.
+Lining up 3.0 → 3.5 → 4.0 for the three SMALL sets shows them alternating and cancelling:
+
+```
+humaneval (n= 154)   4.855 → 4.832 (−0.023) → 4.924 (+0.092)
+mbpp      (n= 247)   4.512 → 4.504 (−0.008) → 4.574 (+0.070)
+mt-bench  (n=  70)   3.046 → 3.107 (+0.061) → 3.062 (−0.045)
+```
+
+At 3.5ep humaneval and mbpp happened to dip together while mt-bench rose, producing the +0.02 that
+read as a plateau; at 4.0ep all three reversed. Meanwhile the two LARGE sets — gsm8k (n=1309) and
+math500 (n=490) — have risen at **every** checkpoint with no inflection at all.
+
+**Method note, for every future checkpoint:** the per-half-epoch deltas (+0.22/+0.12/+0.07/+0.04/
++0.06/+0.01/+0.03) are now the *same order of magnitude* as the per-checkpoint bounce of the small
+sets. ⟹ **convergence cannot be called from a single point at ±0.03 resolution.** Read the trend on
+gsm8k + math500 (which carry 1799 of the 2270 samples), quote the 5-set mean as the headline, and
+treat any single-checkpoint move in humaneval / mbpp / mt-bench as provisional until the next point
+confirms the direction. Both this and the earlier "anneal LR is a future lever" error came from the
+same habit — turning one observation into a conclusion.
+
+gsm8k conditional c0–c4 = **0.936/0.912/0.896/0.888/0.880** vs released 0.928/0.892/0.885/0.868/0.842:
+above at every position, and the **c4 margin has widened to +3.8pt** (was +1.4pt at 2.5ep). LR here is
+2.07e-05, i.e. two thirds through the cosine anneal.
+
+⚠ Both 4.0ep and 4.5ep were saved before either was converted (the 4.0ep notification was missed).
+4.0ep sits in `/3`, which nothing writes to again — safe. 4.5ep sits in `/4` and **is overwritten by the
+5.0ep epoch-end save**; both were converted in time. Checkpoint→dir mapping for this run:
+`/0`←0.5,1.0ep · `/1`←1.5,2.0 · `/2`←2.5,3.0 · `/3`←3.5,4.0 · `/4`←4.5,5.0.
