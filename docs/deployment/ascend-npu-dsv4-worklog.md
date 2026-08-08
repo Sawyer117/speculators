@@ -797,3 +797,55 @@ denominator. It is **draft-independent** (target + serve only), so it is measure
   notice and the benchmark proceeds. Compare **output tok/s** and **mean ITL**; **TTFT must be
   ~unchanged** between the arms (it is prefill, draft-independent) — that is the free validity check
   that the two runs saw the same machine state.
+
+### AR (no-spec) baseline @ conc48 — **mean speedup 1.42× (1.21–1.77×)**; the long-open denominator is closed
+
+Serve started **without `DRAFT=`**, otherwise the identical command (`DATASET=all CONCURRENCY=48`).
+`run_dspark_eval.sh` tolerates the missing spec counters as predicted — step [3/4] printed its notice
+and the benchmark ran. Log `~/eval_ar_base_conc48.txt`. Denominator is draft-independent, so this is
+measured once and reused for every row in the ledger.
+
+| dataset | AR tok/s | spec tok/s (4.5ep) | ×(thru) | ×(wall) | ×(E2E) | ms/token AR→spec |
+|---|---:|---:|---:|---:|---:|---|
+| gsm8k | 460.7 | 596.4 | **1.29×** | 1.29× | 1.28× | 102.6 → 79.7 |
+| math500 | 612.3 | 819.6 | **1.34×** | 1.34× | 1.28× | 66.8 → 52.4 |
+| humaneval | 320.9 | 568.6 | **1.77×** | 1.81× | 1.43× | 103.2 → 73.6 |
+| mbpp | 669.0 | 988.9 | **1.48×** | 1.47× | 1.39× | 61.5 → 44.1 |
+| mt-bench | 446.8 | 540.9 | **1.21×** | 1.18× | 1.12× | 114.3 → 99.9 |
+| **mean** | | | **1.42×** | | | |
+
+Three independent estimators (throughput ratio, wall-clock ratio, E2E-latency ratio) agree to ~1%.
+
+### ★ Correction: "TTFT must be unchanged" is NOT the validity check for spec-vs-AR
+
+Stated in the 4.5ep entry when planning this measurement. Measured TTFT is **1.50–2.43× HIGHER** with
+spec (gsm8k 467→1134, math500 422→904, humaneval 558→1092, mbpp 485→803, mt-bench 492→740 ms).
+
+That is **expected, not a broken comparison**. At conc48 TTFT is dominated by **queueing**, and with
+drafting on, every engine step costs a draft forward plus a 6-token verify, so requests are admitted
+more slowly. The original rule was derived from comparing **two drafts** (both paying the same
+per-step cost, so TTFT genuinely isolates machine state) — it does not transfer to spec-vs-AR.
+Likewise **`Mean/Median ITL` is not comparable across arms**: spec emits an accepted block at once, so
+its ITL measures the gap between *blocks*, not tokens (median 416 ms for ~4.8 tokens ≈ 87 ms/token,
+against AR's 48.8 ms — which would wrongly suggest spec is slower).
+
+**The correct check is total output tokens** — greedy over identical prompts ⟹ identical work:
++0.6 / −0.4 / −1.9 / +0.5 / +2.2 % across the five sets, all within ±2.2%. Use this from now on.
+
+### Observation worth following up: our spec decode is not bit-lossless vs AR
+
+Greedy + a *lossless* speculative decoder should emit **token-for-token identical** output, so the
+totals above should match exactly rather than to ±2%. Most likely cause is **batch-dependent numerics
+in the target forward** (spec runs different batch shapes ⟹ different reduction order ⟹ an occasional
+different argmax at a near-tie), which is not by itself a defect. But it means **"bit-identical to the
+AR path" is something we have never verified**. A direct check (same prompts, greedy, diff the output
+strings) is cheap and has not been run.
+
+### Why speedup does not track accept_len
+
+gsm8k has the highest non-chat accept_len (4.840) but the **lowest** non-chat speedup (1.29×), while
+humaneval (4.954) gets **1.77×**. At fixed concurrency the win depends on how saturated the engine is:
+humaneval's 154 samples finish in 31–56 s and never fill the batch, so the latency win shows; gsm8k /
+math500 / mbpp run long and saturate, so the gain is capped by throughput. ⟹ **conc48 systematically
+understates the draft. 1.42× is a conservative lower bound** — quote it as such. The conc1 pair (both
+arms re-run) is the figure that isolates the draft's contribution, and is the open TODO.
