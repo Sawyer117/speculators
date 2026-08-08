@@ -745,3 +745,55 @@ above at every position, and the **c4 margin has widened to +3.8pt** (was +1.4pt
 4.0ep sits in `/3`, which nothing writes to again — safe. 4.5ep sits in `/4` and **is overwritten by the
 5.0ep epoch-end save**; both were converted in time. Checkpoint→dir mapping for this run:
 `/0`←0.5,1.0ep · `/1`←1.5,2.0 · `/2`←2.5,3.0 · `/3`←3.5,4.0 · `/4`←4.5,5.0.
+
+### 4.5ep eval — mean **4.41 = 99.7%**, THREE datasets above released; convergence finally has large-sample support
+
+`dsv4_dspark_ep4p5_ropefix_vllm-77w` (ckpt `/4` = epoch4_step12448, `global_step` 112,032), 176
+A3-single, conc48, ns5, log `~/eval_ep4p5_ropefix_all.txt`. 2378/2378 bit-exact.
+
+| dataset | n | 4.0ep | **4.5ep** | Δ | released | % |
+|---|---:|---:|---:|---:|---:|---:|
+| gsm8k | 1309 | 4.831 | **4.840** | +0.009 | 4.658 | **103.9%** |
+| math500 | 490 | 4.573 | **4.564** | −0.009 | 4.661 | 97.9% |
+| humaneval | 154 | 4.924 | **4.954** | +0.030 | 4.942 | **100.2%** |
+| mbpp | 247 | 4.574 | **4.553** | −0.021 | 4.535 | **100.4%** |
+| mt-bench | 70 | 3.062 | **3.122** | +0.060 | 3.294 | 94.8% |
+| **mean** | | 4.393 | **4.407** | +0.014 | 4.418 | **99.7%** |
+| **non-chat (4)** | | 4.726 | **4.728** | +0.002 | 4.699 | **100.6%** |
+
+**humaneval crosses this step**, so gsm8k / humaneval / mbpp are all now above the released draft and
+the overall mean is 0.3% short of it.
+
+**Applying the method note from 4.0ep — read the LARGE sets, not the mean:**
+
+```
+gsm8k  (n=1309)  +0.184 +0.135 +0.073 +0.052 +0.043 +0.026 +0.009 +0.009
+math500(n= 490)  +0.173 +0.167 +0.023 +0.054 +0.034 +0.029 +0.025 −0.009   <- first decline
+```
+
+gsm8k's per-checkpoint gain has decayed monotonically by 20× and is **flat at +0.009 for two
+consecutive checkpoints**; math500 declines for the first time after eight straight rises. **This is
+the convergence signal — on 1799 of the 2270 samples, not on a single-point mean move.** Unlike the
+3.5ep call it does not rest on the noisy small sets. Still: it is one step from the end, 5.0ep is the
+confirmation, and **no decision rides on it** — the run terminates at 5.0ep regardless and the LR is
+already down to 5.31e-06.
+
+gsm8k conditional c0–c4 = **0.936/0.914/0.900/0.886/0.878** vs released 0.928/0.892/0.885/0.868/0.842
+— above at every position, c4 margin +3.6pt.
+
+### Next: AR (no-spec) baseline at conc48 — closes the open `no-spec base` TODO
+
+Decided with the user: measure the autoregressive baseline so every ledger row gets a speedup
+denominator. It is **draft-independent** (target + serve only), so it is measured once and reused.
+
+- **conc48 first** — same concurrency as every existing row, so the comparison is apples-to-apples
+  with the whole ledger. ⚠ Expect a modest number: at conc48 the serve is **throughput-bound**, and
+  spec decode spends compute on drafting that would otherwise serve more requests. This is the same
+  effect already seen when accept_len rose while tok/s did not track.
+- **conc1 later** — that is where spec decode actually pays, and it is the number that matches what
+  people mean by "speedup". Needs BOTH arms re-run at conc1 (2 runs), so it is a separate exercise.
+- **Method:** identical command, serve started **without `DRAFT=`**. `run_dspark_eval.sh` tolerates
+  this — its step [3/4] counter check is `grep ... || echo`, so zero spec counters only print a
+  notice and the benchmark proceeds. Compare **output tok/s** and **mean ITL**; **TTFT must be
+  ~unchanged** between the arms (it is prefill, draft-independent) — that is the free validity check
+  that the two runs saw the same machine state.
