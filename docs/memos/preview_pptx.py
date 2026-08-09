@@ -137,3 +137,23 @@ def overlaps(pptx):
                     if ox * oy > 0.25 * amin:
                         print(f"  slide {idx}: shapes {a[0]}&{b[0]} overlap "
                               f"{ox/EMU:.2f}x{oy/EMU:.2f}in")
+
+
+def text_overflow(pptx):
+    """Report text frames whose laid-out text runs past their own shape."""
+    from PIL import Image, ImageDraw
+    prs = Presentation(pptx)
+    dr = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    for idx, sl in enumerate(prs.slides, 1):
+        for sh in sl.shapes:
+            if not sh.has_text_frame or sh.has_table:
+                continue
+            w = int((sh.width or 0) / EMU * DPI); h = int((sh.height or 0) / EMU * DPI)
+            used = 6
+            for p in sh.text_frame.paragraphs:
+                for run in p.runs:
+                    f = fnt(run.font.size.pt if run.font.size else 12, run.font.bold)
+                    used += len(wrap(dr, run.text, f, max(20, w - 10))) * (f.size + 2)
+            if used > h + 6:
+                print(f"  slide {idx}: shape {sh.shape_id} text {used/DPI:.2f}in "
+                      f"> box {h/DPI:.2f}in — {sh.text_frame.text[:34]!r}")

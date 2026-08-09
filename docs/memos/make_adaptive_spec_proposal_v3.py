@@ -187,8 +187,7 @@ def one_pager(prs):
     # 每个闭环把自己的「失败回退路径」写在框内,紧贴它所属的环 —— 不堆到列底下
     for (py, col, hdr, steps, fallback) in [
         (2.72, BLUE, "① 置信度调度闭环",
-         ("生存概率打分", "全局预算择优", "每请求 K_i"),
-         "⚠ 置信度与接受率不相关 → 回草稿侧重拟合(分钟级)"),
+         ("生存概率打分", "全局预算择优", "每请求 K_i"), ""),
         (4.82, ORNG, "② 变长图执行闭环",
          ("变长 decode 图捕获", "真机成本曲线标定", "场景配置"),
          "⚠ 变长进不了图 → 退回 eager,失去图重放收益"),
@@ -202,7 +201,8 @@ def one_pager(prs):
             if j < 2:
                 _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, py + 0.71 + j * 0.42,
                        0.10, 0.08, col)
-        _tbox(s, LX + 0.12, py + 1.60, LW - 0.24, 0.28, [(fallback, False, RED, 7.5)])
+        if fallback:
+            _tbox(s, LX + 0.12, py + 1.60, LW - 0.24, 0.28, [(fallback, False, RED, 7.5)])
     _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, 4.68, 0.10, 0.10, INK)
     _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX, 6.86, LW, 0.34, LGREY),
          [("可部署:动态 K 投机解码", True, INK, 9.5)], align=PP_ALIGN.CENTER, space=0)
@@ -238,10 +238,12 @@ def one_pager(prs):
              [(t, True, ORNG, 9), (sub, False, MUTE, 8)], align=PP_ALIGN.CENTER, space=1)
         if j < 2:
             _shape(s, MSO_SHAPE.RIGHT_ARROW, bx + 1.10, 5.43, 0.12, 0.14, ORNG)
-    _tbox(s, MX + 0.16, 6.02, 3.7, 0.9, [
-        ("两条候选路线,阶段 2 先验证可行性再投入:", True, INK, 9),
-        ("· 对齐上游语义 —— 后端上报 ALWAYS,按 max_query_len 派发;", False, INK, 8.5),
-        ("· SGLang 式 packed varlen —— graph key 只按总 token 数,padding 更省。", False, INK, 8.5)], space=1.5)
+    _tbox(s, MX + 0.16, 5.96, 3.74, 0.92, [
+        ("让变长进图有两条路线,阶段 2 先验证可行性:", True, INK, 8),
+        ("· 对齐上游 —— 图按 token 总数分档捕获,运行时用批内最长请求的长度挑图、其余补齐;"
+         "图数 = 档数 × 长度取值数,有补齐浪费;", False, INK, 7),
+        ("· SGLang 式 —— 各请求 token 紧挨着打包成一条,图只按总 token 数分档;"
+         "图少且无补齐浪费,代价是改数据布局 + 算子须支持。", False, INK, 7)], space=1.5)
     _tbox(s, MX + 4.02, 4.94, 3.30, 2.10, [
         ("· 固定 K 每步形状一致 → 能入图;自适应下每请求 K_i 每步不同 → 形状参差且逐步变化 → 默认出图;",
          False, INK, 8),
@@ -428,8 +430,10 @@ def build(out: str) -> None:
     _p(tf, "⟹ 准确的风险表述不是「昇腾不能变长入图」", size=15.5, bold=True, color=ACCENT, first=True, before=0)
     _p(tf, "而是:DSA 路径在设备侧持有长度、图内元数据更新机制已存在,两项结构性条件都已具备;"
            "未知量集中在 workspace 与图数量随 K 组合的膨胀,以及随之而来的显存占用与捕获耗时。", size=13, before=7)
-    _p(tf, "这把阶段 2 的第一件事定死了:先量形状数量与 workspace 膨胀,再决定走「对齐上游 ALWAYS 语义」还是"
-           "「SGLang 式 packed varlen(graph key 只按总 token 数,天然压制形状数量)」—— 而不是先写实现。",
+    _p(tf, "这把阶段 2 的第一件事定死了:先量形状数量与 workspace 膨胀,再在两条路线里选 —— "
+           "「对齐上游」按 token 总数分档捕获、运行时用批内最长请求的长度挑图并补齐(上游称后端上报 ALWAYS、"
+           "按 max_query_len 派发);「SGLang 式」把各请求 token 紧挨着打包,图只按总 token 数分档,"
+           "图少且无补齐浪费,但要改数据布局。先量再选,而不是先写实现。",
        size=13, bold=True, before=5)
 
     # 5 实施方案 ──────────────────────────────────────────────────────────────
