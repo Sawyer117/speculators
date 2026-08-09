@@ -184,28 +184,28 @@ def one_pager(prs):
          [("自适应验证运行闭环", False, BG, 11.5)], align=PP_ALIGN.CENTER, space=0)
     _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX, 2.28, LW, 0.34, LGREY),
          [("输入:草稿 block + 逐位 confidence", False, INK, 8.5)], align=PP_ALIGN.CENTER, space=0)
-    _shape(s, MSO_SHAPE.RECTANGLE, LX, 2.72, LW, 1.72, None, BLUE, 1.25)
-    _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.06, 2.78, LW - 0.12, 0.28, None),
-         [("① 置信度调度闭环", True, BLUE, 10)], space=0)
-    for j, t in enumerate(("生存概率打分", "全局预算择优", "每请求 K_i")):
-        _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.14, 3.10 + j * 0.42, LW - 0.28, 0.32, BG, BLUE, 0.75),
-             [(t, False, INK, 9)], align=PP_ALIGN.CENTER, space=0)
-        if j < 2:
-            _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, 3.43 + j * 0.42, 0.10, 0.08, BLUE)
-    _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, 4.47, 0.10, 0.10, INK)
-    _shape(s, MSO_SHAPE.RECTANGLE, LX, 4.62, LW, 1.72, None, ORNG, 1.25)
-    _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.06, 4.68, LW - 0.12, 0.28, None),
-         [("② 变长图执行闭环", True, ORNG, 10)], space=0)
-    for j, t in enumerate(("变长 decode 图捕获", "真机成本曲线标定", "场景配置")):
-        _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.14, 5.00 + j * 0.42, LW - 0.28, 0.32, BG, ORNG, 0.75),
-             [(t, False, INK, 9)], align=PP_ALIGN.CENTER, space=0)
-        if j < 2:
-            _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, 5.33 + j * 0.42, 0.10, 0.08, ORNG)
-    _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX, 6.46, LW, 0.36, LGREY),
+    # 每个闭环把自己的「失败回退路径」写在框内,紧贴它所属的环 —— 不堆到列底下
+    for (py, col, hdr, steps, fallback) in [
+        (2.72, BLUE, "① 置信度调度闭环",
+         ("生存概率打分", "全局预算择优", "每请求 K_i"),
+         "⚠ 置信度与接受率不相关 → 回草稿侧重拟合(分钟级)"),
+        (4.82, ORNG, "② 变长图执行闭环",
+         ("变长 decode 图捕获", "真机成本曲线标定", "场景配置"),
+         "⚠ 变长进不了图 → 退回 eager,失去图重放收益"),
+    ]:
+        _shape(s, MSO_SHAPE.RECTANGLE, LX, py, LW, 1.92, None, col, 1.25)
+        _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.06, py + 0.06, LW - 0.12, 0.28, None),
+             [(hdr, True, col, 10)], space=0)
+        for j, t in enumerate(steps):
+            _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.14, py + 0.38 + j * 0.42, LW - 0.28, 0.32,
+                        BG, col, 0.75), [(t, False, INK, 9)], align=PP_ALIGN.CENTER, space=0)
+            if j < 2:
+                _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, py + 0.71 + j * 0.42,
+                       0.10, 0.08, col)
+        _tbox(s, LX + 0.12, py + 1.60, LW - 0.24, 0.28, [(fallback, False, RED, 7.5)])
+    _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, 4.68, 0.10, 0.10, INK)
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX, 6.86, LW, 0.34, LGREY),
          [("可部署:动态 K 投机解码", True, INK, 9.5)], align=PP_ALIGN.CENTER, space=0)
-    _tbox(s, LX - 0.02, 6.84, LW + 0.1, 0.56,
-          [("① 信号不可用 → 回草稿侧重拟合置信度头", False, MUTE, 8),
-           ("② 进不了图 → 退回 eager,收益打折", False, RED, 8)], space=1)
 
     # ── 中栏 ① 算法侧 ─────────────────────────────────────────────────────
     MX, MW = 2.98, 7.42
