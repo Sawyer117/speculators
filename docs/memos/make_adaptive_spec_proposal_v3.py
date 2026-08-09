@@ -169,8 +169,8 @@ def one_pager(prs):
          [("挑", False, BG, 12), ("战", False, BG, 12)], align=PP_ALIGN.CENTER, space=0)
     _fit(_shape(s, MSO_SHAPE.RECTANGLE, 0.74, Y, 5.62, H, GREY),
          [("· 固定 K 对全 batch 一视同仁 —— 高置信请求本可多验,低置信请求白耗 target 算力", False, INK, 10.5),
-          ("· 变长 K_i 与设备图「形状固定」天然冲突,昇腾当前按固定形状捕获", False, INK, 10.5),
-          ("· 昇腾侧 confidence head 根本未被加载,调度所需的信号拿不到", False, RED, 10.5)])
+          ("★ 变长 K_i 与设备图「形状固定」冲突 —— 若进不了图,即便自适应实现了,性能仍可能不如固定 K", False, RED, 10.5),
+          ("· confidence head 在昇腾侧尚未加载(短期缺项,移植上游改法即可,非难点)", False, MUTE, 10.5)])
     _fit(_shape(s, MSO_SHAPE.RECTANGLE, 6.62, Y, 0.42, H, RED),
          [("目", False, BG, 12), ("标", False, BG, 12)], align=PP_ALIGN.CENTER, space=0)
     _fit(_shape(s, MSO_SHAPE.RECTANGLE, 7.04, Y, 5.94, H, GREY),
@@ -203,8 +203,9 @@ def one_pager(prs):
             _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, 5.33 + j * 0.42, 0.10, 0.08, ORNG)
     _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX, 6.46, LW, 0.36, LGREY),
          [("可部署:动态 K 投机解码", True, INK, 9.5)], align=PP_ALIGN.CENTER, space=0)
-    _tbox(s, LX - 0.02, 6.88, LW + 0.1, 0.5,
-          [("信号不可用 → 回草稿侧重拟合置信度头", False, RED, 8)])
+    _tbox(s, LX - 0.02, 6.84, LW + 0.1, 0.56,
+          [("① 信号不可用 → 回草稿侧重拟合置信度头", False, MUTE, 8),
+           ("② 进不了图 → 退回 eager,收益打折", False, RED, 8)], space=1)
 
     # ── 中栏 ① 算法侧 ─────────────────────────────────────────────────────
     MX, MW = 2.98, 7.42
@@ -341,9 +342,9 @@ def build(out: str) -> None:
                "均已在源码层面核实,不是推测")
     _table(s, [
         ["#", "缺口", "证据", "工作量判断"],
-        ["1", "confidence head 在昇腾侧\n根本没有被加载",
+        ["1", "confidence head 在昇腾侧\n尚未加载(短期缺项)",
          "vllm-ascend 的 deepseek_v4_draft.py 中\n_remap_dspark_name 对 confidence_head.*\n直接 return None;上游 main 原本同样如此,\n#47808 正是解除它的那个 PR",
-         "小 —— 移植上游改法即可。\n草稿侧我们已就位:训练已产出该头,\n且已按上游区分 bias(DSV4 无 / Qwen3 有)"],
+         "小 —— 非难点。上游改动仅为解除一行\n丢弃逻辑 + 一个线性头。草稿侧我们已就位:\n训练已产出该头,且已按上游区分 bias"],
         ["2", "没有支持变长 decode 图的\n昇腾注意力后端",
          "上游依赖 AttentionCGSupport.ALWAYS;\n昇腾图模式当前按固定形状捕获",
          "★ 大 —— 本项目的主要技术风险\n与主要投入所在"],
