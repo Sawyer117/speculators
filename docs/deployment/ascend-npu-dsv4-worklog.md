@@ -849,3 +849,55 @@ humaneval's 154 samples finish in 31–56 s and never fill the batch, so the lat
 math500 / mbpp run long and saturate, so the gain is capped by throughput. ⟹ **conc48 systematically
 understates the draft. 1.42× is a conservative lower bound** — quote it as such. The conc1 pair (both
 arms re-run) is the figure that isolates the draft's contribution, and is the open TODO.
+
+## 2026-08-10 — 🏁 RUN COMPLETE: `ckpt_faithful_ep_20260804_165215`, 10/10 checkpoints, LR annealed to 0
+
+Final checkpoint `/4` (epoch4_end, `global_step` 124,480 = 5 × 24,896) → `dsv4_dspark_ep5p0_ropefix_vllm-77w`,
+2378/2378 bit-exact. Eval log `~/eval_ep5p0_ropefix_all.txt`.
+
+### The full curve (5-dataset mean accept_len)
+
+| ep | gsm8k | math500 | humaneval | mbpp | mt-bench | mean | %rel | non-chat |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.5 | 4.309 | 4.068 | 4.298 | 3.908 | 2.627 | 3.842 | 87.0% | 4.146 |
+| 1.0 | 4.493 | 4.241 | 4.585 | 4.167 | 2.796 | 4.056 | 91.8% | 4.371 |
+| 1.5 | 4.628 | 4.408 | 4.706 | 4.300 | 2.865 | 4.181 | 94.6% | 4.511 |
+| 2.0 | 4.701 | 4.431 | 4.745 | 4.412 | 2.980 | 4.254 | 96.3% | 4.572 |
+| 2.5 | 4.753 | 4.485 | 4.818 | 4.428 | 2.988 | 4.294 | 97.2% | 4.621 |
+| 3.0 | 4.796 | 4.519 | 4.855 | 4.512 | 3.046 | 4.346 | 98.4% | 4.671 |
+| 3.5 | 4.822 | 4.548 | 4.832 | 4.504 | 3.107 | 4.363 | 98.7% | 4.677 |
+| 4.0 | 4.831 | 4.573 | 4.924 | 4.574 | 3.062 | 4.393 | 99.4% | 4.726 |
+| 4.5 | 4.840 | 4.564 | 4.954 | 4.553 | 3.122 | 4.407 | 99.7% | 4.728 |
+| **5.0** | **4.849** | **4.565** | **4.933** | **4.555** | **3.079** | **4.396** | **99.5%** | **4.726** |
+| *released* | 4.658 | 4.661 | 4.942 | 4.535 | 3.294 | 4.418 | 100% | 4.699 |
+
+**Headline:** mean **99.5%** of the released DeepSeek draft; the four **non-chat** datasets average
+**100.6% — above it**; gsm8k **104.1%** and mbpp **100.4%** individually exceed it. **End-to-end speedup
+over autoregressive decoding = 1.39× mean (1.18–1.64×) at conc48**, a conservative lower bound.
+
+### Convergence — decided on the large-sample criterion, as agreed at 4.0ep
+
+```
+gsm8k (n=1309) per-checkpoint delta:
+  +0.184 +0.135 +0.073 +0.052 +0.043 +0.026 +0.009 +0.009 +0.009
+last three means: 4.3928 / 4.4066 / 4.3962   -> spread 0.0138
+```
+
+A 20× monotone decay settling on the **same +0.009 three checkpoints running**, and a three-point mean
+spread of 0.0138 — smaller than the single-step bounce of the small sets (mt-bench alone swings ±0.06).
+⟹ **4.0 / 4.5 / 5.0ep are statistically one point.** Over the last three steps every dataset oscillates
+about zero except gsm8k's steady +0.009. The LR reached exactly 0, so the anneal is complete too.
+
+### Deliverable = 5.0ep, deliberately NOT the highest-mean checkpoint
+
+4.5ep has the highest mean (4.4066 vs 4.3962, **+0.011**) but that is *inside* the bounce. 5.0ep is the
+end of the schedule (LR=0) and is where the **largest-sample** dataset peaks — gsm8k 4.849, its maximum
+over all ten checkpoints. Picking 4.5ep on +0.011 would repeat exactly the single-point over-reading
+that had to be retracted at 3.5ep and again at 4.0ep. **Recording the reasoning, not just the choice.**
+
+### What this run cost / measured
+
+- 124,480 steps at a measured **3.17–3.20 s/step** end-to-end (the log's `profile/step_ms ≈ 1.95–2.03e3`
+  is ~60% optimistic — the rest is HS fetch waits, dataloader stalls and checkpoint writes).
+- Checkpoint→dir map: `/0`←0.5,1.0ep · `/1`←1.5,2.0 · `/2`←2.5,3.0 · `/3`←3.5,4.0 · `/4`←4.5,5.0.
+  All ten were converted and evaluated; none was lost.
