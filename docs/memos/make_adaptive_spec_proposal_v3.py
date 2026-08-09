@@ -104,6 +104,170 @@ def _table(slide, rows, x, y, w, col_w=None, font=11.5, row_h=0.32, colors=None,
 
 
 
+# ── 「技术点一页纸」总览页(参照华为内部单页汇报版式) ──────────────────────
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import MSO_ANCHOR
+
+RED = RGBColor(0xC0, 0x00, 0x00)
+NAVY = RGBColor(0x1F, 0x30, 0x50)
+BLUE = RGBColor(0x1F, 0x5F, 0xA8)
+ORNG = RGBColor(0xD3, 0x62, 0x0B)
+GREY = RGBColor(0xF2, 0xF2, 0xF2)
+LGREY = RGBColor(0xE9, 0xEE, 0xF5)
+
+
+def _shape(s, kind, x, y, w, h, fill=None, line=None, lw=1.0):
+    sh = s.shapes.add_shape(kind, Inches(x), Inches(y), Inches(w), Inches(h))
+    if fill is None:
+        sh.fill.background()
+    else:
+        sh.fill.solid(); sh.fill.fore_color.rgb = fill
+    if line is None:
+        sh.line.fill.background()
+    else:
+        sh.line.color.rgb = line; sh.line.width = Pt(lw)
+    sh.shadow.inherit = False
+    return sh
+
+
+def _fit(sh, lines, size=9, color=INK, bold_first=False, align=PP_ALIGN.LEFT, space=1):
+    tf = sh.text_frame
+    tf.word_wrap = True
+    tf.margin_left = tf.margin_right = Inches(0.05)
+    tf.margin_top = tf.margin_bottom = Inches(0.02)
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    for i, ln in enumerate(lines):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.alignment = align
+        p.space_before = p.space_after = Pt(space)
+        txt, bold, col, sz = (ln if isinstance(ln, tuple) else (ln, False, color, size))
+        r = p.add_run(); r.text = txt
+        r.font.size, r.font.bold, r.font.color.rgb = Pt(sz), bold or (i == 0 and bold_first), col
+        _cjk(r)
+    return sh
+
+
+def _tbox(s, x, y, w, h, lines, size=9, color=INK, space=1.5):
+    tf = _txbox(s, Inches(x), Inches(y), Inches(w), Inches(h))
+    for i, ln in enumerate(lines):
+        txt, bold, col, sz = (ln if isinstance(ln, tuple) else (ln, False, color, size))
+        _p(tf, txt, size=sz, bold=bold, color=col, first=(i == 0), before=(0 if i == 0 else space))
+    return tf
+
+
+def one_pager(prs):
+    s = prs.slides.add_slide(prs.slide_layouts[6])
+    s.background.fill.solid(); s.background.fill.fore_color.rgb = BG
+
+    # ── 标题 ───────────────────────────────────────────────────────────────
+    _tbox(s, 0.32, 0.14, 12.7, 0.5,
+          [("技术点:昇腾 NPU 自适应投机解码 —— 按置信度分配验证预算", True, RED, 23)])
+
+    # ── 挑战 / 目标 ────────────────────────────────────────────────────────
+    Y, H = 0.70, 0.98
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, 0.32, Y, 0.42, H, RED),
+         [("挑", False, BG, 12), ("战", False, BG, 12)], align=PP_ALIGN.CENTER, space=0)
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, 0.74, Y, 5.62, H, GREY),
+         [("· 固定 K 对全 batch 一视同仁 —— 高置信请求本可多验,低置信请求白耗 target 算力", False, INK, 10.5),
+          ("· 变长 K_i 与设备图「形状固定」天然冲突,昇腾当前按固定形状捕获", False, INK, 10.5),
+          ("· 昇腾侧 confidence head 根本未被加载,调度所需的信号拿不到", False, RED, 10.5)])
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, 6.62, Y, 0.42, H, RED),
+         [("目", False, BG, 12), ("标", False, BG, 12)], align=PP_ALIGN.CENTER, space=0)
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, 7.04, Y, 5.94, H, GREY),
+         [("· 对齐上游 vLLM #47808 机制,在昇腾实现按置信度的验证预算分配", False, INK, 10.5),
+          ("· 同等验证预算下提升接受长度 —— 上游实测 +7.6%,收益随 target 变贵而放大", False, RED, 10.5),
+          ("· 动态 K 在图模式下端到端不劣于同预算的固定 K", False, INK, 10.5)])
+
+    # ── 左栏:运行闭环 ─────────────────────────────────────────────────────
+    LX, LW = 0.32, 2.52
+    _fit(_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, LX, 1.86, LW, 0.34, NAVY),
+         [("自适应验证运行闭环", False, BG, 11.5)], align=PP_ALIGN.CENTER, space=0)
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX, 2.28, LW, 0.34, LGREY),
+         [("输入:草稿 block + 逐位 confidence", False, INK, 8.5)], align=PP_ALIGN.CENTER, space=0)
+    _shape(s, MSO_SHAPE.RECTANGLE, LX, 2.72, LW, 1.72, None, BLUE, 1.25)
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.06, 2.78, LW - 0.12, 0.28, None),
+         [("① 置信度调度闭环", True, BLUE, 10)], space=0)
+    for j, t in enumerate(("生存概率打分", "全局预算择优", "每请求 K_i")):
+        _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.14, 3.10 + j * 0.42, LW - 0.28, 0.32, BG, BLUE, 0.75),
+             [(t, False, INK, 9)], align=PP_ALIGN.CENTER, space=0)
+        if j < 2:
+            _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, 3.43 + j * 0.42, 0.10, 0.08, BLUE)
+    _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, 4.47, 0.10, 0.10, INK)
+    _shape(s, MSO_SHAPE.RECTANGLE, LX, 4.62, LW, 1.72, None, ORNG, 1.25)
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.06, 4.68, LW - 0.12, 0.28, None),
+         [("② 变长图执行闭环", True, ORNG, 10)], space=0)
+    for j, t in enumerate(("变长 decode 图捕获", "真机成本曲线标定", "场景配置")):
+        _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX + 0.14, 5.00 + j * 0.42, LW - 0.28, 0.32, BG, ORNG, 0.75),
+             [(t, False, INK, 9)], align=PP_ALIGN.CENTER, space=0)
+        if j < 2:
+            _shape(s, MSO_SHAPE.DOWN_ARROW, LX + LW / 2 - 0.05, 5.33 + j * 0.42, 0.10, 0.08, ORNG)
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, LX, 6.46, LW, 0.36, LGREY),
+         [("可部署:动态 K 投机解码", True, INK, 9.5)], align=PP_ALIGN.CENTER, space=0)
+    _tbox(s, LX - 0.02, 6.88, LW + 0.1, 0.5,
+          [("信号不可用 → 回草稿侧重拟合置信度头", False, RED, 8)])
+
+    # ── 中栏 ① 算法侧 ─────────────────────────────────────────────────────
+    MX, MW = 2.98, 7.42
+    _shape(s, MSO_SHAPE.RECTANGLE, MX, 1.86, MW, 2.58, None, BLUE, 1.5)
+    _tbox(s, MX + 0.12, 1.94, 3.9, 0.34, [("① 置信度调度(算法侧,对标 #47808)", True, BLUE, 13)])
+    _tbox(s, MX + 0.12, 2.34, 3.85, 1.9, [
+        ("A. 生存概率打分", True, INK, 10),
+        ("每个 (请求, 位置) 的 draft slot 以该请求逐位 confidence 的累积乘积打分。", False, INK, 9),
+        ("B. 跨请求竞争的全局预算", True, INK, 10),
+        ("所有 slot 统一排序、择优录取直至预算耗尽 —— 自信请求的第 5 位可压过犹豫请求的第 1 位。", False, INK, 9),
+        ("C. 成本曲线标定", True, INK, 10),
+        ("启动期 dummy step 测出步开销;batch 预算用 CPU 侧陈旧值(不同步),per-request 用 GPU 实时值。", False, INK, 9)], space=2)
+    for j, (t, sub) in enumerate([("draft slot", "逐位置信度"), ("排序 / 打分", "累积乘积"), ("录取前缀", "预算内择优")]):
+        bx = MX + 4.12 + j * 1.08
+        _fit(_shape(s, MSO_SHAPE.RECTANGLE, bx, 2.62, 0.92, 0.86, BG, BLUE, 0.75),
+             [(t, True, BLUE, 9), (sub, False, MUTE, 8)], align=PP_ALIGN.CENTER, space=1)
+        if j < 2:
+            _shape(s, MSO_SHAPE.RIGHT_ARROW, bx + 0.94, 2.97, 0.12, 0.14, BLUE)
+    _tbox(s, MX + 4.12, 3.60, 3.16, 0.5, [("机制示意:同预算下把验证 token 挪给最可能被接受的位置", False, MUTE, 8.5)])
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, MX + 0.12, 4.02, MW - 0.24, 0.30, LGREY),
+         [("交付:昇腾预算调度 kernel  |  成本曲线标定脚本  |  置信度-接受率相关性报告", True, BLUE, 9.5)],
+         align=PP_ALIGN.CENTER, space=0)
+
+    # ── 中栏 ② 工程侧 ─────────────────────────────────────────────────────
+    _shape(s, MSO_SHAPE.RECTANGLE, MX, 4.60, MW, 2.72, None, ORNG, 1.5)
+    _tbox(s, MX + 0.12, 4.68, 4.2, 0.34, [("② 变长 decode 图(工程侧,★ 主要投入)", True, ORNG, 13)])
+    for j, (t, sub) in enumerate([("固定形状捕获", "现状"), ("变长图", "按 token 网格"), ("真机测量", "开销 / padding")]):
+        bx = MX + 0.16 + j * 1.24
+        _fit(_shape(s, MSO_SHAPE.RECTANGLE, bx, 5.10, 1.08, 0.80, BG, ORNG, 0.75),
+             [(t, True, ORNG, 9), (sub, False, MUTE, 8)], align=PP_ALIGN.CENTER, space=1)
+        if j < 2:
+            _shape(s, MSO_SHAPE.RIGHT_ARROW, bx + 1.10, 5.43, 0.12, 0.14, ORNG)
+    _tbox(s, MX + 0.16, 6.02, 3.7, 0.9, [
+        ("两条候选路线,阶段 2 先验证可行性再投入:", True, INK, 9),
+        ("· 对齐上游语义 —— 后端上报 ALWAYS,按 max_query_len 派发;", False, INK, 8.5),
+        ("· SGLang 式 packed varlen —— graph key 只按总 token 数,padding 更省。", False, INK, 8.5)], space=1.5)
+    _tbox(s, MX + 4.06, 5.06, 3.24, 1.9, [
+        ("· 昇腾无对应的「任意形状可入图」机制,这是本项目唯一的阻断性风险;", False, INK, 8.5),
+        ("· 上游为 NVIDIA 后端加了 ALWAYS 声明,昇腾需自建等价能力;", False, INK, 8.5),
+        ("· 若不可行,保留 eager 路径成果,并把图支持作为独立议题提交上游。", False, RED, 8.5)], space=3)
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, MX + 0.12, 6.92, MW - 0.24, 0.30, RGBColor(0xFD, 0xF0, 0xE4)),
+         [("交付:变长 decode 图实现  |  Shape 配置  |  三模式(无投机 / 固定 K / 动态 K)对比实测包", True, ORNG, 9.5)],
+         align=PP_ALIGN.CENTER, space=0)
+
+    # ── 右栏:里程碑 ───────────────────────────────────────────────────────
+    RX, RW = 10.54, 2.44
+    _fit(_shape(s, MSO_SHAPE.RECTANGLE, RX, 1.86, RW, 0.34, RED),
+         [("里 程 碑", True, BG, 12)], align=PP_ALIGN.CENTER, space=0)
+    _shape(s, MSO_SHAPE.RECTANGLE, RX + 0.22, 2.42, 0.028, 4.55, RED)
+    MS = [("T+1 天", "G1 · 判定", ["把加速比从 c=48 补测到", "c=128 / c=256", "看固定 K 是否收益衰减", "不达标即停,不进入开发"]),
+          ("T+3 周", "G2 · 打通信号", ["vllm-ascend 加载置信度头", "端到端读出逐位置信度", "与实测接受率做相关性验证"]),
+          ("T+11 周", "G3 · 图模式 ★", ["动态 K 在图模式下运行", "端到端不劣于同预算固定 K", "本项目主要技术风险所在"]),
+          ("T+15 周", "合入与扩展", ["推广到通用模型路径", "补齐限制项 + 复现文档"])]
+    for j, (when, what, det) in enumerate(MS):
+        y = 2.46 + j * 1.16
+        _fit(_shape(s, MSO_SHAPE.OVAL, RX + 0.09, y, 0.30, 0.30, BG, RED, 1.25),
+             [(str(j + 1), True, RED, 10)], align=PP_ALIGN.CENTER, space=0)
+        _tbox(s, RX + 0.46, y - 0.06, RW - 0.5, 1.1,
+              [(when, True, RED, 11.5), (what, True, INK, 10)] + [(d, False, MUTE, 8) for d in det], space=1)
+    _tbox(s, RX, 7.06, RW, 0.34, [("T = 立项批准日;绝对日期待排期确定后填入", False, MUTE, 7.5)])
+    return s
+
+
 def build(out: str) -> None:
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
@@ -119,7 +283,10 @@ def build(out: str) -> None:
            "SGLang 亦已上线。本项目据此由“设计并实现”重定义为“昇腾侧适配与验证”,范围与周期同步收缩。",
        size=12, color=MUTE, before=20)
 
-    # 2 立项理由 ──────────────────────────────────────────────────────────────
+    # 2 技术点一页纸(总览) ───────────────────────────────────────────────────
+    one_pager(prs)
+
+    # 3 立项理由 ──────────────────────────────────────────────────────────────
     s = _slide(prs, "一、为什么立项", "固定 K 对所有请求一视同仁,而“该验多长”的信号其实已经有了")
     _table(s, [
         ["", "现状", "问题", "本项目要解决的"],
