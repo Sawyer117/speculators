@@ -242,11 +242,14 @@ def one_pager(prs):
         ("两条候选路线,阶段 2 先验证可行性再投入:", True, INK, 9),
         ("· 对齐上游语义 —— 后端上报 ALWAYS,按 max_query_len 派发;", False, INK, 8.5),
         ("· SGLang 式 packed varlen —— graph key 只按总 token 数,padding 更省。", False, INK, 8.5)], space=1.5)
-    _tbox(s, MX + 4.06, 5.02, 3.24, 2.0, [
-        ("· 通用 FIA 路径的序列长度是 host 侧 list,捕获即固化 → 变长必须重捕;", False, INK, 8.5),
-        ("· ★ DSV4 走的 DSA 路径长度在 device tensor 上,结构上无需重捕 —— 有利条件;", False, INK, 8.5),
-        ("· 真正的未知量是 workspace / 图数量随 K 组合膨胀(workspace 按 num_tokens 做键);", False, RED, 8.5),
-        ("· 若确不可行,保留 eager 成果,把图支持作为独立议题提交上游。", False, MUTE, 8.5)], space=2)
+    _tbox(s, MX + 4.06, 4.98, 3.24, 2.1, [
+        ("为什么变长会掉出设备图", True, INK, 9.5),
+        ("· 设备图 = 把一串算子按固定的张量形状录制下来直接重放,省掉逐算子下发开销;录制的前提就是形状固定;",
+         False, INK, 8.5),
+        ("· 固定 K 每步形状一致 → 能入图;自适应下每请求 K_i 每步不同 → 形状参差且逐步变化 → 默认出图;",
+         False, INK, 8.5),
+        ("· 能否留在图内,取决于图里的长度参数是「录制时固化的常量」还是「运行时可改的设备张量」 ——"
+         " DSV4 属于后者(有利)。详见「三(补充)」两页。", False, RED, 8.5)], space=2)
     _fit(_shape(s, MSO_SHAPE.RECTANGLE, MX + 0.12, 6.92, MW - 0.24, 0.30, RGBColor(0xFD, 0xF0, 0xE4)),
          [("交付:变长 decode 图实现  |  Shape 配置  |  三模式(无投机 / 固定 K / 动态 K)对比实测包", True, ORNG, 9.5)],
          align=PP_ALIGN.CENTER, space=0)
@@ -360,8 +363,43 @@ def build(out: str) -> None:
            "confidence head 训练时输入是 detach 的,可在冻结骨干上分钟级重新拟合。",
        size=13, color=MUTE, first=True, before=0)
 
-    # 4b 技术补充:变长入图 ────────────────────────────────────────────────
-    s = _slide(prs, "三(补充)、「变长入图」在昇腾究竟难在哪",
+    # 4b-1 技术补充(概念):为什么变长会掉出设备图 ─────────────────────────
+    s = _slide(prs, "三(补充 1)、为什么「变长」会掉出设备图",
+               "先讲清楚机制,再落到算子 —— 这是本项目最大技术风险的来源")
+    tf = _txbox(s, Inches(0.55), Inches(1.56), Inches(12.3), Inches(1.0))
+    _p(tf, "设备图(昇腾 ACL Graph,对应 GPU 侧的 CUDA Graph)是把一串算子按【固定的张量形状与地址】预先录制下来,"
+           "推理时直接重放整段,省掉逐算子下发的开销。解码是「算子小、次数多」的场景,这部分开销占比很高,"
+           "所以能否入图直接决定性能。", size=13.5, first=True, before=0)
+    _p(tf, "而录制的前提,是每一步的形状都一样。", size=13.5, bold=True, color=ACCENT, before=5)
+
+    for k, (px, pw, ttl, col, ks, note, tot) in enumerate([
+        (0.55, 6.02, "固定 K = 5   →   形状固定,可入图", GOOD, [5, 5, 5, 5],
+         "每个请求每步都验证 5 个 token。batch 内 query 长度一致、总 token 数每步相同,"
+         "录制一次即可一直重放。", "总 token 数 = 4 × 5 = 20,每一步都是这个数"),
+        (6.76, 6.02, "自适应 K_i   →   形状逐步变化,默认出图", RISK, [5, 2, 7, 1],
+         "每个请求按自身置信度拿到不同的 K_i,下一步又是另一组。query 长度参差(ragged)、"
+         "总 token 数每步都在变。", "总 token 数 = 5+2+7+1 = 15,下一步又是别的数")]):
+        _shape(s, MSO_SHAPE.RECTANGLE, px, 2.70, pw, 2.86, None, col, 1.5)
+        _tbox(s, px + 0.14, 2.78, pw - 0.28, 0.32, [(ttl, True, col, 12.5)])
+        for r, kk in enumerate(ks):
+            y = 3.22 + r * 0.38
+            _tbox(s, px + 0.14, y - 0.04, 0.84, 0.28, [("请求 " + str(r + 1), False, MUTE, 9)])
+            for j in range(kk):
+                _shape(s, MSO_SHAPE.RECTANGLE, px + 1.02 + j * 0.32, y, 0.26, 0.22, col, BG, 0.5)
+            _tbox(s, px + 1.02 + 7 * 0.32 + 0.12, y - 0.04, 0.9, 0.28, [("K=" + str(kk), False, col, 9)])
+        _tbox(s, px + 0.16, 4.78, pw - 0.34, 0.36, [(note, False, INK, 10)])
+        _fit(_shape(s, MSO_SHAPE.RECTANGLE, px + 0.14, 5.16, pw - 0.28, 0.30,
+                    LGREY if k == 0 else RGBColor(0xFD, 0xEC, 0xEC)),
+             [(tot, True, col, 10)], align=PP_ALIGN.CENTER, space=0)
+
+    tf = _txbox(s, Inches(0.55), Inches(5.74), Inches(12.3), Inches(1.5))
+    _p(tf, "⟹ 于是问题归结为一件很具体的事", size=15.5, bold=True, color=ACCENT, first=True, before=0)
+    _p(tf, "图里那些【依赖序列长度】的参数,是在录制时就被固化成了常量,还是留成了运行时可以改内容的设备张量?"
+           "前者一变就必须整张图重录,后者只改张量内容即可。答案因算子而异 —— 下一页逐个部件核对。",
+       size=13.5, before=7)
+
+    # 4b-2 技术补充(算子):逐部件核对 ─────────────────────────────────────
+    s = _slide(prs, "三(补充 2)、落到算子:逐个部件核对",
                "四条结论均出自 vllm-ascend 现网代码,标注文件与行号,可自行核对")
     _table(s, [
         ["路径 / 部件", "机制", "代码出处(vllm-ascend)", "对变长 K 的影响"],
@@ -377,9 +415,13 @@ def build(out: str) -> None:
         ["图内元数据\n更新", "机制已存在\n(固定 K 已在用)",
          "attention_v1.py:530-565\n  graph_task_update_begin/end 块内已有\n  _EXTRA_CTX.is_draft_model 与\n  attn_metadata[draft_step][key]",
          "固定 K 投机已经在图里跑,逐 draft step 更新图内\n元数据的机制与开销已经付过 —— 自适应不是从零\n造图内变长,而是让这套机制吃变化的长度"],
-    ], Inches(0.55), Inches(1.58), Inches(12.3), col_w=[0.10, 0.15, 0.39, 0.36], row_h=0.86, font=10)
+    ], Inches(0.55), Inches(1.56), Inches(12.3), col_w=[0.10, 0.15, 0.39, 0.36], row_h=0.80, font=10)
+    _tbox(s, 0.55, 5.62, 12.3, 0.34,
+          [("术语:FIA v2 = npu_fused_infer_attention_score_v2,昇腾融合注意力算子,通用模型走这条路径;"
+            "DSA = DeepSeek Sparse Attention,SFA = 稀疏融合注意力,DeepSeek-V4-Flash 走这条;"
+            "workspace = 算子运行所需的临时显存。", False, MUTE, 9)])
 
-    tf = _txbox(s, Inches(0.55), Inches(6.06), Inches(12.3), Inches(1.3))
+    tf = _txbox(s, Inches(0.55), Inches(6.02), Inches(12.3), Inches(1.3))
     _p(tf, "⟹ 准确的风险表述不是「昇腾不能变长入图」", size=15.5, bold=True, color=ACCENT, first=True, before=0)
     _p(tf, "而是:DSA 路径在设备侧持有长度、图内元数据更新机制已存在,两项结构性条件都已具备;"
            "未知量集中在 workspace 与图数量随 K 组合的膨胀,以及随之而来的显存占用与捕获耗时。", size=13, before=7)
