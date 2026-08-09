@@ -211,7 +211,7 @@ def one_pager(prs):
     MX, MW = 2.98, 7.42
     _shape(s, MSO_SHAPE.RECTANGLE, MX, 1.86, MW, 2.58, None, BLUE, 1.5)
     _tbox(s, MX + 0.12, 1.94, 3.9, 0.34, [("① 置信度调度(算法侧,对标 #47808)", True, BLUE, 13)])
-    _tbox(s, MX + 0.12, 2.34, 3.85, 1.9, [
+    _tbox(s, MX + 0.12, 2.34, 3.85, 1.62, [
         ("A. 生存概率打分", True, INK, 10),
         ("每个 (请求, 位置) 的 draft slot 以该请求逐位 confidence 的累积乘积打分。", False, INK, 9),
         ("B. 跨请求竞争的全局预算", True, INK, 10),
@@ -242,10 +242,11 @@ def one_pager(prs):
         ("两条候选路线,阶段 2 先验证可行性再投入:", True, INK, 9),
         ("· 对齐上游语义 —— 后端上报 ALWAYS,按 max_query_len 派发;", False, INK, 8.5),
         ("· SGLang 式 packed varlen —— graph key 只按总 token 数,padding 更省。", False, INK, 8.5)], space=1.5)
-    _tbox(s, MX + 4.06, 5.06, 3.24, 1.9, [
-        ("· 昇腾无对应的「任意形状可入图」机制,这是本项目唯一的阻断性风险;", False, INK, 8.5),
-        ("· 上游为 NVIDIA 后端加了 ALWAYS 声明,昇腾需自建等价能力;", False, INK, 8.5),
-        ("· 若不可行,保留 eager 路径成果,并把图支持作为独立议题提交上游。", False, RED, 8.5)], space=3)
+    _tbox(s, MX + 4.06, 5.02, 3.24, 2.0, [
+        ("· 通用 FIA 路径的序列长度是 host 侧 list,捕获即固化 → 变长必须重捕;", False, INK, 8.5),
+        ("· ★ DSV4 走的 DSA 路径长度在 device tensor 上,结构上无需重捕 —— 有利条件;", False, INK, 8.5),
+        ("· 真正的未知量是 workspace / 图数量随 K 组合膨胀(workspace 按 num_tokens 做键);", False, RED, 8.5),
+        ("· 若确不可行,保留 eager 成果,把图支持作为独立议题提交上游。", False, MUTE, 8.5)], space=2)
     _fit(_shape(s, MSO_SHAPE.RECTANGLE, MX + 0.12, 6.92, MW - 0.24, 0.30, RGBColor(0xFD, 0xF0, 0xE4)),
          [("交付:变长 decode 图实现  |  Shape 配置  |  三模式(无投机 / 固定 K / 动态 K)对比实测包", True, ORNG, 9.5)],
          align=PP_ALIGN.CENTER, space=0)
@@ -359,6 +360,33 @@ def build(out: str) -> None:
            "confidence head 训练时输入是 detach 的,可在冻结骨干上分钟级重新拟合。",
        size=13, color=MUTE, first=True, before=0)
 
+    # 4b 技术补充:变长入图 ────────────────────────────────────────────────
+    s = _slide(prs, "三(补充)、「变长入图」在昇腾究竟难在哪",
+               "四条结论均出自 vllm-ascend 现网代码,标注文件与行号,可自行核对")
+    _table(s, [
+        ["路径 / 部件", "机制", "代码出处(vllm-ascend)", "对变长 K 的影响"],
+        ["通用路径\nFIA v2", "序列长度是\nhost 侧 Python list",
+         "attention_v1.py:183\n  actual_seq_lengths_q: list[int]\nattention_v1.py:314  由\n  query_start_loc_cpu[1:].tolist() 构造",
+         "值在捕获时被烘进图 —— K 一变图里的长度就是错的,\n必须为每个形状重新捕获。这就是「任意形状\n不可入图」的机械原因"],
+        ["★ DSV4 路径\nDSA / SFA", "序列长度是\ndevice tensor",
+         "device_op.py:559\n  actual_seq_lengths_query: torch.Tensor\ndsa_v1.py:1061  传入\n  query_start_loc[1:].clone()",
+         "图捕获的是指针不是值 —— 改张量内容即可,结构上\n不需要重捕。★ 我们主攻的路径恰好在更有利的一侧"],
+        ["workspace", "按 token 数做缓存键",
+         "attention_v1.py:490/636/812/953\n  workspaces.get(num_tokens)\nattention_v1.py:774\n  num_tokens = actual_seq_lengths_q[-1]",
+         "K 变 → num_tokens 变 → 缓存未命中、重新分配;\n不同 K 组合一多,图与 workspace 数量一起膨胀。\n★ 真正的成本在这里"],
+        ["图内元数据\n更新", "机制已存在\n(固定 K 已在用)",
+         "attention_v1.py:530-565\n  graph_task_update_begin/end 块内已有\n  _EXTRA_CTX.is_draft_model 与\n  attn_metadata[draft_step][key]",
+         "固定 K 投机已经在图里跑,逐 draft step 更新图内\n元数据的机制与开销已经付过 —— 自适应不是从零\n造图内变长,而是让这套机制吃变化的长度"],
+    ], Inches(0.55), Inches(1.58), Inches(12.3), col_w=[0.10, 0.15, 0.39, 0.36], row_h=0.86, font=10)
+
+    tf = _txbox(s, Inches(0.55), Inches(6.06), Inches(12.3), Inches(1.3))
+    _p(tf, "⟹ 准确的风险表述不是「昇腾不能变长入图」", size=15.5, bold=True, color=ACCENT, first=True, before=0)
+    _p(tf, "而是:DSA 路径在设备侧持有长度、图内元数据更新机制已存在,两项结构性条件都已具备;"
+           "未知量集中在 workspace 与图数量随 K 组合的膨胀,以及随之而来的显存占用与捕获耗时。", size=13, before=7)
+    _p(tf, "这把阶段 2 的第一件事定死了:先量形状数量与 workspace 膨胀,再决定走「对齐上游 ALWAYS 语义」还是"
+           "「SGLang 式 packed varlen(graph key 只按总 token 数,天然压制形状数量)」—— 而不是先写实现。",
+       size=13, bold=True, before=5)
+
     # 5 实施方案 ──────────────────────────────────────────────────────────────
     s = _slide(prs, "四、实施方案与里程碑", "阶段 0 由“两周量化”缩为“一天判定”—— 上游数据已给出大部分答案")
     _table(s, [
@@ -377,7 +405,7 @@ def build(out: str) -> None:
          "可合入的实现 + 对比数据"],
     ], Inches(0.55), Inches(1.62), Inches(12.3), col_w=[0.07, 0.08, 0.47, 0.38], row_h=0.86)
 
-    tf = _txbox(s, Inches(0.55), Inches(5.35), Inches(12.3), Inches(1.9))
+    tf = _txbox(s, Inches(0.55), Inches(6.00), Inches(12.3), Inches(1.4))
     _p(tf, "总周期约 2.5–3.5 个月(v2 为 3–4 个月;算法设计部分由上游承担后收缩)",
        size=16, bold=True, color=ACCENT, first=True, before=0)
     _p(tf, "阶段 0 只要一天:我们已有无投机基线和固定 K 的完整评测链路,只需把并发点补齐。"

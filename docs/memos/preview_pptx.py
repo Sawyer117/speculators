@@ -114,3 +114,26 @@ def render(pptx, out_prefix, only=None):
 if __name__ == "__main__":
     only = {int(a) for a in sys.argv[3:]} if len(sys.argv) > 3 else None
     render(sys.argv[1], sys.argv[2], only)
+
+
+def overlaps(pptx):
+    """Flag shape pairs that overlap enough to look like a layout bug."""
+    prs = Presentation(pptx)
+    for idx, sl in enumerate(prs.slides, 1):
+        bs = [(sh.shape_id, sh.left or 0, sh.top or 0, (sh.left or 0) + (sh.width or 0),
+               (sh.top or 0) + (sh.height or 0)) for sh in sl.shapes]
+        for i in range(len(bs)):
+            for j in range(i + 1, len(bs)):
+                a, b = bs[i], bs[j]
+                ox = min(a[3], b[3]) - max(a[1], b[1])
+                oy = min(a[4], b[4]) - max(a[2], b[2])
+                # skip legitimate nesting: one shape fully inside the other
+                inside = (a[1] <= b[1] and a[2] <= b[2] and a[3] >= b[3] and a[4] >= b[4]) or \
+                         (b[1] <= a[1] and b[2] <= a[2] and b[3] >= a[3] and b[4] >= a[4])
+                if inside:
+                    continue
+                if ox > 0 and oy > EMU * 0.06:          # >0.06in vertical bite
+                    amin = min((a[3]-a[1])*(a[4]-a[2]), (b[3]-b[1])*(b[4]-b[2]))
+                    if ox * oy > 0.25 * amin:
+                        print(f"  slide {idx}: shapes {a[0]}&{b[0]} overlap "
+                              f"{ox/EMU:.2f}x{oy/EMU:.2f}in")
