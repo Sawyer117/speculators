@@ -182,6 +182,8 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
             enable_confidence_head=kwargs.get("enable_confidence_head", True),
             confidence_head_with_markov=kwargs.get("confidence_head_with_markov", True),
+            # DSV4-Flash: the released mtp.* layout has NO confidence_head.proj.bias.
+            confidence_head_bias=kwargs.get("confidence_head_bias", False),
             **overrides,
         )
         model = cls(config=config)

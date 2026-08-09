@@ -65,6 +65,16 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "hidden state as the confidence-head input."
         ),
     )
+    confidence_head_bias: bool = Field(
+        default=False,
+        description=(
+            "Whether the confidence head's projection carries a bias. The two DSpark "
+            "families differ: the released DSV4-Flash draft layout has no "
+            "`confidence_head.proj.bias` (default here), while the Qwen3 DSpark draft "
+            "does — pass True for that line. A bias that the serving layout cannot "
+            "represent trains fine but is dropped at conversion."
+        ),
+    )
 
     # DSpark serving (vllm-ascend) samples EVERY block slot (slot 0 predicts from the
     # anchor's own hidden, no target shift, slot 0 trained), so DSpark overrides the

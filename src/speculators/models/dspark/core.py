@@ -53,7 +53,9 @@ class DSparkDraftModel(DFlashDraftModel):
             input_dim = hidden_size + (
                 config.markov_rank if config.confidence_head_with_markov else 0
             )
-            self.confidence_head = ConfidenceHead(input_dim)
+            self.confidence_head = ConfidenceHead(
+                input_dim, bias=config.confidence_head_bias
+            )
 
     @classmethod
     def from_training_args(
@@ -80,6 +82,9 @@ class DSparkDraftModel(DFlashDraftModel):
                 if confidence_head_with_markov_arg is None
                 else confidence_head_with_markov_arg
             ),
+            # Family-dependent: the released DSV4-Flash layout has no bias, the
+            # Qwen3 DSpark draft does. Default False; pass True for the Qwen3 line.
+            confidence_head_bias=kwargs.get("confidence_head_bias", False),
         )
 
         model = cls(config=config)

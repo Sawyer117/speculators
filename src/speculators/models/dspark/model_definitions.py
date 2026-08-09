@@ -83,14 +83,18 @@ class MarkovHead(nn.Module):
 class ConfidenceHead(nn.Module):
     """Per-position acceptance-probability predictor (linear -> scalar logit).
 
-    ``bias=False`` matches the released DSpark ``mtp.*`` layout, which carries only
-    ``confidence_head.proj.weight`` (see ``dsv4_dspark/weights.py::expected_draft_keys``).
-    A bias here would train fine but could never be serialized into that layout.
+    ``bias`` is family-dependent, so it is a config knob rather than a constant. The
+    released DSV4-Flash draft layout carries only ``confidence_head.proj.weight`` (see
+    ``dsv4_dspark/weights.py::expected_draft_keys``) — hence the ``False`` default; the
+    Qwen3 DSpark draft does carry a bias. vLLM's own ``DSparkConfidenceHead`` makes the
+    same split: its DSV4 construction takes the ``bias=False`` default while the Qwen3
+    one passes ``bias=True``. A bias the serving layout cannot represent trains fine but
+    is silently dropped at conversion.
     """
 
-    def __init__(self, input_dim: int) -> None:
+    def __init__(self, input_dim: int, bias: bool = False) -> None:
         super().__init__()
-        self.proj = nn.Linear(input_dim, 1, bias=False)
+        self.proj = nn.Linear(input_dim, 1, bias=bias)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.proj(features).squeeze(-1)
