@@ -242,14 +242,17 @@ def one_pager(prs):
         ("两条候选路线,阶段 2 先验证可行性再投入:", True, INK, 9),
         ("· 对齐上游语义 —— 后端上报 ALWAYS,按 max_query_len 派发;", False, INK, 8.5),
         ("· SGLang 式 packed varlen —— graph key 只按总 token 数,padding 更省。", False, INK, 8.5)], space=1.5)
-    _tbox(s, MX + 4.06, 4.98, 3.24, 2.1, [
-        ("为什么变长会掉出设备图", True, INK, 9.5),
-        ("· 设备图 = 把一串算子按固定的张量形状录制下来直接重放,省掉逐算子下发开销;录制的前提就是形状固定;",
-         False, INK, 8.5),
+    _tbox(s, MX + 4.02, 4.94, 3.30, 2.10, [
         ("· 固定 K 每步形状一致 → 能入图;自适应下每请求 K_i 每步不同 → 形状参差且逐步变化 → 默认出图;",
-         False, INK, 8.5),
-        ("· 能否留在图内,取决于图里的长度参数是「录制时固化的常量」还是「运行时可改的设备张量」 ——"
-         " DSV4 属于后者(有利)。详见「三(补充)」两页。", False, RED, 8.5)], space=2)
+         False, INK, 8),
+        ("· 能否留在图内,取决于图里的长度参数是「录制时固化的常量」还是「运行时可改的设备张量」:",
+         False, INK, 8),
+        ("  通用路径 FIA v2(npu_fused_infer_attention_score_v2)—— 长度是 host 侧 list,"
+         "录制即固化 → K 一变必须整图重录;", False, INK, 8),
+        ("  ★ DSV4 路径 DSA / SFA —— 长度是 device tensor,图里存的是指针 → 改内容即可,"
+         "结构上无需重录(有利条件);", False, INK, 8),
+        ("· ★ 真正的未知量:workspace(算子临时显存)按 token 数做缓存键,K 一变即未命中、重新分配 →"
+         " 图与 workspace 数量随 K 组合膨胀,显存与捕获耗时随之上升。", False, RED, 8)], space=2)
     _fit(_shape(s, MSO_SHAPE.RECTANGLE, MX + 0.12, 6.92, MW - 0.24, 0.30, RGBColor(0xFD, 0xF0, 0xE4)),
          [("交付:变长 decode 图实现  |  Shape 配置  |  三模式(无投机 / 固定 K / 动态 K)对比实测包", True, ORNG, 9.5)],
          align=PP_ALIGN.CENTER, space=0)
