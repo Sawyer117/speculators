@@ -1,5 +1,6 @@
 """Tests for opt-in DFlash backbone features and baseline parity."""
 
+import pytest
 import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
@@ -9,17 +10,17 @@ from speculators.models.dflash.core import DFlashDraftModel
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 
-def _make_model(**feature_flags) -> DFlashDraftModel:
+def _make_model(*, num_draft_layers: int = 1, **feature_flags) -> DFlashDraftModel:
     transformer_config = Qwen3Config(
         vocab_size=32,
         hidden_size=16,
         intermediate_size=32,
-        num_hidden_layers=1,
+        num_hidden_layers=num_draft_layers,
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=4,
         max_position_embeddings=32,
-        layer_types=["full_attention"],
+        layer_types=["full_attention"] * num_draft_layers,
     )
     config = DFlashSpeculatorConfig(
         transformer_layer_config=transformer_config,
@@ -60,11 +61,15 @@ def test_optional_features_default_off_preserves_original_helpers():
     assert conditioned is noise
     assert model.layer_fusion_norms is None
     assert model.layer_fusion_score is None
+    assert model.dfly_layer_fusion_logits is None
+    assert model.layers[0].self_attn.target_k_proj is None
+    assert model.layers[0].self_attn.target_v_proj is None
     assert model.context_hidden_proj is None
     assert model.verifier_final_hidden_proj is None
     assert model.block_position_embedding is None
     optional_prefixes = (
         "layer_fusion_",
+        "dfly_layer_fusion_",
         "context_hidden_",
         "verifier_final_hidden_",
         "block_position_embedding",
@@ -89,6 +94,71 @@ def test_gated_layer_fusion_returns_draft_hidden_shape():
     with torch.no_grad():
         model.layer_fusion_gate.fill_(1.0)
     assert not torch.equal(model._fuse_target_hidden(hidden), baseline)
+
+
+def test_dfly_layer_residual_requires_current_gated_fusion():
+    with pytest.raises(ValueError, match="requires dflash_gated_layer_fusion"):
+        _make_model(dflash_dfly_layer_residual=True)
+
+
+def test_dfly_layer_residual_adds_distinct_per_draft_layer_views():
+    torch.manual_seed(2)
+    model = _make_model(
+        num_draft_layers=2,
+        dflash_gated_layer_fusion=True,
+        dflash_dfly_layer_residual=True,
+    )
+    hidden = torch.randn(1, 5, 32)
+    shared_projection, target_layer_states = model._prepare_target_hidden(hidden)
+    assert target_layer_states is not None
+    assert model.dfly_layer_fusion_logits is not None
+
+    initial_0 = model._add_dfly_layer_residual(
+        shared_projection, target_layer_states, 0
+    )
+    initial_1 = model._add_dfly_layer_residual(
+        shared_projection, target_layer_states, 1
+    )
+    assert torch.equal(initial_0, initial_1)
+
+    with torch.no_grad():
+        model.dfly_layer_fusion_logits[0].copy_(torch.tensor([8.0, -8.0]))
+        model.dfly_layer_fusion_logits[1].copy_(torch.tensor([-8.0, 8.0]))
+
+    fused_0 = model._add_dfly_layer_residual(
+        shared_projection, target_layer_states, 0
+    )
+    fused_1 = model._add_dfly_layer_residual(
+        shared_projection, target_layer_states, 1
+    )
+    assert fused_0.shape == (1, 5, 16)
+    assert fused_1.shape == (1, 5, 16)
+    assert torch.isfinite(fused_0).all()
+    assert torch.isfinite(fused_1).all()
+    assert not torch.equal(fused_0, fused_1)
+
+
+def test_heterogeneous_kv_projections_are_separate_and_used_for_context():
+    torch.manual_seed(3)
+    model = _make_model(dflash_heterogeneous_kv_projections=True)
+    attention = model.layers[0].self_attn
+    assert attention.target_k_proj is not None
+    assert attention.target_v_proj is not None
+    assert attention.target_k_proj is not attention.k_proj
+    assert attention.target_v_proj is not attention.v_proj
+
+    attention.config._attn_implementation = "eager"  # noqa: SLF001
+    draft_hidden = torch.randn(1, 3, 16)
+    target_hidden = torch.randn(1, 5, 16)
+    cos = torch.ones(1, 8, 4)
+    sin = torch.zeros(1, 8, 4)
+    output_before = attention(draft_hidden, target_hidden, (cos, sin), None)[0]
+    with torch.no_grad():
+        attention.target_v_proj.weight.zero_()
+    output_after = attention(draft_hidden, target_hidden, (cos, sin), None)[0]
+    assert output_before.shape == draft_hidden.shape
+    assert torch.isfinite(output_before).all()
+    assert not torch.equal(output_before, output_after)
 
 
 def test_context_and_slot_residuals_start_at_exact_zero():

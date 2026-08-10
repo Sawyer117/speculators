@@ -102,6 +102,23 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    dflash_dfly_layer_residual: bool = Field(
+        default=False,
+        description=(
+            "Add a DFly-style, draft-layer-specific softmax fusion residual on top "
+            "of the existing token-adaptive gated fusion. Requires "
+            "dflash_gated_layer_fusion."
+        ),
+    )
+
+    dflash_heterogeneous_kv_projections: bool = Field(
+        default=False,
+        description=(
+            "Use separate key/value projections for injected target context and "
+            "DFlash draft/noise hidden states."
+        ),
+    )
+
     sample_from_anchor: bool = Field(
         default=False,
         description=(

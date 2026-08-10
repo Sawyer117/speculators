@@ -1170,6 +1170,25 @@ def parse_args():
             "(default: disabled)."
         ),
     )
+    parser.add_argument(
+        "--dflash-dfly-layer-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: add a DFly-style per-draft-layer residual to the "
+            "existing token-adaptive gated fusion; requires "
+            "--dflash-gated-layer-fusion (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-heterogeneous-kv-projections",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: use separate target-context and draft/noise K/V "
+            "projections (default: disabled)."
+        ),
+    )
     # DSpark-specific arguments (sequential correction + confidence head).
     parser.add_argument(
         "--markov-rank",
@@ -1728,9 +1747,16 @@ def parse_args():
         or args.dflash_verifier_final_residual
         or args.dflash_block_position_embedding
         or args.dflash_gated_layer_fusion
+        or args.dflash_dfly_layer_residual
+        or args.dflash_heterogeneous_kv_projections
     ) and args.speculator_type not in ("dflash", "dspark"):
         parser.error(
             "DFlash backbone feature flags are only valid for DFlash or DSpark"
+        )
+    if args.dflash_dfly_layer_residual and not args.dflash_gated_layer_fusion:
+        parser.error(
+            "--dflash-dfly-layer-residual requires "
+            "--dflash-gated-layer-fusion"
         )
     if args.per_position_loss_weight == "dpace":
         if args.loss_fn != "ce":

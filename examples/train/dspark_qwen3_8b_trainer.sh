@@ -123,6 +123,9 @@ DFLASH_CONTEXT_RESIDUAL_ARGS=(--no-dflash-context-residual)
 DFLASH_VERIFIER_FINAL_RESIDUAL_ARGS=(--no-dflash-verifier-final-residual)
 DFLASH_BLOCK_POSITION_ARGS=(--no-dflash-block-position-embedding)
 DFLASH_GATED_LAYER_FUSION_ARGS=(--no-dflash-gated-layer-fusion)
+# Requires DFLASH_GATED_LAYER_FUSION_ARGS=(--dflash-gated-layer-fusion).
+DFLASH_DFLY_LAYER_RESIDUAL_ARGS=(--no-dflash-dfly-layer-residual)
+DFLASH_HETEROGENEOUS_KV_ARGS=(--no-dflash-heterogeneous-kv-projections)
 
 # Ascend NPU assignments (online training needs separate devices for vLLM/training)
 VLLM_NPUS="0,1,2,3"
@@ -203,6 +206,8 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     "${DFLASH_VERIFIER_FINAL_RESIDUAL_ARGS[@]}" \
     "${DFLASH_BLOCK_POSITION_ARGS[@]}" \
     "${DFLASH_GATED_LAYER_FUSION_ARGS[@]}" \
+    "${DFLASH_DFLY_LAYER_RESIDUAL_ARGS[@]}" \
+    "${DFLASH_HETEROGENEOUS_KV_ARGS[@]}" \
     "${CONFIDENCE_HEAD_ARGS[@]}" \
     "${CONFIDENCE_SEQUENTIAL_FEATURE_ARGS[@]}" \
     --loss-fn "$LOSS_FN" \

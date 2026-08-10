@@ -80,7 +80,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.block_size = config.block_size
         self.layers = nn.ModuleList(
             [
-                Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
+                Qwen3DFlashDecoderLayer(
+                    config.transformer_layer_config,  # type: ignore[arg-type]
+                    layer_idx,
+                    heterogeneous_kv_projections=(
+                        config.dflash_heterogeneous_kv_projections
+                    ),
+                )
                 for layer_idx in range(num_draft_layers)
             ]
         )
@@ -101,6 +107,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
 
         self.dflash_gated_layer_fusion = config.dflash_gated_layer_fusion
+        self.dflash_dfly_layer_residual = config.dflash_dfly_layer_residual
+        if self.dflash_dfly_layer_residual and not self.dflash_gated_layer_fusion:
+            raise ValueError(
+                "dflash_dfly_layer_residual requires dflash_gated_layer_fusion"
+            )
         self.fc = nn.Linear(
             num_target_layers * hidden_size,
             hidden_size,
@@ -123,6 +134,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             self.layer_fusion_score = nn.Linear(hidden_size, 1, bias=False)
             self.layer_fusion_proj = nn.Linear(hidden_size, hidden_size, bias=False)
             self.layer_fusion_gate = nn.Parameter(torch.zeros(()))
+
+        self.dfly_layer_fusion_logits: nn.Parameter | None = None
+        if self.dflash_dfly_layer_residual:
+            self.dfly_layer_fusion_logits = nn.Parameter(
+                torch.zeros(num_draft_layers, num_target_layers)
+            )
 
         self.hidden_norm = Qwen3RMSNorm(
             hidden_size,
@@ -163,6 +180,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.post_init()
         if self.layer_fusion_score is not None:
             nn.init.zeros_(self.layer_fusion_score.weight)
+        if self.dfly_layer_fusion_logits is not None:
+            nn.init.zeros_(self.dfly_layer_fusion_logits)
         if self.block_position_embedding is not None:
             nn.init.zeros_(self.block_position_embedding.weight)
 
@@ -265,6 +284,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ),
             "dflash_gated_layer_fusion": kwargs.get(
                 "dflash_gated_layer_fusion", False
+            ),
+            "dflash_dfly_layer_residual": kwargs.get(
+                "dflash_dfly_layer_residual", False
+            ),
+            "dflash_heterogeneous_kv_projections": kwargs.get(
+                "dflash_heterogeneous_kv_projections", False
             ),
             "sample_from_anchor": sample_from_anchor,
             "speculators_config": SpeculatorsConfig(
@@ -373,11 +398,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
-    def _fuse_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project verifier auxiliary states into the DFlash hidden space."""
+    def _prepare_target_hidden(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Build the shared target projection and expose raw per-layer states."""
         baseline_projection = self.fc(hidden_states)
         if not self.dflash_gated_layer_fusion:
-            return self.hidden_norm(baseline_projection)
+            return baseline_projection, None
 
         if (
             self.layer_fusion_norms is None
@@ -412,7 +439,31 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         projected = baseline_projection + (
             torch.tanh(self.layer_fusion_gate) * fusion_residual
         )
-        return self.hidden_norm(projected)
+        return projected, layer_states
+
+    def _fuse_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the existing shared FC plus token-adaptive target context."""
+        shared_projection, _ = self._prepare_target_hidden(hidden_states)
+        return self.hidden_norm(shared_projection)
+
+    def _add_dfly_layer_residual(
+        self,
+        shared_projection: torch.Tensor,
+        target_layer_states: torch.Tensor | None,
+        draft_layer_idx: int,
+    ) -> torch.Tensor:
+        """Add DFly's draft-layer-specific target view to the shared projection."""
+        if not self.dflash_dfly_layer_residual:
+            return self.hidden_norm(shared_projection)
+        if self.dfly_layer_fusion_logits is None or target_layer_states is None:
+            raise RuntimeError("DFly layer residual modules were not initialized")
+
+        weights = torch.softmax(
+            self.dfly_layer_fusion_logits[draft_layer_idx].float(), dim=-1
+        ).to(target_layer_states.dtype)
+        weight_shape = [1] * (target_layer_states.ndim - 2) + [weights.shape[0], 1]
+        layer_residual = (target_layer_states * weights.view(*weight_shape)).sum(dim=-2)
+        return self.hidden_norm(shared_projection + layer_residual)
 
     def _condition_noise_embedding(
         self,
@@ -540,7 +591,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 verifier_last_hidden_states.to(self.verifier_norm.weight.dtype)
             )
 
-        fc_output = self._fuse_target_hidden(hidden_states)
+        shared_projection, target_layer_states = self._prepare_target_hidden(
+            hidden_states
+        )
+        fc_output = self.hidden_norm(shared_projection)
         noise_embedding = self._condition_noise_embedding(
             noise_embedding,
             fc_output,
@@ -574,9 +628,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
         for layer_idx, layer in enumerate(self.layers):
+            target_hidden = fc_output
+            if self.dflash_dfly_layer_residual:
+                target_hidden = self._add_dfly_layer_residual(
+                    shared_projection,
+                    target_layer_states,
+                    layer_idx,
+                )
             noise_embedding = layer(
                 hidden_states=noise_embedding,
-                target_hidden=fc_output,
+                target_hidden=target_hidden,
                 attention_mask=sliding_window_attn_mask
                 if layer_idx in self.sliding_window_indices
                 else full_attn_mask,

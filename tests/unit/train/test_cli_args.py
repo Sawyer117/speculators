@@ -109,6 +109,8 @@ def test_dspark_defaults_match_paper_weighting(monkeypatch):
     assert args.dflash_verifier_final_residual is False
     assert args.dflash_block_position_embedding is False
     assert args.dflash_gated_layer_fusion is False
+    assert args.dflash_dfly_layer_residual is False
+    assert args.dflash_heterogeneous_kv_projections is False
     assert args.enable_confidence_head is True
     assert args.confidence_head_with_markov is True
     assert args.confidence_detach_features is False
@@ -362,6 +364,8 @@ def test_new_dflash_and_collaboration_features_default_off(monkeypatch):
     assert args.dflash_verifier_final_residual is False
     assert args.dflash_block_position_embedding is False
     assert args.dflash_gated_layer_fusion is False
+    assert args.dflash_dfly_layer_residual is False
+    assert args.dflash_heterogeneous_kv_projections is False
     assert args.correction_cross_block_memory is False
 
 
@@ -382,6 +386,8 @@ def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
             "--dflash-verifier-final-residual",
             "--dflash-block-position-embedding",
             "--dflash-gated-layer-fusion",
+            "--dflash-dfly-layer-residual",
+            "--dflash-heterogeneous-kv-projections",
         ],
     )
     assert args.correction_with_markov is True
@@ -392,6 +398,8 @@ def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
     assert args.dflash_verifier_final_residual is True
     assert args.dflash_block_position_embedding is True
     assert args.dflash_gated_layer_fusion is True
+    assert args.dflash_dfly_layer_residual is True
+    assert args.dflash_heterogeneous_kv_projections is True
 
 
 # ---------------------------------------------------------------------------
