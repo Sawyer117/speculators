@@ -46,6 +46,22 @@ class _RecordingCorrectionHead(nn.Module):
         return delta_hidden, states, next_cache
 
 
+class _FusedRecordingCorrectionHead(_RecordingCorrectionHead):
+    def forward(self, *args, **kwargs):
+        delta_hidden, _, next_cache = super().forward(*args, **kwargs)
+        return delta_hidden, delta_hidden, next_cache
+
+    @staticmethod
+    def fused_lm_head_residual(
+        causal_states,
+        lm_head_weight,
+        previous_logits=None,
+        previous_logits_mask=None,
+    ):
+        del previous_logits, previous_logits_mask
+        return torch.nn.functional.linear(causal_states, lm_head_weight)
+
+
 class _RecordingLogitCorrectionHead(nn.Module):
     output_mode = "logits"
 
@@ -194,12 +210,43 @@ def test_rollout_uses_generated_token_as_next_feedback():
     assert harness.lm_head.calls == harness.block_size
 
 
+def test_rollout_lm_head_fusion_projects_base_block_once():
+    harness = _RolloutHarness()
+    harness.block_size = 3
+    harness.config = SimpleNamespace(
+        sample_from_anchor=True,
+        correction_lm_head_fusion=True,
+    )
+    harness.correction_head = _FusedRecordingCorrectionHead()
+    harness.embed_tokens = nn.Embedding(8, 4)
+    harness.lm_head = _CountingLinear(4, 8)
+    harness.d2t = None
+    with torch.no_grad():
+        harness.embed_tokens.weight.copy_(
+            torch.arange(8, dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+        )
+        harness.lm_head.weight.zero_()
+        harness.lm_head.weight[1, 0] = 10.0
+        harness.lm_head.weight[2, 1] = 10.0
+        harness.lm_head.weight[3, 2] = 10.0
+
+    tokens, logits = harness.rollout_correction(
+        torch.zeros(1, 3, 4),
+        anchor_token_ids=torch.tensor([7]),
+    )
+
+    assert torch.equal(tokens, torch.tensor([[1, 2, 3]]))
+    assert logits.shape == (1, 3, 8)
+    assert harness.lm_head.calls == 1
+
+
 def test_generated_feedback_training_retains_gradients_and_generated_tokens():
     harness = _GeneratedFeedbackHarness()
     harness.block_size = 3
     harness.config = SimpleNamespace(
         sample_from_anchor=True,
         correction_hidden_size=4,
+        correction_lm_head_fusion=True,
     )
     harness.correction_head = _RecordingCorrectionHead()
     harness.embed_tokens = nn.Embedding(8, 4)

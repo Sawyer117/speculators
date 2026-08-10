@@ -85,6 +85,15 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         gt=0,
         description="Low-rank bottleneck used to produce the correction residual.",
     )
+    correction_lm_head_fusion: bool = Field(
+        default=False,
+        description=(
+            "During no-grad hidden-mode rollout, fuse Correction's low-rank "
+            "output projection with the LM head. This computes the block base "
+            "logits once and applies only rank-to-vocabulary residual projections "
+            "at sequential positions. Training is unchanged."
+        ),
+    )
     correction_num_layers: int = Field(
         default=1,
         gt=0,

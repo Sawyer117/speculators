@@ -4,7 +4,7 @@ from typing import Literal
 
 import torch
 from torch import nn
-from torch.nn.functional import scaled_dot_product_attention, silu
+from torch.nn.functional import linear, scaled_dot_product_attention, silu
 
 __all__ = [
     "CausalCorrectionHead",
@@ -140,10 +140,12 @@ class CausalCorrectionHead(nn.Module):
     those features across the block.
 
     ``output_mode="hidden"`` preserves the baseline path: the returned residual is
-    added to the DFlash hidden state before the model's single full LM-head
-    projection. MoE hidden mode fuses an always-on shared expert and one Top-1
-    expert after both return to the DFlash hidden width. MoE logits mode instead
-    fuses them in a common low-rank space before one shared vocabulary projection.
+    added to the DFlash hidden state before the model's full LM-head projection.
+    No-grad rollout can equivalently cache ``LMHead @ correction_up`` and add a
+    low-rank vocabulary residual to one parallel base projection. MoE hidden mode
+    fuses an always-on shared expert and one Top-1 expert after both return to the
+    DFlash hidden width. MoE logits mode instead fuses them in a common low-rank
+    space before one shared vocabulary projection.
     Detached previous-logit uncertainty statistics can optionally condition only
     the MoE router and residual gate. ``output_mode="logits"`` additionally
     encodes the previous position's target/generated logits and returns a low-rank
@@ -331,6 +333,14 @@ class CausalCorrectionHead(nn.Module):
             nn.init.zeros_(self.auxiliary_hidden_gate.weight)
             nn.init.constant_(self.auxiliary_hidden_gate.bias, gate_bias)
 
+        # Inference-only products of LM-head and Correction up-projection
+        # weights. They are deliberately ordinary attributes: checkpoints keep
+        # the original factorized weights, while each inference worker lazily
+        # materializes device/dtype-specific fused projections once.
+        self._lm_fusion_signature: tuple[object, ...] | None = None
+        self._lm_fusion_shared_weight: torch.Tensor | None = None
+        self._lm_fusion_expert_weights: tuple[torch.Tensor, ...] | None = None
+
     def _moe_logit_features(
         self,
         previous_logits: torch.Tensor | None,
@@ -464,6 +474,162 @@ class CausalCorrectionHead(nn.Module):
         if self.enable_moe and self.output_mode == "logits":
             residual = self.correction_up(residual)
         return residual
+
+    def clear_lm_head_fusion_cache(self) -> None:
+        """Drop lazily materialized inference-only LM-head products."""
+        self._lm_fusion_signature = None
+        self._lm_fusion_shared_weight = None
+        self._lm_fusion_expert_weights = None
+
+    def _lm_head_fusion_weights(
+        self,
+        lm_head_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Return cached ``LMHead @ correction_up`` projection weights."""
+        if self.output_mode != "hidden":
+            raise RuntimeError("LM-head fusion requires hidden Correction mode")
+        if torch.is_grad_enabled():
+            raise RuntimeError("LM-head fusion is inference-only")
+
+        up_weights = [self.correction_up.weight]
+        if self.enable_moe:
+            if self.moe_experts is None:
+                raise RuntimeError("Correction MoE experts are missing")
+            up_weights.extend(expert.up.weight for expert in self.moe_experts)
+
+        signature_weights = [lm_head_weight, *up_weights]
+        signature_items: list[object] = []
+        for weight in signature_weights:
+            try:
+                version = weight._version  # noqa: SLF001
+            except RuntimeError:
+                # Parameters created inside inference_mode do not expose a
+                # version counter; inference weights are immutable in practice.
+                version = None
+            signature_items.append(
+                (
+                    weight.data_ptr(),
+                    version,
+                    weight.device,
+                    weight.dtype,
+                    tuple(weight.shape),
+                )
+            )
+        signature = tuple(signature_items)
+        if (
+            signature != self._lm_fusion_signature
+            or self._lm_fusion_shared_weight is None
+            or self._lm_fusion_expert_weights is None
+        ):
+            shared_up = up_weights[0]
+            lm_for_shared = lm_head_weight.detach().to(
+                device=shared_up.device,
+                dtype=shared_up.dtype,
+            )
+            shared = torch.matmul(lm_for_shared, shared_up.detach())
+            experts: list[torch.Tensor] = []
+            for expert_up in up_weights[1:]:
+                lm_for_expert = lm_head_weight.detach().to(
+                    device=expert_up.device,
+                    dtype=expert_up.dtype,
+                )
+                experts.append(torch.matmul(lm_for_expert, expert_up.detach()))
+            self._lm_fusion_signature = signature
+            self._lm_fusion_shared_weight = shared
+            self._lm_fusion_expert_weights = tuple(experts)
+
+        assert self._lm_fusion_shared_weight is not None  # noqa: S101
+        assert self._lm_fusion_expert_weights is not None  # noqa: S101
+        return (
+            self._lm_fusion_shared_weight,
+            self._lm_fusion_expert_weights,
+        )
+
+    @torch.compiler.disable
+    def fused_lm_head_residual(
+        self,
+        causal_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        previous_logits: torch.Tensor | None = None,
+        previous_logits_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Project a hidden residual to logits through cached fused weights.
+
+        This is algebraically equivalent to applying the LM-head weight to
+        :meth:`auxiliary_hidden_residual`, but associates the two linear maps as
+        ``(LMHead @ up) @ low_rank``. It therefore avoids materializing a full
+        hidden-to-vocabulary projection at every sequential rollout position.
+        """
+        shared_weight, expert_weights = self._lm_head_fusion_weights(
+            lm_head_weight
+        )
+        logit_features = self._moe_logit_features(
+            previous_logits,
+            previous_logits_mask,
+        )
+        shared_rank = silu(self.correction_down(causal_states))
+        shared_logits = linear(
+            shared_rank.to(shared_weight.dtype),
+            shared_weight,
+        )
+
+        residual_logits = shared_logits
+        if self.enable_moe:
+            if (
+                self.moe_router is None
+                or self.moe_experts is None
+                or self.moe_selected_scale is None
+                or len(expert_weights) != len(self.moe_experts)
+            ):
+                raise RuntimeError("Correction MoE fusion state is incomplete")
+            router_probs = torch.softmax(
+                self._moe_router_logits(causal_states, logit_features).float(),
+                dim=-1,
+            )
+            selected_ids = router_probs.argmax(dim=-1)
+            selected_probs = router_probs.gather(
+                -1, selected_ids.unsqueeze(-1)
+            ).squeeze(-1)
+            flat_states = causal_states.reshape(-1, causal_states.shape[-1])
+            flat_ids = selected_ids.reshape(-1)
+            flat_probs = selected_probs.reshape(-1)
+            flat_logits = shared_logits.new_zeros(
+                flat_states.shape[0], shared_logits.shape[-1]
+            )
+            for expert_id, (expert, fused_weight) in enumerate(
+                zip(self.moe_experts, expert_weights, strict=True)
+            ):
+                token_indices = torch.nonzero(
+                    flat_ids == expert_id, as_tuple=False
+                ).flatten()
+                expert_rank = silu(
+                    expert.down(flat_states.index_select(0, token_indices))
+                )
+                expert_logits = linear(
+                    expert_rank.to(fused_weight.dtype),
+                    fused_weight,
+                )
+                expert_logits = expert_logits * flat_probs.index_select(
+                    0, token_indices
+                ).to(expert_logits.dtype).unsqueeze(-1)
+                flat_logits = flat_logits.index_copy(
+                    0,
+                    token_indices,
+                    expert_logits.to(flat_logits.dtype),
+                )
+            selected_logits = flat_logits.view_as(shared_logits)
+            residual_logits = shared_logits + self.moe_selected_scale.to(
+                shared_logits.dtype
+            ) * selected_logits
+
+        gate_logits = self.residual_gate(causal_states)
+        if self.moe_logit_routing:
+            if logit_features is None or self.moe_logit_gate is None:
+                raise RuntimeError("MoE logit routing features are missing")
+            gate_logits = gate_logits + self.moe_logit_gate(logit_features)
+        return residual_logits * torch.sigmoid(gate_logits).to(
+            residual_logits.dtype
+        )
 
     def moe_router_statistics(
         self,

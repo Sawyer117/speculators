@@ -547,6 +547,90 @@ def _run_preprojection_correction_rollout(
     return draft.rollout_correction(hidden_states, **rollout_kwargs)
 
 
+def _prepare_dflash_target_context(draft, hidden_states):
+    """Mirror the training/validation target-layer preparation exactly."""
+    shared_projection, target_layer_states = draft._prepare_target_hidden(
+        hidden_states
+    )
+    shared_context = draft.hidden_norm(shared_projection)
+    return shared_projection, target_layer_states, shared_context
+
+
+def _target_context_for_draft_layer(
+    draft,
+    *,
+    shared_projection,
+    target_layer_states,
+    shared_context,
+    layer_idx: int,
+):
+    """Return the shared or DFly draft-layer-specific target context."""
+    if not draft.dflash_dfly_layer_residual:
+        return shared_context
+    return draft._add_dfly_layer_residual(
+        shared_projection,
+        target_layer_states,
+        layer_idx,
+    )
+
+
+def _prepare_optional_dflash_weights(
+    draft_model,
+    draft_config,
+    loading_info,
+) -> None:
+    """Validate DFly and safely initialize missing heterogeneous K/V weights."""
+    missing_keys = tuple(loading_info.get("missing_keys", ()))
+    if getattr(draft_config, "dflash_dfly_layer_residual", False):
+        dfly_missing = [
+            key
+            for key in missing_keys
+            if "dfly_layer_fusion_logits" in key
+            or "layer_fusion_norms" in key
+            or "layer_fusion_score" in key
+            or "layer_fusion_proj" in key
+            or "layer_fusion_gate" in key
+        ]
+        if dfly_missing:
+            preview = ", ".join(dfly_missing[:8])
+            suffix = " ..." if len(dfly_missing) > 8 else ""
+            raise RuntimeError(
+                "The checkpoint enables DFly layer residuals but does not contain "
+                f"their trained weights: {preview}{suffix}. Do not enable DFly by "
+                "editing an older checkpoint config."
+            )
+
+    if getattr(draft_config, "dflash_heterogeneous_kv_projections", False):
+        copied: list[str] = []
+        for layer_idx, layer in enumerate(draft_model.layers):
+            attention = layer.self_attn
+            for target_name, shared_name in (
+                ("target_k_proj", "k_proj"),
+                ("target_v_proj", "v_proj"),
+            ):
+                key_fragment = (
+                    f"layers.{layer_idx}.self_attn.{target_name}."
+                )
+                if not any(key_fragment in key for key in missing_keys):
+                    continue
+                target_proj = getattr(attention, target_name, None)
+                shared_proj = getattr(attention, shared_name, None)
+                if target_proj is None or shared_proj is None:
+                    raise RuntimeError(
+                        "Heterogeneous K/V is enabled but its projection modules "
+                        "were not constructed"
+                    )
+                target_proj.load_state_dict(shared_proj.state_dict())
+                copied.append(f"layer {layer_idx} {target_name}")
+        if copied:
+            logger.warning(
+                "Checkpoint has no trained heterogeneous K/V weights; copied "
+                "the loaded shared K/V projections for baseline-equivalent "
+                "initialization: %s",
+                ", ".join(copied),
+            )
+
+
 def speculative_slots_for_draft(draft) -> int:
     block = int(draft.block_size)
     return block if _draft_sample_from_anchor(draft) else max(1, block - 1)
@@ -1066,7 +1150,9 @@ class DSparkOfflineRunner:
         )
         mask_token_ids[:, 0] = input_ids[:, start]
         noise_embedding = draft.embed_tokens(mask_token_ids)
-        fc_output = draft._fuse_target_hidden(hidden_states)
+        shared_projection, target_layer_states, fc_output = (
+            _prepare_dflash_target_context(draft, hidden_states)
+        )
         noise_embedding = draft._condition_noise_embedding(
             noise_embedding,
             fc_output,
@@ -1094,7 +1180,13 @@ class DSparkOfflineRunner:
             )
             noise_embedding = layer(
                 hidden_states=noise_embedding,
-                target_hidden=fc_output,
+                target_hidden=_target_context_for_draft_layer(
+                    draft,
+                    shared_projection=shared_projection,
+                    target_layer_states=target_layer_states,
+                    shared_context=fc_output,
+                    layer_idx=layer_idx,
+                ),
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=False,
@@ -1835,12 +1927,19 @@ def run(args: argparse.Namespace) -> None:
         d2t_path=args.d2t_path,
         t2d_path=args.t2d_path,
     )
-    draft_model = DSparkDraftModel.from_pretrained(
+    draft_model, draft_loading_info = DSparkDraftModel.from_pretrained(
         args.draft_model,
         config=draft_config,
         d2t=d2t,
         t2d=t2d,
-    ).to(device).eval()
+        output_loading_info=True,
+    )
+    _prepare_optional_dflash_weights(
+        draft_model,
+        draft_config,
+        draft_loading_info,
+    )
+    draft_model = draft_model.to(device).eval()
     _ensure_loaded_vocab_mappings(draft_model, args)
     if draft_model.correction_head is not None:
         if not _is_preprojection_correction(draft_model):
@@ -1859,11 +1958,21 @@ def run(args: argparse.Namespace) -> None:
         sequential_head = "none"
     logger.info(
         "Loaded DSpark | block_size=%d sample_from_anchor=%s "
-        "max_proposal_tokens=%d sequential_head=%s",
+        "max_proposal_tokens=%d sequential_head=%s lm_head_fusion=%s "
+        "dfly_layer_residual=%s heterogeneous_kv=%s",
         int(draft_model.block_size),
         bool(draft_config.sample_from_anchor),
         speculative_slots_for_draft(draft_model),
         sequential_head,
+        bool(getattr(draft_config, "correction_lm_head_fusion", False)),
+        bool(getattr(draft_config, "dflash_dfly_layer_residual", False)),
+        bool(
+            getattr(
+                draft_config,
+                "dflash_heterogeneous_kv_projections",
+                False,
+            )
+        ),
     )
     logger.info(
         "DSpark implementation: %s",

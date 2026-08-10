@@ -1,5 +1,7 @@
 """Tests for CLI arguments."""
 
+import pytest
+
 from scripts.train import parse_args
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
@@ -104,6 +106,7 @@ def test_dspark_defaults_match_paper_weighting(monkeypatch):
     assert args.epochs == 10
     assert args.enable_correction_head is False
     assert args.correction_moe is False
+    assert args.correction_lm_head_fusion is False
     assert args.correction_rollout_metrics is False
     assert args.dflash_context_residual is False
     assert args.dflash_verifier_final_residual is False
@@ -217,6 +220,7 @@ def test_dspark_preprojection_correction_head_cli(monkeypatch):
             "6",
             "--correction-gate-bias",
             "-1.0",
+            "--correction-lm-head-fusion",
             "--no-correction-rollout-metrics",
             "--correction-base-diagnostics",
             "--confidence-detach-features",
@@ -229,6 +233,7 @@ def test_dspark_preprojection_correction_head_cli(monkeypatch):
     assert args.correction_num_layers == 2
     assert args.correction_num_heads == 6
     assert args.correction_gate_bias == -1.0
+    assert args.correction_lm_head_fusion is True
     assert args.correction_generated_token_ratio == 0.0
     assert args.correction_rollout_metrics is False
     assert args.correction_base_diagnostics is True
@@ -251,6 +256,21 @@ def test_dspark_logit_residual_correction_head_cli(monkeypatch):
     )
     assert args.enable_correction_head is True
     assert args.correction_output_mode == "logits"
+
+
+def test_dspark_lm_head_fusion_rejects_logit_mode(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type",
+                "dspark",
+                "--enable-correction-head",
+                "--correction-output-mode",
+                "logits",
+                "--correction-lm-head-fusion",
+            ],
+        )
 
 
 def test_dspark_logit_correction_moe_cli(monkeypatch):

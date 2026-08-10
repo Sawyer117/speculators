@@ -90,6 +90,56 @@ class TestCausalCorrectionHead:
         assert torch.isfinite(balance_loss)
         assert 0.0 <= entropy <= 1.0
 
+    @pytest.mark.parametrize("enable_moe", [False, True])
+    def test_hidden_residual_lm_head_fusion_matches_unfused_projection(
+        self, enable_moe
+    ):
+        torch.manual_seed(10)
+        head = CausalCorrectionHead(
+            input_hidden_size=16,
+            token_embedding_size=16,
+            block_size=4,
+            correction_hidden_size=12,
+            correction_rank=8,
+            num_layers=1,
+            num_heads=3,
+            enable_moe=enable_moe,
+            moe_shared_rank=4,
+            moe_expert_rank=2,
+            moe_num_experts=2,
+        ).eval()
+        with torch.no_grad():
+            head.correction_up.weight.normal_()
+            if head.moe_experts is not None:
+                for expert in head.moe_experts:
+                    expert.up.weight.normal_()
+
+            states = torch.randn(2, 3, 12)
+            lm_head_weight = torch.randn(20, 16)
+            expected = torch.nn.functional.linear(
+                head.auxiliary_hidden_residual(states),
+                lm_head_weight,
+            )
+            actual = head.fused_lm_head_residual(states, lm_head_weight)
+
+            assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-4)
+
+            # In-place parameter updates invalidate the lazy inference cache.
+            head.correction_up.weight.add_(0.1)
+            refreshed_expected = torch.nn.functional.linear(
+                head.auxiliary_hidden_residual(states),
+                lm_head_weight,
+            )
+            refreshed_actual = head.fused_lm_head_residual(
+                states, lm_head_weight
+            )
+            assert torch.allclose(
+                refreshed_actual,
+                refreshed_expected,
+                atol=1e-4,
+                rtol=1e-4,
+            )
+
     def test_logit_moe_fuses_before_one_shared_vocabulary_projection(self):
         torch.manual_seed(11)
         head = CausalCorrectionHead(

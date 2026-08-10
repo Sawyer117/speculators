@@ -1236,6 +1236,16 @@ def parse_args():
         help="DSpark correction residual bottleneck (default: 256).",
     )
     parser.add_argument(
+        "--correction-lm-head-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark hidden Correction: during no-grad rollout, fuse its low-rank "
+            "output weights with the LM head and avoid per-slot full hidden-to-vocab "
+            "projections (default: disabled)."
+        ),
+    )
+    parser.add_argument(
         "--correction-num-layers",
         type=int,
         default=1,
@@ -1680,6 +1690,16 @@ def parse_args():
         parser.error(
             "--correction-output-mode=logits requires --enable-correction-head"
         )
+    if args.correction_lm_head_fusion:
+        if not args.enable_correction_head:
+            parser.error(
+                "--correction-lm-head-fusion requires --enable-correction-head"
+            )
+        if args.correction_output_mode != "hidden":
+            parser.error(
+                "--correction-lm-head-fusion requires "
+                "--correction-output-mode=hidden"
+            )
     if args.correction_moe:
         if not args.enable_correction_head:
             parser.error("--correction-moe requires --enable-correction-head")

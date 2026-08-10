@@ -55,6 +55,15 @@ class DSparkDraftModel(DFlashDraftModel):
             and not config.enable_correction_head
         ):
             raise ValueError("correction_output_mode='logits' requires Correction")
+        if config.correction_lm_head_fusion:
+            if not config.enable_correction_head:
+                raise ValueError(
+                    "correction_lm_head_fusion=True requires Correction"
+                )
+            if config.correction_output_mode != "hidden":
+                raise ValueError(
+                    "correction_lm_head_fusion=True requires hidden output mode"
+                )
         if config.correction_moe and not config.enable_correction_head:
             raise ValueError("correction_moe=True requires Correction")
         if config.correction_moe_logit_routing and not config.correction_moe:
@@ -210,6 +219,9 @@ class DSparkDraftModel(DFlashDraftModel):
             correction_output_mode=kwargs.get("correction_output_mode", "hidden"),
             correction_hidden_size=kwargs.get("correction_hidden_size", 512),
             correction_rank=kwargs.get("correction_rank", 256),
+            correction_lm_head_fusion=kwargs.get(
+                "correction_lm_head_fusion", False
+            ),
             correction_num_layers=kwargs.get("correction_num_layers", 1),
             correction_num_heads=kwargs.get("correction_num_heads", 8),
             correction_gate_bias=kwargs.get("correction_gate_bias", 0.0),
@@ -741,6 +753,17 @@ class DSparkDraftModel(DFlashDraftModel):
         logit_feedback_enabled = (
             correction_output_mode == "logits" or logit_routing_enabled
         )
+        fused_lm_head_enabled = bool(
+            getattr(self.config, "correction_lm_head_fusion", False)
+        ) and correction_output_mode == "hidden" and not torch.is_grad_enabled()
+        fused_base_logits = None
+        if fused_lm_head_enabled:
+            # Project the full parallel DFlash block once. Each sequential
+            # Correction position adds an inference-cached rank-to-vocabulary
+            # residual instead of invoking the full LM head again.
+            fused_base_logits = self.lm_head(
+                dflash_hidden.to(self.lm_head.weight.dtype)
+            )
         previous_feedback_logits = None
         previous_feedback_mask = None
         if logit_feedback_enabled:
@@ -778,9 +801,12 @@ class DSparkDraftModel(DFlashDraftModel):
             current_hidden = dflash_hidden[:, position]
             if position < start_position:
                 corrected_current_hidden = current_hidden
-                final_logits = self.lm_head(
-                    current_hidden.to(self.lm_head.weight.dtype)
-                )
+                if fused_base_logits is not None:
+                    final_logits = fused_base_logits[:, position]
+                else:
+                    final_logits = self.lm_head(
+                        current_hidden.to(self.lm_head.weight.dtype)
+                    )
                 causal_states = current_hidden.new_zeros(
                     current_hidden.shape[0], self.config.correction_hidden_size
                 )
@@ -864,9 +890,22 @@ class DSparkDraftModel(DFlashDraftModel):
                     corrected_current_hidden = current_hidden + delta_hidden[
                         :, 0
                     ].to(current_hidden.dtype)
-                    final_logits = self.lm_head(
-                        corrected_current_hidden.to(self.lm_head.weight.dtype)
-                    )
+                    if fused_base_logits is not None:
+                        delta_logits = (
+                            self.correction_head.fused_lm_head_residual(
+                                causal_states,
+                                self.lm_head.weight,
+                                previous_logits=previous_feedback_logits,
+                                previous_logits_mask=previous_feedback_mask,
+                            )
+                        )
+                        final_logits = fused_base_logits[:, position] + (
+                            delta_logits[:, 0].to(fused_base_logits.dtype)
+                        )
+                    else:
+                        final_logits = self.lm_head(
+                            corrected_current_hidden.to(self.lm_head.weight.dtype)
+                        )
                 causal_states = causal_states[:, 0]
                 if getattr(self, "markov_head", None) is not None:
                     final_logits, _, _ = self._apply_collaborative_markov(

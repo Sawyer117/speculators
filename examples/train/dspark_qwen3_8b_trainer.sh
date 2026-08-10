@@ -49,6 +49,9 @@ CORRECTION_HEAD_ARGS=()
 CORRECTION_OUTPUT_MODE="hidden"
 CORRECTION_HIDDEN_SIZE=512
 CORRECTION_RANK=256
+# In hidden mode, replace sequential full LM-head projections during rollout
+# with cached rank-to-vocabulary projections. Training remains unchanged.
+CORRECTION_LM_HEAD_FUSION_ARGS=(--no-correction-lm-head-fusion)
 CORRECTION_NUM_LAYERS=1
 CORRECTION_NUM_HEADS=8
 CORRECTION_GATE_BIAS=0.0
@@ -180,6 +183,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --correction-output-mode "$CORRECTION_OUTPUT_MODE" \
     --correction-hidden-size "$CORRECTION_HIDDEN_SIZE" \
     --correction-rank "$CORRECTION_RANK" \
+    "${CORRECTION_LM_HEAD_FUSION_ARGS[@]}" \
     --correction-num-layers "$CORRECTION_NUM_LAYERS" \
     --correction-num-heads "$CORRECTION_NUM_HEADS" \
     --correction-gate-bias "$CORRECTION_GATE_BIAS" \
