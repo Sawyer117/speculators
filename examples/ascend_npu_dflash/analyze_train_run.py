@@ -586,9 +586,14 @@ def loss_imbalance_report(recs, text: str) -> None:
         spread.append((max(v) - min(v)) / mean)
 
     n = len(steps)
+    med = lambda v: sorted(v)[len(v) // 2]
     print(f"  logged steps: {n}   ranks: {len(steps[0])}")
-    print(f"  weight skew mean(n)/n_r    most OVER-weighted rank: mean {sum(hi)/n:.3f}  worst {max(hi):.3f}")
-    print(f"                             most UNDER-weighted rank: mean {sum(lo)/n:.3f}  worst {min(lo):.3f}")
+    # median first: the mean of skew_max is dragged by rare near-empty ranks, so the
+    # median is the representative figure and the max is a tail illustration.
+    print(f"  weight skew mean(n)/n_r    most OVER-weighted rank: median {med(hi):.3f}  "
+          f"mean {sum(hi)/n:.3f}  worst {max(hi):.3f}")
+    print(f"                             most UNDER-weighted rank: median {med(lo):.3f}  "
+          f"mean {sum(lo)/n:.3f}  worst {min(lo):.3f}")
     print(f"  token spread (max-min)/mean: mean {sum(spread)/n:.3f}  worst {max(spread):.3f}")
     if zero_steps:
         print(f"  ⚠ {zero_steps}/{n} steps had a rank with ZERO supervised tokens — the extreme case:")
@@ -605,6 +610,30 @@ def loss_imbalance_report(recs, text: str) -> None:
     print("  cumulative tokens/rank: " + " ".join(f"r{i}={per_rank[i]}" for i in sorted(per_rank)))
     print(f"  ⟹ cumulatively rank {worst} carries {100*per_rank[worst]/gmean-100:+.1f}% vs mean, "
           f"rank {best} {100*per_rank[best]/gmean-100:+.1f}%")
+    # NOISE vs SYSTEMATIC BIAS. If the per-step deviations were zero-mean and independent,
+    # the cumulative relative deviation would shrink like 1/sqrt(steps) — halving the sample
+    # should inflate it by ~sqrt(2). If instead each half shows the SAME deviation, the
+    # imbalance is a fixed property of the sampler and never averages out.
+    half = len(steps) // 2
+    if half >= 20:
+        def _dev(chunk):
+            tot: dict[int, int] = {}
+            for v in chunk:
+                for i, t in enumerate(v):
+                    tot[i] = tot.get(i, 0) + t
+            m = sum(tot.values()) / len(tot)
+            return {i: 100 * tot[i] / m - 100 for i in tot}, tot
+        d1, t1 = _dev(steps[:half])
+        d2, t2 = _dev(steps[half:])
+        hv = max(d1, key=d1.get)
+        print(f"  systematic? first half r{hv} {d1[hv]:+.1f}%   second half r{hv} {d2[hv]:+.1f}%")
+        order_same = sorted(t1, key=t1.get, reverse=True) == sorted(t2, key=t2.get, reverse=True)
+        if abs(d1[hv] - d2[hv]) < 0.35 * abs(d1[hv]) and order_same:
+            print("    ⟹ SYSTEMATIC: both halves show the same skew AND the same rank ordering.")
+            print("      Zero-mean noise would shrink ~1/sqrt(n); this does not, so it never averages out.")
+        else:
+            print("    ⟹ looks like sampling noise: the halves disagree, so it averages out with more steps.")
+
     ratio = per_rank[best] / max(per_rank[worst], 1)
     if ratio < 1.01:
         print("  ⟹ balanced within 1% cumulatively — per-rank and global normalization are")
