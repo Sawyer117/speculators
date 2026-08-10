@@ -585,6 +585,11 @@ def loss_imbalance_report(recs, text: str) -> None:
         vals = [int(x) for x in line.replace(" ", "").split(",") if x]
         for i, v in enumerate(vals):
             per_rank.setdefault(i, []).append(v)
+    zero_steps = sum(1 for v in col(recs, "profile/sup_tokens_zero_ranks") if not isnan(v) and v)
+    if zero_steps:
+        print(f"  ⚠ {zero_steps}/{n} logged steps had a rank with ZERO supervised tokens — the extreme")
+        print("    case: that rank contributes nothing to the loss yet still takes 1/R of the")
+        print("    per-rank mean-of-ratios. Excluded from the skew figures above (mean/0 is not a ratio).")
     if per_rank:
         tot = {i: sum(v) for i, v in per_rank.items()}
         gmean = sum(tot.values()) / len(tot)

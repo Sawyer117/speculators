@@ -589,11 +589,21 @@ class Trainer:
                         profile["align_ms"] = round(align_ms, 1)
                     if tokens_all and sum(tokens_all) > 0:
                         _mean = sum(tokens_all) / len(tokens_all)
-                        _skew = [_mean / max(t, 1) for t in tokens_all]
                         profile["sup_tokens_ranks"] = tokens_all
-                        # how much the per-rank objective over/under-weights a rank's tokens
-                        profile["sup_tokens_skew_max"] = round(max(_skew), 4)
-                        profile["sup_tokens_skew_min"] = round(min(_skew), 4)
+                        # Skew over ranks that HAVE tokens. A zero-token rank is reported
+                        # separately, not folded in: mean/0 is not a weight ratio, and letting
+                        # it through as mean/1 fabricates a huge "skew" out of a divide guard.
+                        _nz = [t for t in tokens_all if t > 0]
+                        if _nz:
+                            _skew = [_mean / t for t in _nz]
+                            # how much the per-rank objective over/under-weights a rank's tokens
+                            profile["sup_tokens_skew_max"] = round(max(_skew), 4)
+                            profile["sup_tokens_skew_min"] = round(min(_skew), 4)
+                        if len(_nz) < len(tokens_all):
+                            # the extreme case of the same bug: a rank with no supervised tokens
+                            # contributes nothing to the loss yet still takes 1/R of the
+                            # per-rank mean-of-ratios.
+                            profile["sup_tokens_zero_ranks"] = len(tokens_all) - len(_nz)
                         # spread as a fraction of the mean; 0.0 = perfectly balanced
                         profile["sup_tokens_spread"] = round(
                             (max(tokens_all) - min(tokens_all)) / _mean, 4
