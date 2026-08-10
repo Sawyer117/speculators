@@ -627,10 +627,25 @@ def loss_imbalance_report(recs, text: str) -> None:
         d2, t2 = _dev(steps[half:])
         hv = max(d1, key=d1.get)
         print(f"  systematic? first half r{hv} {d1[hv]:+.1f}%   second half r{hv} {d2[hv]:+.1f}%")
-        order_same = sorted(t1, key=t1.get, reverse=True) == sorted(t2, key=t2.get, reverse=True)
-        if abs(d1[hv] - d2[hv]) < 0.35 * abs(d1[hv]) and order_same:
-            print("    ⟹ SYSTEMATIC: both halves show the same skew AND the same rank ordering.")
+        # Correlate the two halves' per-rank deviation VECTORS. Requiring the full rank
+        # ordering to match was too strict: the middle ranks sit within ~1% of each other,
+        # so one swap among near-ties flipped the verdict to "noise" while both halves were
+        # showing the same +11.5% skew. Correlation is robust to those ties.
+        ks = sorted(d1)
+        a = [d1[k] for k in ks]
+        b = [d2[k] for k in ks]
+        ma, mb = sum(a) / len(a), sum(b) / len(b)
+        cov = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+        va = sum((x - ma) ** 2 for x in a) ** 0.5
+        vb = sum((y - mb) ** 2 for y in b) ** 0.5
+        corr = cov / (va * vb) if va and vb else 0.0
+        same_mag = abs(d1[hv] - d2[hv]) < 0.35 * max(abs(d1[hv]), 1e-9)
+        print(f"    per-rank deviation correlation between halves: {corr:+.3f}")
+        if corr > 0.8 and same_mag:
+            print("    ⟹ SYSTEMATIC: both halves show the same skew, on the same ranks.")
             print("      Zero-mean noise would shrink ~1/sqrt(n); this does not, so it never averages out.")
+        elif corr > 0.8:
+            print("    ⟹ same ranks are consistently heavy/light, but the magnitude moved — partly systematic.")
         else:
             print("    ⟹ looks like sampling noise: the halves disagree, so it averages out with more steps.")
 
@@ -796,7 +811,10 @@ def main() -> None:
         last_al = median([v for _, v in al[-20:]])
         trend = "↑" if last_al > first_al + 1e-3 else ("↓" if last_al < first_al - 1e-3 else "→")
         print(f"accept_len     : first {fmt(first_al)} → last {fmt(last_al)} {trend}  (max {fmt(hi[1])}@{hi[0]})"
-              f"   [block ceiling = block_size; target released draft AL 3.94 @ num_spec=5]")
+              f"   [block ceiling = block_size. ⚠ this is the SOFT/analytical accept_len "
+              f"(1-d_TV overlap); hard_accept_len is the greedy one comparable to a serve eval. "
+              f"Same-serve released draft = {RELEASED_ACCEPT_LEN['avg']} avg / "
+              f"{RELEASED_ACCEPT_LEN['gsm8k']} gsm8k; 3.94 is only the cross-stack floor]")
     for k, lab in [("train/accept_rate", "accept_rate"), ("train/full_acc", "full_acc")]:
         v = last_n_med(k)
         if v is not None:
@@ -879,7 +897,8 @@ def main() -> None:
     elif verdicts and any("SLOW-CREEP" in v for v in verdicts.values()):
         print("  → short window flat but still SLOWLY improving on the long horizon — NOT converged; keep going.")
     elif verdicts and all(v == "→ plateaued" for v in verdicts.values()):
-        print("  → truly plateaued on all metrics — near-converged or stuck (lr schedule / more data if far from 3.94).")
+        print("  → truly plateaued on all metrics — near-converged or stuck (lr schedule / more data "
+              f"if far from the {RELEASED_ACCEPT_LEN['avg']} same-serve released bar).")
 
     # ---------------- timing (steady-state) ----------------
     print("\n-- TIMING (per stage: STEADY vs EFFECTIVE-avg incl spikes) " + "-" * 16)
@@ -1056,8 +1075,12 @@ def main() -> None:
         if ov > 0.3 * tot:
             notes.append(f"recompile spikes eat {100*ov/tot:.0f}% of wall-clock — fixing them (fixed-shape "
                          f"MoE padding) would ~{tot/(tot-ov):.1f}× throughput.")
-    if al and last_al < 3.94:
-        notes.append(f"accept_len {last_al:.2f} < released-draft 3.94 — still training/warming; keep going.")
+    if al and last_al < RELEASED_ACCEPT_LEN["avg"]:
+        notes.append(
+            f"accept_len {last_al:.2f} (SOFT) < the {RELEASED_ACCEPT_LEN['avg']} same-serve released "
+            "bar — still training; note the serve-side number is measured differently, so compare "
+            "hard_accept_len, and settle it with a real eval."
+        )
     cl = last_n_med("train/confidence_loss")
     pm, ar = last_n_med("train/confidence_pred_mean"), last_n_med("train/accept_rate")
     if pm is not None and ar is not None and abs(pm - ar) > 0.1:
