@@ -238,6 +238,54 @@ def test_speculator_model_from_pretrained_local_marshalling(
 
 
 @pytest.mark.smoke
+def test_from_pretrained_loading_info_keeps_post_load_hooks(
+    speculator_model_test_config,
+    monkeypatch,
+):
+    original_model = SpeculatorTestModel(speculator_model_test_config)
+    loaded_vocab = []
+    loaded_verifier = []
+
+    def load_vocab_mappings(self, t2d, d2t):
+        loaded_vocab.append((self, t2d, d2t))
+
+    def load_verifier_weights(self):
+        loaded_verifier.append(self)
+
+    monkeypatch.setattr(
+        SpeculatorTestModel,
+        "load_vocab_mappings",
+        load_vocab_mappings,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        SpeculatorTestModel,
+        "load_verifier_weights",
+        load_verifier_weights,
+        raising=False,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        original_model.save_pretrained(tmpdir)  # type: ignore[attr-defined]
+        t2d = torch.tensor([True])
+        d2t = torch.tensor([0])
+        loaded_model, loading_info = SpeculatorTestModel.from_pretrained(
+            tmpdir,
+            t2d=t2d,
+            d2t=d2t,
+            output_loading_info=True,
+        )
+
+    assert isinstance(loaded_model, SpeculatorTestModel)
+    assert isinstance(loading_info, dict)
+    assert len(loaded_vocab) == 1
+    assert loaded_vocab[0][0] is loaded_model
+    assert loaded_vocab[0][1] is t2d
+    assert loaded_vocab[0][2] is d2t
+    assert loaded_verifier == [loaded_model]
+
+
+@pytest.mark.smoke
 def test_speculator_model_from_pretrained(
     speculator_model_test_config,
 ):

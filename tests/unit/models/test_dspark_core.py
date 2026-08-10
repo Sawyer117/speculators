@@ -336,6 +336,37 @@ def test_logit_residual_rollout_feeds_back_previous_final_logits():
     assert harness.lm_head.calls == harness.block_size
 
 
+def test_no_anchor_sampling_starts_logit_feedback_from_verifier_logits():
+    harness = _RolloutHarness()
+    harness.block_size = 3
+    harness.draft_vocab_size = 8
+    harness.config = SimpleNamespace(
+        sample_from_anchor=False,
+        correction_hidden_size=4,
+    )
+    harness.correction_head = _RecordingLogitCorrectionHead(
+        harness.draft_vocab_size
+    )
+    harness.embed_tokens = nn.Embedding(8, 4)
+    harness.lm_head = _CountingLinear(4, harness.draft_vocab_size)
+    harness.d2t = None
+    initial_logits = torch.arange(8, dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad():
+        harness.lm_head.weight.zero_()
+
+    _, logits = harness.rollout_correction(
+        torch.zeros(1, 3, 4),
+        anchor_token_ids=torch.tensor([7]),
+        initial_previous_logits=initial_logits,
+    )
+
+    masks = torch.cat(harness.correction_head.previous_logits_masks, dim=1)
+    feedback = torch.cat(harness.correction_head.previous_logits, dim=1)
+    assert torch.equal(masks, torch.tensor([[True, True]]))
+    assert torch.equal(feedback[:, 0], initial_logits)
+    assert torch.equal(feedback[:, 1], logits[:, 1].detach())
+
+
 def test_logit_mode_can_project_corrected_hidden_before_adding_delta_logits():
     harness = _RolloutHarness()
     harness.block_size = 2

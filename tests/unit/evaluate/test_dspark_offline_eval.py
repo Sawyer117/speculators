@@ -254,15 +254,38 @@ def test_preprojection_rollout_forwards_cross_block_memory():
     hidden_states = object()
     anchor_token_ids = object()
     block_memory = object()
+    initial_previous_logits = object()
     module._run_preprojection_correction_rollout(
         Draft(),
         hidden_states=hidden_states,
         anchor_token_ids=anchor_token_ids,
         temperature=0.0,
         block_memory=block_memory,
+        initial_previous_logits=initial_previous_logits,
     )
 
     assert calls[0][1]["block_memory"] is block_memory
+    assert (
+        calls[0][1]["initial_previous_logits"] is initial_previous_logits
+    )
+
+
+def test_target_logits_are_selected_in_draft_vocab_order():
+    module = _load_module()
+    runner = module.DSparkOfflineRunner.__new__(module.DSparkOfflineRunner)
+    runner.draft_model = SimpleNamespace(
+        use_draft_vocab=True,
+        draft_vocab_size=3,
+        d2t=module.torch.tensor([0, 1, 2]),
+    )
+    target_logits = module.torch.arange(6, dtype=module.torch.float32).unsqueeze(0)
+
+    selected = runner._target_logits_to_draft_vocab(target_logits)
+
+    assert module.torch.equal(
+        selected,
+        module.torch.tensor([[0.0, 2.0, 4.0]]),
+    )
 
 
 def test_offline_dfly_uses_draft_layer_specific_target_context():
@@ -306,65 +329,6 @@ def test_offline_dfly_uses_draft_layer_specific_target_context():
     assert shared_context == "normalized-shared"
     assert contexts == ["dfly-0", "dfly-1"]
     assert calls == [("shared", "layers", 0), ("shared", "layers", 1)]
-
-
-def test_offline_optional_dflash_features_require_checkpoint_weights():
-    module = _load_module()
-    config = SimpleNamespace(
-        dflash_dfly_layer_residual=True,
-        dflash_heterogeneous_kv_projections=False,
-    )
-    loading_info = {"missing_keys": ["dfly_layer_fusion_logits"]}
-
-    with pytest.raises(RuntimeError, match="does not contain their trained weights"):
-        module._prepare_optional_dflash_weights(
-            SimpleNamespace(layers=[]),
-            config,
-            loading_info,
-        )
-
-
-def test_offline_missing_heterogeneous_kv_copies_shared_projections():
-    module = _load_module()
-
-    class Projection:
-        def __init__(self, value):
-            self.value = value
-
-        def state_dict(self):
-            return {"weight": self.value}
-
-        def load_state_dict(self, state):
-            self.value = state["weight"]
-
-    attention = SimpleNamespace(
-        k_proj=Projection("shared-k"),
-        v_proj=Projection("shared-v"),
-        target_k_proj=Projection("random-k"),
-        target_v_proj=Projection("random-v"),
-    )
-    draft = SimpleNamespace(
-        layers=[SimpleNamespace(self_attn=attention)],
-    )
-    config = SimpleNamespace(
-        dflash_dfly_layer_residual=False,
-        dflash_heterogeneous_kv_projections=True,
-    )
-    loading_info = {
-        "missing_keys": [
-            "layers.0.self_attn.target_k_proj.weight",
-            "layers.0.self_attn.target_v_proj.weight",
-        ]
-    }
-
-    module._prepare_optional_dflash_weights(
-        draft,
-        config,
-        loading_info,
-    )
-
-    assert attention.target_k_proj.value == "shared-k"
-    assert attention.target_v_proj.value == "shared-v"
 
 
 def test_shard_records_round_robin():

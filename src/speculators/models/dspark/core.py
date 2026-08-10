@@ -703,6 +703,7 @@ class DSparkDraftModel(DFlashDraftModel):
         *,
         temperature: float = 0.0,
         block_memory: torch.Tensor | None = None,
+        initial_previous_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run a differentiable Correction pass with greedy token self-feedback.
 
@@ -767,18 +768,50 @@ class DSparkDraftModel(DFlashDraftModel):
         previous_feedback_logits = None
         previous_feedback_mask = None
         if logit_feedback_enabled:
-            previous_feedback_logits = dflash_hidden.new_zeros(
+            expected_initial_shape = (
                 dflash_hidden.shape[0],
-                1,
                 self.draft_vocab_size,
-                dtype=self.lm_head.weight.dtype,
             )
-            previous_feedback_mask = torch.zeros(
-                dflash_hidden.shape[0],
-                1,
-                dtype=torch.bool,
-                device=dflash_hidden.device,
-            )
+            if self.config.sample_from_anchor:
+                if initial_previous_logits is not None:
+                    raise ValueError(
+                        "initial_previous_logits is only valid when "
+                        "sample_from_anchor=False"
+                    )
+                previous_feedback_logits = dflash_hidden.new_zeros(
+                    dflash_hidden.shape[0],
+                    1,
+                    self.draft_vocab_size,
+                    dtype=self.lm_head.weight.dtype,
+                )
+                previous_feedback_mask = torch.zeros(
+                    dflash_hidden.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=dflash_hidden.device,
+                )
+            else:
+                if initial_previous_logits is None:
+                    raise ValueError(
+                        "Logit-aware Correction with sample_from_anchor=False "
+                        "requires verifier logits for the current anchor"
+                    )
+                if initial_previous_logits.shape != expected_initial_shape:
+                    raise ValueError(
+                        "Expected initial_previous_logits shape "
+                        f"{expected_initial_shape}, got "
+                        f"{tuple(initial_previous_logits.shape)}"
+                    )
+                previous_feedback_logits = initial_previous_logits.detach().to(
+                    device=dflash_hidden.device,
+                    dtype=self.lm_head.weight.dtype,
+                ).unsqueeze(1)
+                previous_feedback_mask = torch.ones(
+                    dflash_hidden.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=dflash_hidden.device,
+                )
         previous_corrected_hidden = None
         previous_corrected_hidden_mask = None
         block_memory_kwargs = (
@@ -931,7 +964,7 @@ class DSparkDraftModel(DFlashDraftModel):
             output_states.append(causal_states)
             output_corrected_hidden.append(corrected_current_hidden)
 
-            if logit_feedback_enabled:
+            if logit_feedback_enabled and position >= start_position:
                 previous_feedback_logits = final_logits.detach().unsqueeze(1)
                 previous_feedback_mask = torch.ones(
                     final_logits.shape[0],
@@ -1077,11 +1110,23 @@ class DSparkDraftModel(DFlashDraftModel):
             moe_previous_logits_mask = block_positions > 0
         if self.correction_head is not None:
             if generated_correction_training:
+                initial_previous_logits = None
+                if (
+                    not self.config.sample_from_anchor
+                    and (
+                        correction_output_mode == "logits"
+                        or self.config.correction_moe_logit_routing
+                    )
+                ):
+                    initial_previous_logits = targets.view(
+                        num_blocks, block, -1
+                    )[:, 0]
                 _, logits_blocks, correction_states, corrected_hidden = (
                     self._generated_feedback_correction(
                         hidden_blocks,
                         anchor_token_ids=block_tokens[:, 0],
                         block_memory=block_memory,
+                        initial_previous_logits=initial_previous_logits,
                     )
                 )
                 logits = logits_blocks.reshape(1, mask_tokens_size, -1)
@@ -1350,10 +1395,22 @@ class DSparkDraftModel(DFlashDraftModel):
             # Validation keeps the teacher-forced view for comparison and also
             # measures the actual generated-token feedback chain.
             if not self.training and self.config.correction_rollout_metrics:
+                rollout_initial_logits = None
+                if (
+                    not self.config.sample_from_anchor
+                    and (
+                        correction_output_mode == "logits"
+                        or self.config.correction_moe_logit_routing
+                    )
+                ):
+                    rollout_initial_logits = targets.view(
+                        num_blocks, block, -1
+                    )[:, 0]
                 _, rollout_blocks = self.rollout_correction(
                     hidden_blocks.detach(),
                     anchor_token_ids=block_tokens[:, 0],
                     block_memory=block_memory,
+                    initial_previous_logits=rollout_initial_logits,
                 )
                 rollout_logits = rollout_blocks.reshape(1, mask_tokens_size, -1)
         elif self.markov_head is not None:
@@ -1502,6 +1559,7 @@ class DSparkDraftModel(DFlashDraftModel):
         *,
         temperature: float = 0.0,
         block_memory: torch.Tensor | None = None,
+        initial_previous_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressively apply correction using generated-token feedback."""
         tokens, logits, _, _ = self._generated_feedback_correction(
@@ -1509,5 +1567,6 @@ class DSparkDraftModel(DFlashDraftModel):
             anchor_token_ids,
             temperature=temperature,
             block_memory=block_memory,
+            initial_previous_logits=initial_previous_logits,
         )
         return tokens, logits

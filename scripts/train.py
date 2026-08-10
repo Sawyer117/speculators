@@ -381,6 +381,7 @@ def _build_from_config_only(
     d2t: torch.Tensor | None,
     verifier_name_or_path: str | None = None,
     draft_attn_impl: str | None = None,
+    training_args: argparse.Namespace | None = None,
 ) -> SpeculatorModel:
     """Initialize a fresh draft from a saved speculator *config* (no weights).
 
@@ -389,6 +390,8 @@ def _build_from_config_only(
     no trained draft weights to restore (decoder weights are randomly initialized).
     """
     config = model_class.config_class.from_pretrained(path)
+    if training_args is not None:
+        _reconcile_pretrained_config_args(training_args, config)
     if draft_attn_impl is not None:
         config.transformer_layer_config._attn_implementation = draft_attn_impl
     speculators_config = getattr(config, "speculators_config", None)
@@ -446,6 +449,7 @@ def build_draft_model(
                 draft_attn_impl=(
                     args.draft_attn_impl if args.speculator_type != "mtp" else None
                 ),
+                training_args=args,
             )
         if args.speculator_type != "mtp":
             # _attn_implementation is never serialized by HF configs, so re-apply
@@ -453,6 +457,7 @@ def build_draft_model(
             # MTP is skipped: its from_training_args never sets the field and its
             # __init__ resolves its own default ("eager") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
+            _reconcile_pretrained_config_args(args, config)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl
             return model_class.from_pretrained(
                 args.from_pretrained,
@@ -717,6 +722,115 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
     "sliding_window": "--sliding-window",
     "full_attention_indices": "--full-attention-indices",
 }
+
+# Model-config options that would otherwise be silently ignored when a complete
+# checkpoint is restored via --from-pretrained. Most change parameter shapes or
+# learned proposal semantics and therefore must match the checkpoint. The small
+# runtime-only subset below can safely change without adding/removing weights.
+PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
+    "block_size": "--block-size",
+    "sample_from_anchor": "--sample-from-anchor",
+    "sliding_window_non_causal": "--sliding-window-non-causal",
+    "dflash_context_residual": "--dflash-context-residual",
+    "dflash_verifier_final_residual": "--dflash-verifier-final-residual",
+    "dflash_block_position_embedding": "--dflash-block-position-embedding",
+    "dflash_gated_layer_fusion": "--dflash-gated-layer-fusion",
+    "dflash_dfly_layer_residual": "--dflash-dfly-layer-residual",
+    "dflash_heterogeneous_kv_projections": (
+        "--dflash-heterogeneous-kv-projections"
+    ),
+    "markov_rank": "--markov-rank",
+    "markov_head_type": "--markov-head-type",
+    "enable_correction_head": "--enable-correction-head",
+    "correction_output_mode": "--correction-output-mode",
+    "correction_hidden_size": "--correction-hidden-size",
+    "correction_rank": "--correction-rank",
+    "correction_lm_head_fusion": "--correction-lm-head-fusion",
+    "correction_num_layers": "--correction-num-layers",
+    "correction_num_heads": "--correction-num-heads",
+    "correction_gate_bias": "--correction-gate-bias",
+    "correction_moe": "--correction-moe",
+    "correction_moe_shared_rank": "--correction-moe-shared-rank",
+    "correction_moe_expert_rank": "--correction-moe-expert-rank",
+    "correction_moe_num_experts": "--correction-moe-num-experts",
+    "correction_moe_load_balance_weight": (
+        "--correction-moe-load-balance-weight"
+    ),
+    "correction_moe_logit_routing": "--correction-moe-logit-routing",
+    "correction_hidden_aux_loss": "--correction-hidden-aux-loss",
+    "correction_hidden_aux_weight": "--correction-hidden-aux-weight",
+    "correction_hidden_feedback": "--correction-hidden-feedback",
+    "correction_cross_block_memory": "--correction-cross-block-memory",
+    "correction_memory_gate_bias": "--correction-memory-gate-bias",
+    "correction_project_corrected_hidden": (
+        "--correction-project-corrected-hidden"
+    ),
+    "correction_with_markov": "--correction-with-markov",
+    "correction_markov_gate_bias": "--correction-markov-gate-bias",
+    "correction_generated_token_ratio": "--correction-generated-token-ratio",
+    "correction_generated_token_warmup": "--correction-generated-token-warmup",
+    "correction_generated_token_ramp": "--correction-generated-token-ramp",
+    "correction_rollout_metrics": "--correction-rollout-metrics",
+    "correction_base_diagnostics": "--correction-base-diagnostics",
+    "enable_confidence_head": "--enable-confidence-head",
+    "confidence_head_with_markov": "--confidence-head-with-markov",
+    "confidence_detach_features": "--confidence-detach-features",
+}
+
+PRETRAINED_RUNTIME_CONFIG_FIELDS = {
+    "correction_lm_head_fusion",
+    "correction_moe_load_balance_weight",
+    "correction_hidden_aux_weight",
+    "correction_generated_token_ratio",
+    "correction_generated_token_warmup",
+    "correction_generated_token_ramp",
+    "correction_rollout_metrics",
+    "correction_base_diagnostics",
+    "confidence_detach_features",
+}
+
+
+def _reconcile_pretrained_config_args(
+    args: argparse.Namespace,
+    config: PretrainedConfig,
+) -> None:
+    """Safely reconcile explicit CLI flags with a restored model config."""
+    provided = set(getattr(args, "_provided_model_config_dests", set()))
+    incompatible: list[str] = []
+    applied: list[str] = []
+
+    for dest, flag in PRETRAINED_MODEL_CONFIG_FLAGS.items():
+        if not hasattr(config, dest) or not hasattr(args, dest):
+            continue
+        checkpoint_value = getattr(config, dest)
+        cli_value = getattr(args, dest)
+        if dest not in provided:
+            # Trainer kwargs are built from args later. Inherit the saved value so
+            # parser defaults cannot silently reset the checkpoint's policy.
+            setattr(args, dest, checkpoint_value)
+            continue
+        if cli_value == checkpoint_value:
+            continue
+        if dest in PRETRAINED_RUNTIME_CONFIG_FIELDS:
+            setattr(config, dest, cli_value)
+            applied.append(f"{flag}={cli_value!r}")
+        else:
+            incompatible.append(
+                f"{flag}={cli_value!r} (checkpoint: {checkpoint_value!r})"
+            )
+
+    if incompatible:
+        raise ValueError(
+            "--from-pretrained cannot change checkpoint architecture or learned "
+            f"proposal semantics: {', '.join(incompatible)}. Remove the conflicting "
+            "option(s), use matching values, or start a fresh model without "
+            "--from-pretrained."
+        )
+    if applied:
+        logger.info(
+            "Applied explicit runtime-only overrides to pretrained config: %s",
+            ", ".join(applied),
+        )
 
 
 def validate_draft_init_args(
@@ -1631,6 +1745,9 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    args._provided_model_config_dests = explicitly_provided_dests(
+        parser, PRETRAINED_MODEL_CONFIG_FLAGS
+    )
 
     # Preserve the shared CLI defaults for every other algorithm while making a
     # bare ``--speculator-type dspark`` reproduce the paper training recipe.
@@ -1686,12 +1803,12 @@ def parse_args():
                 "--correction-hidden-size must be divisible by "
                 "--correction-num-heads"
             )
-    elif args.correction_output_mode != "hidden":
+    elif args.correction_output_mode != "hidden" and not args.from_pretrained:
         parser.error(
             "--correction-output-mode=logits requires --enable-correction-head"
         )
     if args.correction_lm_head_fusion:
-        if not args.enable_correction_head:
+        if not args.enable_correction_head and not args.from_pretrained:
             parser.error(
                 "--correction-lm-head-fusion requires --enable-correction-head"
             )
@@ -1701,7 +1818,7 @@ def parse_args():
                 "--correction-output-mode=hidden"
             )
     if args.correction_moe:
-        if not args.enable_correction_head:
+        if not args.enable_correction_head and not args.from_pretrained:
             parser.error("--correction-moe requires --enable-correction-head")
         if min(
             args.correction_moe_shared_rank,
@@ -1711,14 +1828,14 @@ def parse_args():
             parser.error("Correction MoE ranks and expert count must be > 0")
         if args.correction_moe_load_balance_weight < 0.0:
             parser.error("--correction-moe-load-balance-weight must be >= 0")
-    elif args.correction_moe_logit_routing:
+    elif args.correction_moe_logit_routing and not args.from_pretrained:
         parser.error("--correction-moe-logit-routing requires --correction-moe")
     if (
         args.correction_hidden_aux_loss
         or args.correction_hidden_feedback
         or args.correction_cross_block_memory
         or args.correction_project_corrected_hidden
-    ) and not args.enable_correction_head:
+    ) and not args.enable_correction_head and not args.from_pretrained:
         parser.error(
             "Correction auxiliary/feedback features require --enable-correction-head"
         )
@@ -1727,12 +1844,17 @@ def parse_args():
     if (
         args.correction_project_corrected_hidden
         and args.correction_output_mode != "logits"
+        and not args.from_pretrained
     ):
         parser.error(
             "--correction-project-corrected-hidden requires "
             "--correction-output-mode=logits"
         )
-    if args.correction_generated_token_ratio > 0.0 and not args.enable_correction_head:
+    if (
+        args.correction_generated_token_ratio > 0.0
+        and not args.enable_correction_head
+        and not args.from_pretrained
+    ):
         parser.error(
             "--correction-generated-token-ratio > 0 requires --enable-correction-head"
         )
@@ -1746,13 +1868,14 @@ def parse_args():
         args.correction_generated_token_warmup
         + args.correction_generated_token_ramp
         > 1.0
+        and not args.from_pretrained
     ):
         parser.error(
             "--correction-generated-token-warmup + "
             "--correction-generated-token-ramp must be <= 1"
         )
     if args.correction_with_markov:
-        if not args.enable_correction_head:
+        if not args.enable_correction_head and not args.from_pretrained:
             parser.error(
                 "--correction-with-markov requires --enable-correction-head"
             )
@@ -1773,7 +1896,11 @@ def parse_args():
         parser.error(
             "DFlash backbone feature flags are only valid for DFlash or DSpark"
         )
-    if args.dflash_dfly_layer_residual and not args.dflash_gated_layer_fusion:
+    if (
+        args.dflash_dfly_layer_residual
+        and not args.dflash_gated_layer_fusion
+        and not args.from_pretrained
+    ):
         parser.error(
             "--dflash-dfly-layer-residual requires "
             "--dflash-gated-layer-fusion"

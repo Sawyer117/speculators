@@ -24,6 +24,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from scripts.train import (
     DECODER_SHAPING_FLAGS,
     _build_from_config_only,
+    _reconcile_pretrained_config_args,
     build_draft_model,
     create_transformer_layer_config,
     load_draft_transformer_layer_config,
@@ -247,6 +248,25 @@ def test_from_pretrained_alone_parses(monkeypatch):
     assert args.draft_config == ""
 
 
+def test_from_pretrained_runtime_override_defers_to_checkpoint_config(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--from-pretrained",
+            "some/checkpoint",
+            "--correction-generated-token-ratio",
+            "0.25",
+        ],
+    )
+
+    assert args.correction_generated_token_ratio == 0.25
+    assert "correction_generated_token_ratio" in (
+        args._provided_model_config_dests
+    )
+
+
 @pytest.mark.parametrize(
     "extra",
     [
@@ -461,6 +481,42 @@ def test_build_from_config_only_reapplies_draft_attn_impl(tmp_path):
         )
 
     assert built.config.transformer_layer_config._attn_implementation == "sdpa"
+
+
+def test_pretrained_config_unspecified_runtime_value_inherits_checkpoint():
+    args = SimpleNamespace(
+        correction_generated_token_ratio=0.0,
+        _provided_model_config_dests=set(),
+    )
+    config = SimpleNamespace(correction_generated_token_ratio=0.25)
+
+    _reconcile_pretrained_config_args(args, config)  # type: ignore[arg-type]
+
+    assert args.correction_generated_token_ratio == 0.25
+    assert config.correction_generated_token_ratio == 0.25
+
+
+def test_pretrained_config_allows_explicit_runtime_override():
+    args = SimpleNamespace(
+        correction_rollout_metrics=True,
+        _provided_model_config_dests={"correction_rollout_metrics"},
+    )
+    config = SimpleNamespace(correction_rollout_metrics=False)
+
+    _reconcile_pretrained_config_args(args, config)  # type: ignore[arg-type]
+
+    assert config.correction_rollout_metrics is True
+
+
+def test_pretrained_config_rejects_structural_override():
+    args = SimpleNamespace(
+        dflash_heterogeneous_kv_projections=True,
+        _provided_model_config_dests={"dflash_heterogeneous_kv_projections"},
+    )
+    config = SimpleNamespace(dflash_heterogeneous_kv_projections=False)
+
+    with pytest.raises(ValueError, match="checkpoint architecture"):
+        _reconcile_pretrained_config_args(args, config)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

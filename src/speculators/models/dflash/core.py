@@ -136,10 +136,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             self.layer_fusion_gate = nn.Parameter(torch.zeros(()))
 
         self.dfly_layer_fusion_logits: nn.Parameter | None = None
+        self.dfly_layer_residual_gate: nn.Parameter | None = None
         if self.dflash_dfly_layer_residual:
             self.dfly_layer_fusion_logits = nn.Parameter(
                 torch.zeros(num_draft_layers, num_target_layers)
             )
+            self.dfly_layer_residual_gate = nn.Parameter(torch.zeros(()))
 
         self.hidden_norm = Qwen3RMSNorm(
             hidden_size,
@@ -182,6 +184,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             nn.init.zeros_(self.layer_fusion_score.weight)
         if self.dfly_layer_fusion_logits is not None:
             nn.init.zeros_(self.dfly_layer_fusion_logits)
+        if self.dfly_layer_residual_gate is not None:
+            nn.init.zeros_(self.dfly_layer_residual_gate)
         if self.block_position_embedding is not None:
             nn.init.zeros_(self.block_position_embedding.weight)
 
@@ -455,7 +459,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         """Add DFly's draft-layer-specific target view to the shared projection."""
         if not self.dflash_dfly_layer_residual:
             return self.hidden_norm(shared_projection)
-        if self.dfly_layer_fusion_logits is None or target_layer_states is None:
+        if (
+            self.dfly_layer_fusion_logits is None
+            or self.dfly_layer_residual_gate is None
+            or target_layer_states is None
+        ):
             raise RuntimeError("DFly layer residual modules were not initialized")
 
         weights = torch.softmax(
@@ -463,7 +471,93 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         ).to(target_layer_states.dtype)
         weight_shape = [1] * (target_layer_states.ndim - 2) + [weights.shape[0], 1]
         layer_residual = (target_layer_states * weights.view(*weight_shape)).sum(dim=-2)
-        return self.hidden_norm(shared_projection + layer_residual)
+        return self.hidden_norm(
+            shared_projection
+            + self.dfly_layer_residual_gate.to(layer_residual.dtype) * layer_residual
+        )
+
+    def _prepare_missing_checkpoint_weights(self, loading_info: dict) -> None:
+        """Safely initialize optional DFlash modules absent from a checkpoint."""
+        missing_keys = tuple(loading_info.get("missing_keys", ()))
+        if self.dflash_dfly_layer_residual:
+            trained_dfly_fragments = (
+                "dfly_layer_fusion_logits",
+                "layer_fusion_norms",
+                "layer_fusion_score",
+                "layer_fusion_proj",
+                "layer_fusion_gate",
+            )
+            missing_trained_dfly = [
+                key
+                for key in missing_keys
+                if any(fragment in key for fragment in trained_dfly_fragments)
+            ]
+            if missing_trained_dfly:
+                preview = ", ".join(missing_trained_dfly[:8])
+                suffix = " ..." if len(missing_trained_dfly) > 8 else ""
+                raise RuntimeError(
+                    "The checkpoint enables DFly layer residuals but does not "
+                    f"contain their trained weights: {preview}{suffix}. Do not "
+                    "enable DFly by editing an older checkpoint config."
+                )
+            gate_missing = any(
+                "dfly_layer_residual_gate" in key for key in missing_keys
+            )
+            if gate_missing:
+                if self.dfly_layer_residual_gate is None:
+                    raise RuntimeError("DFly residual gate was not constructed")
+                with torch.no_grad():
+                    # Checkpoints from the original ungated implementation used
+                    # the full residual, so a scale of one preserves them exactly.
+                    self.dfly_layer_residual_gate.fill_(1.0)
+                logger.warning(
+                    "Loaded a legacy ungated DFly checkpoint; initialized its "
+                    "new residual gate to 1 for exact backward compatibility."
+                )
+
+        if self.config.dflash_heterogeneous_kv_projections:
+            copied: list[str] = []
+            for layer_idx, layer in enumerate(self.layers):
+                attention = layer.self_attn
+                for target_name, shared_name in (
+                    ("target_k_proj", "k_proj"),
+                    ("target_v_proj", "v_proj"),
+                ):
+                    target_proj = getattr(attention, target_name, None)
+                    shared_proj = getattr(attention, shared_name, None)
+                    if target_proj is None or shared_proj is None:
+                        raise RuntimeError(
+                            "Heterogeneous K/V is enabled but its projection "
+                            "modules were not constructed"
+                        )
+                    key_fragment = f"layers.{layer_idx}.self_attn.{target_name}."
+                    state_names = tuple(target_proj.state_dict())
+                    missing_state_names = tuple(
+                        name
+                        for name in state_names
+                        if any(
+                            key_fragment in key
+                            and key.endswith(f"{target_name}.{name}")
+                            for key in missing_keys
+                        )
+                    )
+                    if not missing_state_names:
+                        continue
+                    if len(missing_state_names) != len(state_names):
+                        raise RuntimeError(
+                            "Checkpoint contains only part of heterogeneous K/V "
+                            f"projection {layer_idx}.{target_name}; refusing to "
+                            "overwrite its loaded weights."
+                        )
+                    target_proj.load_state_dict(shared_proj.state_dict())
+                    copied.append(f"layer {layer_idx} {target_name}")
+            if copied:
+                logger.warning(
+                    "Checkpoint has no trained heterogeneous K/V weights; copied "
+                    "the loaded shared K/V projections for baseline-equivalent "
+                    "initialization: %s",
+                    ", ".join(copied),
+                )
 
     def _condition_noise_embedding(
         self,

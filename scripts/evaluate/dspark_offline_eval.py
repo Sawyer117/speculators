@@ -532,6 +532,7 @@ def _run_preprojection_correction_rollout(
     anchor_token_ids,
     temperature: float,
     block_memory=None,
+    initial_previous_logits=None,
 ):
     """Run native Correction rollout, including optional previous-logit feedback."""
     if not _is_preprojection_correction(draft):
@@ -544,6 +545,8 @@ def _run_preprojection_correction_rollout(
     }
     if block_memory is not None:
         rollout_kwargs["block_memory"] = block_memory
+    if initial_previous_logits is not None:
+        rollout_kwargs["initial_previous_logits"] = initial_previous_logits
     return draft.rollout_correction(hidden_states, **rollout_kwargs)
 
 
@@ -572,63 +575,6 @@ def _target_context_for_draft_layer(
         target_layer_states,
         layer_idx,
     )
-
-
-def _prepare_optional_dflash_weights(
-    draft_model,
-    draft_config,
-    loading_info,
-) -> None:
-    """Validate DFly and safely initialize missing heterogeneous K/V weights."""
-    missing_keys = tuple(loading_info.get("missing_keys", ()))
-    if getattr(draft_config, "dflash_dfly_layer_residual", False):
-        dfly_missing = [
-            key
-            for key in missing_keys
-            if "dfly_layer_fusion_logits" in key
-            or "layer_fusion_norms" in key
-            or "layer_fusion_score" in key
-            or "layer_fusion_proj" in key
-            or "layer_fusion_gate" in key
-        ]
-        if dfly_missing:
-            preview = ", ".join(dfly_missing[:8])
-            suffix = " ..." if len(dfly_missing) > 8 else ""
-            raise RuntimeError(
-                "The checkpoint enables DFly layer residuals but does not contain "
-                f"their trained weights: {preview}{suffix}. Do not enable DFly by "
-                "editing an older checkpoint config."
-            )
-
-    if getattr(draft_config, "dflash_heterogeneous_kv_projections", False):
-        copied: list[str] = []
-        for layer_idx, layer in enumerate(draft_model.layers):
-            attention = layer.self_attn
-            for target_name, shared_name in (
-                ("target_k_proj", "k_proj"),
-                ("target_v_proj", "v_proj"),
-            ):
-                key_fragment = (
-                    f"layers.{layer_idx}.self_attn.{target_name}."
-                )
-                if not any(key_fragment in key for key in missing_keys):
-                    continue
-                target_proj = getattr(attention, target_name, None)
-                shared_proj = getattr(attention, shared_name, None)
-                if target_proj is None or shared_proj is None:
-                    raise RuntimeError(
-                        "Heterogeneous K/V is enabled but its projection modules "
-                        "were not constructed"
-                    )
-                target_proj.load_state_dict(shared_proj.state_dict())
-                copied.append(f"layer {layer_idx} {target_name}")
-        if copied:
-            logger.warning(
-                "Checkpoint has no trained heterogeneous K/V weights; copied "
-                "the loaded shared K/V projections for baseline-equivalent "
-                "initialization: %s",
-                ", ".join(copied),
-            )
 
 
 def speculative_slots_for_draft(draft) -> int:
@@ -1013,6 +959,37 @@ class DSparkOfflineRunner:
             draft_model.config.dflash_verifier_final_residual
             or draft_model.config.correction_cross_block_memory
         )
+        correction_output_mode = getattr(
+            getattr(draft_model, "correction_head", None),
+            "output_mode",
+            "hidden",
+        )
+        self.uses_initial_correction_logits = bool(
+            draft_model.correction_head is not None
+            and not self.sample_from_anchor
+            and (
+                correction_output_mode == "logits"
+                or getattr(
+                    draft_model.config,
+                    "correction_moe_logit_routing",
+                    False,
+                )
+            )
+        )
+        self._draft_target_logit_indices = None
+        if self.uses_initial_correction_logits and draft_model.use_draft_vocab:
+            if draft_model.d2t is None:
+                raise RuntimeError(
+                    "Draft-to-target vocabulary mapping is not loaded"
+                )
+            draft_ids = torch.arange(
+                draft_model.draft_vocab_size,
+                device=draft_model.d2t.device,
+                dtype=draft_model.d2t.dtype,
+            )
+            self._draft_target_logit_indices = (
+                draft_ids + draft_model.d2t
+            ).long()
         self._latest_verifier_pre_lm_hidden = None
         self._verifier_pre_lm_hook = None
         if self.uses_verifier_pre_lm_context:
@@ -1044,6 +1021,31 @@ class DSparkOfflineRunner:
             dim=-1,
         )
 
+    def _target_logits_to_draft_vocab(self, target_logits):
+        """Select the draft-vocabulary logits without another LM-head call."""
+        draft = self.draft_model
+        if target_logits.ndim != 2:
+            raise ValueError("Target logits for the current anchor must be rank-2")
+        if not draft.use_draft_vocab:
+            if target_logits.shape[-1] != draft.draft_vocab_size:
+                raise ValueError("Target and draft vocabulary sizes do not align")
+            return target_logits
+        if draft.d2t is None:
+            raise RuntimeError("Draft-to-target vocabulary mapping is not loaded")
+        target_ids = getattr(self, "_draft_target_logit_indices", None)
+        if target_ids is None:
+            draft_ids = torch.arange(
+                draft.draft_vocab_size,
+                device=target_logits.device,
+                dtype=draft.d2t.dtype,
+            )
+            target_ids = (draft_ids + draft.d2t.to(target_logits.device)).long()
+            self._draft_target_logit_indices = target_ids
+        elif target_ids.device != target_logits.device:
+            target_ids = target_ids.to(target_logits.device)
+            self._draft_target_logit_indices = target_ids
+        return target_logits.index_select(-1, target_ids)
+
     def _init_context(
         self,
         *,
@@ -1067,12 +1069,18 @@ class DSparkOfflineRunner:
                 verifier_pre_lm_hidden[:, -1, :],
                 initial_token.reshape(-1),
             )
+        correction_previous_logits = None
+        if self.uses_initial_correction_logits:
+            correction_previous_logits = self._target_logits_to_draft_vocab(
+                initial_output.logits[:, -1, :]
+            )
         return SimpleNamespace(
             target_hidden_states=self._extract_context_feature(
                 initial_output.hidden_states,
             ),
             target_pre_lm_hidden_states=verifier_pre_lm_hidden,
             correction_memory=correction_memory,
+            correction_previous_logits=correction_previous_logits,
         )
 
     def _single_anchor_backbone(
@@ -1208,6 +1216,7 @@ class DSparkOfflineRunner:
         hidden_states,
         first_prev_token_id,
         block_memory,
+        initial_previous_logits,
     ):
         """Sample with native causal Correction rollout."""
         del base_logits
@@ -1219,6 +1228,7 @@ class DSparkOfflineRunner:
             anchor_token_ids=first_prev_token_id.reshape(-1).long(),
             temperature=temperature,
             block_memory=block_memory,
+            initial_previous_logits=initial_previous_logits,
         )
 
         # The model returns all block slots.  With sample_from_anchor=False,
@@ -1246,6 +1256,7 @@ class DSparkOfflineRunner:
         hidden_states,
         first_prev_token_id,
         block_memory,
+        initial_previous_logits=None,
     ):
         draft = self.draft_model
         if draft.correction_head is not None:
@@ -1254,6 +1265,7 @@ class DSparkOfflineRunner:
                 hidden_states,
                 first_prev_token_id,
                 block_memory,
+                initial_previous_logits,
             )
 
         if base_logits is None:
@@ -1322,6 +1334,7 @@ class DSparkOfflineRunner:
             hidden,
             output_ids[:, start],
             context.correction_memory,
+            context.correction_previous_logits,
         )
         verify_input_ids = torch.cat(
             [
@@ -1372,6 +1385,14 @@ class DSparkOfflineRunner:
                         verification.next_token.reshape(-1),
                     )
                 )
+        if self.uses_initial_correction_logits:
+            context.correction_previous_logits = (
+                self._target_logits_to_draft_vocab(
+                    verification.target_output.logits[
+                        :, verification.accepted_draft_tokens, :
+                    ]
+                )
+            )
 
     def generate_one(self, prompt: str, stop_token_ids: list[int] | None):
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(
@@ -1927,17 +1948,11 @@ def run(args: argparse.Namespace) -> None:
         d2t_path=args.d2t_path,
         t2d_path=args.t2d_path,
     )
-    draft_model, draft_loading_info = DSparkDraftModel.from_pretrained(
+    draft_model = DSparkDraftModel.from_pretrained(
         args.draft_model,
         config=draft_config,
         d2t=d2t,
         t2d=t2d,
-        output_loading_info=True,
-    )
-    _prepare_optional_dflash_weights(
-        draft_model,
-        draft_config,
-        draft_loading_info,
     )
     draft_model = draft_model.to(device).eval()
     _ensure_loaded_vocab_mappings(draft_model, args)
