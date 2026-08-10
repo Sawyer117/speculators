@@ -552,6 +552,57 @@ def moe_load_report(text: str) -> None:
         print("    ✓ balanced (high entropy, most experts used) — load balancing is NOT the bottleneck.")
 
 
+
+def loss_imbalance_report(recs, text: str) -> None:
+    """Per-rank SUPERVISED-TOKEN imbalance over the run (trainer ``profile/sup_tokens_*``).
+
+    Silent on logs without the instrumentation. This is the premise of the global loss
+    normalization (``DSPARK_GLOBAL_LOSS_REDUCE`` / upstream PR #942): normalizing the masked
+    loss per-rank weights rank r's tokens by ``1/(R*n_r)``, while the token-weighted objective
+    weights every token by ``1/N``. The ratio ``mean(n)/n_r`` is exactly how far off rank r's
+    weight is — **1.0 everywhere means the two objectives coincide and the fix is a no-op**, so
+    this report is what says whether the fix can matter at all on this run.
+    """
+    skew_hi = [x for x in col(recs, "profile/sup_tokens_skew_max") if not isnan(x)]
+    skew_lo = [x for x in col(recs, "profile/sup_tokens_skew_min") if not isnan(x)]
+    spread = [x for x in col(recs, "profile/sup_tokens_spread") if not isnan(x)]
+    if not skew_hi:
+        return  # instrumentation off / older log — stay silent
+
+    print("\n-- PER-RANK SUPERVISED-TOKEN IMBALANCE " + "-" * 41)
+    n = len(skew_hi)
+    mean_hi, mean_lo = sum(skew_hi) / n, sum(skew_lo) / len(skew_lo)
+    print(f"  logged steps: {n}")
+    print(f"  weight skew mean(n)/n_r   over-weighted rank: mean {mean_hi:.3f}  worst {max(skew_hi):.3f}")
+    print(f"                             under-weighted rank: mean {mean_lo:.3f}  worst {min(skew_lo):.3f}")
+    if spread:
+        print(f"  token spread (max-min)/mean: mean {sum(spread)/len(spread):.3f}  worst {max(spread):.3f}")
+
+    # which rank is chronically light/heavy — a systematic skew is worse than a jittery one,
+    # because a fixed under-weighted rank means its data is permanently down-weighted.
+    per_rank: dict[int, list] = {}
+    for line in re.findall(r"sup_tokens_ranks=\[([\d,\s]*)\]", text):
+        vals = [int(x) for x in line.replace(" ", "").split(",") if x]
+        for i, v in enumerate(vals):
+            per_rank.setdefault(i, []).append(v)
+    if per_rank:
+        tot = {i: sum(v) for i, v in per_rank.items()}
+        gmean = sum(tot.values()) / len(tot)
+        worst = min(tot, key=lambda i: tot[i])
+        best = max(tot, key=lambda i: tot[i])
+        print("  cumulative tokens/rank: " + " ".join(f"r{i}={tot[i]}" for i in sorted(tot)))
+        print(f"  ⟹ over the whole run rank {worst} carries {100*tot[worst]/gmean-100:+.1f}% vs mean, "
+              f"rank {best} {100*tot[best]/gmean-100:+.1f}%")
+        if max(tot.values()) / max(min(tot.values()), 1) < 1.01:
+            print("  ⟹ balanced within 1% cumulatively — per-rank vs global normalization are "
+                  "effectively the same objective here.")
+        else:
+            print("  ⟹ NOT balanced: the per-rank objective is a mean-of-ratios, not token-weighted. "
+                  "This is what DSPARK_GLOBAL_LOSS_REDUCE=1 corrects.")
+    on = "[LOSS-REDUCE]" in text
+    print(f"  global loss reduce in this run: {'ON' if on else 'OFF (per-rank normalization)'}")
+
+
 def hs_split_report(text: str) -> None:
     """HS-fetch 3-phase split from ``[HS-SPLIT]`` prints (DSPARK_HS_SPLIT=1). Silent if absent.
     Each SLOW fetch (> DSPARK_HS_SPLIT_MS) is split into: create (the completions.create() round-trip
@@ -725,6 +776,7 @@ def main() -> None:
     fwd_profiler_report(raw_text)
     moe_load_report(raw_text)
     hs_split_report(raw_text)
+    loss_imbalance_report(recs, raw_text)
 
     # ---------------- recent dynamics (is it STILL learning?) ----------------
     N = args.recent

@@ -531,16 +531,26 @@ class Trainer:
             # rank's fetch_ms here -- the gather doubles as an ALIGN BARRIER, so the straggler-wait is
             # absorbed into align_ms (measured on this rank) instead of the forward below, and
             # fetch_ms_ranks exposes WHICH rank stalled. If the spikes move fwd->align, it's HS-bound.
+            # The SUPERVISED-TOKEN COUNT rides this same all_gather (no extra collective, log
+            # steps only). Per-rank loss normalization weights rank r's tokens by 1/(R*n_r)
+            # instead of the token-weighted 1/N, so mean(n)/n_r is exactly how far off that
+            # rank's weight is -- 1.0 everywhere means the two objectives coincide and
+            # DSPARK_GLOBAL_LOSS_REDUCE is a no-op. See models/metrics.py.
             fetch_all: list[float] | None = None
+            tokens_all: list[int] | None = None
             align_ms = 0.0
             if timer.enabled and self.is_distributed:
                 _fetch_local = (timer._marks["fetch"] - timer._marks["start"]) * 1000
+                _lm = gpu_batch.get("loss_mask")
                 _t_align = time.perf_counter()
-                _buf = torch.tensor([_fetch_local], device=self.local_rank, dtype=torch.float32)
+                _buf = torch.tensor([_fetch_local, 0.0], device=self.local_rank, dtype=torch.float32)
+                if _lm is not None:
+                    _buf[1] = _lm.sum().to(torch.float32)
                 _out = [torch.zeros_like(_buf) for _ in range(dist.get_world_size())]
                 dist.all_gather(_out, _buf)
                 align_ms = (time.perf_counter() - _t_align) * 1000
-                fetch_all = [round(float(t.item()), 1) for t in _out]
+                fetch_all = [round(float(t[0].item()), 1) for t in _out]
+                tokens_all = [int(t[1].item()) for t in _out]
             # --------------------------------------------------------------------------------------
             _draft_tokens, loss, metrics = self.model(
                 **gpu_batch, **(self.config.train_call_kwargs or {})
@@ -577,6 +587,17 @@ class Trainer:
                         profile["fetch_ms_ranks"] = fetch_all
                         profile["fetch_ms_max"] = max(fetch_all)
                         profile["align_ms"] = round(align_ms, 1)
+                    if tokens_all and sum(tokens_all) > 0:
+                        _mean = sum(tokens_all) / len(tokens_all)
+                        _skew = [_mean / max(t, 1) for t in tokens_all]
+                        profile["sup_tokens_ranks"] = tokens_all
+                        # how much the per-rank objective over/under-weights a rank's tokens
+                        profile["sup_tokens_skew_max"] = round(max(_skew), 4)
+                        profile["sup_tokens_skew_min"] = round(min(_skew), 4)
+                        # spread as a fraction of the mean; 0.0 = perfectly balanced
+                        profile["sup_tokens_spread"] = round(
+                            (max(tokens_all) - min(tokens_all)) / _mean, 4
+                        )
                 if self.is_distributed:
                     for v in metrics.values():
                         dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
