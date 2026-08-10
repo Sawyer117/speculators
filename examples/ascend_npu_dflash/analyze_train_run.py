@@ -554,7 +554,7 @@ def moe_load_report(text: str) -> None:
 
 
 def loss_imbalance_report(recs, text: str) -> None:
-    """Per-rank SUPERVISED-TOKEN imbalance over the run (trainer ``profile/sup_tokens_*``).
+    """Per-rank SUPERVISED-TOKEN imbalance over the run (trainer ``profile/sup_tokens_ranks``).
 
     Silent on logs without the instrumentation. This is the premise of the global loss
     normalization (``DSPARK_GLOBAL_LOSS_REDUCE`` / upstream PR #942): normalizing the masked
@@ -562,50 +562,57 @@ def loss_imbalance_report(recs, text: str) -> None:
     weights every token by ``1/N``. The ratio ``mean(n)/n_r`` is exactly how far off rank r's
     weight is — **1.0 everywhere means the two objectives coincide and the fix is a no-op**, so
     this report is what says whether the fix can matter at all on this run.
+
+    Everything is recomputed from the RAW per-rank counts rather than read from the trainer's
+    derived fields, so a log written before those fields were fixed still analyses correctly.
     """
-    skew_hi = [x for x in col(recs, "profile/sup_tokens_skew_max") if not isnan(x)]
-    skew_lo = [x for x in col(recs, "profile/sup_tokens_skew_min") if not isnan(x)]
-    spread = [x for x in col(recs, "profile/sup_tokens_spread") if not isnan(x)]
-    if not skew_hi:
+    steps = [
+        [int(x) for x in line.replace(" ", "").split(",") if x]
+        for line in re.findall(r"sup_tokens_ranks=\[([\d,\s]*)\]", text)
+    ]
+    steps = [v for v in steps if v and sum(v) > 0]
+    if not steps:
         return  # instrumentation off / older log — stay silent
 
     print("\n-- PER-RANK SUPERVISED-TOKEN IMBALANCE " + "-" * 41)
-    n = len(skew_hi)
-    mean_hi, mean_lo = sum(skew_hi) / n, sum(skew_lo) / len(skew_lo)
-    print(f"  logged steps: {n}")
-    print(f"  weight skew mean(n)/n_r   over-weighted rank: mean {mean_hi:.3f}  worst {max(skew_hi):.3f}")
-    print(f"                             under-weighted rank: mean {mean_lo:.3f}  worst {min(skew_lo):.3f}")
-    if spread:
-        print(f"  token spread (max-min)/mean: mean {sum(spread)/len(spread):.3f}  worst {max(spread):.3f}")
+    hi, lo, spread, zero_steps = [], [], [], 0
+    for v in steps:
+        mean = sum(v) / len(v)
+        nz = [t for t in v if t > 0]
+        if len(nz) < len(v):
+            zero_steps += 1
+        skew = [mean / t for t in nz]          # zero-token ranks excluded: mean/0 is not a ratio
+        hi.append(max(skew)); lo.append(min(skew))
+        spread.append((max(v) - min(v)) / mean)
 
-    # which rank is chronically light/heavy — a systematic skew is worse than a jittery one,
-    # because a fixed under-weighted rank means its data is permanently down-weighted.
-    per_rank: dict[int, list] = {}
-    for line in re.findall(r"sup_tokens_ranks=\[([\d,\s]*)\]", text):
-        vals = [int(x) for x in line.replace(" ", "").split(",") if x]
-        for i, v in enumerate(vals):
-            per_rank.setdefault(i, []).append(v)
-    zero_steps = sum(1 for v in col(recs, "profile/sup_tokens_zero_ranks") if not isnan(v) and v)
+    n = len(steps)
+    print(f"  logged steps: {n}   ranks: {len(steps[0])}")
+    print(f"  weight skew mean(n)/n_r    most OVER-weighted rank: mean {sum(hi)/n:.3f}  worst {max(hi):.3f}")
+    print(f"                             most UNDER-weighted rank: mean {sum(lo)/n:.3f}  worst {min(lo):.3f}")
+    print(f"  token spread (max-min)/mean: mean {sum(spread)/n:.3f}  worst {max(spread):.3f}")
     if zero_steps:
-        print(f"  ⚠ {zero_steps}/{n} logged steps had a rank with ZERO supervised tokens — the extreme")
-        print("    case: that rank contributes nothing to the loss yet still takes 1/R of the")
-        print("    per-rank mean-of-ratios. Excluded from the skew figures above (mean/0 is not a ratio).")
-    if per_rank:
-        tot = {i: sum(v) for i, v in per_rank.items()}
-        gmean = sum(tot.values()) / len(tot)
-        worst = min(tot, key=lambda i: tot[i])
-        best = max(tot, key=lambda i: tot[i])
-        print("  cumulative tokens/rank: " + " ".join(f"r{i}={tot[i]}" for i in sorted(tot)))
-        print(f"  ⟹ over the whole run rank {worst} carries {100*tot[worst]/gmean-100:+.1f}% vs mean, "
-              f"rank {best} {100*tot[best]/gmean-100:+.1f}%")
-        if max(tot.values()) / max(min(tot.values()), 1) < 1.01:
-            print("  ⟹ balanced within 1% cumulatively — per-rank vs global normalization are "
-                  "effectively the same objective here.")
-        else:
-            print("  ⟹ NOT balanced: the per-rank objective is a mean-of-ratios, not token-weighted. "
-                  "This is what DSPARK_GLOBAL_LOSS_REDUCE=1 corrects.")
-    on = "[LOSS-REDUCE]" in text
-    print(f"  global loss reduce in this run: {'ON' if on else 'OFF (per-rank normalization)'}")
+        print(f"  ⚠ {zero_steps}/{n} steps had a rank with ZERO supervised tokens — the extreme case:")
+        print("    it contributes nothing to the loss yet still takes 1/R of the mean-of-ratios.")
+
+    # A chronically light rank is a permanently down-weighted slice of the data, which the
+    # per-step spread hides — cumulative totals are the number that matters.
+    per_rank: dict[int, int] = {}
+    for v in steps:
+        for i, t in enumerate(v):
+            per_rank[i] = per_rank.get(i, 0) + t
+    gmean = sum(per_rank.values()) / len(per_rank)
+    worst, best = min(per_rank, key=per_rank.get), max(per_rank, key=per_rank.get)
+    print("  cumulative tokens/rank: " + " ".join(f"r{i}={per_rank[i]}" for i in sorted(per_rank)))
+    print(f"  ⟹ cumulatively rank {worst} carries {100*per_rank[worst]/gmean-100:+.1f}% vs mean, "
+          f"rank {best} {100*per_rank[best]/gmean-100:+.1f}%")
+    ratio = per_rank[best] / max(per_rank[worst], 1)
+    if ratio < 1.01:
+        print("  ⟹ balanced within 1% cumulatively — per-rank and global normalization are")
+        print("    effectively the same objective here, so the fix would be a no-op on this run.")
+    else:
+        print(f"  ⟹ NOT balanced (heaviest/lightest = {ratio:.3f} cumulatively): the per-rank objective")
+        print("    is a mean-of-ratios, not token-weighted. This is what DSPARK_GLOBAL_LOSS_REDUCE=1 fixes.")
+    print(f"  global loss reduce in this run: {'ON' if '[LOSS-REDUCE]' in text else 'OFF (per-rank)'}")
 
 
 def hs_split_report(text: str) -> None:
