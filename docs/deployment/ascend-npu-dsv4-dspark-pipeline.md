@@ -95,6 +95,7 @@ Expected trajectory (so you can tell early whether your run is on track):
 
 | Doc / tool | What it's for |
 |---|---|
+| [**`ascend-npu-dsv4-dspark-technical-report.md`**](./ascend-npu-dsv4-dspark-technical-report.md) | **技术报告(中文)** — the completed work in one document: result, method, the root-cause chapter (what broke, what we wrongly blamed, what it actually was, how it was confirmed), the full 10-point curve with the convergence criterion, the end-to-end speedup, and what is still open. **Read this first if you want the story rather than the commands.** |
 | [`ascend-npu-dsv4-worklog.md`](./ascend-npu-dsv4-worklog.md) | **The exhaustive, append-only flight recorder** — every decision, dead-end, cross-check and number, in date order. Includes the **★ CANONICAL REPRODUCIBLE COMMANDS** block (best + last full training command, *including* the `DSPARK_*` env vars that `train_command.txt` does NOT capture). **Start here to reconstruct "what exactly was run".** |
 | [`ascend-npu-dsv4-dspark-acceptance-troubleshooting.md`](./ascend-npu-dsv4-dspark-acceptance-troubleshooting.md) | **When a trained draft under-performs**: diagnose by the shape of the per-position curve (low *peak* vs low *tail* have disjoint causes). Carries the found-and-fixed root causes. |
 | [`ascend-npu-dsv4-dspark-run-comparison.md`](./ascend-npu-dsv4-dspark-run-comparison.md) | Config diff between training runs — what actually differed between two experiments. |
