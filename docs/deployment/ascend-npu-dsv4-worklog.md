@@ -901,3 +901,65 @@ that had to be retracted at 3.5ep and again at 4.0ep. **Recording the reasoning,
   is ~60% optimistic — the rest is HS fetch waits, dataloader stalls and checkpoint writes).
 - Checkpoint→dir map: `/0`←0.5,1.0ep · `/1`←1.5,2.0 · `/2`←2.5,3.0 · `/3`←3.5,4.0 · `/4`←4.5,5.0.
   All ten were converted and evaluated; none was lost.
+
+## 2026-08-11 — PR #942 A/B: global loss normalization is free, and the imbalance it fixes is systematic
+
+Reviewer `eldarkurtic` asked on the PR for runtime implications and short training runs with accuracy
+evals. Run `ckpt_faithful_ep_20260810_234322` is that experiment: the canonical recipe with
+`DSPARK_GLOBAL_LOSS_REDUCE=1` added and nothing else changed, against the completed
+`ckpt_faithful_ep_20260804_165215` as the OFF arm.
+
+### Accuracy at 0.5ep — indistinguishable
+
+| dataset | OFF | ON | Δ |
+|---|---:|---:|---:|
+| gsm8k | 4.309 | 4.298 | −0.011 |
+| math500 | 4.068 | 4.048 | −0.020 |
+| humaneval | 4.298 | 4.326 | +0.028 |
+| mbpp | 3.908 | 3.911 | +0.003 |
+| mt-bench | 2.627 | 2.626 | −0.001 |
+| **mean** | **3.8420** | **3.8418** | **−0.0002** |
+| **non-chat (4)** | **4.1457** | **4.1458** | **+0.0000** |
+
+The non-chat four sum to the same number (16.583) in both arms. Largest per-dataset move is 0.028 on
+humaneval, the smallest sample set, inside the ±0.03 resolution established at 4.0ep.
+
+**Read it as "no regression", not as "no effect worth having".** The argument for the change is that
+the per-rank objective depends on `world_size` and on how the sampler happened to shard the data;
+this run says adopting the correct objective costs nothing measurable.
+
+### The imbalance is real, and it does not average out
+
+From `profile/sup_tokens_*` in the same run (@2095 logged steps):
+
+```
+cumulative tokens/rank: r0=5731147 r1=5466186 r2=5256060 r3=5142604
+                        r4=5027599 r5=4887614 r6=4845435 r7=4801747
+heaviest/lightest = 1.194   r0 +11.4%  …  r7 −6.7%
+first half r0 +11.5%   second half r0 +11.3%   deviation correlation +0.997
+24/2095 steps had a rank with ZERO supervised tokens
+```
+
+Three independent signals that this is structural, not sampling noise:
+
+1. **It does not decay.** Cumulative skew read 1.185 @889 steps, 1.190 @1745, 1.194 @2095. Zero-mean
+   noise would shrink like 1/√n — doubling the steps should have taken +11.3% to about +8%.
+2. **Cumulative totals are monotone in rank index** (r0 > r1 > … > r7). Random assignment does not do
+   that; the sampler distributes in index order, so rank 0 systematically receives the densest packs.
+   *(The sampler mechanism is inference; the monotonicity and stability are measured.)*
+3. **Half-vs-half correlation +0.997** — the same ranks are heavy and light in both halves.
+
+⟹ Under per-rank normalization a token on r7 is weighted ~19% more than an identical token on r0,
+permanently. Because the packing order (not the sample identity) determines it, the bias attaches to
+supervision-DENSITY: dense packs are systematically down-weighted.
+
+### Runtime — no measurable cost
+
+step_ms steady across three measurements: **+20 / +50 / +40 ms** (~1–2% of 2080 ms). It is not stable,
+whereas one scalar all-reduce would add a constant; the spread is the same order as the ~2.6% machine
+drift already on record from the 1.5→2.0ep throughput dip. A dedicated micro-benchmark would be needed
+to resolve the true cost, which is expected to be microseconds.
+
+⚠ **`~/eval_ep0p5_ropefix_all.txt` was destroyed** — this eval was tee'd over it, the same
+name-reuse mistake that took out the 2.5ep log. The OFF-arm numbers survive only as the ledger
+transcription. **The `tee` target is part of the command; change it before pressing enter.**
