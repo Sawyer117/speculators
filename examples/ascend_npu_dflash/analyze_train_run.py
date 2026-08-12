@@ -168,7 +168,7 @@ def epoch_boundaries(recs) -> list[tuple[int, int]]:
 
 # tqdm's "  N/M [elapsed<remaining, rate]" bar — M = len(train_loader) = full-epoch step count.
 # M is epoch-invariant, so it's readable even mid-epoch-0 (before any epoch boundary exists).
-_TQDM_TOTAL = re.compile(r"(\d+)/(\d+)\s*\[\d[\d:]*<")
+_TQDM_TOTAL = re.compile(r"(\d[\d,]*)/(\d[\d,]*)\s*\[\s*\d[\d:]*\s*<")
 
 
 def _steps_per_epoch(recs, raw_text: str = "") -> int | None:
@@ -176,9 +176,12 @@ def _steps_per_epoch(recs, raw_text: str = "") -> int | None:
     the raw log (``M`` = steps/epoch, present from step 1 so it works while still in epoch 0). Fallback:
     the spacing between parsed ``epoch`` boundary increments. ``None`` if neither is available
     (→ the footer/console just show steps/wall and skip the per-epoch projection)."""
-    totals = [int(m.group(2)) for m in _TQDM_TOTAL.finditer(raw_text or "")]
-    if totals:
-        return max(totals)  # a resumed epoch's bar is a shorter slice → max = the true full length
+    # ⚠ ORDER MATTERS. Parsed epoch boundaries are ground truth, so prefer them whenever the run
+    # has crossed at least one epoch. The tqdm bar is only the fallback for a run still INSIDE
+    # epoch 0 (no boundary yet). Previously the bar was tried first and got poisoned by the
+    # checkpoint-writer's own bar ("Writing model shards: … 1/1 [01:03<00:00") → steps_per_epoch=1
+    # → the MoE plot's `while ep*steps_per_epoch <= xmax` loop drew ~124k epoch lines+annotations
+    # (minutes of text layout), and the loss-plot footer read "1 steps/ep · ~0.0 h/epoch".
     eb = epoch_boundaries(recs)
     if eb:
         steps0 = [step_of(r) for r in recs if step_of(r) >= 0]
@@ -186,6 +189,10 @@ def _steps_per_epoch(recs, raw_text: str = "") -> int | None:
         diffs = [b - a for a, b in zip(pts, pts[1:]) if b > a]
         if diffs:
             return int(median(diffs))
+    totals = [int(m.group(2).replace(",", "")) for m in _TQDM_TOTAL.finditer(raw_text or "")]
+    totals = [t for t in totals if t > 1]  # drop the 1/1 shard-writer bars
+    if totals:
+        return max(totals)  # a resumed epoch's bar is a shorter slice → max = the true full length
     return None
 
 
@@ -923,7 +930,11 @@ def main() -> None:
         print(f"  {_labels[s]:10} {r['steady_med']:8.0f}ms   {avg:12.0f}ms   {avg/r['steady_med']:4.1f}×{note}")
     tp = col(recs, "profile/tokens_per_s")
     if tp:
-        steady_tp = [v for v in tp if v > 0.5 * median(sorted(tp)[len(tp)//2:])]
+        # ⚠ hoist the threshold OUT of the comprehension. Inline it was re-sorted + re-medianed
+        # once PER ELEMENT — O(n² log n). On a 124,480-step run that is ~17 min of pure waste
+        # (8.3 ms × 124,480); hoisted it is ~1 ms. Same value, same result.
+        _tp_thr = 0.5 * median(sorted(tp)[len(tp) // 2:])
+        steady_tp = [v for v in tp if v > _tp_thr]
         print(f"tokens/s   : {median(steady_tp):8.0f} (steady)")
     # EFFECTIVE (incl spikes) — the REAL average the run actually achieves.
     pairs = [(f(r, "profile/tokens_per_s"), f(r, "profile/step_ms")) for r in recs
@@ -1254,7 +1265,8 @@ def _plot_moe(text, out, steps_per_epoch=None):
     if steps_per_epoch:
         xmax = max(s for lyr in layers for s, _, _, _ in series[lyr])
         ep = 1
-        while ep * steps_per_epoch <= xmax * 1.001:
+        while ep * steps_per_epoch <= xmax * 1.001 and ep <= 64:  # cap: never let a bad
+            # steps_per_epoch turn this into tens of thousands of text artists
             axA.axvline(ep * steps_per_epoch, color="0.6", ls=":", lw=0.8, alpha=0.6)
             axA.annotate(f"e{ep}", xy=(ep * steps_per_epoch, 1.0), xycoords=("data", "axes fraction"),
                          xytext=(2, -2), textcoords="offset points", color="0.45", fontsize=7, va="top")
