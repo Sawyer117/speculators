@@ -963,3 +963,53 @@ to resolve the true cost, which is expected to be microseconds.
 ⚠ **`~/eval_ep0p5_ropefix_all.txt` was destroyed** — this eval was tee'd over it, the same
 name-reuse mistake that took out the 2.5ep log. The OFF-arm numbers survive only as the ledger
 transcription. **The `tee` target is part of the command; change it before pressing enter.**
+
+## 2026-08-13 — PR #942 A/B run status @ gs 59,180; ⚠ the 2.5ep window will close before tomorrow
+
+Run `ckpt_faithful_ep_20260810_234322` (ON arm, `DSPARK_GLOBAL_LOSS_REDUCE=1`) is at
+**global_step 59,180 / 124,480 = 47.5%**. At the measured 3.17 s/step the remaining 65,300 steps
+are **~2.4 days**.
+
+### Save grid — what is safe and what is not
+
+Interval 12,448 (= 0.5 epoch); dirs cycle `/0 /1 /2 /3 /4` and **each dir is written exactly twice,
+then never again**, so a dir becomes permanent once its second (integer-epoch) save lands.
+
+| step | epoch | dir | state as of gs 59,180 |
+|---:|---|---|---|
+| 24,896 | 1.0 | `/0` | ✅ permanent (already converted + eval'd) |
+| 37,344 | 1.5 | `/1` | ❌ overwritten by 2.0ep |
+| **49,792** | **2.0** | **`/1`** | ✅ **permanent — convertible any time** |
+| **62,240** | **2.5** | **`/2`** | ⏳ lands ~2 h 40 m from gs 59,180 |
+| 74,688 | 3.0 | `/2` | overwrites 2.5ep — **11.0 h window** |
+
+**⚠ ACTION REQUIRED IF 2.5ep IS WANTED.** The user plans to batch the evals **tomorrow** because the
+serve boxes are busy. 2.5ep lands at T+2h40m and is gone at T+13h40m; a next-day eval misses it.
+Two options, decide before the window closes:
+1. **Keep it:** `cp -r <run>/ckpt_faithful_ep_20260810_234322/2 <run>/ckpt_ab_ep2p5_keep` inside the
+   window. A plain directory copy — no conversion, no serve needed, cheap.
+2. **Skip it:** let 3.0ep take `/2`. From then on `/2` is permanent and can be evaluated at leisure.
+   The A/B already has 0.5ep and 1.0ep points; 2.0ep in `/1` is also banked. Losing 2.5ep costs one
+   curve point, not the comparison.
+
+Note this is the **third** time a mid-epoch checkpoint's deadline has driven the schedule. Nothing is
+at risk *right now* — `/1` (2.0ep) is permanent — so if the boxes stay busy, the zero-effort path is
+option 2.
+
+### OFF-arm reference (same recipe, per-rank loss normalization) — for whichever point gets eval'd
+
+5-dataset mean accept_len: 1.0ep **4.056** · 2.0ep **4.254** · 2.5ep **4.294** · 3.0ep **4.346**.
+Convert cmd pattern and the expected `2378/2378 bit-exact` / 83 input tensors / 0 skipped are in the
+`ascend-npu-dsv4-dspark-pipeline.md` §4 block; substitute the run TS and the `epXpY_lossreduce` name.
+
+### Still outstanding (all one-liners on the box, no rush)
+
+- `~/eval_ar_base_conc48.txt` per-token latency — needed to replace the DERIVED ~57 ms AR value in the
+  eval-results ledger's mt-bench divisor-bug note with a measured one.
+- Rollout truncation rate (`finish_reason=length` share of the cleaned jsonl) — the 公众号 article
+  currently says "触及 3072 上限的样本占比较低" with no number.
+- Dedup before/after row counts (`wc -l` of `out_bf16/rollout_*.clean.jsonl` vs
+  `out_bf16_clean/rollout_all.clean.jsonl` = 775,965) — the article says "按提示去重" with no percentage.
+- **`faithful_ep_20260810_234322.log`** — the ON arm is the only run with `profile/sup_tokens_ranks`;
+  it is the data source for the per-rank supervised-token figure (§4.3), the one finding in the
+  article that has hard numbers but no plot.
