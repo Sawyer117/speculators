@@ -2,21 +2,20 @@ import json
 import math
 import os
 import random
-import shutil
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, cast
 
 import openai
 import torch
-import torch.nn.functional as F  # noqa: N812
 from datasets import load_from_disk
 from safetensors.torch import load as load_from_bytes, load_file
 from torch.utils.data import Dataset
 
+from hs_connectors import FileTransfer, HiddenStatesTransfer
 from speculators.data_generation.offline import check_hidden_states
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
@@ -40,13 +39,6 @@ def list_files(path):
             datapath.append(file_path)
 
     return datapath
-
-
-def slice_and_pad_to_length(tensor, length):
-    sliced_tensor = tensor[:length]
-    padding = [0, 0] * sliced_tensor.dim()
-    padding[-1] = length - sliced_tensor.shape[0]
-    return F.pad(sliced_tensor, padding)
 
 
 def split_files(datapath: str, ratio: float = 0.9, seed: int = 0):
@@ -186,12 +178,6 @@ class BaseDataset(Dataset):
         #  "loss_mask": [seq_len],
         # }
 
-        # Convert hidden states to the correct dtype
-        data = {
-            k: v.to(self.hidden_states_dtype) if "hidden_states" in k else v
-            for k, v in data.items()
-        }
-
         # Add lengths tensor
         seq_len = data["input_ids"].shape[0]
         data["lengths"] = torch.tensor([seq_len], dtype=torch.long)
@@ -293,45 +279,45 @@ class ArrowDataset(BaseDataset):
         self,
         max_len: int,
         datapath: str | PathLike,
-        hidden_states_path: str | PathLike | None = None,
+        transfer: HiddenStatesTransfer | None = None,
         vllm_endpoint: str = "http://localhost:8000/v1",
         on_missing: Literal["generate", "skip", "warn", "raise"] = "generate",
         on_generate: Literal["cache", "delete"] = "delete",
-        split_ratio: float = 1.0,
+        train_ratio: float = 1.0,
+        split: Literal["train", "val"] = "train",
         transform: TransformTensors | None = None,
         hidden_states_dtype=torch.bfloat16,
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
     ):
-        """Initialize the ArrowDataset.
-        Args:
-            max_len: The maximum length of the sequence.
-            datapath: The path to the data directory that contains the preprocessed
-            arrow dataset.
-            transform: The transform to apply to the data.
-            hidden_states_dtype: The dtype of the hidden states.
-        """
         self.data = load_from_disk(datapath)
-        self.start_file_idx = 0
-        if split_ratio == 1.0:
-            pass
-        elif 1.0 > split_ratio > 0:
-            self.start_file_idx = 0
-            split_idx = int(len(self.data) * split_ratio)
-            self.data = self.data.select(range(split_idx))
-        elif -1.0 < split_ratio < 0:
-            split_idx = int(len(self.data) * (1.0 + split_ratio))
-            self.start_file_idx = split_idx
-            self.data = self.data.select(range(split_idx, len(self.data)))
-        else:
-            raise ValueError("split_ratio must be in range (-1.0, 1.0] excluding 0.0.")
+        if not 0.0 < train_ratio <= 1.0:
+            raise ValueError(f"train_ratio must be in (0.0, 1.0], got {train_ratio}")
+        if split == "val" and train_ratio == 1.0:
+            raise ValueError("train_ratio=1.0 leaves no validation split")
 
-        self.hidden_states_path: Path = (
-            Path(datapath) / "hidden_states"
-            if hidden_states_path is None
-            else Path(hidden_states_path)
+        # Both splits derive their boundary from this one expression,
+        # so they are exactly complementary.
+        split_idx = int(len(self.data) * train_ratio)
+        start, stop = (
+            (0, split_idx) if split == "train" else (split_idx, len(self.data))
         )
+        if start >= stop:
+            raise ValueError(
+                f"{split} split is empty (dataset has {len(self.data)} rows, "
+                f"train_ratio={train_ratio} gives split_idx={split_idx})"
+            )
+        self.start_file_idx = start
+        self.data = self.data.select(range(start, stop))
+
+        self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
+        # Plan-B (DSPARK_HS_DUMP) polls the concrete directory the serve's dumper writes
+        # into, which the HiddenStatesTransfer interface cannot express (it abstracts
+        # transport, not the generation trigger). The file backend owns the path;
+        # any other backend leaves it None and the dump path is unavailable -- which is
+        # correct, since the dumper writes files.
+        self.hidden_states_path = getattr(self.transfer, "hidden_states_path", None)
         self.vllm_endpoint = vllm_endpoint
         self.on_missing = on_missing
         self.on_generate = on_generate
@@ -347,7 +333,6 @@ class ArrowDataset(BaseDataset):
         return index + self.start_file_idx
 
     def _setup_client(self):
-        # Delay client setup so it runs in dataloader thread if on_missing="generate"
         self.client = openai.OpenAI(
             base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
         )
@@ -360,6 +345,7 @@ class ArrowDataset(BaseDataset):
                 "Please make sure --endpoint is set to the correct vllm instance."
             )
         self.model = model_id
+        self.transfer.setup()
 
     def __len__(self):
         return len(self.data)
@@ -469,38 +455,43 @@ class ArrowDataset(BaseDataset):
         try:
             if _HS_DUMP:
                 # Fires the prefill trigger, polls (remote-aware) until loadable, and
-                # returns the loaded dict; the shared-FS rolling-buffer unlink is handled
-                # inside (remote sidecar already deleted after streaming).
+                # returns the loaded dict; the shared-FS rolling-buffer unlink
+                # happens inside (remote sidecar already deleted after streaming).
                 loaded_hs = self._dump_generate_hs(
                     client_item["input_ids"], self._map_to_file_idx(index)
                 )
             else:
-                hs_filepath = generate_hidden_states(
+                handle = generate_hidden_states(
                     self.client,  # type:ignore[arg-type]
                     self.model,  # type:ignore[arg-type]
                     client_item,
                     timeout=self.request_timeout,
                     max_retries=self.max_retries,
                 )
-                loaded_hs = _maybe_load_hs_file(Path(hs_filepath))
+                # Remote-sidecar mode streams the file off the serve box over HTTP; the
+                # local transfer backend has nothing to read there. Otherwise go through
+                # the upstream HiddenStatesTransfer backend (file / Mooncake / ...).
+                loaded_hs = (
+                    _maybe_load_hs_file(Path(handle))
+                    if _HS_FETCH_BASE
+                    else self.transfer.get_generated(handle)
+                )
                 if loaded_hs is None:
-                    raise ValueError(f"Failed to load hidden states from {hs_filepath}")
-
-                # Connector-path rolling buffer. In remote-fetch mode the file lives on the
-                # serve box and the sidecar already deleted it after sending; nothing local.
-                if not _HS_FETCH_BASE:
-                    match self.on_generate:
-                        case "cache":
-                            file_idx = self._map_to_file_idx(index)
-                            target_path = (
-                                self.hidden_states_path / f"hs_{file_idx}.safetensors"
-                            )
-                            if Path(hs_filepath) != target_path:
-                                shutil.move(hs_filepath, target_path)
-                        case "delete":
-                            Path(hs_filepath).unlink()
+                    raise ValueError(
+                        f"Failed to load hidden states for handle {handle}"
+                    )
 
             check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+
+            # Rolling buffer, connector path only. Under _HS_DUMP the unlink happens in
+            # _dump_generate_hs; under _HS_FETCH_BASE the sidecar already deleted it.
+            if not (_HS_DUMP or _HS_FETCH_BASE):
+                file_idx = self._map_to_file_idx(index)
+                match self.on_generate:
+                    case "cache":
+                        self.transfer.cache(handle, file_idx)
+                    case "delete":
+                        self.transfer.delete(handle)
         except Exception as e:
             if isinstance(e, ValueError) and "NaN" in str(e):
                 raise
@@ -514,15 +505,15 @@ class ArrowDataset(BaseDataset):
 
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
-        candidate_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
         # Remote-fetch generate mode produces HS on demand and the sidecar deletes each
-        # file after streaming it (rolling buffer) -> nothing ever pre-exists on the serve.
+        # file after streaming it (rolling buffer) -> nothing pre-exists on the serve.
         # Skip the initial probe (it would block on the sidecar's wait-ms for an absent
         # file, every sample) and trigger+fetch straight away below.
-        if _HS_FETCH_BASE and self.on_missing == "generate":
-            loaded_hs = None
-        else:
-            loaded_hs = _maybe_load_hs_file(candidate_path)
+        loaded_hs = (
+            None
+            if (_HS_FETCH_BASE and self.on_missing == "generate")
+            else self.transfer.get_cached(file_idx)
+        )
 
         if loaded_hs is None:
             match self.on_missing:
@@ -666,14 +657,28 @@ class SampleFileDataset(BaseDataset):
         )
 
 
-def create_collate_fn(
-    max_len: int,
-    hidden_size: int,
-    num_target_layers: int = 3,
-    dtype: torch.dtype = torch.bfloat16,
-    preprocess: Callable[[BatchType], BatchType] | None = None,
-):
-    def collate_fn(batch: list[BatchType | None]) -> BatchType:
+class CollateFn:
+    """Picklable collate function for use with ``multiprocessing_context='spawn'``."""
+
+    def __init__(
+        self,
+        max_len: int,
+        hidden_size: int,
+        num_target_layers: int = 3,
+        dtype: torch.dtype = torch.bfloat16,
+        preprocess: Callable[[BatchType], BatchType] | None = None,
+    ):
+        self.max_len = max_len
+        self.hidden_size = hidden_size
+        self.num_target_layers = num_target_layers
+        self.dtype = dtype
+        self.preprocess = preprocess
+
+    def __call__(self, batch: Sequence[BatchType | None]) -> BatchType:
+        max_len = self.max_len
+        dtype = self.dtype
+        preprocess = self.preprocess
+
         # Apply per-sample preprocessing and filter failed samples
         batch = [preprocess(b) if preprocess else b for b in batch if b is not None]
 
@@ -683,23 +688,34 @@ def create_collate_fn(
             # Match the configured `dtype` so the placeholder doesn't crash
             # downstream layers loaded at a different precision (e.g. bf16
             # weights vs fp32 default placeholders).
-            empty = create_empty_sample(hidden_size, num_target_layers, dtype=dtype)
+            empty = create_empty_sample(
+                self.hidden_size, self.num_target_layers, dtype=dtype
+            )
             if preprocess:
                 empty = preprocess(empty)
             batch = [empty]
 
         collated_data = {}
         for key in batch[0]:  # type: ignore[union-attr]
-            # Concatenate the tensors along the seq (0th) dimension
-            collated_data[key] = torch.cat([b[key] for b in batch], dim=0)  # type: ignore[index]
-            # shape: [total_seq_len, ...]
-
-            if key != "lengths":
-                # Slice and pad on seq (0th) dimension to max_len
-                collated_data[key] = slice_and_pad_to_length(
-                    collated_data[key], max_len
-                ).unsqueeze(0)
-                # shape: [1, max_len, ...]
+            if key == "lengths":
+                collated_data[key] = torch.cat([b[key] for b in batch], dim=0)  # type: ignore[index]
+                continue
+            # one copy per sample: preallocated buffer, hidden states cast during write
+            first = batch[0][key]  # type: ignore[index]
+            buffer_dtype = dtype if "hidden_states" in key else first.dtype
+            out = torch.zeros(
+                (max_len, *first.shape[1:]), dtype=buffer_dtype, device=first.device
+            )
+            offset = 0
+            for b in batch:
+                tensor = b[key]  # type: ignore[index]
+                num_rows = min(tensor.shape[0], max_len - offset)
+                out[offset : offset + num_rows] = tensor[:num_rows]
+                offset += num_rows
+                if offset == max_len:
+                    break
+            collated_data[key] = out.unsqueeze(0)
+            # shape: [1, max_len, ...]
 
         # Include lengths until while they fit in max_len
         # The last included length is (if necessary) truncated
@@ -729,5 +745,3 @@ def create_collate_fn(
         collated_data["document_ids"] = document_ids
 
         return collated_data
-
-    return collate_fn

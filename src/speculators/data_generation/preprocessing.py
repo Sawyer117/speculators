@@ -34,6 +34,7 @@ __all__ = [
 
 log = PipelineLogger(__name__)
 
+_warned_roles: set[str] = set()
 
 ProcessorLike = PreTrainedTokenizerBase | ProcessorMixin
 
@@ -100,8 +101,11 @@ def _normalize_conversation(
         elif role == "tool":
             role = "tool"
         else:
-            log.warning(f"Unknown role '{role}', skipping turn")
-            continue
+            # Treat unknown roles (e.g. model names in on-policy data) as assistant.
+            if role not in _warned_roles:
+                _warned_roles.add(role)
+                log.warning(f"Mapping unknown role '{role}' → 'assistant'")
+            role = "assistant"
 
         # Build normalized turn with role and content
         normalized_turn = {"role": role, "content": content}
