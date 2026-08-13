@@ -17,7 +17,8 @@ def _ids_to_logits(ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
 class TestComputeMetrics:
     def test_perfect_draft_low_loss_high_accept(self):
         # DSpark drafts every block slot (sample_from_anchor=True, the default), so
-        # all block_size positions are supervised.
+        # all block_size positions are supervised. The False convention is pinned
+        # separately in test_perfect_draft_accept_len_anchor_convention below.
         ids = torch.tensor([[0, 1, 0, 2]])
         logits = _ids_to_logits(ids, 8)
         targets = logits.clone()
@@ -60,6 +61,30 @@ class TestComputeMetrics:
         )
         accept_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
         assert abs(float(accept_len) - 2.0) < 1e-2
+
+    def test_perfect_draft_anchor_sampled_includes_slot0(self):
+        # sample_from_anchor=True (default): slot 0 is the first real prediction,
+        # so every position is supervised and accept_len counts all draft slots.
+        ids = torch.tensor([[0, 1, 0, 2]])
+        logits = _ids_to_logits(ids, 8)
+        targets = logits.clone()
+        loss_mask = torch.ones(1, 4, dtype=torch.float32)
+        loss, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            2,
+            gamma=4.0,
+            loss_config=_DEFAULT_LOSS,
+        )
+        assert torch.isfinite(loss)
+        assert float(loss) < 1e-2
+        accept = metrics["accept_rate_sum"] / metrics["accept_rate_total"]
+        assert float(accept) > 0.99
+        # Two draft slots per block accepted w.p. ~1, plus the anchor token -> ~3.
+        accept_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
+        assert abs(float(accept_len) - 3.0) < 1e-2
 
     def test_confidence_target_is_overlap(self):
         # When draft == target, accept rate == 1, so a confidence logit that is
@@ -112,8 +137,9 @@ class TestComputeMetrics:
         assert float(loss_conf) > float(loss_no_conf)
 
     def test_confidence_cumprod_bias_sign(self):
-        # Draft != target at EVERY slot so accept rate is ~0; an over-confident head
-        # (predicts accept ~1) must show a positive cumulative-product calibration bias.
+        # Draft != target so accept rate is ~0; an over-confident head (predicts
+        # accept ~1) must show a positive cumulative-product calibration bias.
+        # sample_from_anchor=False: position 0 is the anchor (masked).
         ids = torch.tensor([[0, 1, 0, 2]])
         logits = _ids_to_logits(ids, 8)
         targets = _ids_to_logits(torch.tensor([[5, 3, 6, 4]]), 8)
@@ -126,6 +152,7 @@ class TestComputeMetrics:
             loss_mask,
             block_size=2,
             loss_config=_DEFAULT_LOSS,
+            sample_from_anchor=False,
         )
         bias = (
             metrics["confidence_cumprod_bias_sum"]

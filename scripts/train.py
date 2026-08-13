@@ -30,6 +30,7 @@ if not torch.cuda.is_available():
         #   (2) belt-and-suspenders: point the seven torch.cuda.* stats/seed/sync helpers the
         #       trainer actually uses at torch.npu (idempotent if (1) already patched them).
         import importlib  # noqa: PLC0415
+
         import torch_npu  # noqa: PLC0415
 
         with contextlib.suppress(Exception):
@@ -90,6 +91,7 @@ from transformers import LlamaConfig, PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+from hs_connectors import HiddenStatesBackend
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
@@ -475,9 +477,9 @@ def _build_from_config_only(
         speculators_config.verifier.name_or_path = verifier_name_or_path
     model = model_class(config=config)
     if hasattr(model, "load_vocab_mappings"):
-        model.load_vocab_mappings(t2d, d2t)  # type: ignore[attr-defined]
+        model.load_vocab_mappings(t2d, d2t)  # type: ignore[attr-defined, operator]
     if hasattr(model, "load_verifier_weights"):
-        model.load_verifier_weights()  # type: ignore[attr-defined]
+        model.load_verifier_weights()  # type: ignore[attr-defined, operator]
     return model
 
 
@@ -523,7 +525,7 @@ def build_draft_model(
             # _attn_implementation is never serialized by HF configs, so re-apply
             # the CLI selection before construction -- mirroring from_training_args.
             # MTP is skipped: its from_training_args never sets the field and its
-            # __init__ resolves its own default ("eager") when it is absent.
+            # __init__ resolves its own default ("sdpa") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl
             return model_class.from_pretrained(
@@ -599,6 +601,14 @@ def build_draft_model(
 
 
 def main(args: argparse.Namespace):  # noqa: C901
+    # NOTE (fork): upstream #841 moved the CLI into a pydantic `TrainConfig` and calls
+    # `main(TrainConfig.resolve())`, flattening it back to a namespace here. This fork
+    # still owns ~40 DSV4/DSpark-only flags that have no schema fields yet, so it keeps
+    # the argparse entry point and passes the namespace straight in. Everything below
+    # this line reads the flat namespace either way. Porting the fork flags into
+    # `train/config/schema.py` is a separate change -- do it on its own so a changed
+    # default is bisectable.
+
     # Set random seed for reproducibility
     set_seed(args.seed, args.deterministic_cuda)
 
@@ -618,7 +628,9 @@ def main(args: argparse.Namespace):  # noqa: C901
     import os  # noqa: PLC0415
 
     if os.environ.get("DSPARK_GROUPED_MOE") == "1" and args.speculator_type == "dsv4_dspark":
-        from speculators.models.dsv4_dspark.backbone import moe_grouped_gemm  # noqa: PLC0415
+        from speculators.models.dsv4_dspark.backbone import (
+            moe_grouped_gemm,  # noqa: PLC0415
+        )
 
         moe_grouped_gemm.enable()
         if get_rank() == 0:
@@ -680,23 +692,16 @@ def main(args: argparse.Namespace):  # noqa: C901
             "Installed partial-neox rotary patch for HF/vLLM RoPE alignment "
             "(draft_mrope_full_head_hack=False)"
         )
+    # Write the reproducibility artifact next to the checkpoints at rank 0 only, so
+    # every checkpoint carries the command that produced it. Upstream #880 writes
+    # run.yaml + train_command.txt off the resolved `TrainConfig`; this fork still
+    # runs the argparse entry point, so there is no TrainConfig to serialise and it
+    # keeps writing train_command.txt from sys.argv. Switch to cfg.save() when the
+    # fork flags move into train/config/schema.py.
     if get_rank() == 0:
         save_train_command(args.save_path)
 
-    if not hasattr(torch, args.hidden_states_dtype):
-        raise ValueError(
-            "--hidden-states-dtype must be a dtype attribute of torch. e.g. `bfloat16`"
-        )
     hidden_states_dtype = getattr(torch, args.hidden_states_dtype)
-
-    if hidden_states_dtype == torch.float16:
-        raise NotImplementedError(
-            "--hidden-states-dtype=float16 is not supported. "
-            "float16 with torch.autocast requires gradient scaling (GradScaler) to "
-            "prevent gradient underflow, which is not implemented. "
-            "Use bfloat16 instead, which provides the same memory savings with "
-            "better numerical stability and no gradient scaling required."
-        )
 
     if args.speculator_type == "mtp":
         if args.draft_attn_impl != "simple_flex_attention":
@@ -732,7 +737,7 @@ def main(args: argparse.Namespace):  # noqa: C901
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
 
     # Get target layer IDs from the model (resolved at model level)
-    num_target_layers = len(draft_model.target_layer_ids)
+    num_target_layers = len(draft_model.target_layer_ids)  # type: ignore[arg-type]
 
     if args.speculator_type == "mtp":
         args.num_speculative_steps = draft_model.config.num_speculative_steps
@@ -768,14 +773,23 @@ def main(args: argparse.Namespace):  # noqa: C901
     }
     preprocess = preprocess_fns.get(args.speculator_type)
 
+    backend_registry = HiddenStatesBackend.registry
+    backend_cls = backend_registry[args.hidden_states_backend]
+    # from_train_args is the live runtime consumer of the backend's (mirrored)
+    # train-args, read off the flattened namespace. hs_connectors stays
+    # argparse-based and standalone so vLLM can use it without speculators; that
+    # is why the backend's train-args are mirrored into the pydantic schema rather
+    # than the plugin depending on pydantic. test_backend_reconciliation.py keeps
+    # the mirror complete so nothing read here was dropped during resolution.
+    transfer = backend_cls.from_train_args(args, args.data_path)
+
     train_loader, val_loader = create_train_val_loaders(
         data_path=args.data_path,
-        train_data_ratio=args.train_data_ratio,
         total_seq_len=args.total_seq_len,
         hidden_states_dtype=hidden_states_dtype,
         noise_std=args.noise_std,
         legacy_data=args.legacy_data,
-        hidden_states_path=args.hidden_states_path,
+        transfer=transfer,
         vllm_endpoint=args.vllm_endpoint,
         on_missing=args.on_missing,
         on_generate=args.on_generate,
@@ -788,6 +802,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        train_data_ratio=args.train_data_ratio,
         no_validation=args.no_validation,
     )
 
@@ -819,6 +834,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         bf16_experts=args.bf16_experts,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        max_steps=args.max_steps,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -973,6 +989,25 @@ def parse_args():
         help=(
             "The path where cached hidden states files are stored. (Default: "
             "args.data_path / 'hidden_states')"
+        ),
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help=(
+            "Stop training after this many optimizer steps (counted across epochs). "
+            "Useful for quick smoke runs. Default: run all epochs to completion."
+        ),
+    )
+    parser.add_argument(
+        "--hidden-states-backend",
+        type=str,
+        default="file",
+        choices=sorted(HiddenStatesBackend.registry),
+        help=(
+            "Hidden-states transport (upstream #735/#836). 'file' = shared filesystem, "
+            "the behaviour this fork has always had and what DSPARK_HS_DUMP writes into."
         ),
     )
     parser.add_argument(

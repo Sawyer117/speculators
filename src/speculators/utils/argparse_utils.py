@@ -1,4 +1,10 @@
-"""Small, reusable argparse helpers."""
+"""Small, reusable argparse helpers.
+
+Upstream deleted this module in #841, which replaced ``scripts/train.py``'s argparse
+with a pydantic ``TrainConfig``. This fork still owns ~40 DSV4/DSpark-only flags that
+have no schema fields yet, so it keeps the argparse entry point and therefore this
+helper. Delete it again once those flags move into ``train/config/schema.py``.
+"""
 
 import argparse
 from collections.abc import Iterable

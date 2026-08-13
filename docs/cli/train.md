@@ -54,7 +54,7 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--dry-run`** (flag) Build the speculator, initialize weights, save a checkpoint to `--save-path`, then exit before training. Useful to validate the config/weights in vLLM before launching a full run; the saved checkpoint can be fed straight back via `--from-pretrained`.
 
-- **`--num-layers`** (int, default: `1`) Number of transformer layers in the draft model.
+- **`--num-layers`** (int, default: `5` for dflash, `1` otherwise) Number of transformer layers in the draft model.
 
 - **`--draft-arch`** (str, default: `"llama"`) Architecture for the synthesized draft decoder layers. Options: `llama`, `qwen3`. Used by Eagle3 and P-EAGLE, which select the decoder layer class from this value; DFlash always uses a Qwen3-style decoder regardless. Both are supported in vLLM for inference, and the target and draft architectures do not have to match.
 
@@ -100,7 +100,7 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--mask-token-id`** (int, default: auto-detect) Token ID to use as mask token (for DFlash). Auto-detected if not provided.
 
-- **`--target-layer-ids`** (int list, default: auto-select) Space-separated list of layer IDs used for hidden states. Default: `[2, num_layers//2, num_layers-3]` **Must match the values used when launching vLLM if custom layers were specified.**
+- **`--target-layer-ids`** (int list, default: auto-select) Space-separated list of layer IDs for the auxiliary hidden states. Default: `[2, num_layers//2, num_layers-3]` **If custom layers were specified when launching vLLM, pass the same ids here, excluding the final layer `launch_vllm.py` appends** — that one reaches training separately as the verifier's last hidden states.
 
 ### Distributed Training Arguments
 
@@ -130,6 +130,8 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--deterministic-cuda`** (flag) Enable deterministic CUDA operations. May impact performance.
 
+- **`--loss-fn`** (str, default: `"ce"` for dflash, `"kl_div"` otherwise) Loss function specification. Pass a name for a single loss (`kl_div`, `rkl`, `jsd`, `ce`, `tv`, `nla`, `lk_hybrid`) or a JSON dict for a weighted combination, e.g. `'{"ce": 0.1, "tv": 0.9}'`. Required to be `ce` when `--per-position-loss-weight dpace` is used.
+
 ### Optimizer Arguments
 
 - **`--optimizer`** (str, default: `"muon"`) Optimizer to use. Options: `adamw`, `muon`. The `muon` option applies the Muon optimizer to 2D weight matrices and AdamW to the remaining parameters (norms, biases, embeddings, lm_head).
@@ -148,8 +150,6 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 ### Eagle3-Specific Arguments
 
-- **`--use-off-policy-tokens`** (flag) Use off-policy tokens during training (required for [regenerated data](response_regeneration.md)).
-
 - **`--norm-before-residual` / `--no-norm-before-residual`** (flag, default: `True`) Toggle normalization before residual connections.
 
 - **`--embed-requires-grad` / `--no-embed-requires-grad`** (flag, default: `False`) Whether to train embedding layer weights.
@@ -164,19 +164,45 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--ttt-step-loss-decay`** (float, default: `1.0`) Loss decay factor for test-time training steps.
 
+### P-EAGLE-Specific Arguments
+
+- **`--num-depths`** (int, default: `8`) Number of parallel prediction depths.
+
+- **`--down-sample-ratio`** (float, default: `0.7`) Geometric decay ratio for COD sampling.
+
+- **`--down-sample-ratio-min`** (float, default: `0.2`) Minimum retention ratio for COD sampling.
+
 ### Attention Backend Arguments
 
 - **`--draft-attn-impl`** (str, default: `"simple_flex_attention"`) Attention implementation for draft layers. Options: `simple_flex_attention`, `sdpa`, `eager`. Use `sdpa` or `eager` on hardware where flex attention is unavailable (e.g. Ascend NPU). Applies to Eagle3, P-EAGLE, and DFlash. Not supported for MTP.
 
 ### DFlash-Specific Arguments
 
-- **`--block-size`** (int, default: `8`) Block size for DFlash model.
+- **`--block-size`** (int, default: `16` for dflash, `8` for dspark) Block size for DFlash model.
 
 - **`--sample-from-anchor`** / **`--no-sample-from-anchor`** (bool, default: algorithm-specific) Whether to sample from the anchor position. `True`: sample from anchor and all mask positions (default for dspark, produces block_size tokens). `False`: anchor is bonus token (default for dflash, produces block_size-1 tokens).
 
-- **`--max-anchors`** (int, default: `256`) Maximum anchor positions for DFlash training.
+- **`--max-anchors`** (int, default: `3072`) Maximum anchor positions for DFlash, DSpark, and P-EAGLE training.
 
 - **`--dflash-decay-gamma`** (float, default: `4.0`) Decay gamma for DFlash loss weighting.
+
+- **`--per-position-loss-weight`** (str, default: `"dpace"` for dflash, `"fixed-exp-decay"` for dspark) Per-position loss weighting scheme. Options: `fixed-exp-decay`, `dpace`. Applies to DFlash and DSpark. `dpace` requires `--loss-fn ce`.
+
+- **`--dpace-alpha`** (float, default: `0.5`) Confidence smoothing constant for the D-PACE loss. Only used with `--per-position-loss-weight dpace`.
+
+### DSpark-Specific Arguments
+
+DSpark builds on DFlash, so all DFlash-specific arguments apply as well.
+
+- **`--markov-rank`** (int, default: `256`) Low-rank dim of the Markov logit-bias head. `0` disables it.
+
+- **`--markov-head-type`** (str, default: `"vanilla"`) Sequential head variant. Options: `vanilla`, `gated`, `rnn`.
+
+- **`--enable-confidence-head`** / **`--no-enable-confidence-head`** (flag, default: `True`) Attach the per-position acceptance confidence head.
+
+- **`--confidence-head-with-markov`** / **`--no-confidence-head-with-markov`** (flag, default: `True`) Feed the Markov previous-token embedding into the confidence head alongside the backbone hidden state.
+
+- **`--confidence-head-alpha`** (float, default: `1.0`) Weight of the confidence-head BCE term.
 
 ### Sliding Window Attention Arguments
 

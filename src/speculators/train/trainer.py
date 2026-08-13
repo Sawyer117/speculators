@@ -43,7 +43,7 @@ metric_logger = logging.getLogger("speculators.metrics")
 
 
 class _StepTimer:
-    # Each mark()/now() forces a cuda.synchronize to capture true GPU time.
+    # Each mark()/now() forces an accelerator.synchronize to capture true GPU time.
     # This serialises the CUDA pipeline, so profiled steps are slower; keep
     # log_freq > 1 in perf-sensitive runs.
     def __init__(self, enabled: bool = False):
@@ -56,7 +56,7 @@ class _StepTimer:
 
     def mark(self, name: str) -> None:
         if self.enabled:
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             self._marks[name] = time.perf_counter()
 
     def mark_value(self, name: str, value: float) -> None:
@@ -66,7 +66,7 @@ class _StepTimer:
     def now(self) -> float | None:
         if not self.enabled:
             return None
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return time.perf_counter()
 
     def profile(self, num_tokens: int) -> dict[str, float] | None:
@@ -118,6 +118,10 @@ def _gpu_mem_stats() -> dict[str, float] | None:
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 MIN_STEP_PCT = 0.25
 
+# Re-synchronise ranks every N validation batches to bound cross-rank skew, which would
+# otherwise blow the NCCL watchdog at the end-of-epoch metrics all-reduce. 0 disables.
+_VAL_SYNC_INTERVAL = 50
+
 
 class TrainerConfig(NamedTuple):
     lr: float
@@ -149,6 +153,7 @@ class TrainerConfig(NamedTuple):
     bf16_experts: bool = False
     log_freq: int = 1
     fsdp_shard: bool = False
+    max_steps: int | None = None
 
 
 def _resolve_scheduler_steps(
@@ -634,6 +639,12 @@ class Trainer:
             self.global_step += 1
 
             if (
+                self.config.max_steps is not None
+                and self.global_step >= self.config.max_steps
+            ):
+                break
+
+            if (
                 step_interval is not None
                 and not self.config.save_best
                 and local_step % step_interval == 0
@@ -641,6 +652,12 @@ class Trainer:
                 # Avoid saving back to back ay the end of each epoch
             ):
                 self.maybe_save_checkpoint(epoch, local_step=local_step)
+
+    def _maybe_val_sync(self, batch_index: int) -> None:
+        if not self.is_distributed or _VAL_SYNC_INTERVAL <= 0:
+            return
+        if batch_index > 0 and batch_index % _VAL_SYNC_INTERVAL == 0:
+            dist.barrier()
 
     @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float] | None:
@@ -653,9 +670,10 @@ class Trainer:
         if self.rank == 0:
             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
 
-        val_metrics: dict[str, float] = {}
+        accumulated: dict[str, torch.Tensor] = {}
         num_batches = len(val_loader)
-        for batch in val_loader:
+        for i, batch in enumerate(val_loader):
+            self._maybe_val_sync(i)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
@@ -667,12 +685,16 @@ class Trainer:
                 **gpu_batch, **(self.config.val_call_kwargs or {})
             )
 
-            if self.is_distributed:
-                for m in metrics.values():
-                    dist.all_reduce(m, op=dist.ReduceOp.SUM)
-
             for k, v in metrics.items():
-                val_metrics[k] = val_metrics.get(k, 0.0) + v.item()
+                acc = accumulated.get(k)
+                accumulated[k] = v.float() if acc is None else acc + v.float()
+
+        val_metrics: dict[str, float] = {}
+        if accumulated:
+            stacked = torch.stack(list(accumulated.values()))
+            if self.is_distributed:
+                dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
+            val_metrics = dict(zip(accumulated, stacked.tolist(), strict=True))
 
         world_size = dist.get_world_size() if self.is_distributed else 1
         val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
