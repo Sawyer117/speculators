@@ -17,6 +17,10 @@ NUM_PROMPTS="${NUM_PROMPTS:-0}"      # 0 = full dataset (1319 for gsm8k, ~2h @ c
                                      # accept_len in ~10min. accept_len is a per-token average — a few
                                      # hundred prompts is plenty; full run only tightens the estimate.
 MAX_NEW="${MAX_NEW:-2048}"
+KEEP_WARMUP="${KEEP_WARMUP:-1}"      # 1 = the 10 warmup samples are measured too (default since
+                                     # 2026-08-13). Dropping them cost 12.5% of mt-bench (10/80) and
+                                     # 6.1% of humaneval (10/164). KEEP_WARMUP=0 = the old behaviour,
+                                     # required to reproduce any ledger row recorded before that date.
 # LOCAL tokenizer dir — --model is the served-name `dsv4` (for the API), NOT a HF repo, so the tokenizer
 # must load from a local path (the bf16 target has tokenizer.json). Override via TOKENIZER=<dir>.
 # Auto-detect the box's ckpt root: A3-176 = /home/canada_group_folder, A2 = /share, A3-nfs = /mnt/nfs.
@@ -56,8 +60,9 @@ curl -s --noproxy '*' "$BASE/metrics" | grep -E "spec_decode_num_(drafts|accepte
 
 echo ">>> [4/4] $DATASET accept_len (Evaluator, greedy temp0/top-p1/top-k1) — bar = released 3.94 ..."
 NP_ARG=(); [ "$NUM_PROMPTS" -gt 0 ] 2>/dev/null && NP_ARG=(--num-prompts "$NUM_PROMPTS")
+KEEP_ARG=(); [ "$KEEP_WARMUP" = "1" ] && KEEP_ARG=(--keep-warmup-samples)
 exec python "$SCRIPT_DIR/Evaluator.py" \
   --base-url "$BASE" --model "$MODEL" --tokenizer "$TOKENIZER" --chat-template "$CHAT_TEMPLATE" \
   --dataset "$DATASET" "${NP_ARG[@]}" \
-  --concurrency "$CONCURRENCY" --warmup-steps 10 --max-new-tokens "$MAX_NEW" \
+  --concurrency "$CONCURRENCY" --warmup-steps 10 "${KEEP_ARG[@]}" --max-new-tokens "$MAX_NEW" \
   --temperature 0 --top-p 1 --top-k 1

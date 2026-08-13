@@ -22,6 +22,18 @@ Unless a run says otherwise, all numbers below share:
   > EAGER=1 does NOT work here (eager DSpark can't do DP token padding); v2 `431a64b18` is eager-only (no graph).
 - **Eval**: `examples/ascend_npu_dflash/run_dspark_eval.sh` (→ `Evaluator.py`), **greedy**
   `temp0 / top-p1 / top-k1`, concurrency 16, `max_new_tokens=2048`, **FULL** datasets, warmup 10.
+- ⚠️ **MEASURED-SET CUTOVER (2026-08-13) — rows before and after this date are on different sample
+  counts.** Warmup samples used to be *spent*: `Evaluator.py` shuffled with a fixed `random.seed(42)`,
+  sent the first 10, then dropped them (`samples = samples[actual_warmup:]`). Every row above this date
+  is therefore on **1309 / 490 / 247 / 154 / 70** (gsm8k / math500 / mbpp / humaneval / mt-bench) rather
+  than the full **1319 / 500 / 257 / 164 / 80** — 12.5% of mt-bench and 6.1% of humaneval were never
+  measured. Because the seed is fixed, the *same* 10 were dropped in every run, so all historical
+  comparisons (ON-vs-OFF arms, ckpt-vs-ckpt, ours-vs-released) are on identical sample sets and remain
+  valid; only the absolute values carry a fixed offset from the full-set mean (order `√10·σ/N` ⟹ ~0.03
+  on mt-bench, ~0.002 on gsm8k). From this date `KEEP_WARMUP=1` (the new wrapper default,
+  `--keep-warmup-samples`) measures those 10 as well, with a second prefix-cache flush after warmup so
+  they get no prefill advantage. **New rows must state their sample count**; to reproduce an older row
+  exactly, set `KEEP_WARMUP=0`.
 - **Metric defs**:
   - `accept_len` = 1 (bonus token) + mean accepted **draft** tokens per draft.
   - `accept_rate` = accepted draft tokens / proposed draft tokens (= `accept_len − 1` over 5).

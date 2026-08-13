@@ -983,18 +983,17 @@ then never again**, so a dir becomes permanent once its second (integer-epoch) s
 | **62,240** | **2.5** | **`/2`** | ⏳ lands ~2 h 40 m from gs 59,180 |
 | 74,688 | 3.0 | `/2` | overwrites 2.5ep — **11.0 h window** |
 
-**⚠ ACTION REQUIRED IF 2.5ep IS WANTED.** The user plans to batch the evals **tomorrow** because the
-serve boxes are busy. 2.5ep lands at T+2h40m and is gone at T+13h40m; a next-day eval misses it.
-Two options, decide before the window closes:
-1. **Keep it:** `cp -r <run>/ckpt_faithful_ep_20260810_234322/2 <run>/ckpt_ab_ep2p5_keep` inside the
-   window. A plain directory copy — no conversion, no serve needed, cheap.
-2. **Skip it:** let 3.0ep take `/2`. From then on `/2` is permanent and can be evaluated at leisure.
-   The A/B already has 0.5ep and 1.0ep points; 2.0ep in `/1` is also banked. Losing 2.5ep costs one
-   curve point, not the comparison.
+**Checkpoint handling — settled.** The user converts **every** checkpoint as it lands, so the
+11 h window on each mid-epoch save is covered by prompt conversion; the evals themselves are batched
+later (serve boxes busy) against the already-converted weights. No copy-out workaround needed. The
+window numbers above remain the reason conversion must happen promptly rather than in bulk.
 
-Note this is the **third** time a mid-epoch checkpoint's deadline has driven the schedule. Nothing is
-at risk *right now* — `/1` (2.0ep) is permanent — so if the boxes stay busy, the zero-effort path is
-option 2.
+**Recording rule for this run.** Each eval result is appended to
+[`ascend-npu-dsv4-dspark-eval-results.md`](ascend-npu-dsv4-dspark-eval-results.md) **as it arrives**,
+one row per checkpoint, with the OFF-arm value alongside — this run is an A/B, so a row without its
+paired OFF-arm number is not usable. Record per row: 5 per-dataset accept_len, the 5-dataset macro
+mean, the non-chat mean, per-position cumulative accept rates, throughput, the trainer ckpt dir, the
+converted draft name, and the eval log path. Do not defer these to the end of the run.
 
 ### OFF-arm reference (same recipe, per-rank loss normalization) — for whichever point gets eval'd
 
@@ -1013,3 +1012,35 @@ Convert cmd pattern and the expected `2378/2378 bit-exact` / 83 input tensors / 
 - **`faithful_ep_20260810_234322.log`** — the ON arm is the only run with `profile/sup_tokens_ranks`;
   it is the data source for the per-rank supervised-token figure (§4.3), the one finding in the
   article that has hard numbers but no plot.
+
+## 2026-08-13 — eval no longer spends the warmup samples (`KEEP_WARMUP=1` is the new default)
+
+`Evaluator.py` shuffled each dataset with a fixed `random.seed(42)`, sent the first 10 as warmup, then
+**dropped them** (`samples = samples[actual_warmup:]`). Every ledger row up to today is therefore on
+1309/490/247/154/**70** instead of 1319/500/257/164/**80** — 12.5% of mt-bench and 6.1% of humaneval
+were paid for and thrown away.
+
+**The old numbers are not wrong.** The seed is fixed, so the *same* 10 were dropped in every run ever
+made, on every draft — released bar, ON/OFF arms, every checkpoint. All comparisons were on byte-identical
+sample sets. What the drop costs is a fixed offset between our absolute value and the full-set mean,
+of order `√10·σ/N`: ~0.03 on mt-bench, ~0.019σ on humaneval, ~0.002 on gsm8k. A constant, not scatter.
+
+It could have been much worse: mt-bench's 80 questions ship ordered by category (8 × 10). The
+`random.shuffle` sits at `Evaluator.py:127`, *before* the warmup slice — had the slice come first,
+`samples[:10]` would have deleted an entire category.
+
+**Change (user's call: "宁愿测出来速度有点误差").** New `--keep-warmup-samples` flag: warm up on the
+first 10, then **flush the prefix cache a second time** and measure all N including those 10. The
+second flush is why the speed cost is smaller than feared — without it those 10 would enter the timed
+phase with their prefill cached.
+
+- `Evaluator.py` — flag **defaults OFF**, so the shared team client still reproduces every earlier
+  number byte-for-byte (its docstring mandates cross-team identity).
+- `run_eval.sh`, `run_dspark_eval.sh`, `eval_trainsample.py` — new `KEEP_WARMUP` env var, **default 1**.
+  `KEEP_WARMUP=0` reproduces any pre-cutover row.
+
+⚠ **Do not mix the two modes inside one comparison.** The A/B in flight
+(`ckpt_faithful_ep_20260810_234322` vs `ckpt_faithful_ep_20260804_165215`) has its OFF arm already
+measured under the old mode, so **every remaining A/B eval must run `KEEP_WARMUP=0`** — the OFF-arm
+reference values (1.0ep 4.056 · 2.0ep 4.254 · 2.5ep 4.294 · 3.0ep 4.346) are on the 70/154/247 sets.
+Switch to the new default only for runs whose whole comparison set is post-cutover.

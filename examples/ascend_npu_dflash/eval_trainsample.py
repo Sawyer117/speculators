@@ -73,6 +73,8 @@ def main() -> None:
         "--max-new-tokens", os.environ.get("MAX_NEW", "2048"),
         "--temperature", "0", "--top-p", "1", "--top-k", "1",
     ]
+    if os.environ.get("KEEP_WARMUP", "1") == "1":
+        argv += ["--keep-warmup-samples"]
     ct = os.path.join(_HERE, "dsv4_chat_template.jinja")
     if os.path.isfile(ct):
         argv += ["--chat-template", ct]

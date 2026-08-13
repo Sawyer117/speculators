@@ -32,6 +32,16 @@ NOTE (fork-only, team-internal eval alignment — NOT upstream): this is the
 team's shared DFlash benchmark client (originally bench_dflash_vllm_all.py).
 Keep this file identical across the team so acceptance numbers stay comparable.
 Wrapper run_eval.sh launches it with the team-standard defaults.
+
+MEASURED-SET CHANGE (2026-08-13): --keep-warmup-samples measures the warmup
+samples instead of spending them. Without it the run loses a fixed random 10
+per dataset -- 12.5% of mt-bench (10/80), 6.1% of humaneval (10/164) -- which
+is harmless for comparisons (random.seed(42) means every run drops the SAME
+10) but shrinks the small sets for no reason. The flag DEFAULTS OFF here, so
+this file still reproduces every earlier number byte-for-byte; the wrappers
+(run_eval.sh, run_dspark_eval.sh) default it ON via KEEP_WARMUP=1. Numbers
+from the two modes are on different sample sets -- do not mix them in one
+comparison.
 """
 
 
@@ -469,19 +479,32 @@ def send_sample(
 
 def run_one_dataset(args, dataset_name, tokenizer):
     warmup_steps = max(args.warmup_steps, 0)
+    # Warmup samples are normally spent (dropped from the measured set). On the
+    # small datasets that is a big slice -- 10/80 of mt-bench, 10/164 of
+    # humaneval -- so --keep-warmup-samples measures them as well.
+    keep_warmup = args.keep_warmup_samples
+    extra = 0 if keep_warmup else warmup_steps
 
     if args.num_prompts is None:
         print(
             f"\nLoading FULL {dataset_name} dataset "
-            f"(plus {warmup_steps} warmup, if enough samples exist)..."
+            + (
+                "(warmup samples are measured too)..."
+                if keep_warmup
+                else f"(plus {warmup_steps} warmup, if enough samples exist)..."
+            )
         )
         samples = load_data(dataset_name, None)
     else:
         print(
             f"\nLoading {args.num_prompts} samples from {dataset_name} "
-            f"(plus {warmup_steps} warmup)..."
+            + (
+                "(warmup samples are measured too)..."
+                if keep_warmup
+                else f"(plus {warmup_steps} warmup)..."
+            )
         )
-        samples = load_data(dataset_name, args.num_prompts + warmup_steps)
+        samples = load_data(dataset_name, args.num_prompts + extra)
 
     print(f"  Loaded samples:   {len(samples)}")
     print(f"  Loaded turns:     {sum(len(x['turns']) for x in samples)}")
@@ -522,7 +545,18 @@ def run_one_dataset(args, dataset_name, tokenizer):
                     )
                 )
 
-            samples = samples[actual_warmup:]
+            if keep_warmup:
+                # The warmup prompts stay in the measured set, so flush the
+                # prefix cache again -- otherwise those 10 alone would enter
+                # the timed phase with their prefill already cached.
+                try:
+                    requests.post(
+                        f"{args.base_url}/reset_prefix_cache", timeout=30
+                    )
+                except Exception:
+                    pass
+            else:
+                samples = samples[actual_warmup:]
 
     # Reset-aware accumulation: this build's spec_decode_*_total counters reset
     # mid-run, so a single after-minus-before delta is unreliable. Poll throughout.
@@ -612,7 +646,10 @@ def run_one_dataset(args, dataset_name, tokenizer):
     print(f"Samples:                    {len(samples)}")
     print(f"Turns:                      {total_turns}")
     print(f"Concurrency:                {args.concurrency}")
-    print(f"Warmup steps:               {warmup_steps}")
+    print(
+        f"Warmup steps:               {warmup_steps}"
+        + (" (measured, not discarded)" if keep_warmup else " (discarded)")
+    )
     print(f"Wall clock:                 {elapsed:.2f} s")
     print(f"Total output tokens:        {total_tokens}")
     print()
@@ -741,6 +778,18 @@ def main():
     )
     ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--warmup-steps", type=int, default=10)
+    ap.add_argument(
+        "--keep-warmup-samples",
+        action="store_true",
+        help=(
+            "Measure the warmup samples too instead of discarding them. "
+            "Default (off) drops them, which costs 12.5%% of mt-bench (10/80) "
+            "and 6.1%% of humaneval (10/164). The prefix cache is flushed a "
+            "second time after warmup so the reused prompts get no prefill "
+            "advantage. Changes the measured sample set -> numbers are NOT "
+            "comparable with runs made without this flag."
+        ),
+    )
 
     ap.add_argument("--max-new-tokens", type=int, default=2048)
     ap.add_argument("--temperature", type=float, default=0.0)
