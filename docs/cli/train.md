@@ -55,6 +55,7 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 - **`--dry-run`** (flag) Build the speculator, initialize weights, save a checkpoint to `--save-path`, then exit before training. Useful to validate the config/weights in vLLM before launching a full run; the saved checkpoint can be fed straight back via `--from-pretrained`.
 
 - **`--num-layers`** (int, default: `5` for dflash, `1` otherwise) Number of transformer layers in the draft model.
+- **`--num-layers`** (int, default: `1`; DSpark: `5`) Number of transformer layers in the draft model.
 
 - **`--draft-arch`** (str, default: `"llama"`) Architecture for the synthesized draft decoder layers. Options: `llama`, `qwen3`. Used by Eagle3 and P-EAGLE, which select the decoder layer class from this value; DFlash always uses a Qwen3-style decoder regardless. Both are supported in vLLM for inference, and the target and draft architectures do not have to match.
 
@@ -110,9 +111,11 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--save-path`** (str, default: `"./checkpoints"`) Directory to save model checkpoints.
 
-- **`--epochs`** (int, default: `20`) Number of training epochs.
+- **`--epochs`** (int, default: `20`; DSpark: `10`) Number of training epochs.
 
 - **`--lr`** (float, default: `1e-4`) Learning rate.
+
+- **`--loss-fn`** (str, default: `"kl_div"`; DSpark: `{"ce": 0.1, "tv": 0.9}`) Training loss or weighted loss combination. Explicit values override the algorithm default.
 
 - **`--train-data-ratio`** (float, default: `0.9`) Ratio of data to use for training, the rest of the provided data will be used for validation.
 
@@ -179,12 +182,17 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 ### DFlash-Specific Arguments
 
 - **`--block-size`** (int, default: `16` for dflash, `8` for dspark) Block size for DFlash model.
+- **`--block-size`** (int, default: `8`; DSpark: `7`) Draft proposal length.
 
 - **`--sample-from-anchor`** / **`--no-sample-from-anchor`** (bool, default: algorithm-specific) Whether to sample from the anchor position. `True`: sample from anchor and all mask positions (default for dspark, produces block_size tokens). `False`: anchor is bonus token (default for dflash, produces block_size-1 tokens).
 
 - **`--max-anchors`** (int, default: `3072`) Maximum anchor positions for DFlash, DSpark, and P-EAGLE training.
 
-- **`--dflash-decay-gamma`** (float, default: `4.0`) Decay gamma for DFlash loss weighting.
+- **`--dflash-decay-gamma`** (float, default: `4.0`; DSpark: its block size) Exponential position-loss decay denominator.
+
+### DSpark-Specific Defaults
+
+With `--speculator-type dspark`, the paper baseline uses a vanilla rank-256 Markov head, enables the confidence head with the Markov feature, and applies the same fixed exponential position weights to draft and confidence losses (`match-draft`). Correction, Correction MoE, generated-token feedback, collaboration, adaptive losses, and optional DFlash residual/fusion features are disabled unless explicitly enabled.
 
 - **`--per-position-loss-weight`** (str, default: `"dpace"` for dflash, `"fixed-exp-decay"` for dspark) Per-position loss weighting scheme. Options: `fixed-exp-decay`, `dpace`. Applies to DFlash and DSpark. `dpace` requires `--loss-fn ce`.
 

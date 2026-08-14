@@ -52,6 +52,15 @@ class DSparkDraftConfig:
     target_layer_ids: tuple[int, ...] = (40, 41, 42)  # verifier layers -> main_proj
     markov_rank: int = 256
 
+    # ⚠ Overrides the base DSpark default (False) to preserve THIS fork's validated
+    # baseline. Every checkpoint in the eval ledger -- including the 4.41-mean
+    # deliverable -- was trained with the ConfidenceHead inputs detached, because the
+    # detach used to be hardcoded here. Flipping it to False is a deliberate experiment
+    # (it lets the confidence BCE shape the draft backbone), NOT something a merge from
+    # upstream or a sibling fork should do as a side effect. Pass
+    # --no-confidence-detach-features to run that experiment.
+    confidence_detach_features: bool = True
+
     # ---- multi-head latent attention (MLA) ----------------------------------
     num_heads: int = 64
     head_dim: int = 512  # per-head q/k/v width (nope | rope)

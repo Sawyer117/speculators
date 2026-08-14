@@ -16,6 +16,8 @@ from speculators.models.metrics import (
     loss_function,
     neg_log_acceptance_loss,
     nla_loss_fused_or_eager,
+    position_weights,
+    prefix_product_weights,
     resolve_loss_config,
     reverse_kl_div_loss,
     tv_loss,
@@ -394,6 +396,23 @@ class TestDecayFunctions:
             0.25
         )
         assert exp_loss_decay(torch.tensor(0.0), gamma=0.5).item() == pytest.approx(1.0)
+
+    def test_prefix_product_and_mix(self):
+        scores = torch.tensor([[0.5, 0.5, 0.5, 0.5]])
+        pref = prefix_product_weights(scores, block_size=4, start_pos=0)
+        assert pref[0].tolist() == pytest.approx([1.0, 0.5, 0.25, 0.125])
+
+        pos = torch.arange(4, dtype=torch.float).unsqueeze(0)
+        mix = position_weights(
+            pos,
+            block_size=4,
+            gamma=4.0,
+            sample_from_anchor=True,
+            adaptive_scores=scores,
+            decay_mix=0.5,
+        )
+        decay = dflash_loss_decay(pos, gamma=4.0, sample_from_anchor=True)
+        assert torch.allclose(mix, 0.5 * decay + 0.5 * pref)
 
 
 class TestBf16GradientPrecision:

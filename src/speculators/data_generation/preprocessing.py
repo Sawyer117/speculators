@@ -199,7 +199,17 @@ def _adapt_conv_for_vllm(normalized_conv: list[dict]):
     return [_adapt_turn_for_vllm(turn) for turn in normalized_conv]
 
 
-def _supports_assistant_mask(processor: ProcessorLike) -> bool:
+def _thinking_template_kwargs(enable_thinking: bool | None) -> dict[str, bool]:
+    if enable_thinking is None:
+        return {}
+    return {"enable_thinking": enable_thinking}
+
+
+def _supports_assistant_mask(
+    processor: ProcessorLike,
+    *,
+    enable_thinking: bool | None = None,
+) -> bool:
     """Check if processor truly supports HF assistant token mask.
 
     Must return a non-zero mask for a conversation containing an assistant message.
@@ -220,6 +230,7 @@ def _supports_assistant_mask(processor: ProcessorLike) -> bool:
             tokenize=True,
             return_assistant_tokens_mask=True,
             return_dict=True,
+            **_thinking_template_kwargs(enable_thinking),
         )
         res = cast("BatchEncoding | BatchFeature", res_any)
 
@@ -235,7 +246,11 @@ def _supports_assistant_mask(processor: ProcessorLike) -> bool:
         return False
 
 
-def _detect_assistant_pattern(processor: ProcessorLike) -> str:
+def _detect_assistant_pattern(
+    processor: ProcessorLike,
+    *,
+    enable_thinking: bool | None = None,
+) -> str:
     """Auto-detect the assistant message pattern from the processor's chat template.
 
     Uses multi-turn conversation but extracts pattern from the LAST assistant
@@ -252,7 +267,10 @@ def _detect_assistant_pattern(processor: ProcessorLike) -> str:
     )
 
     formatted = processor.apply_chat_template(
-        test_conv, tokenize=False, add_generation_prompt=False
+        test_conv,
+        tokenize=False,
+        add_generation_prompt=False,
+        **_thinking_template_kwargs(enable_thinking),
     )
     assert isinstance(formatted, str), "Expected string from apply_chat_template"
 
@@ -384,6 +402,7 @@ def _get_input_ids_loss_mask(
     assistant_pattern: str | Pattern[str] | None,
     *,
     tools: list[dict] | None = None,
+    enable_thinking: bool | None = None,
     # For logging
     conv_idx: int | None = None,
 ):
@@ -398,6 +417,7 @@ def _get_input_ids_loss_mask(
             add_generation_prompt=False,
             return_assistant_tokens_mask=True,
             return_dict=True,
+            **_thinking_template_kwargs(enable_thinking),
         )
         encoded = cast("BatchEncoding | BatchFeature", encoded_any)
 
@@ -430,6 +450,7 @@ def _get_input_ids_loss_mask(
                 add_generation_prompt=False,
                 return_dict=True,
                 processor_kwargs=processor_kwargs,
+                **_thinking_template_kwargs(enable_thinking),
             )
         else:
             encoded_any = processor.apply_chat_template(
@@ -438,6 +459,7 @@ def _get_input_ids_loss_mask(
                 tools=tools,
                 add_generation_prompt=False,
                 return_dict=True,
+                **_thinking_template_kwargs(enable_thinking),
                 **processor_kwargs,
             )
 
@@ -457,6 +479,7 @@ def _get_input_ids_loss_mask(
             tokenize=False,
             tools=tools,  # type: ignore[arg-type]
             add_generation_prompt=False,
+            **_thinking_template_kwargs(enable_thinking),
         )
         assert isinstance(formatted_text, str)
 
@@ -538,6 +561,7 @@ def _preprocess_batch(
     max_length: int,
     assistant_pattern: str | Pattern[str] | None,
     minimum_valid_tokens: int | None = None,
+    enable_thinking: bool | None = None,
 ) -> dict[str, list]:
     """Process a batch of conversations into tokenized format with loss masks."""
 
@@ -585,6 +609,7 @@ def _preprocess_batch(
                 max_length=max_length,
                 assistant_pattern=assistant_pattern,
                 tools=parsed_tools,
+                enable_thinking=enable_thinking,
                 conv_idx=idx,
             )
         # Templates reject rows they cannot render with arbitrary types -- Mistral
@@ -632,6 +657,7 @@ def build_eagle3_dataset(
     num_proc: int = 8,
     assistant_pattern: str | Pattern[str] | None = None,
     minimum_valid_tokens: int | None = None,
+    enable_thinking: bool | None = None,
 ) -> HFDataset:
     """Build EAGLE3 dataset by tokenizing conversations and creating loss masks.
 
@@ -646,6 +672,8 @@ def build_eagle3_dataset(
                           responses. If None, pattern will be auto-detected from
                           chat template.
         minimum_valid_tokens: Number of tokens to consider for a valid sample
+        enable_thinking: Explicit chat-template thinking mode. None keeps the
+                         target model's template default.
     """
     original_cols = dataset.column_names
     # These rows carry the generation boundary as their mask, so _preprocess_batch
@@ -654,6 +682,11 @@ def build_eagle3_dataset(
 
     if pretokenized:
         log.info("Pre-tokenized rows: using their loss mask, skipping chat template")
+        if enable_thinking is not None:
+            log.warning(
+                "Thinking mode cannot rewrite pre-tokenized rows; regenerate their "
+                "input_ids with the requested mode before preprocessing"
+            )
         if assistant_pattern is not None:
             log.warning(
                 "assistant_pattern does not apply to pre-tokenized rows; ignoring"
@@ -661,11 +694,17 @@ def build_eagle3_dataset(
     # Detect and use provided assistant message pattern
     elif assistant_pattern is not None:
         log.info(f"Using custom assistant pattern: {str(assistant_pattern)[:80]}...")
-    elif _supports_assistant_mask(processor):
+    elif _supports_assistant_mask(
+        processor,
+        enable_thinking=enable_thinking,
+    ):
         assistant_pattern = None  # Signal to use HF mask in _preprocess_batch
         log.info("Using HF assistant token mask for loss masking")
     else:
-        assistant_pattern = _detect_assistant_pattern(processor)
+        assistant_pattern = _detect_assistant_pattern(
+            processor,
+            enable_thinking=enable_thinking,
+        )
         log.info(f"Detected assistant pattern: {str(assistant_pattern)[:80]}...")
 
     # Avoid CPU contention for MM processing:
@@ -682,6 +721,7 @@ def build_eagle3_dataset(
                 max_length,
                 assistant_pattern,
                 minimum_valid_tokens,
+                enable_thinking,
             ),
             batched=True,
             num_proc=num_proc,
@@ -841,6 +881,7 @@ def load_and_preprocess_dataset(
     allow_empty_output: bool = False,
     trust_remote_code: bool = False,
     chat_template: str | None = None,
+    enable_thinking: bool | None = None,
 ) -> tuple[HFDataset, ProcessorLike]:
     """Load, tokenize, and preprocess a dataset for EAGLE3 training.
 
@@ -866,6 +907,8 @@ def load_and_preprocess_dataset(
         chat_template: Optional .jinja file path or inline template string to set on
             the processor when the model ships none (e.g. DeepSeek-V4). Must match the
             template the serve used to roll the data.
+        enable_thinking: Explicit chat-template thinking mode. None keeps the
+                         target model's template default.
 
     Returns:
         Tuple of (preprocessed_dataset, processor)
@@ -880,6 +923,9 @@ def load_and_preprocess_dataset(
 
     log.subsection("Loading processor")
     processor = load_processor(target_model_path, trust_remote_code=trust_remote_code)
+    if enable_thinking is not None:
+        mode = "thinking" if enable_thinking else "non-thinking"
+        log.info(f"Chat-template mode: {mode}")
 
     # Some models (e.g. DeepSeek-V4) ship NO Jinja chat_template — they use a custom
     # encoder instead. Inject an explicit template (a .jinja file path or inline string)
@@ -930,6 +976,7 @@ def load_and_preprocess_dataset(
             num_proc=build_dataset_num_proc,
             assistant_pattern=assistant_pattern,
             minimum_valid_tokens=minimum_valid_tokens,
+            enable_thinking=enable_thinking,
         )
         dropped = len(raw_dataset) - len(preprocessed_dataset)
         if dropped:

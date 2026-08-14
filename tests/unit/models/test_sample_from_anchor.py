@@ -14,6 +14,12 @@ class TestSampleFromAnchorDFlash:
         """DFlash should default to sample_from_anchor=False."""
         config = DFlashSpeculatorConfig(draft_vocab_size=128, block_size=4)
         assert not config.sample_from_anchor
+        assert not config.dflash_context_residual
+        assert not config.dflash_verifier_final_residual
+        assert not config.dflash_block_position_embedding
+        assert not config.dflash_gated_layer_fusion
+        assert not config.dflash_dfly_layer_residual
+        assert not config.dflash_heterogeneous_kv_projections
 
     def test_can_set_to_true(self):
         """DFlash can be configured with sample_from_anchor=True."""
@@ -30,6 +36,13 @@ class TestSampleFromAnchorDSpark:
         """DSpark should default to sample_from_anchor=True."""
         config = DSparkSpeculatorConfig(draft_vocab_size=128, block_size=4)
         assert config.sample_from_anchor
+        assert not config.correction_with_markov
+        assert config.correction_generated_token_ratio == 0.0
+        assert config.correction_generated_token_warmup == 0.2
+        assert config.correction_generated_token_ramp == 0.4
+        assert not config.correction_cross_block_memory
+        assert not config.dflash_dfly_layer_residual
+        assert not config.dflash_heterogeneous_kv_projections
 
     def test_can_override_to_false(self):
         """DSpark can be configured with sample_from_anchor=False."""

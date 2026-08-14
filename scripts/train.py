@@ -130,6 +130,10 @@ DRAFT_ARCH_CONFIGS: dict[str, type] = {
     "qwen3": Qwen3Config,
 }
 MROPE_INVERSE_TOLERANCE = 1e-6
+DSPARK_PAPER_LOSS_FN = '{"ce": 0.1, "tv": 0.9}'
+DSPARK_PAPER_BLOCK_SIZE = 7
+DSPARK_PAPER_NUM_LAYERS = 5
+DSPARK_PAPER_EPOCHS = 10
 
 
 def set_seed(seed: int, deterministic: bool = False):
@@ -455,6 +459,7 @@ def _build_from_config_only(
     d2t: torch.Tensor | None,
     verifier_name_or_path: str | None = None,
     draft_attn_impl: str | None = None,
+    training_args: argparse.Namespace | None = None,
 ) -> SpeculatorModel:
     """Initialize a fresh draft from a saved speculator *config* (no weights).
 
@@ -463,6 +468,8 @@ def _build_from_config_only(
     no trained draft weights to restore (decoder weights are randomly initialized).
     """
     config = model_class.config_class.from_pretrained(path)
+    if training_args is not None:
+        _reconcile_pretrained_config_args(training_args, config)
     if draft_attn_impl is not None:
         config.transformer_layer_config._attn_implementation = draft_attn_impl
     speculators_config = getattr(config, "speculators_config", None)
@@ -520,6 +527,7 @@ def build_draft_model(
                 draft_attn_impl=(
                     args.draft_attn_impl if args.speculator_type != "mtp" else None
                 ),
+                training_args=args,
             )
         if args.speculator_type != "mtp":
             # _attn_implementation is never serialized by HF configs, so re-apply
@@ -527,6 +535,7 @@ def build_draft_model(
             # MTP is skipped: its from_training_args never sets the field and its
             # __init__ resolves its own default ("sdpa") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
+            _reconcile_pretrained_config_args(args, config)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl
             return model_class.from_pretrained(
                 args.from_pretrained,
@@ -849,6 +858,14 @@ def main(args: argparse.Namespace):  # noqa: C901
     maybe_destroy_distributed()
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for flags upstream's schema constrains with ``ge=1``."""
+    ivalue = int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {ivalue}")
+    return ivalue
+
+
 def _checkpoint_freq(value: str) -> float:
     fvalue = float(value)
     if fvalue <= 0:
@@ -870,6 +887,115 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
     "sliding_window": "--sliding-window",
     "full_attention_indices": "--full-attention-indices",
 }
+
+# Model-config options that would otherwise be silently ignored when a complete
+# checkpoint is restored via --from-pretrained. Most change parameter shapes or
+# learned proposal semantics and therefore must match the checkpoint. The small
+# runtime-only subset below can safely change without adding/removing weights.
+PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
+    "block_size": "--block-size",
+    "sample_from_anchor": "--sample-from-anchor",
+    "sliding_window_non_causal": "--sliding-window-non-causal",
+    "dflash_context_residual": "--dflash-context-residual",
+    "dflash_verifier_final_residual": "--dflash-verifier-final-residual",
+    "dflash_block_position_embedding": "--dflash-block-position-embedding",
+    "dflash_gated_layer_fusion": "--dflash-gated-layer-fusion",
+    "dflash_dfly_layer_residual": "--dflash-dfly-layer-residual",
+    "dflash_heterogeneous_kv_projections": (
+        "--dflash-heterogeneous-kv-projections"
+    ),
+    "markov_rank": "--markov-rank",
+    "markov_head_type": "--markov-head-type",
+    "enable_correction_head": "--enable-correction-head",
+    "correction_output_mode": "--correction-output-mode",
+    "correction_hidden_size": "--correction-hidden-size",
+    "correction_rank": "--correction-rank",
+    "correction_lm_head_fusion": "--correction-lm-head-fusion",
+    "correction_num_layers": "--correction-num-layers",
+    "correction_num_heads": "--correction-num-heads",
+    "correction_gate_bias": "--correction-gate-bias",
+    "correction_moe": "--correction-moe",
+    "correction_moe_shared_rank": "--correction-moe-shared-rank",
+    "correction_moe_expert_rank": "--correction-moe-expert-rank",
+    "correction_moe_num_experts": "--correction-moe-num-experts",
+    "correction_moe_load_balance_weight": (
+        "--correction-moe-load-balance-weight"
+    ),
+    "correction_moe_logit_routing": "--correction-moe-logit-routing",
+    "correction_hidden_aux_loss": "--correction-hidden-aux-loss",
+    "correction_hidden_aux_weight": "--correction-hidden-aux-weight",
+    "correction_hidden_feedback": "--correction-hidden-feedback",
+    "correction_cross_block_memory": "--correction-cross-block-memory",
+    "correction_memory_gate_bias": "--correction-memory-gate-bias",
+    "correction_project_corrected_hidden": (
+        "--correction-project-corrected-hidden"
+    ),
+    "correction_with_markov": "--correction-with-markov",
+    "correction_markov_gate_bias": "--correction-markov-gate-bias",
+    "correction_generated_token_ratio": "--correction-generated-token-ratio",
+    "correction_generated_token_warmup": "--correction-generated-token-warmup",
+    "correction_generated_token_ramp": "--correction-generated-token-ramp",
+    "correction_rollout_metrics": "--correction-rollout-metrics",
+    "correction_base_diagnostics": "--correction-base-diagnostics",
+    "enable_confidence_head": "--enable-confidence-head",
+    "confidence_head_with_markov": "--confidence-head-with-markov",
+    "confidence_detach_features": "--confidence-detach-features",
+}
+
+PRETRAINED_RUNTIME_CONFIG_FIELDS = {
+    "correction_lm_head_fusion",
+    "correction_moe_load_balance_weight",
+    "correction_hidden_aux_weight",
+    "correction_generated_token_ratio",
+    "correction_generated_token_warmup",
+    "correction_generated_token_ramp",
+    "correction_rollout_metrics",
+    "correction_base_diagnostics",
+    "confidence_detach_features",
+}
+
+
+def _reconcile_pretrained_config_args(
+    args: argparse.Namespace,
+    config: PretrainedConfig,
+) -> None:
+    """Safely reconcile explicit CLI flags with a restored model config."""
+    provided = set(getattr(args, "_provided_model_config_dests", set()))
+    incompatible: list[str] = []
+    applied: list[str] = []
+
+    for dest, flag in PRETRAINED_MODEL_CONFIG_FLAGS.items():
+        if not hasattr(config, dest) or not hasattr(args, dest):
+            continue
+        checkpoint_value = getattr(config, dest)
+        cli_value = getattr(args, dest)
+        if dest not in provided:
+            # Trainer kwargs are built from args later. Inherit the saved value so
+            # parser defaults cannot silently reset the checkpoint's policy.
+            setattr(args, dest, checkpoint_value)
+            continue
+        if cli_value == checkpoint_value:
+            continue
+        if dest in PRETRAINED_RUNTIME_CONFIG_FIELDS:
+            setattr(config, dest, cli_value)
+            applied.append(f"{flag}={cli_value!r}")
+        else:
+            incompatible.append(
+                f"{flag}={cli_value!r} (checkpoint: {checkpoint_value!r})"
+            )
+
+    if incompatible:
+        raise ValueError(
+            "--from-pretrained cannot change checkpoint architecture or learned "
+            f"proposal semantics: {', '.join(incompatible)}. Remove the conflicting "
+            "option(s), use matching values, or start a fresh model without "
+            "--from-pretrained."
+        )
+    if applied:
+        logger.info(
+            "Applied explicit runtime-only overrides to pretrained config: %s",
+            ", ".join(applied),
+        )
 
 
 def validate_draft_init_args(
@@ -993,7 +1119,7 @@ def parse_args():
     )
     parser.add_argument(
         "--max-steps",
-        type=int,
+        type=_positive_int,
         default=None,
         help=(
             "Stop training after this many optimizer steps (counted across epochs). "
@@ -1088,7 +1214,12 @@ def parse_args():
         ),
     )
     parser.add_argument("--save-path", type=str, default="./output/checkpoints")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=20,
+        help="Training epochs (default: 20; DSpark paper default: 10).",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--train-data-ratio", type=float, default=0.9)
     parser.add_argument(
@@ -1177,7 +1308,12 @@ def parse_args():
     )
     parser.add_argument("--log-dir", type=str, default="./logs")
     parser.add_argument("--run-name", type=str, default=None)
-    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument(
+        "--num-layers",
+        type=int,
+        default=1,
+        help="Draft decoder layers (default: 1; DSpark paper default: 5).",
+    )
     parser.add_argument(
         "--init-on-meta",
         action="store_true",
@@ -1268,7 +1404,8 @@ def parse_args():
         help=(
             "Loss function specification. Pass a name for a single loss "
             "(kl_div, rkl, jsd, ce, tv, nla, lk_hybrid) or a JSON dict for a weighted "
-            'combination, e.g. \'{"ce": 0.1, "tv": 0.9}\'.'
+            'combination, e.g. \'{"ce": 0.1, "tv": 0.9}\'. The DSpark default '
+            "is the paper's CE=0.1, TV=0.9 combination."
         ),
     )
     parser.add_argument(
@@ -1357,7 +1494,7 @@ def parse_args():
         "--block-size",
         type=int,
         default=8,
-        help="Block size for DFlash model (default: 8)",
+        help="Draft block size (default: 8; DSpark paper default: 7).",
     )
     parser.add_argument(
         "--sample-from-anchor",
@@ -1377,7 +1514,10 @@ def parse_args():
         "--dflash-decay-gamma",
         type=float,
         default=4.0,
-        help="Decay gamma for DFlash/DSpark loss weighting (default: 4.0)",
+        help=(
+            "Decay gamma for DFlash/DSpark loss weighting (default: 4.0; "
+            "DSpark paper default: its block size)."
+        ),
     )
     # D-Pace specific arguments (loss weight option + smoothing)
     parser.add_argument(
@@ -1417,6 +1557,62 @@ def parse_args():
     )
     # DSpark-specific arguments (sequential Markov head + confidence head).
     parser.add_argument(
+        "--dflash-context-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: inject the last inference-available verifier hidden "
+            "state into each draft block (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-verifier-final-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: inject the last inference-available verifier "
+            "final/pre-LM hidden into each draft block (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-block-position-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: add zero-initialized block-relative slot embeddings "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-gated-layer-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: use normalized per-token gated auxiliary-layer fusion "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-dfly-layer-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: add a DFly-style per-draft-layer residual to the "
+            "existing token-adaptive gated fusion; requires "
+            "--dflash-gated-layer-fusion (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-heterogeneous-kv-projections",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash/DSpark: use separate target-context and draft/noise K/V "
+            "projections (default: disabled)."
+        ),
+    )
+    # DSpark-specific arguments (sequential correction + confidence head).
+    parser.add_argument(
         "--markov-rank",
         type=int,
         default=256,
@@ -1430,6 +1626,216 @@ def parse_args():
         help="DSpark: sequential head variant (default: vanilla).",
     )
     parser.add_argument(
+        "--enable-correction-head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: use causal Correction; it replaces Markov unless "
+            "--correction-with-markov is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--correction-output-mode",
+        type=str,
+        default="hidden",
+        choices=["hidden", "logits"],
+        help=(
+            "DSpark Correction output: 'hidden' adds a pre-LM-head hidden "
+            "residual; 'logits' consumes previous logits and adds a low-rank "
+            "vocabulary bias to DFlash base logits (default: hidden)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-hidden-size",
+        type=int,
+        default=512,
+        help="DSpark correction-head hidden width (default: 512).",
+    )
+    parser.add_argument(
+        "--correction-rank",
+        type=int,
+        default=256,
+        help="DSpark correction residual bottleneck (default: 256).",
+    )
+    parser.add_argument(
+        "--correction-lm-head-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark hidden Correction: during no-grad rollout, fuse its low-rank "
+            "output weights with the LM head and avoid per-slot full hidden-to-vocab "
+            "projections (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-num-layers",
+        type=int,
+        default=1,
+        help="DSpark correction-head causal layers (default: 1).",
+    )
+    parser.add_argument(
+        "--correction-num-heads",
+        type=int,
+        default=8,
+        help="DSpark correction-head attention heads (default: 8).",
+    )
+    parser.add_argument(
+        "--correction-gate-bias",
+        type=float,
+        default=0.0,
+        help="DSpark initial correction residual-gate bias (default: 0).",
+    )
+    parser.add_argument(
+        "--correction-moe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark Correction: use one shared low-rank expert plus a Top-1 "
+            "selected expert; logits mode shares one final vocabulary projection "
+            "across experts (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-moe-shared-rank",
+        type=int,
+        default=128,
+        help="DSpark Correction shared-expert rank (default: 128).",
+    )
+    parser.add_argument(
+        "--correction-moe-expert-rank",
+        type=int,
+        default=64,
+        help="DSpark Correction selected-expert rank (default: 64).",
+    )
+    parser.add_argument(
+        "--correction-moe-num-experts",
+        type=int,
+        default=4,
+        help="DSpark Correction selected-expert count (default: 4).",
+    )
+    parser.add_argument(
+        "--correction-moe-load-balance-weight",
+        type=float,
+        default=0.01,
+        help="DSpark Correction router balance-loss weight (default: 0.01).",
+    )
+    parser.add_argument(
+        "--correction-moe-logit-routing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: condition only the Correction MoE router and gate on "
+            "detached previous-logit uncertainty statistics "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-hidden-aux-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: align Correction's corrected DFlash hidden with verifier "
+            "pre-LM hidden using an auxiliary SmoothL1 loss (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-hidden-aux-weight",
+        type=float,
+        default=0.1,
+        help="DSpark hidden auxiliary-loss weight (default: 0.1).",
+    )
+    parser.add_argument(
+        "--correction-hidden-feedback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: feed each corrected hidden into the next Correction slot "
+            "(default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-cross-block-memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: carry a verifier-confirmed gated residual memory between "
+            "Correction blocks (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-memory-gate-bias",
+        type=float,
+        default=-2.0,
+        help="DSpark initial cross-block memory update-gate bias (default: -2.0).",
+    )
+    parser.add_argument(
+        "--correction-project-corrected-hidden",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark logits mode: compute current logits as "
+            "LMHead(h_DFlash + delta_hidden) + delta_logits while retaining one "
+            "full LM-head projection (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-with-markov",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: jointly add a Correction-gated low-rank Markov bias after "
+            "Correction's single LM-head projection (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-markov-gate-bias",
+        type=float,
+        default=-2.0,
+        help="DSpark initial collaboration gate bias (default: -2.0).",
+    )
+    parser.add_argument(
+        "--correction-generated-token-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "DSpark: target fraction of training steps using generated-token "
+            "feedback instead of teacher forcing (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-generated-token-warmup",
+        type=float,
+        default=0.2,
+        help=(
+            "DSpark: initial training fraction kept at zero generated-token ratio "
+            "(default: 0.2)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-generated-token-ramp",
+        type=float,
+        default=0.4,
+        help=(
+            "DSpark: training fraction used to ramp to the target generated-token "
+            "ratio (default: 0.4)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-rollout-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark Correction: measure greedy self-feedback metrics during "
+            "validation (default: disabled for DSpark baseline parity)."
+        ),
+    )
+    parser.add_argument(
+        "--correction-base-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="DSpark: add a validation-only base projection for change/gain metrics.",
+    )
+    parser.add_argument(
         "--enable-confidence-head",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1439,14 +1845,65 @@ def parse_args():
         "--confidence-head-with-markov",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="DSpark: feed the Markov previous-token embedding into the "
-        "confidence head alongside the backbone hidden state.",
+        help="DSpark: feed the active sequential state into the confidence "
+        "head alongside the backbone hidden state.",
+    )
+    parser.add_argument(
+        "--confidence-detach-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="DSpark: detach all ConfidenceHead inputs so its loss is auxiliary.",
     )
     parser.add_argument(
         "--confidence-head-alpha",
         type=float,
         default=1.0,
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
+    )
+    parser.add_argument(
+        "--confidence-length-alpha",
+        type=float,
+        default=0.0,
+        help="DSpark: Smooth-L1 weight on predicted accept length (default: 0).",
+    )
+    parser.add_argument(
+        "--confidence-loss-weighting",
+        type=str,
+        default="match-draft",
+        choices=["uniform", "match-draft"],
+        help="DSpark: how to weight confidence BCE over positions "
+        "(default: match-draft, matching the DSpark objective).",
+    )
+    parser.add_argument(
+        "--first-error-focal-alpha",
+        type=float,
+        default=0.0,
+        help="DSpark: weight of first-error focal CE (default: 0).",
+    )
+    parser.add_argument(
+        "--adaptive-loss",
+        type=str,
+        default="none",
+        choices=["none", "cat", "ssal"],
+        help="DSpark: adaptive position weights (default: none = fixed decay).",
+    )
+    parser.add_argument(
+        "--ssal-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="DSpark: mix decay→SSAL over training (requires --adaptive-loss ssal).",
+    )
+    parser.add_argument(
+        "--ssal-curriculum-start",
+        type=float,
+        default=0.1,
+        help="Progress fraction where decay→SSAL mix begins (default: 0.1).",
+    )
+    parser.add_argument(
+        "--ssal-curriculum-end",
+        type=float,
+        default=0.6,
+        help="Progress fraction where mix reaches pure SSAL (default: 0.6).",
     )
     parser.add_argument(
         "--draft-attn-impl",
@@ -1596,6 +2053,53 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    args._provided_model_config_dests = explicitly_provided_dests(
+        parser, PRETRAINED_MODEL_CONFIG_FLAGS
+    )
+
+    # Preserve the shared CLI defaults for every other algorithm while making a
+    # bare ``--speculator-type dspark`` reproduce the paper training recipe.
+    dspark_default_dests = {
+        "block_size",
+        "dflash_decay_gamma",
+        "epochs",
+        "loss_fn",
+        "num_layers",
+    }
+    dspark_provided = explicitly_provided_dests(parser, dspark_default_dests)
+    # Upstream #980 (RFC #979) moved the per-speculator defaults into
+    # train/config/schema.py. This fork keeps the argparse entry point, so mirror
+    # them here or `--speculator-type dflash` silently trains the pre-#980 recipe.
+    # Gate every one on `dspark_provided` -- the set of dests the user actually typed
+    # -- so an explicit flag always wins, exactly as the schema's `is None` checks do.
+    # DSpark's own paper defaults are applied in the block below and win for dspark.
+    _dflash_defaults = {
+        "num_layers": 5,
+        "per_position_loss_weight": "dpace",
+        "loss_fn": "ce",
+        "block_size": 16,
+    }
+    if args.speculator_type == "dflash":
+        # NB: compute the provided-set over THESE dests -- dspark_default_dests does
+        # not include per_position_loss_weight, so reusing it silently clobbers an
+        # explicit --per-position-loss-weight.
+        _dflash_provided = explicitly_provided_dests(parser, set(_dflash_defaults))
+        for dest, value in _dflash_defaults.items():
+            if dest not in _dflash_provided:
+                setattr(args, dest, value)
+
+    if args.speculator_type == "dspark":
+        if "block_size" not in dspark_provided:
+            args.block_size = DSPARK_PAPER_BLOCK_SIZE
+        if "dflash_decay_gamma" not in dspark_provided:
+            # The paper uses the proposal length gamma in w_k=exp(-(k-1)/gamma).
+            args.dflash_decay_gamma = float(args.block_size)
+        if "epochs" not in dspark_provided:
+            args.epochs = DSPARK_PAPER_EPOCHS
+        if "loss_fn" not in dspark_provided:
+            args.loss_fn = DSPARK_PAPER_LOSS_FN
+        if "num_layers" not in dspark_provided:
+            args.num_layers = DSPARK_PAPER_NUM_LAYERS
 
     is_eagle3 = args.speculator_type == "eagle3"
     if args.draft_arch is None:
@@ -1611,6 +2115,125 @@ def parse_args():
     validate_draft_init_args(parser, args, provided)
     resolve_loss_config(args.loss_fn)
 
+    if args.enable_correction_head:
+        if args.speculator_type != "dspark":
+            parser.error("--enable-correction-head is only valid for DSpark")
+        if min(
+            args.correction_hidden_size,
+            args.correction_rank,
+            args.correction_num_layers,
+            args.correction_num_heads,
+        ) <= 0:
+            parser.error(
+                "DSpark correction sizes, layers, and heads must be > 0"
+            )
+        if args.correction_hidden_size % args.correction_num_heads != 0:
+            parser.error(
+                "--correction-hidden-size must be divisible by "
+                "--correction-num-heads"
+            )
+    elif args.correction_output_mode != "hidden" and not args.from_pretrained:
+        parser.error(
+            "--correction-output-mode=logits requires --enable-correction-head"
+        )
+    if args.correction_lm_head_fusion:
+        if not args.enable_correction_head and not args.from_pretrained:
+            parser.error(
+                "--correction-lm-head-fusion requires --enable-correction-head"
+            )
+        if args.correction_output_mode != "hidden":
+            parser.error(
+                "--correction-lm-head-fusion requires "
+                "--correction-output-mode=hidden"
+            )
+    if args.correction_moe:
+        if not args.enable_correction_head and not args.from_pretrained:
+            parser.error("--correction-moe requires --enable-correction-head")
+        if min(
+            args.correction_moe_shared_rank,
+            args.correction_moe_expert_rank,
+            args.correction_moe_num_experts,
+        ) <= 0:
+            parser.error("Correction MoE ranks and expert count must be > 0")
+        if args.correction_moe_load_balance_weight < 0.0:
+            parser.error("--correction-moe-load-balance-weight must be >= 0")
+    elif args.correction_moe_logit_routing and not args.from_pretrained:
+        parser.error("--correction-moe-logit-routing requires --correction-moe")
+    if (
+        args.correction_hidden_aux_loss
+        or args.correction_hidden_feedback
+        or args.correction_cross_block_memory
+        or args.correction_project_corrected_hidden
+    ) and not args.enable_correction_head and not args.from_pretrained:
+        parser.error(
+            "Correction auxiliary/feedback features require --enable-correction-head"
+        )
+    if args.correction_hidden_aux_weight < 0.0:
+        parser.error("--correction-hidden-aux-weight must be >= 0")
+    if (
+        args.correction_project_corrected_hidden
+        and args.correction_output_mode != "logits"
+        and not args.from_pretrained
+    ):
+        parser.error(
+            "--correction-project-corrected-hidden requires "
+            "--correction-output-mode=logits"
+        )
+    if (
+        args.correction_generated_token_ratio > 0.0
+        and not args.enable_correction_head
+        and not args.from_pretrained
+    ):
+        parser.error(
+            "--correction-generated-token-ratio > 0 requires --enable-correction-head"
+        )
+    if not 0.0 <= args.correction_generated_token_ratio <= 1.0:
+        parser.error("--correction-generated-token-ratio must be in [0, 1]")
+    if not 0.0 <= args.correction_generated_token_warmup <= 1.0:
+        parser.error("--correction-generated-token-warmup must be in [0, 1]")
+    if not 0.0 <= args.correction_generated_token_ramp <= 1.0:
+        parser.error("--correction-generated-token-ramp must be in [0, 1]")
+    if (
+        args.correction_generated_token_warmup
+        + args.correction_generated_token_ramp
+        > 1.0
+        and not args.from_pretrained
+    ):
+        parser.error(
+            "--correction-generated-token-warmup + "
+            "--correction-generated-token-ramp must be <= 1"
+        )
+    if args.correction_with_markov:
+        if not args.enable_correction_head and not args.from_pretrained:
+            parser.error(
+                "--correction-with-markov requires --enable-correction-head"
+            )
+        if args.markov_rank <= 0:
+            parser.error("--correction-with-markov requires --markov-rank > 0")
+        if args.markov_head_type == "rnn":
+            parser.error(
+                "--correction-with-markov supports only vanilla or gated Markov heads"
+            )
+    if (
+        args.dflash_context_residual
+        or args.dflash_verifier_final_residual
+        or args.dflash_block_position_embedding
+        or args.dflash_gated_layer_fusion
+        or args.dflash_dfly_layer_residual
+        or args.dflash_heterogeneous_kv_projections
+    ) and args.speculator_type not in ("dflash", "dspark"):
+        parser.error(
+            "DFlash backbone feature flags are only valid for DFlash or DSpark"
+        )
+    if (
+        args.dflash_dfly_layer_residual
+        and not args.dflash_gated_layer_fusion
+        and not args.from_pretrained
+    ):
+        parser.error(
+            "--dflash-dfly-layer-residual requires "
+            "--dflash-gated-layer-fusion"
+        )
     if args.per_position_loss_weight == "dpace":
         if args.loss_fn != "ce":
             parser.error("--per-position-loss-weight=dpace requires --loss-fn=ce")

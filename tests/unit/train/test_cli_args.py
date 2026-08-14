@@ -4,6 +4,9 @@ import argparse
 
 import pytest
 
+import pytest
+
+from scripts.train import parse_args
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3.core import Eagle3DraftModel
@@ -13,8 +16,14 @@ from speculators.train.config import TrainConfig
 
 
 def _parse(monkeypatch, extra: list[str]) -> argparse.Namespace:
-    cfg = TrainConfig.resolve(["--verifier-name-or-path", "dummy", *extra])
-    return argparse.Namespace(**cfg.flatten())
+    # This fork keeps the argparse entry point (upstream #841's pydantic TrainConfig
+    # is present but unused: main() takes a Namespace). Test the parser we actually
+    # run, otherwise the ~40 fork-only flags and the ported Correction/DFlash flags
+    # are untested here.
+    monkeypatch.setattr(
+        "sys.argv", ["train.py", "--verifier-name-or-path", "dummy", *extra]
+    )
+    return parse_args()
 
 
 # ---------------------------------------------------------------------------
@@ -98,14 +107,64 @@ def test_peagle_explicit_ce(monkeypatch):
     assert "ce" in val_kw["loss_config"]
 
 
-def test_dspark_default_uses_kl(monkeypatch):
-    args = _parse(monkeypatch, [])
+def test_dspark_defaults_match_paper_weighting(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "dspark"])
+    assert args.block_size == 7
+    assert args.dflash_decay_gamma == 7.0
+    assert args.num_layers == 5
+    assert args.epochs == 10
+    assert args.enable_correction_head is False
+    assert args.correction_moe is False
+    assert args.correction_lm_head_fusion is False
+    assert args.correction_rollout_metrics is False
+    assert args.dflash_context_residual is False
+    assert args.dflash_verifier_final_residual is False
+    assert args.dflash_block_position_embedding is False
+    assert args.dflash_gated_layer_fusion is False
+    assert args.dflash_dfly_layer_residual is False
+    assert args.dflash_heterogeneous_kv_projections is False
+    assert args.enable_confidence_head is True
+    assert args.confidence_head_with_markov is True
+    assert args.confidence_detach_features is False
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
-    assert "kl_div" in train_kw["loss_config"]
-    assert train_kw["loss_config"]["kl_div"][0] is kl_div_loss
-    assert "kl_div" in val_kw["loss_config"]
+    assert train_kw["loss_config"]["ce"] == (ce_loss, 0.1)
+    assert train_kw["loss_config"]["tv"] == (tv_loss_fused_or_eager, 0.9)
+    assert val_kw["loss_config"]["ce"] == (ce_loss, 0.1)
+    assert val_kw["loss_config"]["tv"] == (tv_loss_fused_or_eager, 0.9)
+    assert train_kw["gamma"] == 7.0
+    assert val_kw["gamma"] == 7.0
     assert train_kw["confidence_head_alpha"] == 1.0
     assert val_kw["confidence_head_alpha"] == 1.0
+    assert train_kw["confidence_loss_weighting"] == "match-draft"
+    assert val_kw["confidence_loss_weighting"] == "match-draft"
+
+
+def test_dspark_explicit_recipe_overrides_win(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--block-size",
+            "8",
+            "--dflash-decay-gamma",
+            "4",
+            "--num-layers",
+            "3",
+            "--epochs",
+            "2",
+            "--loss-fn",
+            "kl_div",
+            "--confidence-loss-weighting",
+            "uniform",
+        ],
+    )
+    assert args.block_size == 8
+    assert args.dflash_decay_gamma == 4.0
+    assert args.num_layers == 3
+    assert args.epochs == 2
+    assert args.loss_fn == "kl_div"
+    assert args.confidence_loss_weighting == "uniform"
 
 
 def test_dspark_compound_loss(monkeypatch):
@@ -126,6 +185,250 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["confidence_head_alpha"] == 0.5
     assert val_kw["confidence_head_alpha"] == 0.5
+
+
+def test_dspark_adaptive_and_confidence_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--adaptive-loss",
+            "ssal",
+            "--ssal-curriculum",
+            "--confidence-length-alpha",
+            "0.1",
+            "--confidence-loss-weighting",
+            "match-draft",
+            "--first-error-focal-alpha",
+            "0.3",
+        ],
+    )
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["adaptive_loss"] == "ssal"
+    assert train_kw["ssal_curriculum"] is True
+    assert train_kw["confidence_length_alpha"] == 0.1
+    assert train_kw["confidence_loss_weighting"] == "match-draft"
+    assert train_kw["first_error_focal_alpha"] == 0.3
+    assert "ssal_curriculum" not in val_kw
+    assert val_kw["ssal_decay_weight"] == 0.0
+
+
+def test_dspark_preprojection_correction_head_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-hidden-size",
+            "96",
+            "--correction-rank",
+            "48",
+            "--correction-num-layers",
+            "2",
+            "--correction-num-heads",
+            "6",
+            "--correction-gate-bias",
+            "-1.0",
+            "--correction-lm-head-fusion",
+            "--no-correction-rollout-metrics",
+            "--correction-base-diagnostics",
+            "--confidence-detach-features",
+        ],
+    )
+    assert args.enable_correction_head is True
+    assert args.correction_output_mode == "hidden"
+    assert args.correction_hidden_size == 96
+    assert args.correction_rank == 48
+    assert args.correction_num_layers == 2
+    assert args.correction_num_heads == 6
+    assert args.correction_gate_bias == -1.0
+    assert args.correction_lm_head_fusion is True
+    assert args.correction_generated_token_ratio == 0.0
+    assert args.correction_rollout_metrics is False
+    assert args.correction_base_diagnostics is True
+    assert args.confidence_detach_features is True
+
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw == val_kw
+
+
+def test_dspark_logit_residual_correction_head_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-output-mode",
+            "logits",
+        ],
+    )
+    assert args.enable_correction_head is True
+    assert args.correction_output_mode == "logits"
+
+
+def test_dspark_lm_head_fusion_rejects_logit_mode(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type",
+                "dspark",
+                "--enable-correction-head",
+                "--correction-output-mode",
+                "logits",
+                "--correction-lm-head-fusion",
+            ],
+        )
+
+
+def test_dspark_logit_correction_moe_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-output-mode",
+            "logits",
+            "--correction-moe",
+            "--correction-moe-logit-routing",
+        ],
+    )
+    assert args.correction_output_mode == "logits"
+    assert args.correction_moe is True
+    assert args.correction_moe_logit_routing is True
+
+
+def test_dspark_hidden_correction_moe_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-moe",
+            "--correction-moe-shared-rank",
+            "128",
+            "--correction-moe-expert-rank",
+            "64",
+            "--correction-moe-num-experts",
+            "4",
+            "--correction-moe-load-balance-weight",
+            "0.005",
+            "--correction-moe-logit-routing",
+        ],
+    )
+    assert args.correction_moe is True
+    assert args.correction_moe_shared_rank == 128
+    assert args.correction_moe_expert_rank == 64
+    assert args.correction_moe_num_experts == 4
+    assert args.correction_moe_load_balance_weight == 0.005
+    assert args.correction_moe_logit_routing is True
+
+
+def test_dspark_correction_hidden_auxiliary_features_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-hidden-aux-loss",
+            "--correction-hidden-aux-weight",
+            "0.2",
+            "--correction-hidden-feedback",
+            "--correction-project-corrected-hidden",
+            "--correction-output-mode",
+            "logits",
+        ],
+    )
+    assert args.correction_hidden_aux_loss is True
+    assert args.correction_hidden_aux_weight == 0.2
+    assert args.correction_hidden_feedback is True
+    assert args.correction_project_corrected_hidden is True
+
+
+def test_dspark_correction_generated_token_curriculum_cli(monkeypatch):
+    teacher_forced = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+        ],
+    )
+    assert teacher_forced.correction_generated_token_ratio == 0.0
+
+    generated = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-generated-token-ratio",
+            "0.25",
+            "--correction-generated-token-warmup",
+            "0.2",
+            "--correction-generated-token-ramp",
+            "0.4",
+        ],
+    )
+    assert generated.correction_generated_token_ratio == 0.25
+    assert generated.correction_generated_token_warmup == 0.2
+    assert generated.correction_generated_token_ramp == 0.4
+
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(generated))
+    assert train_kw["correction_generated_token_curriculum"] is True
+    assert train_kw["correction_generated_token_target_ratio"] == 0.25
+    assert train_kw["correction_generated_token_warmup"] == 0.2
+    assert train_kw["correction_generated_token_ramp"] == 0.4
+    assert "correction_generated_token_curriculum" not in val_kw
+
+
+def test_new_dflash_and_collaboration_features_default_off(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "dspark"])
+    assert args.correction_with_markov is False
+    assert args.dflash_context_residual is False
+    assert args.dflash_verifier_final_residual is False
+    assert args.dflash_block_position_embedding is False
+    assert args.dflash_gated_layer_fusion is False
+    assert args.dflash_dfly_layer_residual is False
+    assert args.dflash_heterogeneous_kv_projections is False
+    assert args.correction_cross_block_memory is False
+
+
+def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-correction-head",
+            "--correction-with-markov",
+            "--correction-markov-gate-bias",
+            "-1.5",
+            "--correction-cross-block-memory",
+            "--correction-memory-gate-bias",
+            "-1.0",
+            "--dflash-context-residual",
+            "--dflash-verifier-final-residual",
+            "--dflash-block-position-embedding",
+            "--dflash-gated-layer-fusion",
+            "--dflash-dfly-layer-residual",
+            "--dflash-heterogeneous-kv-projections",
+        ],
+    )
+    assert args.correction_with_markov is True
+    assert args.correction_markov_gate_bias == -1.5
+    assert args.correction_cross_block_memory is True
+    assert args.correction_memory_gate_bias == -1.0
+    assert args.dflash_context_residual is True
+    assert args.dflash_verifier_final_residual is True
+    assert args.dflash_block_position_embedding is True
+    assert args.dflash_gated_layer_fusion is True
+    assert args.dflash_dfly_layer_residual is True
+    assert args.dflash_heterogeneous_kv_projections is True
 
 
 # ---------------------------------------------------------------------------
@@ -190,9 +493,12 @@ def test_dflash_defaults_block_size_to_16(monkeypatch):
 
 
 def test_dspark_defaults_block_size_to_8(monkeypatch):
-    # block_size is shared with dspark, which never had block_size=16 validated.
+    # Ported fork divergence: upstream's schema defaults dspark block_size to 8;
+    # the DSpark paper (and the branch these Correction features come from) uses 7,
+    # which is what DSPARK_PAPER_BLOCK_SIZE applies. Inert for this fork's own runs --
+    # DSV4-DSpark always passes --block-size explicitly (anchor + gamma(5) = 6).
     args = _parse(monkeypatch, ["--speculator-type", "dspark"])
-    assert args.block_size == 8
+    assert args.block_size == 7
 
 
 def test_dflash_explicit_flags_override_new_defaults(monkeypatch):

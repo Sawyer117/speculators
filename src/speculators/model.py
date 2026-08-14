@@ -379,7 +379,8 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
                 **kwargs,
             )
 
-        model: SpeculatorModel = super().from_pretrained(  # type: ignore[misc]
+        requested_loading_info = bool(kwargs.pop("output_loading_info", False))
+        loaded = super().from_pretrained(  # type: ignore[misc]
             pretrained_model_name_or_path,
             *model_args,
             config=config,
@@ -391,13 +392,22 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
             revision=revision,
             use_safetensors=use_safetensors,
             weights_only=weights_only,
+            output_loading_info=True,
             **kwargs,
         )
+        if isinstance(loaded, tuple):
+            model, loading_info = loaded
+        else:
+            model = loaded
+            loading_info = {}
         if hasattr(model, "load_vocab_mappings"):
             model.load_vocab_mappings(t2d, d2t)  # type: ignore[operator,attr-defined]
         if hasattr(model, "load_verifier_weights"):
             model.load_verifier_weights()  # type: ignore[operator,attr-defined]
-        return model
+        prepare_missing = getattr(model, "_prepare_missing_checkpoint_weights", None)
+        if prepare_missing is not None:
+            prepare_missing(loading_info)
+        return (model, loading_info) if requested_loading_info else model
 
     @classmethod
     def registered_model_class_from_config(

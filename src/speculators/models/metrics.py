@@ -365,6 +365,48 @@ def dflash_loss_decay(
     return decay_mult  # noqa: RET504
 
 
+def prefix_product_weights(
+    scores: torch.Tensor,  # [1, T]
+    block_size: int,
+    start_pos: int = 0,
+) -> torch.Tensor:
+    """Per-position prefix-product weights within each block.
+
+    Slot ``start_pos`` gets weight 1; later slots get the product of prior
+    ``scores`` in the draft range. Slots before ``start_pos`` get 0.
+    """
+    num_blocks = scores.shape[1] // block_size
+    blocks = scores.reshape(num_blocks, block_size)
+    weights = torch.zeros_like(blocks)
+    draft = blocks[:, start_pos:]
+    pref = torch.ones_like(draft)
+    if draft.shape[1] > 1:
+        pref[:, 1:] = draft[:, :-1].cumprod(dim=-1)
+    weights[:, start_pos:] = pref
+    return weights.reshape_as(scores)
+
+
+def position_weights(
+    pos_idx: torch.Tensor,
+    block_size: int,
+    gamma: float,
+    sample_from_anchor: bool = True,
+    adaptive_scores: torch.Tensor | None = None,
+    decay_mix: float = 0.0,
+) -> torch.Tensor:
+    """Fixed decay, adaptive prefix weights, or ``decay_mix`` convex mix."""
+    decay = dflash_loss_decay(
+        pos_idx, gamma=gamma, sample_from_anchor=sample_from_anchor
+    )
+    if adaptive_scores is None:
+        return decay
+    start_pos = 0 if sample_from_anchor else 1
+    adaptive = prefix_product_weights(
+        adaptive_scores, block_size=block_size, start_pos=start_pos
+    )
+    return decay_mix * decay + (1.0 - decay_mix) * adaptive
+
+
 def exp_loss_decay(pos_idx: torch.Tensor, gamma: float, **_kwargs):
     """Compute simple exponential decay weights as gamma^pos_idx.
 

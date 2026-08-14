@@ -70,6 +70,55 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         "bidirectional.",
     )
 
+    dflash_context_residual: bool = Field(
+        default=False,
+        description=(
+            "Inject the last verifier hidden state available before each anchor into "
+            "all slots of its draft block through a zero-gated residual."
+        ),
+    )
+
+    dflash_verifier_final_residual: bool = Field(
+        default=False,
+        description=(
+            "Inject the verifier final/pre-LM hidden state available immediately "
+            "before each anchor into all draft slots through a zero-gated residual."
+        ),
+    )
+
+    dflash_block_position_embedding: bool = Field(
+        default=False,
+        description=(
+            "Add a learned block-relative position embedding to DFlash query slots. "
+            "The embedding is zero-initialized."
+        ),
+    )
+
+    dflash_gated_layer_fusion: bool = Field(
+        default=False,
+        description=(
+            "Add normalized, per-token softmax-gated auxiliary-layer fusion as a "
+            "zero-gated residual over the baseline concatenation projection."
+        ),
+    )
+
+    dflash_dfly_layer_residual: bool = Field(
+        default=False,
+        description=(
+            "Add a DFly-style, draft-layer-specific softmax fusion residual on top "
+            "of the existing token-adaptive gated fusion. Requires "
+            "dflash_gated_layer_fusion."
+        ),
+    )
+
+    dflash_heterogeneous_kv_projections: bool = Field(
+        default=False,
+        description=(
+            "Use separate key/value projections for injected target context and "
+            "DFlash draft/noise hidden states."
+        ),
+    )
+
     sample_from_anchor: bool = Field(
         default=False,
         description=(

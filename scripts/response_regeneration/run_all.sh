@@ -9,6 +9,7 @@
 #   ./run_all.sh --model "Qwen/Qwen2.5-72B-Instruct" --dp-size 4 --tp-size 2 --dataset magpie
 #   ./run_all.sh --model "Qwen/Qwen2.5-72B-Instruct" --gpus 0,1,2,4 --tp-size 4 --dataset magpie
 #   ./run_all.sh --model "Qwen/Qwen2.5-72B-Instruct" --dataset magpie --keep-server
+#   ./run_all.sh --model "Qwen/Qwen3-8B" --disable-thinking --dataset sharegpt
 #   ./run_all.sh --model "Qwen/Qwen3-8B" --tool-call-parser hermes --dataset hermes-fc
 #
 

@@ -143,6 +143,20 @@ def parse_args():
             "used to roll the data — verify with the serve's /tokenize before a full run."
         ),
     )
+    thinking_group = parser.add_mutually_exclusive_group()
+    thinking_group.add_argument(
+        "--enable-thinking",
+        dest="enable_thinking",
+        action="store_true",
+        help="Render training conversations with thinking enabled.",
+    )
+    thinking_group.add_argument(
+        "--disable-thinking",
+        dest="enable_thinking",
+        action="store_false",
+        help="Render training conversations in non-thinking mode.",
+    )
+    parser.set_defaults(enable_thinking=None)
 
     # Output arguments
     parser.add_argument(
@@ -201,6 +215,11 @@ def main():
             "Target Model": args.model,
             "Dataset": args.data,
             "Output Dir": args.output,
+            "Thinking Mode": (
+                "model default"
+                if args.enable_thinking is None
+                else "enabled" if args.enable_thinking else "disabled"
+            ),
         }
     )
 
@@ -239,6 +258,7 @@ def main():
         allow_empty_output=args.allow_empty_output,
         trust_remote_code=args.trust_remote_code,
         chat_template=args.chat_template,
+        enable_thinking=args.enable_thinking,
     )
 
     log.info("Done preparing data")

@@ -42,10 +42,27 @@ root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
 
 
+def _synchronize_device() -> None:
+    """Best-effort device sync for step profiling (CUDA or NPU).
+
+    Never raises: profiling must not abort training if the device sync path is
+    missing or broken on a given accelerator backend.
+    """
+    try:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.synchronize()
+        elif torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001
+        return
+
+
 class _StepTimer:
-    # Each mark()/now() forces an accelerator.synchronize to capture true GPU time.
-    # This serialises the CUDA pipeline, so profiled steps are slower; keep
-    # log_freq > 1 in perf-sensitive runs.
+    # Each mark()/now() forces a device synchronize to capture true accelerator
+    # time. This serialises the device pipeline, so profiled steps are slower;
+    # keep log_freq > 1 in perf-sensitive runs.
+    _PROFILE_MARKS = ("fetch", "fwd", "bwd", "opt")
+
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
         self._marks: dict[str, float] = {}
@@ -55,9 +72,10 @@ class _StepTimer:
         self._marks.clear()
 
     def mark(self, name: str) -> None:
-        if self.enabled:
-            torch.accelerator.synchronize()
-            self._marks[name] = time.perf_counter()
+        if not self.enabled:
+            return
+        _synchronize_device()
+        self._marks[name] = time.perf_counter()
 
     def mark_value(self, name: str, value: float) -> None:
         if self.enabled:
@@ -66,13 +84,15 @@ class _StepTimer:
     def now(self) -> float | None:
         if not self.enabled:
             return None
-        torch.accelerator.synchronize()
+        _synchronize_device()
         return time.perf_counter()
 
     def profile(self, num_tokens: int) -> dict[str, float] | None:
         if not self.enabled:
             return None
         m = self._marks
+        if any(name not in m for name in self._PROFILE_MARKS):
+            return None
         has_start = "start" in m
         fwd_ms = (m["fwd"] - m["fetch"]) * 1000
         bwd_ms = (m["bwd"] - m["fwd"]) * 1000
@@ -218,6 +238,79 @@ class Trainer:
         self.setup_trainer()
         self.setup_model()
         self.setup_optimizer()
+        self._init_loss_curricula()
+
+    def _init_loss_curricula(self) -> None:
+        """Pull trainer-owned curricula out of the model call kwargs."""
+        kwargs = self.config.train_call_kwargs
+        self._ssal_curriculum = False
+        self._ssal_curriculum_start = 0.1
+        self._ssal_curriculum_end = 0.6
+        self._correction_generated_token_curriculum = False
+        self._correction_generated_token_target_ratio = 0.0
+        self._correction_generated_token_warmup = 0.2
+        self._correction_generated_token_ramp = 0.4
+        self._curriculum_total_steps: int | None = None
+        if kwargs and kwargs.pop("ssal_curriculum", False):
+            self._ssal_curriculum = True
+            self._ssal_curriculum_start = float(
+                kwargs.pop("ssal_curriculum_start", 0.1)
+            )
+            self._ssal_curriculum_end = float(kwargs.pop("ssal_curriculum_end", 0.6))
+        if kwargs and kwargs.pop(
+            "correction_generated_token_curriculum", False
+        ):
+            self._correction_generated_token_curriculum = True
+            self._correction_generated_token_target_ratio = float(
+                kwargs.pop("correction_generated_token_target_ratio")
+            )
+            self._correction_generated_token_warmup = float(
+                kwargs.pop("correction_generated_token_warmup", 0.2)
+            )
+            self._correction_generated_token_ramp = float(
+                kwargs.pop("correction_generated_token_ramp", 0.4)
+            )
+
+    def _curriculum_decay_weight(self, start: float, end: float) -> float:
+        """Return a 1-to-0 linear weight over a training-progress interval."""
+        if self._curriculum_total_steps is None or self._curriculum_total_steps <= 0:
+            raise RuntimeError("curriculum total steps must be initialized")
+        progress = self.global_step / self._curriculum_total_steps
+        if progress <= start:
+            return 1.0
+        if progress >= end:
+            return 0.0
+        return 1.0 - (progress - start) / (end - start)
+
+    def _curriculum_ramp_weight(self, start: float, end: float) -> float:
+        """Return a 0-to-1 linear weight over a training-progress interval."""
+        if self._curriculum_total_steps is None or self._curriculum_total_steps <= 0:
+            raise RuntimeError("curriculum total steps must be initialized")
+        progress = self.global_step / self._curriculum_total_steps
+        if end <= start:
+            return float(progress >= start)
+        if progress <= start:
+            return 0.0
+        if progress >= end:
+            return 1.0
+        return (progress - start) / (end - start)
+
+    def _current_correction_generated_token_ratio(self) -> float:
+        """Return the scheduled generated-feedback probability for this step."""
+        start = self._correction_generated_token_warmup
+        end = start + self._correction_generated_token_ramp
+        ramp_weight = self._curriculum_ramp_weight(start, end)
+        return self._correction_generated_token_target_ratio * ramp_weight
+
+    def _sample_correction_generated_token_batch(self, ratio: float) -> bool:
+        """Deterministically sample one shared TF/generated path per global step."""
+        if ratio <= 0.0:
+            return False
+        if ratio >= 1.0:
+            return True
+        generator = torch.Generator()
+        generator.manual_seed(self.global_step + 0xD5A9)
+        return bool(torch.rand((), generator=generator).item() < ratio)
 
     def _training_state_path(self, epoch: int) -> Path:
         return self.checkpointer.path / str(epoch) / "training_state.json"
@@ -499,6 +592,11 @@ class Trainer:
 
         # Capture full-epoch step count before any resume fast-skip mutation.
         num_steps = len(self.train_loader)
+        if (
+            self._ssal_curriculum
+            or self._correction_generated_token_curriculum
+        ) and self._curriculum_total_steps is None:
+            self._curriculum_total_steps = self.config.num_epochs * num_steps
 
         # Determine how many batches to skip for mid-epoch resume.
         skip_steps = self._prepare_resume_skip(epoch)
@@ -557,9 +655,29 @@ class Trainer:
                 fetch_all = [round(float(t[0].item()), 1) for t in _out]
                 tokens_all = [int(t[1].item()) for t in _out]
             # --------------------------------------------------------------------------------------
-            _draft_tokens, loss, metrics = self.model(
-                **gpu_batch, **(self.config.train_call_kwargs or {})
+            # Curriculum kwargs (ported): SSAL decay mix and the generated-token
+            # feedback ratio are per-step scalars the model reads off call_kwargs.
+            call_kwargs = dict(self.config.train_call_kwargs or {})
+            batch_device = next(
+                value.device
+                for value in gpu_batch.values()
+                if isinstance(value, torch.Tensor)
             )
+            if self._ssal_curriculum:
+                ssal_weight = self._curriculum_decay_weight(
+                    self._ssal_curriculum_start, self._ssal_curriculum_end
+                )
+                call_kwargs["ssal_decay_weight"] = torch.tensor(
+                    ssal_weight, device=batch_device, dtype=torch.float32
+                )
+            if self._correction_generated_token_curriculum:
+                generated_ratio = self._current_correction_generated_token_ratio()
+                call_kwargs["correction_generated_token_curriculum_active"] = True
+                call_kwargs["correction_generated_token_ratio"] = generated_ratio
+                call_kwargs["correction_use_generated_tokens"] = (
+                    self._sample_correction_generated_token_batch(generated_ratio)
+                )
+            _draft_tokens, loss, metrics = self.model(**gpu_batch, **call_kwargs)
 
             timer.mark("fwd")
             self._optimizers_zero_grad()

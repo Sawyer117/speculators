@@ -76,9 +76,18 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         # Number of draft layers is encoded in transformer_layer_config
         num_draft_layers = tl_config.num_hidden_layers
+        hidden_size = tl_config.hidden_size
+        num_target_layers = len(self.target_layer_ids)
+        self.block_size = config.block_size
         self.layers = nn.ModuleList(
             [
-                Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
+                Qwen3DFlashDecoderLayer(
+                    config.transformer_layer_config,  # type: ignore[arg-type]
+                    layer_idx,
+                    heterogeneous_kv_projections=(
+                        config.dflash_heterogeneous_kv_projections
+                    ),
+                )
                 for layer_idx in range(num_draft_layers)
             ]
         )
@@ -93,7 +102,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.sliding_window_non_causal = config.sliding_window_non_causal
 
         self.norm = Qwen3RMSNorm(
-            config.transformer_layer_config.hidden_size,
+            hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
         rotary_config = config.transformer_layer_config
@@ -110,21 +119,70 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             rotary_config.rope_parameters = rope_params["sliding_attention"]
         self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)  # type: ignore[arg-type]
 
+        self.dflash_gated_layer_fusion = config.dflash_gated_layer_fusion
+        self.dflash_dfly_layer_residual = config.dflash_dfly_layer_residual
+        if self.dflash_dfly_layer_residual and not self.dflash_gated_layer_fusion:
+            raise ValueError(
+                "dflash_dfly_layer_residual requires dflash_gated_layer_fusion"
+            )
         self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
-            config.transformer_layer_config.hidden_size,
+            num_target_layers * hidden_size,
+            hidden_size,
             bias=False,
         )
+        self.layer_fusion_norms: nn.ModuleList | None = None
+        self.layer_fusion_score: nn.Linear | None = None
+        self.layer_fusion_proj: nn.Linear | None = None
+        self.layer_fusion_gate: nn.Parameter | None = None
+        if self.dflash_gated_layer_fusion:
+            self.layer_fusion_norms = nn.ModuleList(
+                [
+                    Qwen3RMSNorm(
+                        hidden_size,
+                        eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
+                    )
+                    for _ in range(num_target_layers)
+                ]
+            )
+            self.layer_fusion_score = nn.Linear(hidden_size, 1, bias=False)
+            self.layer_fusion_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.layer_fusion_gate = nn.Parameter(torch.zeros(()))
+
+        self.dfly_layer_fusion_logits: nn.Parameter | None = None
+        self.dfly_layer_residual_gate: nn.Parameter | None = None
+        if self.dflash_dfly_layer_residual:
+            self.dfly_layer_fusion_logits = nn.Parameter(
+                torch.zeros(num_draft_layers, num_target_layers)
+            )
+            self.dfly_layer_residual_gate = nn.Parameter(torch.zeros(()))
+
         self.hidden_norm = Qwen3RMSNorm(
-            config.transformer_layer_config.hidden_size,
+            hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
         self.verifier_norm = Qwen3RMSNorm(
-            config.transformer_layer_config.hidden_size,
+            hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
         self.verifier_norm.weight.requires_grad = False
-        self.block_size = config.block_size
+
+        self.context_hidden_proj: nn.Linear | None = None
+        self.context_hidden_gate: nn.Parameter | None = None
+        if config.dflash_context_residual:
+            self.context_hidden_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.context_hidden_gate = nn.Parameter(torch.zeros(()))
+
+        self.verifier_final_hidden_proj: nn.Linear | None = None
+        self.verifier_final_hidden_gate: nn.Parameter | None = None
+        if config.dflash_verifier_final_residual:
+            self.verifier_final_hidden_proj = nn.Linear(
+                hidden_size, hidden_size, bias=False
+            )
+            self.verifier_final_hidden_gate = nn.Parameter(torch.zeros(()))
+
+        self.block_position_embedding: nn.Embedding | None = None
+        if config.dflash_block_position_embedding:
+            self.block_position_embedding = nn.Embedding(self.block_size, hidden_size)
 
         # Warn if using DFlash with sample_from_anchor=True (may not be supported)
         if type(self).__name__ == "DFlashDraftModel" and config.sample_from_anchor:
@@ -135,6 +193,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         self.post_init()
+        if self.layer_fusion_score is not None:
+            nn.init.zeros_(self.layer_fusion_score.weight)
+        if self.dfly_layer_fusion_logits is not None:
+            nn.init.zeros_(self.dfly_layer_fusion_logits)
+        if self.dfly_layer_residual_gate is not None:
+            nn.init.zeros_(self.dfly_layer_residual_gate)
+        if self.block_position_embedding is not None:
+            nn.init.zeros_(self.block_position_embedding.weight)
 
     @property
     def target_layer_ids(self) -> list[int]:
@@ -227,6 +293,24 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "aux_hidden_state_layer_ids": target_layer_ids,
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
+            "dflash_context_residual": kwargs.get(
+                "dflash_context_residual", False
+            ),
+            "dflash_verifier_final_residual": kwargs.get(
+                "dflash_verifier_final_residual", False
+            ),
+            "dflash_block_position_embedding": kwargs.get(
+                "dflash_block_position_embedding", False
+            ),
+            "dflash_gated_layer_fusion": kwargs.get(
+                "dflash_gated_layer_fusion", False
+            ),
+            "dflash_dfly_layer_residual": kwargs.get(
+                "dflash_dfly_layer_residual", False
+            ),
+            "dflash_heterogeneous_kv_projections": kwargs.get(
+                "dflash_heterogeneous_kv_projections", False
+            ),
             "sample_from_anchor": sample_from_anchor,
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
@@ -334,6 +418,240 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
+    def _prepare_target_hidden(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Build the shared target projection and expose raw per-layer states."""
+        baseline_projection = self.fc(hidden_states)
+        if not self.dflash_gated_layer_fusion:
+            return baseline_projection, None
+
+        if (
+            self.layer_fusion_norms is None
+            or self.layer_fusion_score is None
+            or self.layer_fusion_proj is None
+            or self.layer_fusion_gate is None
+        ):
+            raise RuntimeError("Gated layer fusion modules were not initialized")
+        num_layers = len(self.layer_fusion_norms)
+        hidden_size = self.config.transformer_layer_config.hidden_size
+        expected_size = num_layers * hidden_size
+        if hidden_states.shape[-1] != expected_size:
+            raise ValueError(
+                "Expected concatenated verifier hidden size "
+                f"{expected_size}, got {hidden_states.shape[-1]}"
+            )
+
+        layer_states = hidden_states.reshape(
+            *hidden_states.shape[:-1], num_layers, hidden_size
+        )
+        normalized = torch.stack(
+            [
+                norm(layer_states[..., layer_idx, :])
+                for layer_idx, norm in enumerate(self.layer_fusion_norms)
+            ],
+            dim=-2,
+        )
+        scores = self.layer_fusion_score(normalized).squeeze(-1)
+        weights = torch.softmax(scores.float(), dim=-1).to(normalized.dtype)
+        fused = (normalized * weights.unsqueeze(-1)).sum(dim=-2)
+        fusion_residual = self.layer_fusion_proj(fused)
+        projected = baseline_projection + (
+            torch.tanh(self.layer_fusion_gate) * fusion_residual
+        )
+        return projected, layer_states
+
+    def _fuse_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the existing shared FC plus token-adaptive target context."""
+        shared_projection, _ = self._prepare_target_hidden(hidden_states)
+        return self.hidden_norm(shared_projection)
+
+    def _add_dfly_layer_residual(
+        self,
+        shared_projection: torch.Tensor,
+        target_layer_states: torch.Tensor | None,
+        draft_layer_idx: int,
+    ) -> torch.Tensor:
+        """Add DFly's draft-layer-specific target view to the shared projection."""
+        if not self.dflash_dfly_layer_residual:
+            return self.hidden_norm(shared_projection)
+        if (
+            self.dfly_layer_fusion_logits is None
+            or self.dfly_layer_residual_gate is None
+            or target_layer_states is None
+        ):
+            raise RuntimeError("DFly layer residual modules were not initialized")
+
+        weights = torch.softmax(
+            self.dfly_layer_fusion_logits[draft_layer_idx].float(), dim=-1
+        ).to(target_layer_states.dtype)
+        weight_shape = [1] * (target_layer_states.ndim - 2) + [weights.shape[0], 1]
+        layer_residual = (target_layer_states * weights.view(*weight_shape)).sum(dim=-2)
+        return self.hidden_norm(
+            shared_projection
+            + self.dfly_layer_residual_gate.to(layer_residual.dtype) * layer_residual
+        )
+
+    def _prepare_missing_checkpoint_weights(self, loading_info: dict) -> None:
+        """Safely initialize optional DFlash modules absent from a checkpoint."""
+        missing_keys = tuple(loading_info.get("missing_keys", ()))
+        if self.dflash_dfly_layer_residual:
+            trained_dfly_fragments = (
+                "dfly_layer_fusion_logits",
+                "layer_fusion_norms",
+                "layer_fusion_score",
+                "layer_fusion_proj",
+                "layer_fusion_gate",
+            )
+            missing_trained_dfly = [
+                key
+                for key in missing_keys
+                if any(fragment in key for fragment in trained_dfly_fragments)
+            ]
+            if missing_trained_dfly:
+                preview = ", ".join(missing_trained_dfly[:8])
+                suffix = " ..." if len(missing_trained_dfly) > 8 else ""
+                raise RuntimeError(
+                    "The checkpoint enables DFly layer residuals but does not "
+                    f"contain their trained weights: {preview}{suffix}. Do not "
+                    "enable DFly by editing an older checkpoint config."
+                )
+            gate_missing = any(
+                "dfly_layer_residual_gate" in key for key in missing_keys
+            )
+            if gate_missing:
+                if self.dfly_layer_residual_gate is None:
+                    raise RuntimeError("DFly residual gate was not constructed")
+                with torch.no_grad():
+                    # Checkpoints from the original ungated implementation used
+                    # the full residual, so a scale of one preserves them exactly.
+                    self.dfly_layer_residual_gate.fill_(1.0)
+                logger.warning(
+                    "Loaded a legacy ungated DFly checkpoint; initialized its "
+                    "new residual gate to 1 for exact backward compatibility."
+                )
+
+        if self.config.dflash_heterogeneous_kv_projections:
+            copied: list[str] = []
+            for layer_idx, layer in enumerate(self.layers):
+                attention = layer.self_attn
+                for target_name, shared_name in (
+                    ("target_k_proj", "k_proj"),
+                    ("target_v_proj", "v_proj"),
+                ):
+                    target_proj = getattr(attention, target_name, None)
+                    shared_proj = getattr(attention, shared_name, None)
+                    if target_proj is None or shared_proj is None:
+                        raise RuntimeError(
+                            "Heterogeneous K/V is enabled but its projection "
+                            "modules were not constructed"
+                        )
+                    key_fragment = f"layers.{layer_idx}.self_attn.{target_name}."
+                    state_names = tuple(target_proj.state_dict())
+                    missing_state_names = tuple(
+                        name
+                        for name in state_names
+                        if any(
+                            key_fragment in key
+                            and key.endswith(f"{target_name}.{name}")
+                            for key in missing_keys
+                        )
+                    )
+                    if not missing_state_names:
+                        continue
+                    if len(missing_state_names) != len(state_names):
+                        raise RuntimeError(
+                            "Checkpoint contains only part of heterogeneous K/V "
+                            f"projection {layer_idx}.{target_name}; refusing to "
+                            "overwrite its loaded weights."
+                        )
+                    target_proj.load_state_dict(shared_proj.state_dict())
+                    copied.append(f"layer {layer_idx} {target_name}")
+            if copied:
+                logger.warning(
+                    "Checkpoint has no trained heterogeneous K/V weights; copied "
+                    "the loaded shared K/V projections for baseline-equivalent "
+                    "initialization: %s",
+                    ", ".join(copied),
+                )
+
+    def _condition_noise_embedding(
+        self,
+        noise_embedding: torch.Tensor,
+        fused_context: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        document_ids: torch.Tensor,
+        *,
+        verifier_pre_lm_hidden: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply opt-in, inference-safe DFlash block conditioning."""
+        if self.block_position_embedding is not None:
+            slot_ids = torch.arange(
+                self.block_size,
+                dtype=torch.long,
+                device=noise_embedding.device,
+            ).repeat(anchor_positions.numel())
+            noise_embedding = noise_embedding + self.block_position_embedding(
+                slot_ids
+            ).unsqueeze(0).to(noise_embedding.dtype)
+
+        if self.context_hidden_proj is not None:
+            if self.context_hidden_gate is None:
+                raise RuntimeError("Context residual gate was not initialized")
+            context_positions = (anchor_positions - 1).clamp_min(0)
+            last_context = fused_context[:, context_positions, :]
+            residual = self.context_hidden_proj(last_context)
+            residual = residual.repeat_interleave(self.block_size, dim=1)
+
+            anchor_docs = document_ids[:, anchor_positions]
+            context_docs = document_ids[:, context_positions]
+            valid_context = (
+                (anchor_positions.unsqueeze(0) > 0)
+                & (anchor_docs == context_docs)
+                & (anchor_docs != -1)
+            )
+            valid_context = valid_context.repeat_interleave(
+                self.block_size, dim=1
+            ).unsqueeze(-1)
+            residual = residual * valid_context.to(residual.dtype)
+            noise_embedding = noise_embedding + (
+                torch.tanh(self.context_hidden_gate)
+                * residual.to(noise_embedding.dtype)
+            )
+
+        if self.verifier_final_hidden_proj is not None:
+            if self.verifier_final_hidden_gate is None:
+                raise RuntimeError(
+                    "Verifier final-hidden residual gate was not initialized"
+                )
+            if verifier_pre_lm_hidden is None:
+                raise ValueError(
+                    "verifier_pre_lm_hidden is required when the verifier "
+                    "final-hidden residual is enabled"
+                )
+            context_positions = (anchor_positions - 1).clamp_min(0)
+            last_context = verifier_pre_lm_hidden[:, context_positions, :]
+            residual = self.verifier_final_hidden_proj(last_context)
+            residual = residual.repeat_interleave(self.block_size, dim=1)
+
+            anchor_docs = document_ids[:, anchor_positions]
+            context_docs = document_ids[:, context_positions]
+            valid_context = (
+                (anchor_positions.unsqueeze(0) > 0)
+                & (anchor_docs == context_docs)
+                & (anchor_docs != -1)
+            )
+            valid_context = valid_context.repeat_interleave(
+                self.block_size, dim=1
+            ).unsqueeze(-1)
+            residual = residual * valid_context.to(residual.dtype)
+            noise_embedding = noise_embedding + (
+                torch.tanh(self.verifier_final_hidden_gate)
+                * residual.to(noise_embedding.dtype)
+            )
+
+        return noise_embedding
+
     def _backbone_forward(
         self,
         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
@@ -342,13 +660,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        *,
+        project_logits: bool = True,
         **kwargs,
     ):
-        """Run the anchored-block draft transformer up to the draft logits.
+        """Run the anchored-block draft transformer and optionally project logits.
 
         Returns ``(hidden, logits, targets, aligned_loss_mask,
-        anchored_block_indices)``. DSpark reuses this and adds its Markov and
-        confidence heads before computing its own loss.
+        anchored_block_indices)``. ``logits`` is ``None`` when
+        ``project_logits=False`` so DSpark can correct hidden states before the
+        single draft-vocabulary projection.
         """
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
@@ -375,8 +696,22 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
-        fc_output = self.fc(hidden_states)
-        fc_output = self.hidden_norm(fc_output)
+        with torch.no_grad():
+            verifier_pre_lm_hidden = self.verifier_norm(
+                verifier_last_hidden_states.to(self.verifier_norm.weight.dtype)
+            )
+
+        shared_projection, target_layer_states = self._prepare_target_hidden(
+            hidden_states
+        )
+        fc_output = self.hidden_norm(shared_projection)
+        noise_embedding = self._condition_noise_embedding(
+            noise_embedding,
+            fc_output,
+            anchor_positions,
+            document_ids,
+            verifier_pre_lm_hidden=verifier_pre_lm_hidden,
+        )
         # shape: [1, total_seq_len, hidden_size]
 
         mask_position_ids = get_base_indices_for_anchored_blocks(
@@ -394,6 +729,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )  # shape: [num_anchors*block_size]
 
         with torch.no_grad():
+            # Upstream #832: when only a subset of positions is anchored (the normal
+            # case -- 512 anchors out of total_seq_len), run the verifier LM head on
+            # just those rows instead of the whole sequence. verifier_pre_lm_hidden is
+            # already normed above, so indexing it is free (RMSNorm is per-token).
             if anchored_block_indices.numel() < total_seq_len:
                 target_indices = (
                     anchored_block_indices
@@ -401,21 +740,28 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                     else (anchored_block_indices - 1) % total_seq_len
                 )
                 targets = self.verifier_lm_head(
-                    self.verifier_norm(verifier_last_hidden_states[:, target_indices])
+                    verifier_pre_lm_hidden[:, target_indices]
                 )
             else:
-                verifier_logits = self.verifier_lm_head(
-                    self.verifier_norm(verifier_last_hidden_states)
-                )
+                verifier_logits = self.verifier_lm_head(verifier_pre_lm_hidden)
                 if not self.config.sample_from_anchor:
+                    # False: shift right by 1 so slot j predicts token at position j
                     verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+                # else: True, slot k predicts token at position k+1 (next), no shift
                 targets = verifier_logits[:, anchored_block_indices]
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
         for layer_idx, layer in enumerate(self.layers):
+            target_hidden = fc_output
+            if self.dflash_dfly_layer_residual:
+                target_hidden = self._add_dfly_layer_residual(
+                    shared_projection,
+                    target_layer_states,
+                    layer_idx,
+                )
             noise_embedding = layer(
                 hidden_states=noise_embedding,
-                target_hidden=fc_output,
+                target_hidden=target_hidden,
                 attention_mask=sliding_window_attn_mask
                 if layer_idx in self.sliding_window_indices
                 else full_attn_mask,
@@ -426,8 +772,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
 
         hidden = self.norm(noise_embedding)
-        logits = self.lm_head(hidden)
-        # shape: [1, num_anchors*block_size, vocab_size]
+        logits = self.lm_head(hidden) if project_logits else None
+        # shape when projected: [1, num_anchors*block_size, vocab_size]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
         # shape: [1, num_anchors*block_size]
@@ -471,6 +817,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             max_anchors=max_anchors,
             **kwargs,
         )
+        if logits is None:
+            raise RuntimeError("DFlash forward requires projected draft logits")
         loss, metrics = compute_metrics(
             logits,
             targets,

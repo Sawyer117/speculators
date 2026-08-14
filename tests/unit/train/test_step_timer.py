@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -16,19 +16,16 @@ def test_disabled_timer_returns_none():
     assert timer.profile(num_tokens=1024) is None
 
 
-@patch("speculators.train.trainer.torch.accelerator.synchronize")
-def test_enabled_timer_returns_profile(mock_sync):
+def test_enabled_timer_returns_profile():
     timer = _StepTimer(enabled=True)
+    mock_sync = MagicMock()
 
-    with patch(
-        "speculators.train.trainer.time.perf_counter",
-        side_effect=[
-            0.1,
-            0.3,
-            0.5,
-            0.6,
-            0.6,
-        ],
+    with (
+        patch("speculators.train.trainer._synchronize_device", mock_sync),
+        patch(
+            "speculators.train.trainer.time.perf_counter",
+            side_effect=[0.1, 0.3, 0.5, 0.6, 0.6],
+        ),
     ):
         timer.mark_value("start", 0.0)
         timer.mark("fetch")
@@ -49,6 +46,30 @@ def test_enabled_timer_returns_profile(mock_sync):
     assert profile["step_ms"] == (0.6 - 0.0) * 1000
     assert profile["tokens_per_s"] == 4096 / 0.6
     assert profile["fetch_frac"] == 100 / 600
+
+
+def test_profile_returns_none_when_marks_incomplete():
+    timer = _StepTimer(enabled=True)
+    timer.mark_value("start", 0.0)
+    timer.mark("fetch")
+    assert timer.profile(num_tokens=1024) is None
+
+
+def test_synchronize_failure_does_not_abort_mark_or_now():
+    timer = _StepTimer(enabled=True)
+    with (
+        patch(
+            "speculators.train.trainer.torch.npu",
+            create=True,
+        ) as mock_npu,
+        patch("speculators.train.trainer.torch.cuda.is_available", return_value=False),
+        patch("speculators.train.trainer.time.perf_counter", return_value=2.0),
+    ):
+        mock_npu.is_available.return_value = True
+        mock_npu.synchronize.side_effect = RuntimeError("npu sync failed")
+        timer.mark("fetch")
+        assert timer.now() == 2.0
+    assert timer._marks["fetch"] == 2.0
 
 
 def test_disabled_to_enabled_transition():
@@ -80,6 +101,7 @@ def test_disabled_to_enabled_transition():
 
     with (
         patch("speculators.train.trainer.torch.accelerator.synchronize"),
+        patch("speculators.train.trainer._synchronize_device"),
         patch(
             "speculators.train.trainer.time.perf_counter",
             side_effect=[2.1, 2.4, 2.5, 2.6, 2.6],
@@ -107,6 +129,7 @@ def test_zero_step_ms_returns_zero_throughput():
     timer.mark_value("start", 1.0)
     with (
         patch("speculators.train.trainer.torch.accelerator.synchronize"),
+        patch("speculators.train.trainer._synchronize_device"),
         patch("speculators.train.trainer.time.perf_counter", return_value=1.0),
     ):
         timer.mark("fetch")

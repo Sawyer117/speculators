@@ -2,7 +2,7 @@
 
 import torch
 
-from speculators.models.dspark.metrics import compute_metrics
+from speculators.models.dspark.metrics import compute_metrics, select_logged_metrics
 from speculators.models.metrics import resolve_loss_config
 
 _DEFAULT_LOSS = resolve_loss_config('{"ce": 0.1, "tv": 0.9}')
@@ -15,6 +15,48 @@ def _ids_to_logits(ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
 
 
 class TestComputeMetrics:
+    def test_logged_metrics_use_compact_shared_schema(self):
+        metrics = {
+            "loss_sum": torch.tensor(1.0),
+            "loss_total": torch.tensor(1.0),
+            "full_acc_sum": torch.tensor(1.0),
+            "accept_len_sum": torch.tensor(1.0),
+            "position_0_acc_sum": torch.tensor(1.0),
+            "confidence_loss_sum": torch.tensor(1.0),
+            "correction_hidden_aux_loss_sum": torch.tensor(1.0),
+            "collaboration_accept_len_gain_sum": torch.tensor(1.0),
+            "collaboration_markov_gate_mean_sum": torch.tensor(1.0),
+            "collaboration_markov_change_accuracy_sum": torch.tensor(1.0),
+            "collaboration_markov_harmed_count_sum": torch.tensor(1.0),
+            "rollout_full_acc_sum": torch.tensor(1.0),
+            "rollout_accept_len_sum": torch.tensor(1.0),
+            "accept_rate_sum": torch.tensor(1.0),
+            "ce_loss_sum": torch.tensor(1.0),
+            "correction_logit_rms_sum": torch.tensor(1.0),
+            "collaboration_markov_change_wrong_count_sum": torch.tensor(1.0),
+        }
+
+        selected = select_logged_metrics(metrics)
+
+        assert set(selected) == {
+            "loss_sum",
+            "loss_total",
+            "full_acc_sum",
+            "accept_len_sum",
+            "position_0_acc_sum",
+            "confidence_loss_sum",
+            "correction_hidden_aux_loss_sum",
+            "collaboration_accept_len_gain_sum",
+            "collaboration_markov_gate_mean_sum",
+            "collaboration_markov_change_accuracy_sum",
+            "collaboration_markov_harmed_count_sum",
+            "rollout_full_acc_sum",
+            "rollout_accept_len_sum",
+        }
+        assert select_logged_metrics(
+            metrics, include_diagnostics=True
+        ) is metrics
+
     def test_perfect_draft_low_loss_high_accept(self):
         # DSpark drafts every block slot (sample_from_anchor=True, the default), so
         # all block_size positions are supervised. The False convention is pinned
@@ -211,3 +253,257 @@ class TestComputeMetrics:
             assert key in metrics
         # all metric values must be tensors (so dist.reduce works in the trainer)
         assert all(torch.is_tensor(v) for v in metrics.values())
+
+    def test_ssal_ignores_gamma(self):
+        torch.manual_seed(0)
+        logits = torch.randn(1, 4, 8)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.ones(1, 4)
+        loss_a, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="ssal",
+            gamma=1.0,
+        )
+        loss_b, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="ssal",
+            gamma=100.0,
+        )
+        assert torch.allclose(loss_a, loss_b)
+
+    def test_ssal_curriculum_mix_between_decay_and_ssal(self):
+        torch.manual_seed(1)
+        logits = torch.randn(1, 4, 8)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.ones(1, 4)
+        pure_decay, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="none",
+            gamma=4.0,
+        )
+        pure_ssal, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="ssal",
+            ssal_decay_weight=0.0,
+        )
+        mixed, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            adaptive_loss="ssal",
+            ssal_decay_weight=1.0,
+            gamma=4.0,
+        )
+        assert torch.allclose(mixed, pure_decay)
+        assert not torch.allclose(pure_ssal, pure_decay)
+
+    def test_correction_gain_metrics(self):
+        target_ids = torch.tensor([[1, 2, 3, 4]])
+        targets = _ids_to_logits(target_ids, 8)
+        corrected_logits = targets.clone()
+        base_logits = _ids_to_logits(torch.tensor([[5, 6, 7, 0]]), 8)
+        loss_mask = torch.ones(1, 4)
+
+        corrected_loss, corrected_metrics = compute_metrics(
+            corrected_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            base_logits=base_logits,
+        )
+
+        assert float(corrected_loss) < float(corrected_metrics["base_loss_sum"])
+        gain = (
+            corrected_metrics["correction_accept_len_gain_sum"]
+            / corrected_metrics["correction_accept_len_gain_total"]
+        )
+        assert float(gain) > 1.5
+        correction_rms = (
+            corrected_metrics["correction_logit_rms_sum"]
+            / corrected_metrics["correction_logit_rms_total"]
+        )
+        assert float(correction_rms) > 0.0
+        argmax_change = (
+            corrected_metrics["correction_argmax_change_rate_sum"]
+            / corrected_metrics["correction_argmax_change_rate_total"]
+        )
+        assert float(argmax_change) == 1.0
+        assert (
+            float(corrected_metrics["dspark_head_change_correct_count_sum"]) == 4.0
+        )
+        assert float(corrected_metrics["dspark_head_change_wrong_count_sum"]) == 0.0
+        assert float(corrected_metrics["dspark_head_harmed_count_sum"]) == 0.0
+
+    def test_head_and_rollout_change_outcome_counts(self):
+        targets = _ids_to_logits(torch.tensor([[1, 2, 3, 4]]), 8)
+        base_logits = _ids_to_logits(torch.tensor([[1, 6, 7, 4]]), 8)
+        head_logits = _ids_to_logits(torch.tensor([[5, 2, 0, 4]]), 8)
+        rollout_logits = _ids_to_logits(torch.tensor([[1, 2, 0, 5]]), 8)
+
+        _, metrics = compute_metrics(
+            head_logits,
+            targets,
+            None,
+            torch.ones(1, 4),
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            base_logits=base_logits,
+            rollout_logits=rollout_logits,
+        )
+
+        assert float(metrics["dspark_head_change_correct_count_sum"]) == 1.0
+        assert float(metrics["dspark_head_change_wrong_count_sum"]) == 2.0
+        assert float(metrics["dspark_head_harmed_count_sum"]) == 1.0
+        assert float(metrics["dspark_head_change_accuracy_sum"]) == 1.0
+        assert float(metrics["dspark_head_change_accuracy_total"]) == 3.0
+        assert float(metrics["causal_rollout_change_correct_count_sum"]) == 1.0
+        assert float(metrics["causal_rollout_change_wrong_count_sum"]) == 2.0
+        assert float(metrics["causal_rollout_harmed_count_sum"]) == 1.0
+
+    def test_rollout_metrics_are_separate_from_teacher_forcing(self):
+        target_ids = torch.tensor([[1, 2, 3, 4]])
+        targets = _ids_to_logits(target_ids, 8)
+        teacher_forced_logits = targets.clone()
+        rollout_logits = _ids_to_logits(torch.tensor([[1, 6, 7, 0]]), 8)
+        loss_mask = torch.ones(1, 4)
+
+        _, metrics = compute_metrics(
+            teacher_forced_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            rollout_logits=rollout_logits,
+        )
+
+        teacher_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
+        rollout_len = (
+            metrics["rollout_accept_len_sum"]
+            / metrics["rollout_accept_len_total"]
+        )
+        assert float(teacher_len) > float(rollout_len)
+        assert float(teacher_len) > 2.9
+        assert float(rollout_len) < 2.1
+
+    def test_first_error_focal_increases_loss(self):
+        logits = _ids_to_logits(torch.tensor([[0, 4, 5, 3]]), 8)
+        targets = _ids_to_logits(torch.tensor([[0, 1, 2, 3]]), 8)
+        loss_mask = torch.ones(1, 4)
+        base, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            first_error_focal_alpha=0.0,
+        )
+        focal, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            first_error_focal_alpha=1.0,
+        )
+        assert float(focal) > float(base)
+
+    def test_collaboration_metrics_compare_against_correction_only(self):
+        target_ids = torch.tensor([[1, 2, 3, 4]])
+        targets = _ids_to_logits(target_ids, 8)
+        joint_logits = targets.clone()
+        correction_only_logits = _ids_to_logits(torch.tensor([[0, 2, 0, 4]]), 8)
+        loss_mask = torch.ones(1, 4)
+        collaboration_gate = torch.full((2, 2, 1), 0.25)
+
+        _, metrics = compute_metrics(
+            joint_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            collaboration_base_logits=correction_only_logits,
+            collaboration_gate=collaboration_gate,
+        )
+
+        accept_gain = (
+            metrics["collaboration_accept_len_gain_sum"]
+            / metrics["collaboration_accept_len_gain_total"]
+        )
+        gate_mean = (
+            metrics["collaboration_markov_gate_mean_sum"]
+            / metrics["collaboration_markov_gate_mean_total"]
+        )
+        assert float(accept_gain) > 1.0
+        assert abs(float(gate_mean) - 0.25) < 1e-6
+        assert (
+            float(metrics["collaboration_markov_change_correct_count_sum"]) == 2.0
+        )
+        assert float(metrics["collaboration_markov_change_wrong_count_sum"]) == 0.0
+
+    def test_confidence_length_and_uniform_vs_match_draft(self):
+        torch.manual_seed(2)
+        logits = torch.randn(1, 4, 8)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.ones(1, 4)
+        conf = torch.randn(1, 4)
+        _, m_len = compute_metrics(
+            logits,
+            targets,
+            conf,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            confidence_length_alpha=0.1,
+        )
+        assert "confidence_length_loss_sum" in m_len
+
+        loss_u, _ = compute_metrics(
+            logits,
+            targets,
+            conf,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            confidence_loss_weighting="uniform",
+            gamma=1.0,
+        )
+        loss_m, _ = compute_metrics(
+            logits,
+            targets,
+            conf,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            confidence_loss_weighting="match-draft",
+            gamma=1.0,
+        )
+        assert not torch.allclose(loss_u, loss_m)

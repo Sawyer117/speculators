@@ -69,6 +69,48 @@ def test_parse_args_allow_empty_output_defaults_false(monkeypatch: pytest.Monkey
     assert args.allow_empty_output is False
 
 
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ("--enable-thinking", True),
+        ("--disable-thinking", False),
+    ],
+)
+def test_parse_args_forwards_thinking_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    expected: bool,
+):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prepare_data.py",
+            "--model",
+            "target",
+            "--data",
+            "sharegpt",
+            flag,
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.enable_thinking is expected
+
+
+def test_parse_args_thinking_mode_defaults_to_model_template(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prepare_data.py", "--model", "target", "--data", "sharegpt"],
+    )
+
+    args = parse_args()
+
+    assert args.enable_thinking is None
+
+
 class _FakeProcessor:
     """Minimal processor stub that passes the chat-template precondition."""
 
