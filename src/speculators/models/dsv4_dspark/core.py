@@ -50,6 +50,16 @@ class DSV4DSparkConfig(DSparkSpeculatorConfig):
     rms_norm_eps); the fields below configure our MLA + MoE + mHC backbone.
     """
 
+    # ⚠ Overrides the base DSpark default (False) to preserve THIS fork's validated
+    # baseline. Every checkpoint in the eval ledger -- including the 4.41-mean
+    # deliverable -- was trained with the ConfidenceHead inputs detached, because the
+    # detach used to be hardcoded in DSparkDraftModel.forward. Flipping it to False
+    # lets the confidence BCE shape the draft backbone; that is a deliberate
+    # experiment, NOT something a merge from upstream or a sibling fork should do as
+    # a side effect. Pass --no-confidence-detach-features to run it.
+    confidence_detach_features: bool = True
+
+
     speculators_model_type: Literal["dsv4_dspark"] = "dsv4_dspark"  # type: ignore[assignment]
 
     # multi-head latent attention

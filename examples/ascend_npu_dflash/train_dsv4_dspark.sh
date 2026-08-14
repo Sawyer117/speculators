@@ -194,6 +194,16 @@ else
   echo ">>> AMP: option A (experts get fp32 master, upstream #711) — fits under EP=1"
 fi
 
+# EXTRA_ARGS: verbatim pass-through to scripts/train.py, appended LAST so it can
+# override anything composed above. Unset (the default) leaves $EXTRA byte-identical
+# to what this script has always produced -- the guard makes it a strict no-op.
+# Used for the ported opt-in features, e.g.
+#   EXTRA_ARGS="--enable-correction-head --correction-output-mode logits"
+if [ -n "${EXTRA_ARGS:-}" ]; then
+  EXTRA="$EXTRA $EXTRA_ARGS"
+  echo ">>> EXTRA_ARGS: $EXTRA_ARGS"
+fi
+
 # ---- COMPILE=1 on NPU: two box-dependent footguns the inductor_npu_ext AscendC path hits ----
 # (1) umask: inductor's codecache REJECTS a group/world-writable kernel.so ("must not be writable
 #     by group or others"). On a umask-002 box the AscendC build emits 0o775 and compile dies with an
