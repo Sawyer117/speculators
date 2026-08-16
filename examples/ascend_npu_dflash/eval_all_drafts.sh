@@ -286,15 +286,23 @@ emit_table() {                      # $1 = column index in the FINAL SUMMARY row
     local lbl="${E%%|*}" lg="$OUTDIR/${i}_${E%%|*}.log"
     [ -s "$lg" ] || continue
     grep -q "FINAL SUMMARY" "$lg" || continue
+    # `n/a` rather than an em dash on purpose: awk pads %9s by BYTES, so a multi-byte
+    # glyph would shift every following column. The AR baseline legitimately reports
+    # accept_len as nan (num_drafts is 0, so the ratio is 0/0) -- print that as n/a and
+    # suppress its mean, instead of the bare "nan ... 0.000" row it used to emit. Its
+    # throughput row is unaffected and still carries the speedup denominator.
     awk -v L="$lbl" -v C="$1" '
+      function show(x) { return (x == "" || x ~ /^[Nn][Aa][Nn]$/) ? "n/a" : x }
       /FINAL SUMMARY/     { insum = 1; next }
       insum && /^-----/   { rows = 1; next }
       rows && /^={10,}/   { rows = 0 }
-      rows && NF >= 8     { v[$1] = $(C); n++ }
+      rows && NF >= 8     { v[$1] = $(C); if ($(C) ~ /^[Nn][Aa][Nn]$/) bad = 1; n++ }
       END {
-        m = (v["gsm8k"] + v["math500"] + v["humaneval"] + v["mbpp"] + v["mt-bench"]) / 5
-        printf "%-22s %9s %9s %10s %9s %10s %9.3f\n",
-               L, v["gsm8k"], v["math500"], v["humaneval"], v["mbpp"], v["mt-bench"], m
+        m  = (v["gsm8k"] + v["math500"] + v["humaneval"] + v["mbpp"] + v["mt-bench"]) / 5
+        ms = (bad || n < 5) ? "n/a" : sprintf("%.3f", m)
+        printf "%-22s %9s %9s %10s %9s %10s %9s\n",
+               L, show(v["gsm8k"]), show(v["math500"]), show(v["humaneval"]),
+               show(v["mbpp"]), show(v["mt-bench"]), ms
       }' "$lg" | tee -a "$MASTER"
   done
 }
