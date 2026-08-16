@@ -104,8 +104,38 @@ overhead is ~85% of an AR step.
 
 If that is right it is a structural property of MoE + speculative decoding at batch 1, not something
 this draft does badly, and it caps the achievable speedup well below `accept_len` for **any** draft on
-this target. Worth profiling before anyone promises a bigger number — and worth checking whether a
-smaller `num_spec` trades acceptance for a cheaper verify and lands higher overall.
+this target.
+
+⚠ **But there is a competing explanation that this measurement cannot rule out, and it points the
+opposite way.** These runs are **graph mode** (`EAGER=0`, ACLGraph FULL_DECODE_ONLY), which captures
+the decode graph at **padded** shapes. At conc1 with `num_spec=5` a step verifies 6 tokens, which very
+likely pads to a captured size of 8. If the padded shape is what the step actually costs, verify is
+**flat** in `num_spec` up to the pad boundary and the MoE-routing story above is measuring nothing —
+the step would cost 71.39 ms whether it verifies 6 tokens or 8.
+
+One measurement at `num_spec=5` fits both models, because both are calibrated to it. They diverge
+sharply on what to do next:
+
+| `num_spec` | accept_len (extrapolated, c₅≈0.87 c₆≈0.865) | graph-padding model (step flat at 71.39 ms) | linear-cost model (+6.04 ms per extra token) |
+|---:|---:|---:|---:|
+| 5 *(today)* | 4.831 | 2.61× | 2.61× |
+| 6 | 5.350 | 2.89× | 2.66× |
+| **7** | **5.799** | **3.13×** | **2.68×** |
+| 8 | 6.185 | 3.34× | 2.66× |
+
+★ **Both models say go UP, not down** — an earlier draft of this section suggested a *smaller*
+`num_spec` and that was simply wrong. It looked only at the step getting more expensive and never did
+the marginal arithmetic: the marginal speculated token costs ~11.6 ms per token gained even under the
+pessimistic model, against a current average of 14.78 ms. What the models disagree about is the size
+of the prize — **+20% under padding, +3% under linear cost** — i.e. whether a retrain is worth it.
+
+**The cheap decisive test needs no retrain.** Sweep `num_spec = 1,2,3,4,5` at conc1 on ~100 gsm8k
+prompts (all ≤ 5, so the existing weights serve them) and look at the step time. Flat ⟹ padding
+dominates ⟹ retraining at `--block-size 8` is clearly indicated. Rising with k ⟹ the MoE tax is real
+and a retrain buys little. Five runs, well under an hour.
+
+⚠ Our draft emits exactly 5 (`block_size=6` = anchor + 5 mask slots), and so does the released one, so
+anything above `num_spec=5` is a **training-side** change, not a serve flag.
 
 ### Caveats — read before quoting
 

@@ -1139,10 +1139,32 @@ draft's own 3-layer forward cannot explain the gap: 3 layers against 43 is ~7%, 
 overhead is ~85% of an AR step. **Not profiled — this is a hypothesis with an arithmetic bound
 around it**, and it is the first thing to profile if anyone wants a bigger number.
 
-If it holds it is structural, not a defect of this draft: it caps achievable speedup well below
-`accept_len` for *any* draft on a MoE target. It also suggests an untried lever — **a smaller
-`num_spec` may trade acceptance for a cheaper verify and land higher overall**, which nothing in this
-repo has tested.
+⚠ **And the user immediately found the competing explanation, which points the opposite way.** These
+runs are **graph mode** (`EAGER=0`, ACLGraph FULL_DECODE_ONLY): the decode graph is captured at
+*padded* shapes. At conc1 with `num_spec=5` a step verifies 6 tokens, which very likely pads to a
+captured size of 8 — in which case verify is **flat** in `num_spec` up to that boundary and the MoE
+routing story measures nothing. One data point at `num_spec=5` fits both models; both are calibrated
+to it.
+
+They disagree about the prize, not the direction:
+
+    num_spec   accept_len   padding model   linear-cost model
+       5         4.831         2.61x            2.61x
+       7         5.799       * 3.13x *          2.68x
+       8         6.185         3.34x            2.66x
+
+★ **Both say go UP.** My first write-up suggested a *smaller* `num_spec` and that was wrong — it
+looked only at the step getting more expensive and skipped the marginal arithmetic. The marginal
+speculated token costs ~11.6 ms per token gained even under the pessimistic model, against a current
+average of 14.78 ms, so the average keeps improving until roughly `num_spec=7-8`.
+
+**The decisive test is cheap and needs no retrain:** sweep `num_spec = 1..5` at conc1 on ~100 gsm8k
+prompts (all within what the current draft emits) and watch the step time. Flat ⟹ padding dominates
+⟹ retraining at `--block-size 8` is clearly worth it (+20%). Rising with k ⟹ the MoE tax is real and
+a retrain buys ~3%. Five runs, under an hour.
+
+⚠ `num_spec > 5` is a **training-side** change: our draft emits exactly 5 (`block_size=6` = anchor +
+5 mask slots) and so does the released one. No serve flag reaches past that.
 
 **Still missing at conc1:** math500 (abandoned at 61%), humaneval, mbpp, mt-bench. mt-bench will be
 materially worse (accept_len 3.15 vs gsm8k 4.85). The AR arm's 200-prompt sampling is fine for a
