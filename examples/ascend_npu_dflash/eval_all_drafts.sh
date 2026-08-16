@@ -89,7 +89,22 @@ say() { echo "$*" | tee -a "$MASTER"; }
 
 serve_up() { curl -sf --noproxy '*' "http://localhost:$PORT/v1/models" >/dev/null 2>&1; }
 
-procs_alive() { pgrep -if "$PROCPAT" >/dev/null 2>&1; }
+# ⚠ Zombies must NOT count as alive. A killed vLLM worker whose parent never wait()s stays in
+# the process table as `[VLLM::Worker] <defunct>` -- 24 of them, 17 days old, were sitting on the
+# 176 box. They hold no NPU and no signal can touch them (only the parent reaping, or dying, ever
+# clears one), so a plain pgrep made every teardown burn its full kill timeout: ~180 s x 2 per
+# entry, ~1.8 h across an 18-entry batch.
+procs_alive() {
+  local p st
+  for p in $(pgrep -if "$PROCPAT" 2>/dev/null); do
+    st=$(ps -o stat= -p "$p" 2>/dev/null | tr -d ' ')
+    case "$st" in
+      '' | Z*) continue ;;    # already gone, or an unreapable <defunct> shell
+      *)       return 0 ;;
+    esac
+  done
+  return 1
+}
 
 # Max per-device HBM in use, in MB. Best-effort: `npu-smi info` prints a `used / total` cell
 # per device; keep only cells whose total looks like memory (>1000) so the `0 / 0` AICore
