@@ -52,10 +52,160 @@ Unless a run says otherwise, all numbers below share:
   (Our serve runs *above* the official 3.94 because #12006 + bf16 dequant; use the released *row* as
   the same-serve target, and 3.94 only as the cross-stack sanity floor.)
 
+## ★★★ 2026-08-16 — FULL-SET batch: every draft and the AR baseline re-measured in one run
+
+**18 entries, 18 OK, 0 failed, 7h37m unattended**, driven by
+`examples/ascend_npu_dflash/eval_all_drafts.sh` (repo at `35bae76`) — serve → 5-dataset eval → serve
+down, once per draft, all into one master log. Master
+`~/eval_batch_20260816_133434/MASTER.log` on 176, per-entry `<n>_<label>.log` (+ `.serve.log`).
+
+**This section supersedes the matrix below for every absolute number.** Everything here is on the
+**FULL 1319 / 500 / 164 / 257 / 80** set (`KEEP_WARMUP=1`), one machine, one 7.6 h window, identical
+serve config — so cross-checkpoint and ON-vs-OFF comparisons inside it need no caveats. The matrix
+rows below remain valid *among themselves* (old 1309/490/154/247/70 set); do not mix the two.
+
+> ⚡ **THE FINDING: a Δ of ±0.02 between two checkpoints is measurement noise, and this batch proves it
+> directly.** The same three #942 arm pairs were measured twice — once on the old sample set, once here —
+> with **identical weights**; the only difference is the 10 restored prompts per dataset (10 of 2320).
+>
+> | pair | old-set Δ | full-set Δ | |
+> |---|---:|---:|---|
+> | 0.5ep | **−0.0002** | **+0.0226** | ⚡ sign flip |
+> | 4.5ep | **−0.0170** | **+0.0050** | ⚡ sign flip |
+> | 5.0ep | +0.0124 | +0.0024 | same sign, 5× smaller |
+>
+> **Two of three flipped sign from adding 0.4% more prompts.** That retires the `ep4p5-lossreduce` row's
+> open question (whether gsm8k −0.031 there was a trend) and, more usefully, establishes the honest
+> resolution limit of this whole ledger: **differences below ~0.025 on the 5-dataset mean are not
+> interpretable**, no matter how consistent they look across datasets. Several "current best" promotions
+> in the matrix below sit inside that band and should be read as ties, not improvements.
+
+### Accept length — all 17 drafts + the released bar, one sample set
+
+| draft | gsm8k | math500 | humaneval | mbpp | mt-bench | **mean** | %bar | non-chat | %bar |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **released draft** *(bar)* | 4.665 | 4.639 | 4.939 | 4.526 | **3.347** | **4.4232** | 100.00% | 4.6922 | 100.00% |
+| `ep5p0-lossreduce` | 4.831 | 4.591 | 4.919 | 4.557 | 3.195 | **4.4186** | **99.90%** | 4.7245 | 100.69% |
+| `ep5p0-ropefix` | 4.845 | 4.565 | **4.971** | 4.546 | 3.154 | 4.4162 | 99.84% | 4.7317 | 100.84% |
+| `ep4p5-lossreduce` | 4.828 | 4.571 | 4.964 | **4.565** | 3.149 | 4.4154 | 99.82% | **4.7320** | **100.85%** |
+| `ep4p0-ropefix` | 4.832 | 4.553 | 4.939 | 4.557 | 3.177 | 4.4116 | 99.74% | 4.7203 | 100.60% |
+| `ep4p5-ropefix` | **4.846** | 4.563 | 4.899 | 4.560 | 3.184 | 4.4104 | 99.71% | 4.7170 | 100.53% |
+| `ep3p5-ropefix` | 4.816 | 4.528 | 4.942 | 4.521 | 3.133 | 4.3880 | 99.20% | 4.7017 | 100.20% |
+| `ep3p0-lossreduce` | 4.762 | 4.522 | 4.839 | 4.506 | 3.083 | 4.3424 | 98.17% | 4.6572 | 99.25% |
+| `ep3p0-ropefix` | 4.791 | 4.495 | 4.804 | 4.469 | 3.098 | 4.3314 | 97.92% | 4.6398 | 98.88% |
+| `ep2p5-ropefix` | 4.768 | 4.498 | 4.812 | 4.449 | 3.106 | 4.3266 | 97.82% | 4.6318 | 98.71% |
+| `ep2p0-lossreduce` | 4.689 | 4.427 | 4.824 | 4.405 | 3.041 | 4.2772 | 96.70% | 4.5862 | 97.74% |
+| `ep2p0-ropefix` | 4.655 | 4.441 | 4.783 | 4.390 | 2.998 | 4.2534 | 96.16% | 4.5673 | 97.34% |
+| `ep1p5-ropefix` | 4.619 | 4.361 | 4.644 | 4.313 | 2.963 | 4.1800 | 94.50% | 4.4843 | 95.57% |
+| `ep1p0-ropefix` | 4.507 | 4.273 | 4.574 | 4.182 | 2.858 | 4.0788 | 92.21% | 4.3840 | 93.43% |
+| `ep1p0-lossreduce` | 4.496 | 4.227 | 4.574 | 4.160 | 2.872 | 4.0658 | 91.92% | 4.3643 | 93.01% |
+| `ep0p5-lossreduce` | 4.314 | 4.045 | 4.273 | 3.914 | 2.702 | 3.8496 | 87.03% | 4.1365 | 88.16% |
+| `ep0p5-ropefix` | 4.310 | 3.961 | 4.224 | 3.905 | 2.735 | 3.8270 | 86.52% | 4.1000 | 87.38% |
+
+★ **The top five span 4.4104–4.4186 = 0.008, well inside the ±0.025 noise band above — they are tied.**
+The honest statement is not "`ep5p0-lossreduce` is best" but: **from 4.0ep onward every checkpoint is
+the same model at 99.7–99.9% of the released draft, and all of them beat it on the non-chat four
+(100.5–100.9%)**, regardless of which loss normalization trained it.
+
+★ **Per dataset, taking our best value:** gsm8k **4.846 = 103.9%** ✅ · mbpp **4.565 = 100.9%** ✅ ·
+humaneval **4.971 = 100.6%** ✅ · math500 4.591 = 98.97% · **mt-bench 3.195 = 95.5%** ← the only real
+gap left, and the same one every earlier row reports. Restoring the 10 dropped prompts narrowed it
+(the released bar gained +0.053 on mt-bench, ours gained +0.103) but did not close it.
+
+### #942 (global cross-rank loss normalization) — six pairs on one sample set
+
+| pair | OFF (per-rank) | ON (global) | Δ | per-dataset Δ (gsm8k / math500 / humaneval / mbpp / mt-bench) |
+|---|---:|---:|---:|---|
+| 0.5ep | 3.8270 | 3.8496 | **+0.0226** | +0.004 / +0.084 / +0.049 / +0.009 / −0.033 |
+| 1.0ep | 4.0788 | 4.0658 | −0.0130 | −0.011 / −0.046 / +0.000 / −0.022 / +0.014 |
+| 2.0ep | 4.2534 | 4.2772 | **+0.0238** | +0.034 / −0.014 / +0.041 / +0.015 / +0.043 |
+| 3.0ep | 4.3314 | 4.3424 | +0.0110 | −0.029 / +0.027 / +0.035 / +0.037 / −0.015 |
+| 4.5ep | 4.4104 | 4.4154 | +0.0050 | −0.018 / +0.008 / +0.065 / +0.005 / −0.035 |
+| 5.0ep | 4.4162 | 4.4186 | +0.0024 | −0.014 / +0.026 / −0.052 / +0.011 / +0.041 |
+
+**Mean Δ +0.0086, 5 of 6 positive, max |Δ| 0.0238** — i.e. every pair sits inside the noise band the
+sign-flip experiment established. Combined, the two results say: **no effect is measurable at this
+design's resolution, and certainly no regression.** The case for #942 remains correctness (the
+per-rank objective depends on `world_size` and on how the sampler happened to shard the batch), and
+six pairs across the whole training run say taking the correct objective costs nothing. ⚠ Still a
+single seed per arm; this bounds the effect, it does not prove zero.
+
+### Convergence — the ropefix line, ten checkpoints
+
+`0.5ep 3.8270 → 1.0 4.0788 → 1.5 4.1800 → 2.0 4.2534 → 2.5 4.3266 → 3.0 4.3314 → 3.5 4.3880 →
+4.0 4.4116 → 4.5 4.4104 → 5.0 4.4162`
+
+Steps: **+0.252 · +0.101 · +0.073 · +0.073 · +0.005 · +0.057 · +0.024 · −0.001 · +0.006**. Decaying,
+and the last three (+0.024 / −0.001 / +0.006) are inside noise — converged, with the cosine LR
+annealed to exactly 0 at 5.0ep. **Nothing was left on the table by stopping at 5 epochs.**
+
+### Throughput, speedup and per-token latency — AR denominator now on the SAME sample set
+
+The old AR row was measured on the pre-cutover set, which forced a caveat on every speedup number.
+It is now re-measured here: **460.11 / 624.98 / 337.50 / 684.63 / 464.13 tok/s** (gsm8k / math500 /
+humaneval / mbpp / mt-bench), reproducing the old row within −0.1% to +5.2% (largest on humaneval,
+the smallest set). Use these figures for any full-set speedup.
+
+| | gsm8k | math500 | humaneval | mbpp | mt-bench | mean |
+|---|---:|---:|---:|---:|---:|---:|
+| **tok/s** `ep5p0-ropefix` | 598.88 | 831.43 | 564.84 | 976.21 | 538.89 | — |
+| **tok/s** `ep5p0-lossreduce` | 591.20 | 809.05 | 516.97 | 994.24 | 576.11 | — |
+| **tok/s** released | 587.11 | 827.86 | 548.37 | 965.51 | 586.06 | — |
+| **tok/s** AR baseline | 460.11 | 624.98 | 337.50 | 684.63 | 464.13 | — |
+| ×(thru) `ep5p0-ropefix` | 1.302 | 1.330 | 1.674 | 1.426 | 1.161 | **1.379×** |
+| ×(thru) `ep5p0-lossreduce` | 1.285 | 1.295 | 1.532 | 1.452 | 1.241 | **1.361×** |
+| ×(thru) released | 1.276 | 1.325 | 1.625 | 1.410 | 1.263 | **1.380×** |
+| **ms/token** AR | 103.0 | 67.0 | 107.3 | 61.6 | 60.2 | — |
+| **ms/token** `ep5p0-ropefix` | 79.3 | 52.0 | 71.3 | 43.9 | 51.5 | — |
+| **ms/token** released | 81.0 | 52.5 | 75.3 | 44.5 | 47.9 | — |
+| ×(latency) `ep5p0-ropefix` | 1.30 | 1.29 | 1.51 | 1.40 | 1.17 | **1.33×** |
+
+⚠ **At conc48 the throughput ratio does not discriminate between drafts** — ours 1.36–1.38× and the
+released draft 1.380× are the same number, even though accept_len differs by up to 0.17 on gsm8k.
+That is the engine-saturation effect already noted in the `AR baseline` row: at conc48 the win
+depends on how full the batch is, not on how many tokens each draft lands. **Do not quote conc48
+throughput as evidence about draft quality**; per-token latency (both sides now same-set, same
+formula `E2E-per-sample ÷ tokens-per-sample`) is the cleaner statement — **22–34% off the AR
+per-token cost**. The number people mean by "speculative speedup" still needs conc1, which no run
+has done for either arm.
+
+### gsm8k per-position cumulative accept rate (n=1319 — the tightest set)
+
+| draft | pos0 | pos1 | pos2 | pos3 | pos4 | conditional c0…c4 |
+|---|---:|---:|---:|---:|---:|---|
+| released | 92.91 | 82.92 | 73.35 | 63.66 | 53.67 | 0.929 / 0.892 / 0.885 / 0.868 / 0.843 |
+| `ep5p0-ropefix` | 93.67 | 85.60 | 76.99 | 68.26 | 59.94 | 0.937 / 0.914 / 0.899 / 0.887 / 0.878 |
+| `ep4p5-ropefix` | 93.64 | 85.60 | 76.90 | 68.44 | **60.01** | 0.936 / 0.914 / 0.898 / 0.890 / 0.877 |
+| `ep5p0-lossreduce` | 93.55 | 85.36 | 76.58 | 67.96 | 59.67 | 0.935 / 0.912 / 0.897 / 0.887 / 0.878 |
+| `ep4p0-ropefix` | 93.56 | 85.31 | 76.67 | 68.03 | 59.63 | 0.936 / 0.912 / 0.899 / 0.887 / 0.877 |
+| `ep3p0-ropefix` | 93.17 | 84.85 | 75.91 | 66.99 | 58.17 | 0.932 / 0.911 / 0.895 / 0.882 / 0.868 |
+| `ep2p0-ropefix` | 91.97 | 82.72 | 72.97 | 63.51 | 54.32 | 0.920 / 0.899 / 0.882 / 0.870 / 0.855 |
+| `ep1p0-ropefix` | 91.65 | 81.02 | 69.77 | 59.12 | 49.15 | 0.917 / 0.884 / 0.861 / 0.847 / 0.831 |
+| `ep0p5-ropefix` | 90.40 | 78.52 | 65.57 | 53.71 | 42.84 | 0.904 / 0.869 / 0.835 / 0.819 / 0.798 |
+
+★ **Every converged checkpoint is above the released draft at all five positions, and the margin
+widens with depth**: c4 is 0.877–0.878 vs released 0.843, **+3.4pt**, while c0 differs by only
++0.7pt. The draft's advantage is in the *tail* of the block — it keeps a run alive further — which is
+exactly why gsm8k accept_len exceeds released (4.846 vs 4.665) while pos0 is nearly identical.
+
+### Known artifact
+
+The AR row prints `accept_len nan` and a `0.000` mean in the batch's own summary table: with no
+speculative decoding `num_drafts` is 0, so the ratio is 0/0. Correct behaviour, wrong glyph — the
+table should print `—`. The tok/s row is the one that matters and it is unaffected.
+
 ## Summary — accept_len by dataset
 
 Headline `accept_len` per run. `mean` is the unweighted 5-dataset average (mt-bench, being
 multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
+
+> ⚠️ **2026-08-16 — for absolute numbers, read the [full-set batch](#-2026-08-16--full-set-batch-every-draft-and-the-ar-baseline-re-measured-in-one-run)
+> above instead.** Every row in this matrix is on the pre-cutover **1309/490/154/247/70** set and was
+> measured across many separate sessions; the batch re-measured all 17 drafts plus the AR baseline on
+> the full **1319/500/164/257/80** set in one 7.6 h window. The matrix stays here because it carries the
+> per-run history and the reasoning that produced each checkpoint — but where the two disagree, the
+> batch wins. In particular the batch shows that **differences below ~0.025 on the 5-dataset mean are
+> noise**, so the "CURRENT BEST" promotions in the ⭐ rows below (which step by 0.001–0.02) are ties.
 
 > **★★★ 2026-08-05 — read the PRE-ropefix rows as historical.** The `~3.5 plateau`, `train↑/eval↓
 > divergence`, `gap = tail / data / exposure`, and `best draft = f1-1.5ep 3.63` framing in the older rows
