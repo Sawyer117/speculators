@@ -1044,3 +1044,67 @@ phase with their prefill cached.
 measured under the old mode, so **every remaining A/B eval must run `KEEP_WARMUP=0`** — the OFF-arm
 reference values (1.0ep 4.056 · 2.0ep 4.254 · 2.5ep 4.294 · 3.0ep 4.346) are on the 70/154/247 sets.
 Switch to the new default only for runs whose whole comparison set is post-cutover.
+
+## 2026-08-17 — training line closed: the run finished, then one batch re-measured everything
+
+### The run
+
+`ckpt_faithful_ep_20260810_234322` (the `DSPARK_GLOBAL_LOSS_REDUCE=1` arm) reached **global_step
+124,480 = 5.0ep**, LR annealed to exactly 0. The save grid held: `/0`…`/4` each written twice, so the
+five integer-epoch checkpoints are permanent. The 4.5ep save was converted inside its ~1 h window
+before 5.0ep overwrote `/4` — worth it, because 4.5ep is where the OFF arm peaked.
+
+Disk was cleared first: 38 stale trainer checkpoint dirs deleted (31 empty shells + 5×113G + 2×226G)
+= **1.0 TB**, `/` from 93% to 80%. Both keepers verified intact at 565G each.
+
+### The batch driver — `examples/ascend_npu_dflash/eval_all_drafts.sh`
+
+Evaluating 17 drafts by hand is 17 chances to pair a number with the wrong weights. The driver does
+stop-serve → start-serve-with-DRAFT → wait-ready → full 5-dataset eval → stop-serve, appending a
+banner carrying the **absolute weight path** directly above each result, and printing consolidated
+accept-length and tok/s tables at the end. **18/18 OK, 0 failed, 7h37m unattended.**
+
+Three things it had to learn on the way, all worth keeping:
+
+1. **`pkill -f vllm` is not enough.** vLLM renames its subprocesses `VLLM::EngineCore` / `VLLM::Worker`
+   — UPPERCASE — while the API server is `vllm serve`. `pkill -f` is case-sensitive, so the naive
+   pattern killed the server and left the engine cores holding every byte of HBM. All kills use `-i`
+   now. (The user's own habit, `ps -ef | grep VLLM`, was right and mine was wrong.)
+2. **Idle HBM is ~3.1 GB/chip on this box**, so gating teardown on an absolute MB threshold either
+   never fires or fires instantly depending on the box. The right question is *"is any process holding
+   a device"*, which `npu-smi info`'s process table answers directly (`No running processes found`).
+3. **24 zombie `[VLLM::Worker] <defunct>` processes, 17 days old**, all parented to a root-owned
+   `sleep infinity` — the container's PID 1, which never `wait()`s. A zombie holds no NPU and no signal
+   can touch it, but `pgrep` still reports it, so every teardown burned its full 180 s kill timeout:
+   ~1.8 h across the batch. `procs_alive()` now skips `Z` state. **Do not kill that parent** — it is
+   the container init.
+
+### What the batch actually changed
+
+Full numbers: [`ascend-npu-dsv4-dspark-eval-results.md`](ascend-npu-dsv4-dspark-eval-results.md),
+new top section. Three results that change how earlier rows should be read:
+
+★ **A ±0.02 difference on the 5-dataset mean is noise, demonstrated rather than argued.** Three #942
+arm pairs were measured twice with identical weights — old sample set vs full — and **two of the three
+flipped sign** (0.5ep −0.0002 → +0.0226; 4.5ep −0.0170 → +0.0050) purely from restoring 10 prompts per
+dataset, 0.4% more data. This retires the open question in the `ep4p5-lossreduce` row and, more
+usefully, invalidates the "CURRENT BEST" promotions in the ⭐ matrix rows, which step by 0.001–0.02.
+
+★ **#942 is settled on the accuracy side.** Six pairs spanning the whole run: +0.0226 / −0.0130 /
++0.0238 / +0.0110 / +0.0050 / +0.0024, mean **+0.0086**, 5 of 6 positive, max |Δ| 0.024 — every one
+inside the noise band. No effect measurable, no regression. Single seed per arm, so this bounds the
+effect rather than proving zero. The PR was rebased onto main after #951 moved the loss layer into
+`speculators/losses/` (relocation only, logic unchanged, 4/4 tests pass including two 2-rank gloo
+gradient-equivalence tests) and force-pushed; it is now `mergeable`, waiting only on reviewer approval.
+
+★ **The training line is done.** From 4.0ep onward every checkpoint is the same model —
+**99.7–99.9% of the released draft on the 5-dataset mean, 100.5–100.9% on the non-chat four** — and the
+last three convergence steps (+0.024 / −0.001 / +0.006) are inside noise with LR already at 0. gsm8k
+**4.846 = 103.9%**, mbpp 100.9%, humaneval 100.6% all exceed the released draft. **mt-bench 95.5% is the
+only remaining gap**, and restoring the dropped prompts narrowed it without closing it.
+
+The AR denominator was re-measured on the same full set (460.11 / 624.98 / 337.50 / 684.63 / 464.13
+tok/s), removing the caveat that hung on every speedup number. ⚠ But at conc48 the throughput ratio
+does **not** discriminate: ours 1.36–1.38× and the released draft 1.380× are the same number despite
+accept_len differing by 0.17 on gsm8k. Per-token latency is the honest statement — **22–34% off the AR
+cost** — and a real "speculative speedup" figure still needs conc1 for both arms, which nobody has run.
