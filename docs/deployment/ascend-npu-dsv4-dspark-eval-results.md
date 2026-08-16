@@ -52,6 +52,75 @@ Unless a run says otherwise, all numbers below share:
   (Our serve runs *above* the official 3.94 because #12006 + bf16 dequant; use the released *row* as
   the same-serve target, and 3.94 only as the cross-stack sanity floor.)
 
+## ★★ 2026-08-17 — conc1: the speculative speedup conc48 could not measure — **2.27×** on gsm8k
+
+Every speedup in this ledger before today was measured at concurrency 48, where the engine is
+throughput-bound and the ratio turned out not to discriminate between drafts at all (ours 1.36–1.38×,
+released 1.380×, despite a 0.17 accept-length spread). This is the batch-1 number, which is what
+"speculative decoding is N× faster" normally means.
+
+**Setup.** `CONCURRENCY=1`, gsm8k, greedy, same serve as every row above (176 A3-single, DP2×TP8,
+`num_spec=5`). Spec arm = `ep5p0-ropefix`, **full 1319 prompts** (58m53s). AR arm = same serve started
+without `DRAFT=`, **200 prompts** (`NUM_PROMPTS=200`, 20m35s) — the server was being reclaimed and AR
+at conc1 costs ~9 h for the full five datasets. The 200 are the seed-42 shuffle's first 200, i.e. a
+prefix subset of the spec arm's 1319; **tokens per sample land within 1.6%** (153.44 vs 151.02), so
+the two are measuring the same generation workload.
+
+| | AR baseline | `ep5p0-ropefix` | speedup |
+|---|---:|---:|---:|
+| **end-to-end ms/token** (incl. prefill) | 40.28 | **17.75** | **2.27×** |
+| decode-only ms/token (E2E − TTFT) | 38.28 | 14.81 | 2.59× |
+| ITL-derived ms/token | 38.51 | 14.78 | 2.61× |
+| throughput tok/s | 24.83 | 56.37 | 2.27× |
+| TTFT ms | 306.36 | 444.04 | — |
+
+Four independent derivations, two clusters: **2.27× end-to-end, 2.6× in steady-state decode.** The
+gap between them is prefill — spec pays 138 ms more TTFT (the draft is loaded and its prefill runs
+too), which is amortized over a 151-token generation. Quote **2.27×** for a user-facing claim and
+2.6× for a decode-rate claim; do not mix them.
+
+★ **accept_len is concurrency-independent, as it must be** — 4.831 at conc1 vs 4.845 at conc48 on the
+same weights (Δ 0.014, inside the ±0.025 noise band). This also revalidates the whole conc48 matrix:
+whatever batching does to throughput, it does not touch the acceptance measurement.
+
+### Why 2.27× and not 4.8× — the MoE verify tax
+
+| | cost | tokens produced |
+|---|---:|---:|
+| one AR step | 38.51 ms | 1 |
+| one spec step | 71.39 ms | 4.831 |
+
+**A spec step costs 1.85× an AR step.** If it cost the same (the dense-model intuition — at batch 1
+decode is memory-bandwidth-bound on weight loading, so verifying 6 tokens is nearly free), the
+speedup would be the full **4.83×**; we realize **2.61×, i.e. 54% of the ideal**.
+
+The leading explanation — **not yet profiled, so treat it as a hypothesis** — is that the
+dense-model intuition fails on a 256-expert MoE. One token routes to 6 experts per layer; six tokens
+route to **up to 36 distinct experts per layer**, and at batch 1 the step's cost is dominated by
+pulling those expert weights across the bus. So the verify step's cost grows with the speculation
+width in a way it does not on a dense model. The draft's own forward (3 layers × 256 experts) adds to
+this but cannot explain it alone: 3 layers against the target's 43 is ~7%, whereas the observed
+overhead is ~85% of an AR step.
+
+If that is right it is a structural property of MoE + speculative decoding at batch 1, not something
+this draft does badly, and it caps the achievable speedup well below `accept_len` for **any** draft on
+this target. Worth profiling before anyone promises a bigger number — and worth checking whether a
+smaller `num_spec` trades acceptance for a cheaper verify and lands higher overall.
+
+### Caveats — read before quoting
+
+- **gsm8k only.** math500 was 61% through the spec arm when the box was reclaimed; humaneval / mbpp /
+  mt-bench were never started at conc1. Nothing here generalizes to the other four datasets, and
+  mt-bench in particular (accept_len 3.15 vs gsm8k's 4.85) will be materially lower.
+- **The AR arm is 200 prompts, the spec arm 1319.** Defensible for a per-token rate (30,688 tokens is
+  plenty for a decode-rate average, unlike accept_len which needs the large sample) and the two agree
+  on tokens-per-sample to 1.6% — but it is not the strict same-set pairing the conc48 rows have.
+- **DP2×TP8 leaves half the deployment idle at conc1.** These are honest single-request latencies for
+  *this* serve config, not the best a single-request deployment could do — that would be TP16. Both
+  arms are equally affected, so the *ratio* is the robust part; the absolute ms/token is not.
+- Logs: `~/eval_batch_20260817_033326/` (spec, gsm8k complete + math500 partial) and
+  `~/eval_batch_20260817_051244/` (AR) on 176.
+
 ## ★★★ 2026-08-16 — FULL-SET batch: every draft and the AR baseline re-measured in one run
 
 **18 entries, 18 OK, 0 failed, 7h37m unattended**, driven by
@@ -166,8 +235,10 @@ That is the engine-saturation effect already noted in the `AR baseline` row: at 
 depends on how full the batch is, not on how many tokens each draft lands. **Do not quote conc48
 throughput as evidence about draft quality**; per-token latency (both sides now same-set, same
 formula `E2E-per-sample ÷ tokens-per-sample`) is the cleaner statement — **22–34% off the AR
-per-token cost**. The number people mean by "speculative speedup" still needs conc1, which no run
-has done for either arm.
+per-token cost**. The number people mean by "speculative speedup" is the conc1 one, now measured on
+gsm8k: **2.27× end-to-end** — see the [conc1 section](#-2026-08-17--conc1-the-speculative-speedup-conc48-could-not-measure--227-on-gsm8k)
+above, which is 74% higher than the 1.302× this table reports for the same checkpoint on the same
+dataset.
 
 ### gsm8k per-position cumulative accept rate (n=1319 — the tightest set)
 
