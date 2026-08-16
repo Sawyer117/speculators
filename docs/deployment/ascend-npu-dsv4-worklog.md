@@ -1108,3 +1108,44 @@ tok/s), removing the caveat that hung on every speedup number. ⚠ But at conc48
 does **not** discriminate: ours 1.36–1.38× and the released draft 1.380× are the same number despite
 accept_len differing by 0.17 on gsm8k. Per-token latency is the honest statement — **22–34% off the AR
 cost** — and a real "speculative speedup" figure still needs conc1 for both arms, which nobody has run.
+
+## 2026-08-17 — conc1, under a deadline: **2.27×**, and why it isn't 4.8×
+
+The box was being reclaimed, so the conc1 plan (both arms, five datasets, ~12 h) was cut to what
+actually answers the question: **gsm8k, spec arm full 1319 prompts, AR arm 200**. Numbers and caveats
+in the [eval ledger](ascend-npu-dsv4-dspark-eval-results.md), new top section. Three things to carry
+forward:
+
+**① The conc48 speedup was an artifact, confirmed.** Same checkpoint, same dataset: 1.302× at conc48,
+**2.27× at conc1** — 74% higher. Every speedup figure in this repo predating today was measured where
+the engine is throughput-bound, and the conc48 table also shows the ratio failing to separate our
+draft from the released one (1.36–1.38× vs 1.380×) despite a 0.17 accept-length gap. **conc48
+throughput is not evidence about draft quality and should never be quoted as such.**
+
+**② accept_len is concurrency-independent** — 4.831 at conc1 vs 4.845 at conc48 on identical weights.
+That is a free revalidation of the entire conc48 matrix: batching moves throughput, not acceptance.
+
+**③ ★ The MoE verify tax — the finding worth chasing.** I predicted 3.4–3.9× and was wrong; the
+mechanism is the interesting part. Decomposed:
+
+    one AR step   = 38.51 ms -> 1 token
+    one spec step = 71.39 ms -> 4.831 tokens      (1.85x the cost of an AR step)
+    ideal if steps cost the same = 4.83x ;  realized 2.61x ;  efficiency 54%
+
+The dense-model intuition — at batch 1 decode is memory-bandwidth-bound on weight loading, so
+verifying 6 tokens is nearly free — **fails on a 256-expert MoE**. One token routes to 6 experts per
+layer; six tokens route to up to 36 distinct experts, and the step pays for pulling all of them. The
+draft's own 3-layer forward cannot explain the gap: 3 layers against 43 is ~7%, while the observed
+overhead is ~85% of an AR step. **Not profiled — this is a hypothesis with an arithmetic bound
+around it**, and it is the first thing to profile if anyone wants a bigger number.
+
+If it holds it is structural, not a defect of this draft: it caps achievable speedup well below
+`accept_len` for *any* draft on a MoE target. It also suggests an untried lever — **a smaller
+`num_spec` may trade acceptance for a cheaper verify and land higher overall**, which nothing in this
+repo has tested.
+
+**Still missing at conc1:** math500 (abandoned at 61%), humaneval, mbpp, mt-bench. mt-bench will be
+materially worse (accept_len 3.15 vs gsm8k 4.85). The AR arm's 200-prompt sampling is fine for a
+per-token rate but is not the strict same-set pairing the conc48 rows have. And DP2×TP8 idles half
+the deployment at conc1 — the *ratio* is robust, the absolute ms/token is not; a real single-request
+deployment would be TP16.
