@@ -61,11 +61,18 @@ export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"
 # ---------------------------------------------------------------------------------------
 # The work list: "label|dirname". An EMPTY dirname = AR baseline (serve started WITHOUT
 # DRAFT, so no drafting happens and the tok/s columns are the speedup denominator).
-# Ordered by value, not by epoch: the two baselines and the converged endpoints run FIRST,
+# Ordered by value, not by epoch: the released bar and the converged endpoints run FIRST,
 # so a batch that dies at hour 3 still delivered everything the headline needs.
+#
+# AR-baseline runs LAST, deliberately. The worklog's own note is that the denominator is
+# DRAFT-INDEPENDENT -- measured once, reused for every row -- and a usable measurement
+# already exists (460.7 / 612.3 / 320.9 / 669.0 / 446.8 tok/s, on the pre-cutover sample
+# set). So it is the one entry whose absence blocks nothing, and it has already cost this
+# batch one failed run: its serve died mid-stream with `Response ended prematurely` seven
+# minutes in. Putting it at the tail keeps that failure from eating the front of a 9-hour
+# unattended sweep. Drop it entirely with ONLY='released|ep[0-9]'.
 # ---------------------------------------------------------------------------------------
 ENTRIES=(
-  "AR-baseline|"
   "released|released_draft_bf16_standalone"
   "ep5p0-lossreduce|dsv4_dspark_ep5p0_lossreduce_vllm-77w"
   "ep4p5-ropefix|dsv4_dspark_ep4p5_ropefix_vllm-77w"
@@ -83,6 +90,7 @@ ENTRIES=(
   "ep1p0-lossreduce|dsv4_dspark_ep1p0_lossreduce_vllm-77w"
   "ep0p5-ropefix|dsv4_dspark_ep0p5_ropefix_vllm-77w"
   "ep0p5-lossreduce|dsv4_dspark_ep0p5_lossreduce_vllm-77w"
+  "AR-baseline|"
 )
 
 say() { echo "$*" | tee -a "$MASTER"; }
