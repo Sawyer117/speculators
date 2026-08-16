@@ -34,7 +34,13 @@ DATASET="${DATASET:-all}"
 KEEP_WARMUP="${KEEP_WARMUP:-1}"
 MAX_NEW="${MAX_NEW:-2048}"
 SERVE_TIMEOUT="${SERVE_TIMEOUT:-1800}"
-SETTLE="${SETTLE:-45}"
+SETTLE="${SETTLE:-60}"   # fallback settle when npu-smi can't be read at all
+# ⚠ vLLM renames its subprocesses to VLLM::EngineCore / VLLM::Worker -- UPPERCASE -- while the
+#   API server is `vllm serve`, lowercase. `pkill -f` is CASE-SENSITIVE, so a lowercase-only
+#   pattern kills the server and leaves the engine cores alive still holding every byte of HBM,
+#   and the next serve then OOMs at weight load. Every kill/probe below uses -i.
+PROCPAT="${PROCPAT:-vllm|serve_dsv4_a3_singlenode|EngineCore}"
+KILL_PREFIX="${KILL_PREFIX:-}"       # set to 'sudo -n' if the serves need root to kill
 SKIP_DONE="${SKIP_DONE:-1}"
 ONLY="${ONLY:-}"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -83,21 +89,70 @@ say() { echo "$*" | tee -a "$MASTER"; }
 
 serve_up() { curl -sf --noproxy '*' "http://localhost:$PORT/v1/models" >/dev/null 2>&1; }
 
-stop_serve() {
-  # Nothing listening and no vllm process → nothing to tear down, don't burn $SETTLE.
-  serve_up || pgrep -f "vllm" >/dev/null 2>&1 || return 0
-  pkill -f serve_dsv4_a3_singlenode >/dev/null 2>&1
-  sleep 5
-  pkill -f "vllm" >/dev/null 2>&1
-  for _ in $(seq 1 36); do          # up to 180s for a graceful teardown
-    serve_up || { sleep "$SETTLE"; return 0; }
-    sleep 5
+procs_alive() { pgrep -if "$PROCPAT" >/dev/null 2>&1; }
+
+# Max per-device HBM in use, in MB. Best-effort: `npu-smi info` prints a `used / total` cell
+# per device; keep only cells whose total looks like memory (>1000) so the `0 / 0` AICore
+# cells are ignored. Returns non-zero if npu-smi is absent or the output can't be parsed,
+# in which case callers fall back to a fixed sleep.
+npu_used_mb() {
+  command -v npu-smi >/dev/null 2>&1 || return 1
+  npu-smi info 2>/dev/null | grep -oE '[0-9]+ +/ +[0-9]+' \
+    | awk -F'/' '{ u=$1+0; t=$2+0; if (t > 1000 && u > m) m = u } END { if (m == "") exit 1; print m+0 }'
+}
+
+# Is ANY process still holding an NPU? `npu-smi info` ends with a per-device process table; an
+# idle device prints "No running processes found". This is the format-tolerant question to ask --
+# an absolute HBM threshold is not, because the idle Memory-Usage baseline differs per box and a
+# too-low threshold would stall every teardown for the full timeout.
+#   0 = a device is still held   1 = nothing is holding one   2 = cannot tell (no npu-smi / odd output)
+npu_procs_held() {
+  command -v npu-smi >/dev/null 2>&1 || return 2
+  local out; out="$(npu-smi info 2>/dev/null)" || return 2
+  echo "$out" | grep -qi "Process id" || return 2
+  echo "$out" | awk '
+    /Process id/ { p = 1; next }
+    p && /^\|[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]*\|[[:space:]]*[0-9]+/ { n++ }
+    END { exit (n > 0 ? 0 : 1) }'
+}
+
+# HBM is released by the driver a beat AFTER the last process exits. Starting the next serve
+# before that makes it OOM at weight load, which this driver would then log as "serve did not
+# come up" -- i.e. a silently missing data point. pkill above already confirmed OUR processes
+# are gone; this additionally catches a device pinned by somebody else's job.
+wait_npu_free() {
+  local waited=0 rc mb
+  while [ "$waited" -lt 180 ]; do
+    npu_procs_held; rc=$?
+    [ "$rc" = 2 ] && { sleep "$SETTLE"; return 0; }       # can't tell → fixed settle
+    [ "$rc" = 1 ] && break                                # nothing holding a device
+    [ "$waited" = 60 ] && say "    waiting for an NPU still held by another process ..."
+    sleep 10; waited=$((waited + 10))
   done
-  say "    (graceful stop timed out — escalating to SIGKILL)"
-  pkill -9 -f "vllm" >/dev/null 2>&1
   sleep 20
+  if mb=$(npu_used_mb); then say "    NPU clear after ${waited}s (max ${mb} MB still mapped)"
+  else                       say "    NPU clear after ${waited}s"; fi
+  return 0
+}
+
+stop_serve() {
+  # Nothing listening and no process alive → nothing to tear down, don't burn the settle time.
+  serve_up || procs_alive || return 0
+  say "    stopping serve ..."
+  $KILL_PREFIX pkill -if "$PROCPAT" >/dev/null 2>&1
+  for _ in $(seq 1 24); do procs_alive || break; sleep 5; done        # up to 120s graceful
+  if procs_alive; then
+    say "    (graceful stop timed out — escalating to SIGKILL)"
+    $KILL_PREFIX pkill -9 -if "$PROCPAT" >/dev/null 2>&1
+    for _ in $(seq 1 12); do procs_alive || break; sleep 5; done      # 60s more
+  fi
+  if procs_alive; then
+    say "    !! processes STILL alive after SIGKILL — most likely owned by another user."
+    say "       re-run the batch with KILL_PREFIX='sudo -n', or clear them by hand:"
+    pgrep -aif "$PROCPAT" 2>/dev/null | head -10 | sed 's/^/       /' | tee -a "$MASTER"
+  fi
   serve_up && say "    !! WARNING: something is STILL answering on :$PORT"
-  sleep "$SETTLE"
+  wait_npu_free
   return 0
 }
 
