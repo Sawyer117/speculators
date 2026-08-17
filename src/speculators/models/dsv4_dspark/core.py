@@ -555,8 +555,38 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         mask_token_ids[:, :: self.block_size] = input_ids[:, anchor_positions]
         noise_embedding = self.embed_tokens(mask_token_ids)  # [1, TB, H]
 
-        fc_output = self.fc(hidden_states)
-        fc_output = self.hidden_norm(fc_output)  # [1, T, H]  (main_x context)
+        # ⚠ These two calls are why the DFlash backbone experiments are NOT dead on
+        # this model. `_backbone_forward` is overridden here to swap in the DSV4 sparse
+        # stack, and the override used to inline `hidden_norm(fc(hidden_states))` and
+        # take `noise_embedding` straight from the embedding table -- which silently
+        # skipped every `--dflash-*` hook, so those flags parsed, built their modules,
+        # and then did nothing. Route through the inherited helpers instead:
+        #
+        #   _fuse_target_hidden      -> gated layer fusion (--dflash-gated-layer-fusion)
+        #                               and, on top of it, the DFly per-draft-layer
+        #                               residual. With fusion OFF it is EXACTLY the
+        #                               previous `hidden_norm(fc(...))`.
+        #   _condition_noise_embedding -> block-position embedding
+        #                               (--dflash-block-position-embedding), the context
+        #                               residual (--dflash-context-residual) and the
+        #                               verifier-final residual.
+        #
+        # Every one of those parts is zero-initialised (`tanh(0) == 0`, zeroed embedding
+        # and score weights), so with all flags off this is bit-identical to the code it
+        # replaces and no checkpoint in the eval ledger is affected.
+        fc_output = self._fuse_target_hidden(hidden_states)  # [1, T, H] (main_x context)
+
+        noise_embedding = self._condition_noise_embedding(
+            noise_embedding,
+            fc_output,
+            anchor_positions,
+            document_ids,
+            # ⚠ --dflash-verifier-final-residual is WIRED but never exercised on DSV4:
+            # DFlash wants the verifier's pre-LM-head hidden state, and this is the
+            # closest tensor the DSV4 path carries. Validate that identification before
+            # enabling that flag; the other three hooks do not touch it.
+            verifier_pre_lm_hidden=verifier_last_hidden_states,
+        )
 
         from speculators.models.dflash.utils import get_base_indices_for_anchored_blocks
 
