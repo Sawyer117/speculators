@@ -52,15 +52,54 @@
 set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ---------------------------------------------------------------------------------------
+# HEAD WIDTH — the one thing in his config that does NOT transfer by itself.
+#
+# The head's INTERFACE adapts automatically (hidden_proj/token_proj take our hidden 4096,
+# the vocabulary projections take our 129,280), but its INTERNAL width is an absolute
+# number tuned against a dense Qwen3-4B:
+#
+#   his   512 / hidden 2560 = 20.0%          ours  512 / hidden 4096 = 12.5%
+#
+# so verbatim gives us a proportionally TIGHTER bottleneck than he tuned. Preserving his
+# ratio would be ~819; 1024 is the round number (25%, and 8 heads => a clean 128/head).
+#
+# so verbatim would give us a proportionally TIGHTER bottleneck than he ever tested. We
+# scale it: 1024 = 25% of hidden, and 8 heads divide it into a clean 128/head. (His exact
+# 20% ratio is 819, which is NOT usable -- 819/8 is not an integer. 832 is the nearest
+# workable equivalent if the exact ratio is ever wanted.)
+#
+# Scaling up is cheap here, which is the deciding fact: 85% of the head's parameters are
+# the two 129,280-wide matrices, and those follow the RANK, not this width. So 512 -> 1024
+# moves the head from 78.0 M to 97.1 M -- +25% on the head, about +2 points of per-token
+# MAC (roughly 9% -> 11% of the draft). That matters because yesterday's conc1 run showed a
+# spec step already costs 1.85x an AR step, and step cost -- not acceptance -- is what caps
+# the speedup at 2.27x against a 4.83x ceiling. Two points is affordable; starving the head
+# is not, because a flat result would then be unattributable: "the head does not help" and
+# "we gave the head a quarter of the capacity it was tuned with" look identical in the
+# accept-length table.
+#
+# CORRECTION_RANK stays 256 on our OWN evidence, not his: the released DSV4 draft sets
+# markov_rank = 256 at this exact hidden/vocabulary, and our MarkovHead is already
+# Embedding(129280, 256) -- so 256 is the value DeepSeek chose at our scale. It is also the
+# one parameter that DOES scale those two vocabulary matrices, so doubling it would add
+# ~66 M and land squarely on the step-cost axis. Leave it.
+#
+#   CORRECTION_HIDDEN=512 bash ... train_dsv4_dspark_correction.sh faithful   # his original
+# ---------------------------------------------------------------------------------------
+CORRECTION_HIDDEN="${CORRECTION_HIDDEN:-1024}"  # ★ SCALED for hidden 4096 (his was 512 @ 2560)
+CORRECTION_RANK="${CORRECTION_RANK:-256}"       # = the released draft's markov_rank at our scale
+CORRECTION_HEADS="${CORRECTION_HEADS:-8}"       # head dim = CORRECTION_HIDDEN / this = 128
+
 CORRECTION_ARGS=(
   # ---- correction core -------------------------------------------------------
   --enable-correction-head
   --correction-output-mode logits          # feed previous logits + a Markov-like vocab bias
-  --correction-hidden-size 512
-  --correction-rank 256
+  --correction-hidden-size "$CORRECTION_HIDDEN"
+  --correction-rank "$CORRECTION_RANK"
   --no-correction-lm-head-fusion           # hidden-mode-only optimisation; inert in logits mode
   --correction-num-layers 1
-  --correction-num-heads 8
+  --correction-num-heads "$CORRECTION_HEADS"
   --correction-gate-bias 0.0
 
   # ---- correction MoE: OFF (his baseline), values kept so enabling is one edit ----
