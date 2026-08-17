@@ -1214,3 +1214,48 @@ SUPERSEDED with the reasoning attached.
 +3.5%/+5.4%, which means nothing there. The graph-padding and linear-cost models predict **2.95× vs
 2.52×** — opposite sides of ns5's measured 2.61×. One 5-minute conc1 run settles it. Until then ns7
 is an acceptance win and a latency unknown; **do not quote a speedup for it.**
+
+## 2026-08-18 — ⚠ PRECONDITION for merging the upstream sync: hs_connectors
+
+Not a problem on this branch — recorded here because it **will** be, the moment the
+2026-08-13 upstream sync lands, and because the symptom is actively misleading.
+
+Upstream **#735** (`1afb3b2`) turned `hs_connectors` into a **uv workspace member**:
+`pyproject.toml` lists `hs-connectors` under `dependencies` and resolves it via
+`[tool.uv.sources] hs-connectors = { workspace = true }`. **`pip install -e .` cannot read that
+table.** It looks for `hs-connectors` on PyPI, finds nothing, and leaves the dependency
+unsatisfied — while `scripts/train.py:94` imports it unconditionally. Every rank dies before a
+single module is built.
+
+That matters specifically because **our deployment contract is "install this commit"**: the
+install SSOT (`install_npu_env_dspark.sh`) builds every training env with plain pip. The day the
+sync merges, that documented path stops producing a working env.
+
+**The symptom hides the cause.** torch_npu's own excepthook recurses ~996 frames while formatting
+the failure, so the log is a wall of `RecursionError: maximum recursion depth exceeded`. The real
+error is one line at the very bottom, under `Original exception was:`. **When reading any NPU
+training failure, go to that marker first** — everything above it can be noise from the handler
+rather than from the program.
+
+Reproduced away from the box, which also explains it: with the repo root on `sys.path`,
+`import hs_connectors` binds the OUTER `hs_connectors/` directory as a namespace package and
+shadows the real one —
+
+    resolved -> None _NamespacePath(['.../hs_connectors'])
+    ImportError: cannot import name 'HiddenStatesBackend' from 'hs_connectors' (unknown location)
+
+— verbatim the box's message. Prepending `hs_connectors/src` resolves to
+`.../hs_connectors/src/hs_connectors/__init__.py` and the import succeeds.
+
+**Both fixes already exist on `feat/dspark-next-port` (`f48572b`) and MUST come across with the
+sync:**
+
+1. `train_dsv4_dspark.sh` prepends `$REPO_ROOT/hs_connectors/src` to `PYTHONPATH` — repairs
+   every env that already exists, without reinstalling, and is a no-op where the package is
+   installed properly (same files, not a competing copy).
+2. `install_npu_env_dspark.sh` installs the workspace member directly after speculators, asserts
+   the import, and exits 2 if it still fails. Guarded on the directory existing so it stays
+   correct on a pre-#735 checkout.
+
+⚠ Do not "fix" this by reverting anything on this branch. `cc3d2ef` predates #735, has no such
+import, and trains fine — there is nothing broken here to revert.
