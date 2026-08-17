@@ -52,6 +52,109 @@ Unless a run says otherwise, all numbers below share:
   (Our serve runs *above* the official 3.94 because #12006 + bf16 dequant; use the released *row* as
   the same-serve target, and 3.94 only as the cross-stack sanity floor.)
 
+## ★★★ 2026-08-17 — `num_spec=7` on a block-5 draft: train-short/serve-long works, and it moves the bar
+
+The draft is trained with `block_size=6` (anchor + 5 mask slots) and emits 5 tokens; the released
+draft is the same. But **DeepSeek's own serving recipe is `num_spec: 7`** (README: `method:"dspark",
+num_spec:7, draft_sample_method:"greedy"`, GB300 + upstream vLLM — worklog 2026-07-16), so every
+`num_spec=5` row in this ledger, **including the released bar**, is a non-official operating point.
+This section measures all three drafts at 7.
+
+**Validity gate first.** `num_draft_tokens / num_drafts` = **7.000** for all three entries (released
+267715/38245, ropefix 255003/36429, lossreduce 257439/36777). The CLI setting reaches the proposer;
+nothing silently fell back to 5. Full sets, conc48, `KEEP_WARMUP=1`, repo `3d49021`.
+
+| accept_len | gsm8k | math500 | humaneval | mbpp | mt-bench | **mean** | non-chat |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| released **ns7** | 5.221 | **5.273** | **5.619** | **5.072** | **3.525** | **4.9420** | **5.2962** |
+| `ep5p0-ropefix` **ns7** | **5.485** | 5.077 | 5.543 | 5.062 | 3.253 | 4.8840 | 5.2918 |
+| `ep5p0-lossreduce` **ns7** | 5.459 | 5.123 | 5.547 | 5.053 | 3.264 | 4.8892 | 5.2955 |
+| *released ns5 (for reference)* | 4.665 | 4.639 | 4.939 | 4.526 | 3.347 | 4.4232 | 4.6922 |
+| *`ep5p0-ropefix` ns5* | 4.845 | 4.565 | 4.971 | 4.546 | 3.154 | 4.4162 | 4.7317 |
+| *`ep5p0-lossreduce` ns5* | 4.831 | 4.591 | 4.919 | 4.557 | 3.195 | 4.4186 | 4.7245 |
+
+★ **Train-short / serve-long works, and it replicates.** Our two independently-trained arms gain
+**+0.4678** and **+0.4706** on the 5-dataset mean — agreeing to 0.003, far inside the ±0.025 noise
+band. This is a genuine effect, not scatter.
+
+⚠ **But it is not free, and it is not ours alone.**
+
+| | ns5 → ns7 gain |
+|---|---:|
+| released | **+0.5188** |
+| `ep5p0-ropefix` | +0.4678 |
+| `ep5p0-lossreduce` | +0.4706 |
+
+**The released draft gains more than we do**, so our standing *falls* when both move to the official
+configuration:
+
+| | 5-set mean vs released | non-chat four vs released |
+|---|---:|---:|
+| at ns5 | 99.84% / **99.90%** | 100.84% / 100.69% — **ahead** |
+| **at ns7 (official)** | **98.83% / 98.93%** | 99.92% / **99.99%** — **level** |
+
+### Where we lose: the OOD cliff, not the model
+
+gsm8k conditional acceptance `c_k = S_k / S_{k-1}`:
+
+| | c0 | c1 | c2 | c3 | c4 | c5 | c6 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| released | 0.921 | 0.889 | 0.870 | 0.862 | 0.818 | 0.768 | **0.693** |
+| `ep5p0-ropefix` | **0.926** | **0.905** | **0.893** | **0.879** | **0.863** | **0.792** | 0.657 |
+
+**We are higher at every position the draft was trained on (c0–c5) and lower only at c6** — we start
+better and fall off a steeper cliff. Per dataset the same story: gsm8k we win by +0.264, but
+humaneval flips from a small ns5 win to −0.076, mbpp from a small win to level, and mt-bench's
+deficit widens from −0.193 to −0.272. **Every point we lose is at pos5/pos6.** That is the signature
+of a draft over-fitted to its block width, not of a weaker draft.
+
+The extra slots also perturb the positions that *were* trained. gsm8k pos0–4, ns5 → ns7:
+
+    ropefix     93.67 85.60 76.99 68.26 59.94  ->  92.64 83.81 74.87 65.82 56.78
+                -1.03 -1.79 -2.12 -2.44 -3.16     (lossreduce: -0.88 -1.82 -1.78 -2.65 -3.27)
+
+Net on gsm8k: **−0.105 token lost across pos0–4, +0.745 gained from pos5–6, +0.640 net.**
+
+### ★ The action this points at: retrain with `--block-size 8`
+
+If pos5/pos6 were in-distribution and followed our own smooth decay (c5≈0.850, c6≈0.838 extrapolated
+from c4=0.863), gsm8k would reach **≈5.78** against the released draft's 5.221 — and the −0.105
+perturbation of pos0–4 would disappear as well. **We are not losing on model quality; we are losing
+because the block width does not match the serving configuration.** Training at `block_size=8`
+(γ=7) aligns them, and it is what the official recipe implies we should have done from the start.
+
+### Supersedes the earlier train-short/serve-long row
+
+[`ep1mid-f1-blk7`](#runs-detail) ran this same experiment and concluded *"pos6 nearly dead (2–6%) →
+γ=6 likely the sweet spot"* and *"NOT a free speedup: throughput ~FLAT"*. **Both conclusions are
+withdrawn.** That row used the `f1 1.5ep` checkpoint — trained under the **degenerate RoPE** (complex
+freqs cast to bf16 = scale-only, no rotation, fixed in `feb0066`/`8db8f75`) and only 1.5 epochs in:
+
+| | `f1 1.5ep` (pre-RoPE-fix) | `ep5p0-ropefix` (today) |
+|---|---:|---:|
+| mean gain ns5→ns7 | +0.099 | **+0.468** |
+| pos5 | ~10–18% | **44.98%** |
+| pos6 | ~2–6% | **29.56%** |
+
+★ **A model whose positional encoding was broken could not extrapolate to unseen positions.** The
+RoPE fix did not only raise in-distribution acceptance — **it restored positional extrapolation**,
+which is a consequence of that fix nobody had noticed.
+
+### Open: is ns7 actually faster at batch 1?
+
+**Not measured — the box was reclaimed.** conc48 throughput rose only +3.5% (ropefix) / +5.4%
+(lossreduce), but conc48 is saturation-bound and says nothing. The two cost models from the conc1
+section predict **opposite** outcomes, so this is genuinely unresolved:
+
+| ns7 at conc1, gsm8k | step | ms/token | speedup vs AR |
+|---|---:|---:|---:|
+| graph-padding model (step flat) | 71.39 ms | 13.05 | **2.95×** — faster than ns5's 2.61× |
+| linear-cost model (+6.04 ms/token) | 83.47 ms | 15.26 | **2.52×** — *slower* than ns5 |
+
+One 5-minute run settles it: `NUM_SPEC=7 DATASET=gsm8k CONCURRENCY=1 NUM_PROMPTS=100
+ONLY='ep5p0-ropefix'`, then read `Mean ITL` — near 71 ms means padding dominates. **Until then, ns7
+is established as an acceptance win and an unknown on latency.** Do not quote a speedup for it.
+
 ## ★★ 2026-08-17 — conc1: the speculative speedup conc48 could not measure — **2.27×** on gsm8k
 
 Every speedup in this ledger before today was measured at concurrency 48, where the engine is
@@ -356,7 +459,7 @@ multi-turn chat, drags it — quote per-dataset when a run's draft is non-chat).
 | `ep0end-dnorm-bal5e3-77w` *(A2: dnorm + balance 5e-3, epoch0-end = 1.0ep) — ⭐ CROSS-DOMAIN PIPELINE VALIDATION* | 4.027 | 3.626 | 3.838 | 3.568 | 2.455 | **3.50** | ⭐ **The main result here is PIPELINE VALIDATION, not the balance number.** A2 draft (DP8, LR2e-4, anchor512, dnorm, balance-from-0.5ep-resume, trained on **A2's own HS**) → converted → served on **A3-176** → **3.50 ≈ A3 dnorm no-balance 1.0ep (3.59)**, clean output (smoke-test数数 OK). ⟹ the cross-parallel-domain **HS-dump → training → conversion → inference path is SOUND** and A2/A3 are CONSISTENT (settles the abandoned warm-start's "A2 HS ≠ A3 HS" doubt). **NOT a clean balance A/B** — confounded vs the A3 dnorm by LR/anchor/DP/machine/resume, so 3.50 vs 3.59 is within slack, NOT "balance hurt dnorm". **★ Unified read:** balance added ~nothing to dnorm (already un-collapsed, N_eff ~76) but LIFTED f1 (collapsed, N_eff ~18) to the dnorm level (f1+bal 0.5ep 3.527 ≈ dnorm 3.535) → **balance only helps WHERE there's a collapse**; balance & dnorm are two routes to the same un-collapsed ~3.5-3.6 ceiling. Reaching released 4.42 needs MORE (data / lower-LR / teacher). Serve = 176 A3-single, EAGER=0, FLASHCOMM1=0, conc48. `0/`(1.0ep) → `dsv4_dspark_ep0end_dnorm_bal5e3_vllm-77w`. |
 | ⛔ `ep1mid-dnorm-bal5e3-77w` *(A2: dnorm + balance 5e-3, LR2e-4, epoch1-mid = 1.5ep) — DECLINE IS ROBUST* | 3.815 | 3.461 | 3.512 | 3.258 | 2.341 | **3.28** | ⛔ **A2 (LOWER LR + UN-COLLAPSED) ALSO declines → the over-train decline is ROBUST, not a single-lever fix.** A2 dnorm curve: 1.0ep **3.50** → 1.5ep **3.28** (−0.22, ALL datasets down). A2 = LR **2e-4** + dnorm teacher + **un-collapsed** (N_eff 43/77/78) — the exact opposite of A3 f1's high-LR + collapse — yet STILL over-trains past ~1.0ep. ⟹ **neither lower-LR NOR un-collapse NOR dnorm rescues the decline** (my "next lever = lower LR" call RETRACTED). The decline holds across {LR 3e-4 / 2e-4, collapsed / un-collapsed, single / double-norm}. **Best draft across everything stays A3 f1 1.5ep = 3.63 (82%).** Practical move = **EARLY-STOP at the ~1.5ep peak**, don't over-train; the ceiling-raiser to 4.42 must come from elsewhere (more/better DATA, KD-temperature on the correct teacher, #865) — NOT more epochs / balance / lower-LR. Serve = 176 A3-single, conc48. `1/`(1.5ep) → `dsv4_dspark_ep1mid_dnorm_bal5e3_vllm-77w`. |
 | **`ep1mid-f1-77w` *(single-norm, epoch1-mid = REPRODUCTION main line)*** | **4.069** | **3.757** | **4.100** | **3.674** | **2.549** | **3.63** | ★ **Reproduction ON TRACK — data scaling confirmed.** F1 single-norm epoch1-**mid** (1.5ep). vs its own ep0end (1.0ep, 3.37): **+0.26 mean, ALL datasets** (+0.09…+0.42), tail climbing (gsm8k pos2/3/4 51/36/28→**59/44/35**). **82% of released (4.42)** at 1.5/10 epoch (gsm8k 87%). ⚠ f1-1.5ep (3.63) > dnorm-1.0ep (3.59) but **epochs NOT aligned** — dnorm has no 1.5ep+ data (run killed ~1.36ep), so this is NOT a fair "f1 beat dnorm"; dnorm at 1.5ep could match/exceed. Only fair (same-epoch) point = 1.0ep, where dnorm(3.59)>f1(3.37). What IS shown: the single-norm faithful recipe scales with data. To compare trajectories, re-run dnorm to 1.5ep+. |
-| ⚡ `ep1mid-f1-blk7` *(BEST ckpt f1 1.5ep, served num_spec=**7** — TRAIN-SHORT-SERVE-LONG, inference-only)* | 4.266 | 3.887 | 4.111 | 3.758 | 2.624 | **3.73** | ⚡ **TRAIN-SHORT-SERVE-LONG WORKS** (SAME weights as `ep1mid-f1-77w`; trained γ=5/block_size6, **served at `dspark_block_size=7` / num_spec=7**, internal block 8). vs the SAME ckpt at ns5 (3.63): mean **+0.099, ALL 5 datasets up** (gsm8k 4.069→4.266). The **UNTRAINED slots 5/6 extrapolate** (pos5 ~10-18%, pos6 ~2-6% — RoPE + shared mask-token generalize; no weight hardcodes γ). ⚠ **NOT a free speedup: throughput ~FLAT** (533 vs ~541 tok/s; accept_rate 46.7% vs ~61%) — the wider block's draft+verify cost ≈ cancels the accept_len gain; **pos6 nearly dead (2-6%) → γ=6 likely the sweet spot.** ⚠ **NOT apples-to-apples with released 4.42** (that's ns5; released at ns7 would also rise) — keep ns5 for the reproduction comparison; ns7 is a serve-time lever. Serve = 176 A3-single; `dsv4_dspark_ep1mid_f1_blk7_vllm-77w` (softlink weights + `dspark_block_size` 5→7). |
+| ⚠️~~⚡~~ **SUPERSEDED 2026-08-17** `ep1mid-f1-blk7` *(BEST ckpt f1 1.5ep, served num_spec=**7** — TRAIN-SHORT-SERVE-LONG, inference-only)* | 4.266 | 3.887 | 4.111 | 3.758 | 2.624 | **3.73** | ⚡ **TRAIN-SHORT-SERVE-LONG WORKS** (SAME weights as `ep1mid-f1-77w`; trained γ=5/block_size6, **served at `dspark_block_size=7` / num_spec=7**, internal block 8). vs the SAME ckpt at ns5 (3.63): mean **+0.099, ALL 5 datasets up** (gsm8k 4.069→4.266). The **UNTRAINED slots 5/6 extrapolate** (pos5 ~10-18%, pos6 ~2-6% — RoPE + shared mask-token generalize; no weight hardcodes γ). ⚠ **NOT a free speedup: throughput ~FLAT** (533 vs ~541 tok/s; accept_rate 46.7% vs ~61%) — the wider block's draft+verify cost ≈ cancels the accept_len gain; **pos6 nearly dead (2-6%) → γ=6 likely the sweet spot.** ⚠ **NOT apples-to-apples with released 4.42** (that's ns5; released at ns7 would also rise) — keep ns5 for the reproduction comparison; ns7 is a serve-time lever. Serve = 176 A3-single; `dsv4_dspark_ep1mid_f1_blk7_vllm-77w` (softlink weights + `dspark_block_size` 5→7).  ⚠️ **2026-08-17 — the two conclusions in this row are WITHDRAWN.** Rerun on the converged RoPE-fixed draft gives pos5 **44.98%** and pos6 **29.56%** (not 10-18% / 2-6%) and a mean gain of **+0.468** (not +0.099), so neither "pos6 nearly dead" nor "γ=6 is the sweet spot" survives. Cause: this checkpoint was trained under the **degenerate RoPE** (scale-only, no rotation) and only 1.5 epochs — a model with a broken positional encoding cannot extrapolate to unseen block positions, so this was a false negative. The RoPE fix restored positional extrapolation as well as in-distribution acceptance. See the `num_spec=7` section at the top. |
 | ⭐ **`ep0mid-f1-bal5e3-77w` *(f1 + noaux_tc balance 5e-3, epoch0-MID = 0.5ep)*** | **3.998** | **3.700** | **3.885** | **3.595** | **2.457** | **3.53** | ★★ **STRONG POSITIVE for load balancing — clean single-variable A/B** (identical f1 recipe, ONLY variable = `DSPARK_MOE_BALANCE=1` @ rate 5e-3). At just **0.5ep** it ALREADY **beats no-balance f1's 1.0ep (3.37)** and **nears its 1.5ep PEAK (3.63)** — i.e. matches ~1.5ep of no-balance training in 0.5ep (gsm8k 3.998 vs no-bal 1.0ep 3.811 / 1.5ep-peak 4.069). ⚠ NOT same-epoch (favours balance even more: it wins with HALF the training). **Definitive test still ahead:** does it EXCEED the 3.63 peak AND AVOID the no-balance 1.5ep→3.0ep decline (3.63→3.01)? — watch 1.0/1.5/2.0ep. **★ Mechanism puzzle:** training-side N_eff stayed ~18 (5e-3 did NOT un-collapse the per-step load, [[dsv4-dspark-moe-loadbalance]]) yet eval jumped → the gain is likely the LEARNED `gate.bias` improving SERVE routing (picking a better ~18), NOT a higher N_eff — supports "N_eff=256 is too strict; the routing bias matters more than the count". Serve = 176 A3-single (386530d12, EAGER=0, **FLASHCOMM1=0** — now auto-gated on DRAFT, `281cc23`), conc48; `gate.bias` carried bit-exact (verify passed). `0/` (0.5ep) → `dsv4_dspark_ep0mid_bal5e3_vllm-77w`. |
 | `ep0end-f1-bal5e3-77w` *(f1 + balance 5e-3, epoch0-end = 1.0ep)* | 4.087 | 3.638 | 3.846 | 3.530 | 2.488 | **3.52** | f1+bal 1.0ep. gsm8k still climbing (0.5ep 3.998→**4.087**) but **mean FLAT vs 0.5ep (3.53→3.52)** — the harder sets (math500/mbpp/mt-bench) don't move. Training-side N_eff still ~20 (5e-3 too weak). Same 176 serve. `0/`(1.0ep) → `dsv4_dspark_ep0end_bal5e3_vllm-77w`. |
 | ⛔ `ep1mid-f1-bal5e3-77w` *(f1 + balance 5e-3, epoch1-mid = 1.5ep) — VERDICT ROW* | 3.963 | 3.675 | 3.740 | 3.482 | 2.475 | **3.47** | ⛔ **HYPOTHESIS REVERSED — balance is NOT the lever.** f1+bal curve **0.5ep 3.53 → 1.0ep 3.52 → 1.5ep 3.47** = a slow decline FROM THE START; it never climbed to a peak. At the same 1.5ep, **no-balance f1 PEAK 3.63 > balance 3.47 (−0.16)** — balance LOSES the same-epoch A/B; even gsm8k peaked at 1.0ep (4.087) then fell (3.963). ★★ **Both arms over-train & decline under LR 3e-4 → the decline is LR-driven, NOT collapse-driven** (balance never un-collapsed N_eff ~20 AND still declined; earlier "balance must beat the decline curve" call is retracted). noaux_tc @5e-3 = an early-epoch `gate.bias` bump (picks a better ~18) with a LOWER ceiling; it neither beats the peak nor avoids the decline. **Next lever = LOWER LR** — the A2 dnorm@2e-4 arm tests exactly this (does un-collapsed + low-LR HOLD past 1.5ep). Serve = SAME 176 A3-single. `1/`(1.5ep) → `dsv4_dspark_ep1mid_bal5e3_vllm-77w`. |

@@ -1171,3 +1171,46 @@ materially worse (accept_len 3.15 vs gsm8k 4.85). The AR arm's 200-prompt sampli
 per-token rate but is not the strict same-set pairing the conc48 rows have. And DP2×TP8 idles half
 the deployment at conc1 — the *ratio* is robust, the absolute ms/token is not; a real single-request
 deployment would be TP16.
+
+## 2026-08-17 — `num_spec=7`: the block width, not the model, is what is costing us
+
+The user's point: DSpark can be trained short and served long, so test it. Three drafts at
+`num_spec=7`, conc48, full sets — released, `ep5p0-ropefix`, `ep5p0-lossreduce`. Validity gate passed
+on all three (`num_draft_tokens / num_drafts` = **7.000** exactly). Numbers in the
+[ledger](ascend-npu-dsv4-dspark-eval-results.md), new top section.
+
+**It works, and it replicates.** Our two independently-trained arms gain **+0.4678** and **+0.4706**
+on the 5-dataset mean — agreeing to 0.003, far inside the ±0.025 noise band established yesterday.
+
+**But the released draft gains more (+0.5188), so our standing falls at the official setting.** And
+`num_spec=7` *is* the official setting — DeepSeek's README recipe is `num_spec: 7`, which means every
+ns5 row in this ledger, the released bar included, is a non-official operating point:
+
+    5-set mean vs released     ns5  99.84% / 99.90%     ns7  98.83% / 98.93%
+    non-chat four              ns5 100.84% / 100.69%    ns7  99.92% / 99.99%
+
+★ **Where it goes is unambiguous.** gsm8k conditional acceptance: we are higher than released at
+**every position the draft was trained on** (c0–c5: 0.926/0.905/0.893/0.879/0.863/0.792 vs
+0.921/0.889/0.870/0.862/0.818/0.768) and lower only at **c6** (0.657 vs 0.693). Per dataset, every
+point we lose is at pos5/pos6. That is over-fitting to the block width, not a weaker draft. The extra
+slots also perturb the trained positions (pos0–4 drop 1–3 pt, −0.105 token), which a matched block
+width would not.
+
+★★ **Action: the next training run uses `--block-size 8`.** With pos5/pos6 in-distribution and
+following our own decay, gsm8k projects to **≈5.78** against released's 5.221, and the pos0–4
+perturbation disappears. We have been training at a block width that does not match the serving
+configuration the model is meant to run at.
+
+**It also overturns our own earlier finding.** `ep1mid-f1-blk7` ran this exact experiment months ago
+and concluded "pos6 nearly dead (2–6%) → γ=6 likely the sweet spot". That checkpoint was trained
+under the **degenerate RoPE** (complex freqs cast to bf16 = scale-only, no rotation) and only 1.5
+epochs; today the same experiment gives pos5 **44.98%** and pos6 **29.56%**, a 4.7× larger mean gain.
+A model with a broken positional encoding cannot extrapolate to unseen positions — so that was a
+false negative, and **the RoPE fix restored positional extrapolation, not just in-distribution
+acceptance.** That consequence of `feb0066`/`8db8f75` had gone unnoticed. The row is marked
+SUPERSEDED with the reasoning attached.
+
+⚠ **Unresolved, and the box is gone: is ns7 faster at batch 1?** conc48 throughput moved only
++3.5%/+5.4%, which means nothing there. The graph-padding and linear-cost models predict **2.95× vs
+2.52×** — opposite sides of ns5's measured 2.61×. One 5-minute conc1 run settles it. Until then ns7
+is an acceptance win and a latency unknown; **do not quote a speedup for it.**
