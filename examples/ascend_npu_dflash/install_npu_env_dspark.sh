@@ -92,6 +92,22 @@ python -m pip install triton-ascend==3.2.1 "${IDX[@]}"
 
 echo "== 6. speculators (--no-deps) + train/rollout deps =="
 python -m pip install --no-deps -e "$ROOT/speculators" 2>/dev/null || python -m pip install --no-deps -e "$REPO_ROOT"
+
+# hs_connectors is a **uv workspace member**, not a PyPI package: upstream #735 declares it in
+# `dependencies` and resolves it through `[tool.uv.sources] hs-connectors = { workspace = true }`.
+# The `pip install -e` above cannot see that table, so it leaves the dependency unsatisfied while
+# `scripts/train.py` imports it unconditionally -- every rank then dies at import, behind ~996
+# frames of RecursionError from torch_npu's own excepthook. Install the workspace member directly.
+_HS_DIR="$ROOT/speculators/hs_connectors"; [ -d "$_HS_DIR" ] || _HS_DIR="$REPO_ROOT/hs_connectors"
+if [ -d "$_HS_DIR" ]; then
+  python -m pip install --no-deps -e "$_HS_DIR"
+  python -c "from hs_connectors import HiddenStatesBackend" \
+    && echo "   hs_connectors OK" \
+    || { echo "!! hs_connectors still not importable — train.py:94 will kill every rank"; exit 2; }
+else
+  echo "   (no hs_connectors/ in this checkout — pre-#735 tree, nothing to install)"
+fi
+
 python -m pip install datasets loguru typer pydantic-settings tensorboard aiohttp
 
 echo "== 7. FORCE numpy $NUMPY_VER (LAST pip op — triton-ascend<2 downgraded it) + verify =="

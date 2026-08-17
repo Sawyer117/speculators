@@ -245,6 +245,23 @@ _ep_host="$(printf '%s' "$ENDPOINT"        | sed -E 's#^https?://([^:/]+).*#\1#'
 _fb_host="$(printf '%s' "${HS_FETCH_BASE:-}" | sed -E 's#^https?://([^:/]+).*#\1#')"
 export no_proxy="127.0.0.1,localhost,${_ep_host}${_fb_host:+,$_fb_host}"
 export NO_PROXY="$no_proxy"
+
+# ---- hs_connectors: make the import work in a pip-built env ---------------------------
+# Upstream #735 (`1afb3b2`, in this branch's sync) turned hs_connectors into a **uv workspace
+# member**: pyproject declares `hs-connectors` as a dependency and resolves it via
+# `[tool.uv.sources] hs-connectors = { workspace = true }`. Plain `pip install -e .` -- which
+# is what install_npu_env_dspark.sh does and what every existing training env was built with
+# -- does not understand that table, looks for `hs-connectors` on PyPI, and silently leaves it
+# uninstalled. `scripts/train.py:94` then imports it unconditionally and every rank dies.
+#
+# ⚠ The symptom is badly misleading: torch_npu's own excepthook recurses ~996 frames while
+# formatting the failure, so the log is a wall of RecursionError and the real cause sits at
+# the very bottom under "Original exception was:".
+#
+# Pointing PYTHONPATH at the in-repo source makes this work whether or not the package was
+# ever installed, and it is the same files an editable install would expose -- so it is a
+# no-op on a correctly built env rather than a competing copy.
+export PYTHONPATH="$REPO_ROOT/hs_connectors/src${PYTHONPATH:+:$PYTHONPATH}"
 if ! curl -sf --noproxy '*' "$ENDPOINT/models" >/dev/null 2>&1; then
   echo "WARN: serve not reachable at $ENDPOINT — start 115/116 first (or set ENDPOINT=)."
 fi
