@@ -474,8 +474,32 @@ def dpace_loss_decay(
 # ``tv`` and ``nla`` run the fused Triton kernels on CUDA/ROCm (much lower peak
 # memory at long context; see models/fused_tv_loss.py) and fall back to the eager
 # losses above on every other backend -- CPU, or non-CUDA accelerators such as
-# Ascend NPU where mainline Triton has no backend. ``logits.is_cuda`` gates
-# CUDA/ROCm; the import is lazy so this module imports without Triton installed.
+# Ascend NPU. The import is lazy so this module imports without Triton installed.
+#
+# WARNING: the gate CANNOT be the tensor's is_cuda flag. torch_npu's
+# transfer_to_npu shim aliases the entire CUDA surface onto Ascend, so an NPU
+# tensor answers True and the fused path is taken on hardware it was never meant
+# for. On this fork that is not a slow path, it is a hard failure: Ascend's Triton
+# backend compiles the kernel and the BiShengIR pipeline rejects it --
+#
+#     error: ub overflow, requires 33554432 bits while 1572864 bits available!
+#
+# 4 MB of unified buffer requested against the 192 KB the chip has. The kernel
+# stages a whole padded vocabulary row (131,072 x fp32 = 512 KB) several times
+# over, which fits a GPU's shared memory and cannot fit here. A smaller
+# vocabulary would merely have made this latent.
+
+
+def _fused_loss_available(logits: torch.Tensor) -> bool:
+    """True only for a genuine CUDA/ROCm tensor -- see the note above.
+
+    ``SPECULATORS_DISABLE_FUSED_LOSS=1`` forces the eager path unconditionally.
+    The training launcher exports it on Ascend so the choice never depends on what
+    a given torch_npu build happens to report for ``device.type``.
+    """
+    if os.environ.get("SPECULATORS_DISABLE_FUSED_LOSS") == "1":
+        return False
+    return logits.device.type == "cuda"
 
 
 @cache
@@ -490,7 +514,7 @@ def _fused_kernel(name: str):
 
 def tv_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor):
     """TV loss: fused Triton on CUDA/ROCm (fp32), eager ``tv_loss`` on CPU/NPU."""
-    if logits.is_cuda:
+    if _fused_loss_available(logits):
         kernel = _fused_kernel("fused_tv_loss")
         if kernel is not None:
             return kernel(logits, targets)
@@ -499,7 +523,7 @@ def tv_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor):
 
 def nla_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor):
     """NLA loss: fused Triton on CUDA/ROCm (fp32), eager on CPU/NPU."""
-    if logits.is_cuda:
+    if _fused_loss_available(logits):
         kernel = _fused_kernel("fused_nla_loss")
         if kernel is not None:
             return kernel(logits, targets)

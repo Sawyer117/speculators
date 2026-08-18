@@ -262,6 +262,16 @@ export NO_PROXY="$no_proxy"
 # ever installed, and it is the same files an editable install would expose -- so it is a
 # no-op on a correctly built env rather than a competing copy.
 export PYTHONPATH="$REPO_ROOT/hs_connectors/src${PYTHONPATH:+:$PYTHONPATH}"
+
+# ---- fused Triton losses: OFF on Ascend -------------------------------------------------
+# Upstream #752 added Triton-fused tv/nla losses, dispatched on the tensor's is_cuda flag.
+# torch_npu's transfer_to_npu aliases CUDA onto Ascend, so an NPU tensor answers True and
+# the fused kernel is selected here -- where Ascend's Triton backend then refuses it:
+#   error: ub overflow, requires 33554432 bits while 1572864 bits available!
+# 4 MB of unified buffer against the chip's 192 KB, because the kernel stages a padded
+# 131,072-wide vocabulary row several times over. metrics.py now gates on device.type, and
+# this makes the choice explicit rather than dependent on what torch_npu reports.
+export SPECULATORS_DISABLE_FUSED_LOSS="${SPECULATORS_DISABLE_FUSED_LOSS:-1}"
 if ! curl -sf --noproxy '*' "$ENDPOINT/models" >/dev/null 2>&1; then
   echo "WARN: serve not reachable at $ENDPOINT — start 115/116 first (or set ENDPOINT=)."
 fi
