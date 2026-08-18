@@ -145,7 +145,12 @@ class DSparkDraftModel(DFlashDraftModel):
                 self.correction_markov_gate = torch.nn.Linear(
                     config.correction_hidden_size, 1
                 )
-                self.correction_markov_scale = torch.nn.Parameter(torch.zeros(()))
+                # ⚠ 1-D with numel 1, NOT a 0-dim scalar: FSDP2's fully_shard rejects scalar
+                # parameters outright ("doesn't support scalar parameters"), which is how this
+                # whole family of gates killed the first DSV4 run at shard time. Every use is an
+                # elementwise `tanh(gate) * tensor`, so shape (1,) broadcasts to exactly the same
+                # result a 0-dim tensor gave. Do not "simplify" these back to torch.zeros(()).
+                self.correction_markov_scale = torch.nn.Parameter(torch.zeros(1))
                 torch.nn.init.zeros_(self.correction_markov_gate.weight)
                 torch.nn.init.constant_(
                     self.correction_markov_gate.bias,

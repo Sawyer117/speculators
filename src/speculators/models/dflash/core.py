@@ -146,7 +146,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
             self.layer_fusion_score = nn.Linear(hidden_size, 1, bias=False)
             self.layer_fusion_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-            self.layer_fusion_gate = nn.Parameter(torch.zeros(()))
+            # ⚠ 1-D with numel 1, NOT a 0-dim scalar: FSDP2's fully_shard rejects scalar
+            # parameters outright ("doesn't support scalar parameters"), which is how this
+            # whole family of gates killed the first DSV4 run at shard time. Every use is an
+            # elementwise `tanh(gate) * tensor`, so shape (1,) broadcasts to exactly the same
+            # result a 0-dim tensor gave. Do not "simplify" these back to torch.zeros(()).
+            self.layer_fusion_gate = nn.Parameter(torch.zeros(1))
 
         self.dfly_layer_fusion_logits: nn.Parameter | None = None
         self.dfly_layer_residual_gate: nn.Parameter | None = None
@@ -154,7 +159,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             self.dfly_layer_fusion_logits = nn.Parameter(
                 torch.zeros(num_draft_layers, num_target_layers)
             )
-            self.dfly_layer_residual_gate = nn.Parameter(torch.zeros(()))
+            self.dfly_layer_residual_gate = nn.Parameter(torch.zeros(1))
 
         self.hidden_norm = Qwen3RMSNorm(
             hidden_size,
@@ -170,7 +175,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.context_hidden_gate: nn.Parameter | None = None
         if config.dflash_context_residual:
             self.context_hidden_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-            self.context_hidden_gate = nn.Parameter(torch.zeros(()))
+            self.context_hidden_gate = nn.Parameter(torch.zeros(1))
 
         self.verifier_final_hidden_proj: nn.Linear | None = None
         self.verifier_final_hidden_gate: nn.Parameter | None = None
@@ -178,7 +183,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             self.verifier_final_hidden_proj = nn.Linear(
                 hidden_size, hidden_size, bias=False
             )
-            self.verifier_final_hidden_gate = nn.Parameter(torch.zeros(()))
+            self.verifier_final_hidden_gate = nn.Parameter(torch.zeros(1))
 
         self.block_position_embedding: nn.Embedding | None = None
         if config.dflash_block_position_embedding:
