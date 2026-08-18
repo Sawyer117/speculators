@@ -135,6 +135,14 @@ DSPARK_PAPER_BLOCK_SIZE = 7
 DSPARK_PAPER_NUM_LAYERS = 5
 DSPARK_PAPER_EPOCHS = 10
 
+# Speculator types that ARE DSpark for the purpose of the sequential-head and DFlash
+# backbone feature flags. DSV4DSparkDraftModel subclasses DSparkDraftModel and inherits
+# every head and hook those flags drive, so a literal `== "dspark"` gate rejects a model
+# that supports the feature. Deliberately NOT used for the paper-defaults block above:
+# that one back-fills block_size / decay_gamma / epochs / loss_fn / num_layers from the
+# Qwen3 DSpark paper, and DSV4 has its own released geometry.
+DSPARK_FAMILY_TYPES = ("dspark", "dsv4_dspark")
+
 
 def set_seed(seed: int, deterministic: bool = False):
     """Set random seeds for reproducibility."""
@@ -2116,8 +2124,11 @@ def parse_args():
     resolve_loss_config(args.loss_fn)
 
     if args.enable_correction_head:
-        if args.speculator_type != "dspark":
-            parser.error("--enable-correction-head is only valid for DSpark")
+        if args.speculator_type not in DSPARK_FAMILY_TYPES:
+            parser.error(
+                "--enable-correction-head is only valid for DSpark "
+                f"(got --speculator-type {args.speculator_type})"
+            )
         if min(
             args.correction_hidden_size,
             args.correction_rank,
@@ -2221,9 +2232,10 @@ def parse_args():
         or args.dflash_gated_layer_fusion
         or args.dflash_dfly_layer_residual
         or args.dflash_heterogeneous_kv_projections
-    ) and args.speculator_type not in ("dflash", "dspark"):
+    ) and args.speculator_type not in ("dflash", *DSPARK_FAMILY_TYPES):
         parser.error(
-            "DFlash backbone feature flags are only valid for DFlash or DSpark"
+            "DFlash backbone feature flags are only valid for DFlash or DSpark "
+            f"(got --speculator-type {args.speculator_type})"
         )
     if (
         args.dflash_dfly_layer_residual
