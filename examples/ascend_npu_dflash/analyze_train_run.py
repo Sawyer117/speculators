@@ -402,6 +402,86 @@ def _print_selection_headroom(good, col, median):
         print("    ⚠ 上界:此处 Markov 头吃的是真前驱 token,服务端吃的是草稿自己的选择。")
 
 
+def _print_decoder_ablation(good, col, median):
+    """Read decoder_ablation_probe.py's replay of four block decoders on the same blocks.
+
+    Silent on runs without those keys. What it must make impossible to misread:
+
+      * ``today`` is the SERVE'S CURRENT RULE (full-vocab argmax of base+bias, committing
+        each step) replayed offline -- so it is the baseline every other number is measured
+        against, and its agreement with the run's own ``hard_accept_len`` is the fidelity
+        gate. If those two disagree, the replay does not match the real decoder and every
+        figure below is void; that check therefore runs first and shouts.
+
+      * ``restrict`` is the same rule with candidates pruned to top-k. It is a strict
+        handicap on ``today`` (same commit point, smaller search set) and exists only to
+        PRICE that pruning -- which viterbi and decay also pay. Hence the decomposition
+        the verdict below turns on:
+            gain = (what joint decoding wins) - (what top-k pruning costs)
+        A negative gain whose magnitude is under ``restrict_cost`` therefore does NOT mean
+        joint decoding failed; it means k is too small and the next run should raise it.
+    """
+    names = ["today", "restrict", "viterbi", "decay"]
+    if not any(f"train/dec_{n}_accept_len" in r for r in good[-1:] or good for n in names):
+        return
+
+    def med(key, n=200):
+        v = col(good[-n:], key)
+        return median(v) if v else None
+
+    print("\n-- DECODER ABLATION (offline replay; probe run only) " + "-" * 24)
+    al = {n: med(f"train/dec_{n}_accept_len") for n in names}
+    hard = med("train/hard_accept_len")
+
+    # 保真门:重放的 today 必须复现真实解码器
+    if al["today"] is not None and hard is not None:
+        d = abs(al["today"] - hard)
+        if d > 0.05:
+            print(f"  ✗✗ 保真门失败:重放的 today {al['today']:.3f} vs 实际 hard_accept_len {hard:.3f}"
+                  f"(差 {d:.3f})")
+            print("     重放与真实解码路径不一致,下面所有数字作废。先查 base 还原与 seed 取法。")
+        else:
+            print(f"  ✓ 保真门:重放 today {al['today']:.3f} ≈ hard_accept_len {hard:.3f}(差 {d:.3f})"
+                  f" ⟹ 重放可信")
+
+    print(f"\n  {'解码器':<10} {'accept_len':>11} {'相对 today':>11} {'赢':>7} {'输':>7}")
+    for n in names:
+        if al[n] is None:
+            continue
+        g = med(f"train/dec_{n}_gain")
+        w = med(f"train/dec_{n}_win")
+        l = med(f"train/dec_{n}_loss")
+        tag = "  ← 基线(服务端现行)" if n == "today" else ("  ← 剪枝对照" if n == "restrict" else "")
+        print(f"  {n:<10} {al[n]:>11.3f} "
+              + (f"{g:>+11.3f}" if g is not None else f"{'—':>11}")
+              + (f" {w:>6.1%} {l:>6.1%}" if w is not None else f" {'—':>6} {'—':>6}")
+              + tag)
+
+    cost = med("train/dec_restrict_cost")
+    if cost is not None:
+        print(f"\n  ★ top-k 剪枝成本(today − restrict)= {cost:+.3f} token")
+        if cost < -1e-6:
+            print("     ⚠ 为负:不可能 —— restrict 是 today 的严格削弱。查重放实现。")
+
+    print("\n  ── 判读 ──")
+    for n in ("viterbi", "decay"):
+        g = med(f"train/dec_{n}_gain")
+        if g is None:
+            continue
+        if g > 0.02:
+            print(f"    {n}: {g:+.3f} ⟹ **净赢**。联合解码的收益已盖过 k 的剪枝损失。")
+        elif cost is not None and g < 0 and abs(g) < cost:
+            print(f"    {n}: {g:+.3f},而剪枝独自就要 −{cost:.3f} ⟹ **联合解码本身是正收益,被 k 吃掉了**。")
+            print(f"       该加大 DECODER_K 重跑,而不是判死刑。")
+        elif g < -0.02:
+            print(f"    {n}: {g:+.3f},且大于剪枝损失 {cost if cost is not None else float('nan'):.3f}"
+                  f" ⟹ 联合解码本身在伤害接受长度。")
+            print("       对 viterbi 这是预期内的:它最大化整块链分,而前缀接受付钱的是 Σ_t P(0..t 全对)。")
+        else:
+            print(f"    {n}: {g:+.3f} ⟹ 与 today 打平(±0.02 内)。")
+    print("    ⚠ teacher-forced 上界:块的起始上下文是真前缀,服务端是目标模型验证过的那个。")
+
+
 def _print_vs_baseline(recs, ckpt_steps, base_recs, base_ckpt, cur_label, base_label, spike_k):
     """A compact headline delta table: CURRENT vs BASELINE (the plots carry the full comparison)."""
     hc = _headline(recs, ckpt_steps, spike_k)
@@ -915,6 +995,7 @@ def main() -> None:
         if v is not None:
             print(f"{lab:15}: {fmt(v)}")
     _print_selection_headroom(good, col, median)
+    _print_decoder_ablation(good, col, median)
 
     pos_keys = detect_positions(recs)
     if pos_keys:
