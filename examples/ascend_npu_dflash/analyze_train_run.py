@@ -314,6 +314,94 @@ def _headline(recs, ckpt_steps, spike_k=3.0) -> dict:
     }
 
 
+def _print_selection_headroom(good, col, median):
+    """recall@k vs recall@1 per position + oracle vs hard accept_len.
+
+    Reads the metrics emitted by examples/ascend_npu_dflash/recall_headroom_probe.py; stays
+    silent on ordinary runs, which do not have them. The question it answers: when the draft's
+    argmax is wrong, is the target's token still among the top-k candidates the draft already
+    produced? If yes, a selector can recover it WITHOUT retraining the draft -- that is the
+    whole premise of DFlash2-style path selection.
+
+    ``position_{k}_acc`` IS recall@1 (both are "argmax == target"), so it is the correct
+    baseline column and needs no separate metric. Likewise ``hard_accept_len`` is the greedy
+    accept length and ``oracle_accept_len_K`` the same quantity with perfect selection inside
+    top-K, so their difference is the headroom in tokens.
+
+    ⚠ Teacher-forced: the Markov head is fed the TRUE previous token here, where the serve
+    feeds the draft's own pick. These figures are therefore an UPPER bound -- decisive when
+    they come back small, only suggestive when large.
+    """
+    ks, npos = [], 0
+    for r in good[-1:] or good:
+        for k in r:
+            m = re.match(r"train/position_(\d+)_recall(\d+)$", k)
+            if m:
+                npos = max(npos, int(m.group(1)) + 1)
+                if int(m.group(2)) not in ks:
+                    ks.append(int(m.group(2)))
+    if not ks or not npos:
+        return  # not a probe run
+    ks.sort()
+
+    def med(key, n=200):
+        v = col(good[-n:], key)
+        return median(v) if v else None
+
+    print("\n-- SELECTION HEADROOM (recall@k vs argmax; probe run only) " + "-" * 18)
+    print("  是否'草稿其实知道、只是 argmax 选错了'。recall@1 == position_k_acc。")
+    hdr = "  位置  " + "recall@1" + "".join(f"  recall@{k:<2}" for k in ks) + "   缺口(@%d−@1)" % ks[-1]
+    print(hdr)
+    gaps = []
+    for p in range(npos):
+        a = med(f"train/position_{p}_acc")
+        if a is None:
+            continue
+        cells, top = [], None
+        for k in ks:
+            v = med(f"train/position_{p}_recall{k}")
+            cells.append("    —   " if v is None else f"  {v:6.3f} ")
+            if k == ks[-1]:
+                top = v
+        gap = None if top is None else (top - a) * 100
+        if gap is not None:
+            gaps.append((p, gap))
+        print(f"  pos{p}   {a:6.3f} " + "".join(cells)
+              + ("     —" if gap is None else f"   {gap:+5.1f} 点"))
+
+    hard = med("train/hard_accept_len")
+    for k in ks:
+        orc = med(f"train/oracle_accept_len_{k}")
+        if hard is not None and orc is not None:
+            print(f"  accept_len: hard {hard:.3f}  →  oracle@{k:<2} {orc:.3f}   {orc - hard:+.2f} token")
+
+    # 名次分布:小 k 能拿回多少,决定 selector 的 topk 成本
+    tail = [p for p, _ in gaps if p >= max(0, npos - 2)]
+    if tail and len(ks) > 1:
+        p = tail[-1]
+        a = med(f"train/position_{p}_acc")
+        full = med(f"train/position_{p}_recall{ks[-1]}")
+        if a is not None and full is not None and full > a:
+            print(f"  末位(pos{p})的缺口有多少落在浅名次 —— 决定 selector 用多大的 k:")
+            for k in ks:
+                v = med(f"train/position_{p}_recall{k}")
+                if v is not None:
+                    print(f"     k={k:<2} 拿回 {(v - a) * 100:+5.1f} 点 = 全部缺口的 {(v - a) / (full - a) * 100:3.0f}%")
+
+    if gaps:
+        worst = max(g for _, g in gaps[-2:]) if len(gaps) >= 2 else gaps[-1][1]
+        print("  ── 判据(在看到数字之前钉死)──")
+        if worst >= 10:
+            print(f"    末段缺口 {worst:+.1f} 点 ≥ 10 ⟹ 头寸真实:argmax 正在丢掉草稿已经排出来的 token。")
+            print("    值得为 path selection 计算成本(服务侧改动 + host 侧 launch 开销)。")
+        elif worst <= 3:
+            print(f"    末段缺口 {worst:+.1f} 点 ≤ 3 ⟹ 草稿是真不知道那个 token,不是排错。")
+            print("    path selection 对本模型无效;只剩块宽对齐重训这条路。")
+        else:
+            print(f"    末段缺口 {worst:+.1f} 点落在 3–10 的中间地带:看上面的名次分布再定。")
+        print("    ⚠ 上界:此处 Markov 头吃的是真前驱 token,服务端吃的是草稿自己的选择。")
+
+
 def _print_vs_baseline(recs, ckpt_steps, base_recs, base_ckpt, cur_label, base_label, spike_k):
     """A compact headline delta table: CURRENT vs BASELINE (the plots carry the full comparison)."""
     hc = _headline(recs, ckpt_steps, spike_k)
@@ -826,6 +914,8 @@ def main() -> None:
         v = last_n_med(k)
         if v is not None:
             print(f"{lab:15}: {fmt(v)}")
+    _print_selection_headroom(good, col, median)
+
     pos_keys = detect_positions(recs)
     if pos_keys:
         vals = [last_n_med(k) for k in pos_keys]
