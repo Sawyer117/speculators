@@ -421,7 +421,7 @@ def _print_decoder_ablation(good, col, median):
         A negative gain whose magnitude is under ``restrict_cost`` therefore does NOT mean
         joint decoding failed; it means k is too small and the next run should raise it.
     """
-    names = ["today", "restrict", "viterbi", "decay"]
+    names = ["today", "restrict", "viterbi", "decay", "viterbiN", "decayN"]
     if not any(f"train/dec_{n}_accept_len" in r for r in good[-1:] or good for n in names):
         return
 
@@ -451,7 +451,8 @@ def _print_decoder_ablation(good, col, median):
         g = med(f"train/dec_{n}_gain")
         w = med(f"train/dec_{n}_win")
         l = med(f"train/dec_{n}_loss")
-        tag = "  ← 基线(服务端现行)" if n == "today" else ("  ← 剪枝对照" if n == "restrict" else "")
+        tag = {"today": "  ← 基线(服务端现行)", "restrict": "  ← 剪枝对照",
+               "viterbiN": "  ← 同上,按位归一", "decayN": "  ← 同上,按位归一"}.get(n, "")
         print(f"  {n:<10} {al[n]:>11.3f} "
               + (f"{g:>+11.3f}" if g is not None else f"{'—':>11}")
               + (f" {w:>6.1%} {l:>6.1%}" if w is not None else f" {'—':>6} {'—':>6}")
@@ -464,7 +465,13 @@ def _print_decoder_ablation(good, col, median):
             print("     ⚠ 为负:不可能 —— restrict 是 today 的严格削弱。查重放实现。")
 
     print("\n  ── 判读 ──")
-    for n in ("viterbi", "decay"):
+    note = {
+        "viterbi": "它最大化整块链分,而前缀接受付钱的是 Σ_t P(0..t 全对) —— 目标函数本就不同。",
+        "decay":   "位置权重已压低后位、靠近前缀接受;若仍为负,说明衰减还不够或候选集不对。",
+        "viterbiN": "按位归一后链分才是 log P(路径);若这一档才转正,先前的负值来自 logit 量纲而非目标错配。",
+        "decayN":  "归一 + 位置权重,最贴近前缀接受的一档 —— 这是四个联合解码里先验最强的。",
+    }
+    for n in ("viterbi", "decay", "viterbiN", "decayN"):
         g = med(f"train/dec_{n}_gain")
         if g is None:
             continue
@@ -472,13 +479,27 @@ def _print_decoder_ablation(good, col, median):
             print(f"    {n}: {g:+.3f} ⟹ **净赢**。联合解码的收益已盖过 k 的剪枝损失。")
         elif cost is not None and g < 0 and abs(g) < cost:
             print(f"    {n}: {g:+.3f},而剪枝独自就要 −{cost:.3f} ⟹ **联合解码本身是正收益,被 k 吃掉了**。")
-            print(f"       该加大 DECODER_K 重跑,而不是判死刑。")
+            print("       该加大 DECODER_K 重跑,而不是判死刑。")
         elif g < -0.02:
-            print(f"    {n}: {g:+.3f},且大于剪枝损失 {cost if cost is not None else float('nan'):.3f}"
+            print(f"    {n}: {g:+.3f},超出剪枝损失 {cost if cost is not None else float('nan'):.3f}"
                   f" ⟹ 联合解码本身在伤害接受长度。")
-            print("       对 viterbi 这是预期内的:它最大化整块链分,而前缀接受付钱的是 Σ_t P(0..t 全对)。")
         else:
             print(f"    {n}: {g:+.3f} ⟹ 与 today 打平(±0.02 内)。")
+        print(f"       {note[n]}")
+
+    # 归一化到底值多少:同一位置权重下,raw logits 求和 vs log-prob 求和
+    pairs = [("viterbi", "viterbiN"), ("decay", "decayN")]
+    deltas = [(a, b, med(f"train/dec_{b}_accept_len"), med(f"train/dec_{a}_accept_len"))
+              for a, b in pairs]
+    deltas = [(a, b, x - y) for a, b, x, y in deltas if x is not None and y is not None]
+    if deltas:
+        print("\n  ── 按位归一的效果(logsumexp 后再求和)──")
+        for a, b, d in deltas:
+            print(f"    {b} − {a} = {d:+.3f} token")
+        if max(d for _, _, d in deltas) > 0.02:
+            print("    ⟹ 确认:此前的链分把未归一的 logits 跨位置相加,按位置的 logit 量纲加权,这是伪影。")
+        else:
+            print("    ⟹ 归一化没救回来 ⟹ 负收益是真的目标错配,不是量纲伪影。")
     print("    ⚠ teacher-forced 上界:块的起始上下文是真前缀,服务端是目标模型验证过的那个。")
 
 

@@ -366,3 +366,68 @@ Viterbi 只最大化**模型自己的**链分,只能拿回 8-20 实测那 +26.4 
 机器到位后:起服务加 `DSPARK_VITERBI_K=4`(看到 `>>> [DSPARK_VITERBI]` 横幅即生效),
 用同一套 `run_dspark_eval.sh` 对比 ledger 的 `ep5p0-ropefix ns5 = 4.4162`。
 建议 K=4 起步(8-20 实测 k=4 已拿回 60% 缺口,成本比 k=16 小一个量级),绿了再看 K=8/16 的边际。
+
+---
+
+## 5. 解码器离线消融:k=4 首测 —— 联合解码为负,且发现一处实现错误(2026-08-20)
+
+`decoder_ablation_probe.py`,`DECODER_K=4`,run `faithful_ep_20260820_042143`。
+
+**保真门先过**:重放的 `today` 3.932 vs 该 run 自己的 `hard_accept_len` 3.946,差 0.014。
+重放路径与服务端 `_sample_sequential` 一致,以下数字可信。
+
+| 解码器 | accept_len | 相对 today | 赢 | 输 |
+|---|---:|---:|---:|---:|
+| today(服务端现行) | 3.932 | — | — | — |
+| restrict(top-4 剪枝对照) | 3.428 | −0.496 | 2.2% | 26.2% |
+| viterbi | 3.262 | −0.671 | 5.8% | 34.9% |
+| decay(γ=4) | 3.333 | −0.601 | 5.7% | 32.5% |
+
+拆开看:
+
+```
+剪枝成本 = today − restrict = 0.496
+联合解码自身 = gain + 剪枝成本 = −0.175 (viterbi) / −0.105 (decay)
+```
+
+### 两个读数
+
+**① `decay` 优于 `viterbi`(−0.105 vs −0.175)** —— 与跑之前登记的预测方向一致:
+压低后位权重、靠近前缀接受的目标,伤害就小。**目标函数错配的诊断被数据支持。**
+
+**② 但链分把未归一的 logits 跨位置相加,这是实现错误。**
+`base_logits` 未归一,跨位置求和等于按各位置的 logit 量纲加权 —— 哪个位置 logit
+张得开,哪个位置就主宰整条路径,这是任意的。序列解码求和的应当是 log-prob
+(beam search 即如此),那样链分才是 log P(路径),Viterbi 最大化的才是"整块全对"的概率。
+**逐位置 argmax 对归一化不变,所以 `today` 不受影响;联合解码受影响。**
+⟹ −0.175 究竟是目标错配还是量纲伪影,k=4 这一轮分不出来。
+
+### 已做的修改
+
+探针改为一次跑六个解码器:`viterbiN` / `decayN` = 同样的位置权重但**每位置先 log_softmax**。
+候选格(unary 值、id、全部 pairwise 转移)只构建一次并共享,所以多两个变体只多两趟 DP,
+不再多扫一遍词表。四个 DP 变体均已与 4⁵=1024 条路径的暴力枚举逐 token 对齐;
+`today` 与服务端规则逐 token 对齐;`restrict ≤ today` 断言通过。
+
+分析器同步扩到六档,并加了一段"按位归一的效果"对照(`viterbiN − viterbi`、`decayN − decay`),
+把这两种解释直接分开报。
+
+### 下一步
+
+同时抬两个量重跑一轮:`DECODER_K=16`(把 0.496 的剪枝伪影压下去)+ 六解码器。
+
+```bash
+# 与 k=4 那轮(faithful_ep_20260820_042143)逐字段相同,只改 DECODER_K
+DSPARK_EP=1 BF16_EXPERTS=1 RECOMPUTE=1 COMPILE=0 \
+TRAIN_PY=examples/ascend_npu_dflash/decoder_ablation_probe.py \
+DECODER_K=16 DECODER_GAMMA=4.0 \
+LR=0 EPOCHS=6 CKPT_FREQ=99 MAX_ANCHORS=128 \
+SAVE_PATH=$RUN/ckpt_faithful_ep_20260804_165215 \
+  bash examples/ascend_npu_dflash/train_dsv4_dspark.sh faithful
+# 上一轮的实际取值以日志开头的横幅为准:head -20 $RUN/faithful_ep_20260820_042143.log
+```
+
+判读顺序固定为:保真门 → 剪枝成本 → 归一化差值 → 各档 gain。
+- 若 `decayN` 转正 ⟹ 之前的负值是量纲伪影,联合解码本身可用,再谈服务端落地。
+- 若归一化差值 ≈ 0 且各档仍为负 ⟹ 前缀接受与链分的错配是真的,**这条线判负**,
+  头寸(pos4 +25.9pt)得靠训练侧或别的选择器去拿,不是靠换解码规则。

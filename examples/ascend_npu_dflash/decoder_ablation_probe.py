@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare four block DECODERS offline, on the training box, with no eval server.
+"""Compare six block DECODERS offline, on the training box, with no eval server.
 
     TRAIN_PY=examples/ascend_npu_dflash/decoder_ablation_probe.py \
     DECODER_K=4 LR=0 EPOCHS=6 CKPT_FREQ=99 MAX_ANCHORS=128 ... \
@@ -19,8 +19,8 @@ just ``markov_w2(markov_w1(prev))``. Both are in hand during training, so any de
 be replayed exactly as the serve would run it -- feeding each decoder its OWN pick as the
 next predecessor rather than the true token -- and scored against the target.
 
-THE FOUR DECODERS
------------------
+THE DECODERS
+------------
   today      argmax over the FULL vocabulary of ``base + bias(prev)``, committing each
              step. This is what the serve does now (deepseek_v4_dspark_proposer.py's
              ``_sample_sequential``) and is therefore THE baseline.
@@ -36,6 +36,15 @@ THE FOUR DECODERS
              gamma=4. Prefix acceptance pays for E[accepted] = Σ_t P(0..t all correct), not
              for the block's total score, so down-weighting late positions is the cheap way
              to point the decoder at the right objective.
+  viterbiN   viterbi, but each position's scores are log_softmax'd before being summed.
+  decayN     decay, likewise normalised.
+             ★ The N pair exists because summing RAW logits across positions weights each
+             position by its own logit scale, which is arbitrary. Sequence decoders sum
+             log-probabilities, and then the chain total is log P(path). Today's decoder is
+             invariant to this (per-position argmax), joint decoding is not -- so an
+             unnormalised loss could be a units artefact rather than objective mismatch, and
+             only running both tells the two apart. Sharing one lattice makes the extra pair
+             a DP pass, not another sweep over the vocabulary.
 
 WHAT IT REPORTS (all as *_sum/*_total, so the trainer's aggregation folds them into ratios)
     dec_{name}_accept_len     hard accept length under that decoder
@@ -43,6 +52,7 @@ WHAT IT REPORTS (all as *_sum/*_total, so the trainer's aggregation folds them i
     dec_{name}_win / _loss    fraction of blocks where it beats / trails ``today``
     dec_{name}_gain           mean accept-length delta vs ``today``  ← the headline
     dec_restrict_cost         today − restrict, i.e. what top-k candidate pruning costs
+    dec_{viterbiN,decayN}_*   the same, with per-position normalisation
 
 ⚠ TEACHER-FORCED CONTEXT. The backbone hidden states here were produced with the true
 prefix, as in training. The decoder simulation itself is faithful (each decoder feeds its
@@ -70,45 +80,78 @@ _CHUNK = int(os.environ.get("DECODER_CHUNK", "256"))
 _STASH: dict = {}
 
 
-def _decode(base, head, seed_ids, k, mode, gamma):
-    """Replay one decoder over a block. base [N, T, V]; seed_ids [N]; returns ids [N, T].
+def _lattice(base, head, seed_ids, k):
+    """Build the candidate lattice ONCE: unary values, ids, and all pairwise transitions.
 
-    Mirrors the serve's ``_sample_sequential`` exactly for ``today`` (full-vocab argmax,
-    predecessor = own previous pick) and adds the lattice variants on top of it.
+    Shared by every lattice decoder, so adding a scoring variant costs a DP pass rather
+    than another O(T*N*k*V) sweep through markov_bias -- which is what makes it affordable
+    to measure normalised and unnormalised scoring in the same run.
     """
     N, T, _ = base.shape
-    w = [1.0] * T if mode != "decay" else [float(torch.exp(torch.tensor(-t / gamma))) for t in range(T)]
-    bias_of = lambda ids: head.markov_w2(head.markov_w1(ids.long()))  # noqa: E731  vanilla only
-
-    if mode in ("today", "restrict"):
-        prev = seed_ids
-        out = torch.empty((N, T), dtype=torch.long, device=base.device)
-        for t in range(T):
-            scores = base[:, t] + bias_of(prev).to(base.dtype)  # [N, V]
-            if mode == "today":
-                pick = scores.argmax(dim=-1)
-            else:
-                cid = base[:, t].topk(k, dim=-1).indices  # candidates from the unary term
-                pick = cid.gather(1, scores.gather(1, cid).argmax(dim=-1, keepdim=True)).squeeze(1)
-            out[:, t] = pick
-            prev = pick
-        return out
-
-    # lattice modes
     cand_val, cand_id = base.topk(k, dim=-1)  # [N, T, k]
-    score = (cand_val[:, 0] + bias_of(seed_ids).to(base.dtype).gather(1, cand_id[:, 0])) * w[0]
-    back = torch.zeros((N, T, k), dtype=torch.long, device=base.device)
+    bias_of = lambda ids: head.markov_w2(head.markov_w1(ids.long()))  # noqa: E731
+    trans = []  # trans[t][n, i, j] = bias(cand[t-1][i])[cand[t][j]], t >= 1
+    b0 = bias_of(seed_ids).to(base.dtype).gather(1, cand_id[:, 0])  # [N, k]
     for t in range(1, T):
-        b = bias_of(cand_id[:, t - 1].reshape(-1)).to(base.dtype)  # [N*k, V]
-        trans = b.gather(1, cand_id[:, t].unsqueeze(1).expand(N, k, k).reshape(N * k, k)).view(N, k, k)
-        total = score.unsqueeze(2) + (cand_val[:, t].unsqueeze(1) + trans) * w[t]
+        b = bias_of(cand_id[:, t - 1].reshape(-1)).to(base.dtype)
+        trans.append(
+            b.gather(1, cand_id[:, t].unsqueeze(1).expand(N, k, k).reshape(N * k, k)).view(N, k, k)
+        )
+    return cand_val, cand_id, b0, trans
+
+
+def _dp(cand_val, cand_id, b0, trans, w, normalise):
+    """Viterbi over the cached lattice. ``w`` weights positions; ``normalise`` turns the
+    raw logits into per-position log-probabilities first.
+
+    ⚠ WHY normalise MATTERS. ``base_logits`` are unnormalised. Summing them across
+    positions weights each position by its own logit scale, which is arbitrary -- a
+    position whose logits happen to span a wider range dominates which path is chosen.
+    Sequence decoders sum LOG-PROBABILITIES for exactly this reason (so does beam search),
+    and then the total is log P(path) and Viterbi maximises P(the whole block correct).
+    Today's decoder is unaffected either way, since a per-position argmax is invariant to
+    normalisation -- but joint decoding is not, so the two must be measured separately.
+    """
+    N, T, k = cand_val.shape
+
+    def unary(t):
+        v = cand_val[:, t]
+        return v - v.logsumexp(dim=-1, keepdim=True) if normalise else v
+
+    def trans_at(t):
+        m = trans[t - 1]
+        return m - m.logsumexp(dim=-1, keepdim=True) if normalise else m
+
+    score = (unary(0) + (b0 - b0.logsumexp(-1, keepdim=True) if normalise else b0)) * w[0]
+    back = torch.zeros((N, T, k), dtype=torch.long, device=cand_val.device)
+    for t in range(1, T):
+        total = score.unsqueeze(2) + (unary(t).unsqueeze(1) + trans_at(t)) * w[t]
         score, arg = total.max(dim=1)
         back[:, t] = arg
-    out = torch.empty((N, T), dtype=torch.long, device=base.device)
+    out = torch.empty((N, T), dtype=torch.long, device=cand_val.device)
     j = score.argmax(dim=-1)
     for t in range(T - 1, -1, -1):
         out[:, t] = cand_id[:, t].gather(1, j.unsqueeze(1)).squeeze(1)
         j = back[:, t].gather(1, j.unsqueeze(1)).squeeze(1)
+    return out
+
+
+def _stepwise(base, head, seed_ids, k, restrict):
+    """Commit-per-step decoding: the serve's current rule (``restrict=False``) and the same
+    rule with candidates pruned to top-k of the unary term (``restrict=True``)."""
+    N, T, _ = base.shape
+    bias_of = lambda ids: head.markov_w2(head.markov_w1(ids.long()))  # noqa: E731
+    prev = seed_ids
+    out = torch.empty((N, T), dtype=torch.long, device=base.device)
+    for t in range(T):
+        scores = base[:, t] + bias_of(prev).to(base.dtype)
+        if restrict:
+            cid = base[:, t].topk(k, dim=-1).indices
+            pick = cid.gather(1, scores.gather(1, cid).argmax(dim=-1, keepdim=True)).squeeze(1)
+        else:
+            pick = scores.argmax(dim=-1)
+        out[:, t] = pick
+        prev = pick
     return out
 
 
@@ -119,7 +162,7 @@ def _accept_len(ids, target, mask):
 
 
 def decoder_metrics(logits, targets, loss_mask, block_size, head, prev_token_ids, markov_bias):
-    """Replay the four decoders on this batch and return *_sum/*_total metrics."""
+    """Replay every decoder on this batch and return *_sum/*_total metrics."""
     out: dict[str, torch.Tensor] = {}
     with torch.no_grad():
         N = logits.shape[1] // block_size
@@ -135,9 +178,20 @@ def decoder_metrics(logits, targets, loss_mask, block_size, head, prev_token_ids
         nvalid = valid.sum().clamp_min(1.0)
 
         acc_len = {}
-        for name, mode in (("today", "today"), ("restrict", "restrict"),
-                           ("viterbi", "viterbi"), ("decay", "decay")):
-            ids = _decode(base, head, seed, _K, mode, _GAMMA)
+        cv, ci, b0, tr = _lattice(base, head, seed, _K)
+        T = block_size
+        w1 = [1.0] * T
+        wd = [float(torch.exp(torch.tensor(-t / _GAMMA))) for t in range(T)]
+        runs = [
+            ("today", lambda: _stepwise(base, head, seed, _K, False)),
+            ("restrict", lambda: _stepwise(base, head, seed, _K, True)),
+            ("viterbi", lambda: _dp(cv, ci, b0, tr, w1, False)),
+            ("decay", lambda: _dp(cv, ci, b0, tr, wd, False)),
+            ("viterbiN", lambda: _dp(cv, ci, b0, tr, w1, True)),
+            ("decayN", lambda: _dp(cv, ci, b0, tr, wd, True)),
+        ]
+        for name, fn in runs:
+            ids = fn()
             al = _accept_len(ids, target, mask)
             acc_len[name] = al
             out[f"dec_{name}_accept_len_sum"] = (al * valid).sum()
@@ -147,7 +201,7 @@ def decoder_metrics(logits, targets, loss_mask, block_size, head, prev_token_ids
                 out[f"dec_{name}_pos{p}_acc_sum"] = hit[:, p].sum()
                 out[f"dec_{name}_pos{p}_acc_total"] = mask[:, p].sum().clamp_min(1.0)
 
-        for name in ("restrict", "viterbi", "decay"):
+        for name in ("restrict", "viterbi", "decay", "viterbiN", "decayN"):
             d = (acc_len[name] - acc_len["today"]) * valid
             out[f"dec_{name}_gain_sum"] = d.sum()
             out[f"dec_{name}_gain_total"] = nvalid.clone()
@@ -212,10 +266,10 @@ def main() -> None:
     if int(os.environ.get("RANK", "0")) == 0:
         lr = getattr(args, "lr", None)
         print("=" * 78, flush=True)
-        print(f">>> DECODER ABLATION PROBE — today / restrict / viterbi / decay   k={_K} gamma={_GAMMA}", flush=True)
+        print(f">>> DECODER ABLATION PROBE — today/restrict/viterbi/decay(+N)   k={_K} gamma={_GAMMA}", flush=True)
         print(">>> replays each decoder on the SAME blocks; 'today' == the serve's current rule", flush=True)
         print(f">>> lr={lr}" + ("" if lr == 0 else "   ⚠ NOT 0 — this run WILL train"), flush=True)
-        print(">>> read dec_{viterbi,decay}_gain (vs today) and dec_restrict_cost, then kill it", flush=True)
+        print(">>> read dec_*_gain (vs today) and dec_restrict_cost, then kill it", flush=True)
         print("=" * 78, flush=True)
     train_script.main(args)
 
