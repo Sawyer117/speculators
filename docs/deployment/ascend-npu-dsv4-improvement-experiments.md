@@ -70,6 +70,39 @@ vllm-ascend vllm_ascend/models/deepseek_v4_dspark.py  "correction" 出现 0 次
 在"优势已收窄到判不出"+"我方测不了"这两条同时成立时,再烧 3.5 天 × 24 卡去换一个
 测不到的结果不划算,故中止。1.0ep / 1.5ep 两份权重交给有 Correction 头推理实现的一方评测。
 
+### 交付给第三方(复核 / 自行评测所需的全部信息)
+
+本条记录与实现代码**分处两个分支**,只给文件名对方跑不起来。完整清单:
+
+| 要素 | 位置 |
+|---|---|
+| **实现代码** | `Sawyer117/speculators` 分支 **`feat/dspark-next-port`** @ `1d5827d`。自 `feat/dsv4-dspark` 分出,含 `78a0776` 合入 TYS5537/speculators@dspark_next,以及其后 6 条我们的适配提交(见下) |
+| **启动脚本 + PROVENANCE** | 同分支 `examples/ascend_npu_dflash/train_dsv4_dspark_correction.sh`,文件头 10–52 行逐条写明**拿了什么 / 没拿什么 / 每条为什么** |
+| **训练权重** | `run/ckpt_faithful_ep_20260818_122129/0`(1.0 epoch)与 `/1`(1.5 epoch)。**EP 分片的 DCP 格式**,非 safetensors;要用 speculators 的转换器转成部署格式,但见下方 ⚠ |
+| **本次日志** | `run/faithful_ep_20260818_122129.log` |
+| **对照基线日志** | `run/faithful_ep_20260804_165215.log`(`ep5p0-ropefix`,#942 的 OFF 臂,与本次同种子同数据) |
+| **对照命令** | `python3 examples/ascend_npu_dflash/analyze_train_run.py <本次log> --baseline <基线log> --label CORRECTION --baseline-label ROPEFIX --out <目录>` |
+| **环境** | `examples/ascend_npu_dflash/install_npu_env_dspark.sh` 是唯一权威安装脚本(torch/torch-npu 2.10.0、vLLM 0.23.0、vllm-ascend 从源码编) |
+
+我们在他的分支之上做的 6 条适配(都是**让它在 DSV4 上跑起来**所必需,不改他的算法):
+
+```
+ef8cf7d  detach 覆盖挪到真正的 config 类;EXTRA_ARGS 透传
+16db370  让三个 --dflash-* backbone 旗标在本模型上真正生效(此前是死代码)
+92311d2  Correction 头宽按我们的 hidden 缩放(512@2560 -> 1024@4096),rank 保持发布值 256
+f48572b  安装并解析 hs_connectors(上游同步后成为强依赖)
+d5a9208  让 dsv4_dspark 通过 DSpark 的特性门禁
+bcdc2d7  1-D 门控参数 —— FSDP2 拒绝标量
+7c25438  昇腾上不走融合 Triton 损失
+```
+
+⚠ **评测必须由对方做,原因见上一节**:我们的转换器与 vllm-ascend 的模型侧对 `correction`
+均零认知,转出来会丢掉整个 Correction 头。对方若有该头的推理实现,则:
+① 用他自己的转换路径处理 `markov_head` / `confidence_head` **以及 correction 相关权重**;
+② 我们这两份权重只训到 1.0 / 1.5 epoch(基线是 5.0 epoch 的),**跨 epoch 不可直接比**——
+要比就与 `ep5p0-ropefix` 的 **1.0ep / 1.5ep 检查点**比,那两个的全量集五项平均分别是
+**4.0788 / 4.1800**(见 eval ledger 的 FULL-SET 批次)。
+
 ### 附带确认(与本试验无关但同批观测)
 
 - **#942 的两层拆分得到再次验证。** 各卡累计监督 token 现在全在 ±0.1% 内,前后半程偏差
