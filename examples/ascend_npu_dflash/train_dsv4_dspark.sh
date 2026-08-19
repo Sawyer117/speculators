@@ -14,6 +14,10 @@
 #
 # OVERRIDES (env, validated defaults baked in):
 #   RUN VERIFIER DATA HS_DIR ENDPOINT LR MAX_ANCHORS NPROC CKPT_FREQ CANN_ENV
+#   TRAIN_PY  entry script torchrun launches (default: $REPO_ROOT/scripts/train.py).
+#             Only for read-only probes that must wrap something inside train.py before it
+#             runs -- e.g. examples/ascend_npu_dflash/recall_headroom_probe.py. Default
+#             behaviour is unchanged when unset.
 #   RECOMPUTE=1 (activation checkpointing: recompute draft layers in bwd -> raise MAX_ANCHORS past OOM)
 # NB: no `set -u` — CANN's 900env / conda activate reference unbound vars (matches serve).
 set -eo pipefail
@@ -271,7 +275,7 @@ nohup env \
   DSPARK_LOG_EXPERT_LOAD="${DSPARK_LOG_EXPERT_LOAD:-0}" \
   PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}" \
   HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 $PORTS \
-  torchrun --nproc_per_node "$NPROC" "$REPO_ROOT/scripts/train.py" \
+  torchrun --nproc_per_node "$NPROC" "${TRAIN_PY:-$REPO_ROOT/scripts/train.py}" \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
     --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
     --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
