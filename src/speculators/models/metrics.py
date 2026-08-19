@@ -436,6 +436,22 @@ def dpace_loss_decay(
 # CUDA/ROCm; the import is lazy so this module imports without Triton installed.
 
 
+def _fused_loss_available(logits: torch.Tensor) -> bool:
+    """Whether the fused Triton losses may run for ``logits``.
+
+    NOT ``logits.is_cuda``: ``scripts/train.py`` imports torch_npu's
+    ``transfer_to_npu``, which monkeypatches ``.is_cuda`` to True for NPU tensors so
+    that CUDA-shaped code keeps working. That makes ``is_cuda`` a useless test here --
+    it is true on Ascend, where mainline Triton has no backend and the kernel cannot
+    run. Test the device type instead, and honour an explicit off-switch.
+    """
+    import os  # noqa: PLC0415
+
+    if os.environ.get("SPECULATORS_DISABLE_FUSED_LOSS") == "1":
+        return False
+    return logits.device.type == "cuda"
+
+
 @cache
 def _fused_kernel(name: str):
     """Import and cache a fused kernel by name; ``None`` if Triton is unavailable."""
@@ -448,7 +464,7 @@ def _fused_kernel(name: str):
 
 def tv_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor):
     """TV loss: fused Triton on CUDA/ROCm (fp32), eager ``tv_loss`` on CPU/NPU."""
-    if logits.is_cuda:
+    if _fused_loss_available(logits):
         kernel = _fused_kernel("fused_tv_loss")
         if kernel is not None:
             return kernel(logits, targets)
@@ -457,7 +473,7 @@ def tv_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor):
 
 def nla_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor):
     """NLA loss: fused Triton on CUDA/ROCm (fp32), eager on CPU/NPU."""
-    if logits.is_cuda:
+    if _fused_loss_available(logits):
         kernel = _fused_kernel("fused_nla_loss")
         if kernel is not None:
             return kernel(logits, targets)

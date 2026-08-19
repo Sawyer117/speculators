@@ -275,6 +275,17 @@ nohup env \
   DSPARK_LOG_EXPERT_LOAD="${DSPARK_LOG_EXPERT_LOAD:-0}" \
   PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}" \
   HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 $PORTS \
+# hs_connectors 是 uv workspace member(上游 #735),普通 `pip install -e .` 解析不到,而
+# src/speculators/train/data.py 无条件 import 它 -> 每个 rank 在 import 期就死。永久修法是
+# `pip install --no-deps -e hs_connectors/`(已内建于 install_npu_env_dspark.sh);这里兜底,
+# 使未装的环境也能直接跑。
+export PYTHONPATH="$REPO_ROOT/hs_connectors/src${PYTHONPATH:+:$PYTHONPATH}"
+
+# metrics.py 用 `logits.is_cuda` 判断能否走 Triton 融合核 —— 但 scripts/train.py 会 import
+# torch_npu 的 transfer_to_npu,它把 NPU 张量的 .is_cuda 打成 True,判据因此在昇腾上恒真,
+# 于是去调根本没有昇腾后端的 Triton 核。置 1 显式关掉融合路径,走 eager 损失。
+export SPECULATORS_DISABLE_FUSED_LOSS="${SPECULATORS_DISABLE_FUSED_LOSS:-1}"
+
   torchrun --nproc_per_node "$NPROC" "${TRAIN_PY:-$REPO_ROOT/scripts/train.py}" \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
     --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
