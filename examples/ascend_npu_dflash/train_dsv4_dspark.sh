@@ -268,13 +268,6 @@ echo " 📋 log -> $LOG   (rank0 mirror also in $RUN/train_*.log)"
 echo " 💾 save -> $SAVE_PATH"
 echo "==================================================================="
 
-nohup env \
-  DSPARK_HS_DUMP=1 DSPARK_GROUPED_MOE="$GROUPED" DSPARK_EP="$EP" DSPARK_RECOMPUTE="$RECOMPUTE" DSPARK_COMPILE="$COMPILE" \
-  DSPARK_TEACHER_DOUBLE_NORM="$TEACHER_DNORM" \
-  DSPARK_MOE_BALANCE="${DSPARK_MOE_BALANCE:-0}" DSPARK_MOE_BALANCE_RATE="${DSPARK_MOE_BALANCE_RATE:-1e-3}" \
-  DSPARK_LOG_EXPERT_LOAD="${DSPARK_LOG_EXPERT_LOAD:-0}" \
-  PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}" \
-  HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 $PORTS \
 # hs_connectors 是 uv workspace member(上游 #735),普通 `pip install -e .` 解析不到,而
 # src/speculators/train/data.py 无条件 import 它 -> 每个 rank 在 import 期就死。永久修法是
 # `pip install --no-deps -e hs_connectors/`(已内建于 install_npu_env_dspark.sh);这里兜底,
@@ -286,6 +279,19 @@ export PYTHONPATH="$REPO_ROOT/hs_connectors/src${PYTHONPATH:+:$PYTHONPATH}"
 # 于是去调根本没有昇腾后端的 Triton 核。置 1 显式关掉融合路径,走 eager 损失。
 export SPECULATORS_DISABLE_FUSED_LOSS="${SPECULATORS_DISABLE_FUSED_LOSS:-1}"
 
+# ⚠ 从这里到 torchrun 是【一条命令】(`env VAR=… torchrun …`),每行以反斜杠续行。
+# 中间不得插入任何语句或注释 —— 注释会吃掉该逻辑行的剩余部分,`env` 就变成"没有命令"、
+# 只打印环境后退出(留下 nohup.out),torchrun 则脱离这段 env 前缀独立运行,于是
+# DSPARK_HS_DUMP / PYTORCH_NPU_ALLOC_CONF 等【只存在于此处】的变量全部丢失,表现为
+# "Response missing kv_transfer_params"(HS 走错路径)与显存 OOM(抗碎片没开)。
+# 要加环境变量:加进下面的列表;要加 export:放到本注释【之前】。
+nohup env \
+  DSPARK_HS_DUMP=1 DSPARK_GROUPED_MOE="$GROUPED" DSPARK_EP="$EP" DSPARK_RECOMPUTE="$RECOMPUTE" DSPARK_COMPILE="$COMPILE" \
+  DSPARK_TEACHER_DOUBLE_NORM="$TEACHER_DNORM" \
+  DSPARK_MOE_BALANCE="${DSPARK_MOE_BALANCE:-0}" DSPARK_MOE_BALANCE_RATE="${DSPARK_MOE_BALANCE_RATE:-1e-3}" \
+  DSPARK_LOG_EXPERT_LOAD="${DSPARK_LOG_EXPERT_LOAD:-0}" \
+  PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}" \
+  HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 $PORTS \
   torchrun --nproc_per_node "$NPROC" "${TRAIN_PY:-$REPO_ROOT/scripts/train.py}" \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
     --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
