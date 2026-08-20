@@ -1426,7 +1426,7 @@ def parse_args():
         "--markov-head-type",
         type=str,
         default="vanilla",
-        choices=["vanilla", "gated", "rnn"],
+        choices=["vanilla", "gated", "rnn", "dflash2"],
         help="DSpark: sequential head variant (default: vanilla).",
     )
     parser.add_argument(

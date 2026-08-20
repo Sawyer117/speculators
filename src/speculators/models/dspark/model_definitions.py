@@ -28,7 +28,7 @@ class MarkovHead(nn.Module):
         super().__init__()
         if markov_rank <= 0:
             raise ValueError(f"markov_rank must be > 0, got {markov_rank}")
-        if head_type not in ("vanilla", "gated", "rnn"):
+        if head_type not in ("vanilla", "gated", "rnn", "dflash2"):
             raise ValueError(f"Unsupported markov_head_type: {head_type!r}")
         self.head_type = head_type
         self.markov_rank = markov_rank
@@ -39,6 +39,29 @@ class MarkovHead(nn.Module):
         elif head_type == "rnn":
             # Joint [gate; candidate; output] projection over [state; prev_emb; hidden].
             self.joint_proj = nn.Linear(2 * markov_rank + hidden_size, 3 * markov_rank)
+        elif head_type == "dflash2":
+            # The released DFlash2 selector's score, verbatim:
+            #     S_t(a, b) = U_t(b) + <A(a) * H(h_t), B(b)>
+            # (vllm-ascend #14533, `qwen3_dflash2.py::_score_edges`). Its
+            # `predecessor_codebook` IS our markov_w1 and its `successor_codebook` IS our
+            # markov_w2.weight -- same shapes, same roles -- so the only piece we lack is H.
+            #
+            # ★ WHY NOT REUSE "gated". That variant computes sigmoid(...) * prev_emb, so its
+            # modulation lives in (0, 1): it can only ATTENUATE a dimension, never amplify it
+            # and never flip its sign. Every gated bias is therefore a shrunk, sign-preserving
+            # copy of the vanilla one. Since the head is a rank-`r` approximation of a V x V
+            # transition matrix, a (0,1) mask can only SUBTRACT from the unconditional bigram
+            # statistics already occupying that basis, whereas a signed linear scale makes each
+            # context a genuinely different rank-`r` matrix rather than a masked subset of one.
+            #
+            # Initialised to the exact identity (W=0, b=1 => H(h) == 1), so at step 0 this head
+            # computes the same bias as `vanilla`. That keeps a paired A/B clean from the very
+            # first step, and on a warm start it means the gate cannot scramble an already
+            # trained bias before it has learned anything. Symmetry is not a concern: each rank
+            # dimension receives a distinct gradient through its own A/B columns.
+            self.hidden_projection = nn.Linear(hidden_size, markov_rank)
+            nn.init.zeros_(self.hidden_projection.weight)
+            nn.init.ones_(self.hidden_projection.bias)
 
     def prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Look up W1 embeddings for the given previous-token ids."""
@@ -58,6 +81,10 @@ class MarkovHead(nn.Module):
 
         if self.head_type == "vanilla":
             return self.markov_w2(prev_emb)
+
+        if self.head_type == "dflash2":
+            hidden_states = hidden_states.to(prev_emb.dtype)
+            return self.markov_w2(prev_emb * self.hidden_projection(hidden_states))
 
         if self.head_type == "gated":
             hidden_states = hidden_states.to(prev_emb.dtype)

@@ -185,6 +185,12 @@ if [ "$INITNORM" = "1" ]; then EXTRA="$EXTRA --init-norm-from-target"; fi
 if [ "$INITLAYER" = "1" ]; then EXTRA="$EXTRA --init-layer-from-target"; fi
 if [ "$INITNOROUTER" = "1" ]; then EXTRA="$EXTRA --init-moe-no-router"; fi
 if [ -n "$FROM_PRETRAINED" ]; then EXTRA="$EXTRA --from-pretrained $FROM_PRETRAINED"; fi
+# MARKOV_HEAD_TYPE=dflash2 -> the released DFlash2 selector's score, bias(a,h) = <A(a)*H(h), B>.
+# ⚠ IGNORED SILENTLY under FROM_PRETRAINED: train.py:529 rebuilds the config from the
+# checkpoint, and markov_head_type is NOT in DECODER_SHAPING_FLAGS, so it is neither applied
+# nor rejected -- exactly the trap already documented above for --sliding-window-non-causal.
+# To change the head type on a warm start you MUST edit the copied dir's config.json.
+if [ -n "${MARKOV_HEAD_TYPE:-}" ]; then EXTRA="$EXTRA --markov-head-type $MARKOV_HEAD_TYPE"; fi
 
 # AMP experts: resolve "auto" -> downgrade to bf16 experts ONLY on the faithful+EP=0 path (rank0
 # materialises the full unsharded model; fp32 experts would OOM). EP=1 / reduced keep option A.

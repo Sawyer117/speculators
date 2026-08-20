@@ -106,6 +106,14 @@ def expected_draft_keys(cfg: DSparkDraftConfig) -> set[str]:
         "markov_head.markov_w2.weight",
         "confidence_head.proj.weight",
     }
+    # The `dflash2` Markov head adds H: bias(a, h) = <A(a) * H(h), B>. Gating it on the
+    # head type rather than always declaring it keeps a vanilla checkpoint's key set exact,
+    # so the completeness check still catches a genuinely missing tensor.
+    if getattr(cfg, "markov_head_type", "vanilla") == "dflash2":
+        keys |= {
+            "markov_head.hidden_projection.weight",
+            "markov_head.hidden_projection.bias",
+        }
     for n in range(cfg.n_draft_layers):
         p = f"layers.{n}."
         keys |= {
@@ -151,6 +159,9 @@ def expected_draft_shapes(cfg: DSparkDraftConfig) -> dict[str, list[int]]:
         "markov_head.markov_w2.weight": [V, mr],
         "confidence_head.proj.weight": [1, H + mr],
     }
+    if getattr(cfg, "markov_head_type", "vanilla") == "dflash2":
+        s["markov_head.hidden_projection.weight"] = [mr, H]
+        s["markov_head.hidden_projection.bias"] = [mr]
     for n in range(cfg.n_draft_layers):
         p = f"layers.{n}."
         s |= {

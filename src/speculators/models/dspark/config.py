@@ -45,7 +45,7 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "Set to 0 to disable the sequential head (pure DFlash drafting)."
         ),
     )
-    markov_head_type: Literal["vanilla", "gated", "rnn"] = Field(
+    markov_head_type: Literal["vanilla", "gated", "rnn", "dflash2"] = Field(
         default="vanilla",
         description=(
             "Sequential head variant: 'vanilla' (first-order Markov bias), 'gated' "
