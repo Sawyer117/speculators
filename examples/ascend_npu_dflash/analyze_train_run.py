@@ -403,16 +403,20 @@ def _print_selection_headroom(good, col, median):
 
 
 def _print_select_ablation(good, col, median):
-    """Read select_ablation_probe.py's on/off comparison of the ADDITIVE selection term.
+    """Read select_ablation_probe.py's four corners of (markov on/off) x (select on/off).
 
-    Silent on runs without those keys. The gain here is exact and confound-free -- same
-    weights, same batch, one term subtracted -- so it answers a question the paired
-    run-vs-baseline comparison cannot: how much the selection term itself contributes, as
-    opposed to everything that moved when the two arms trained separately. It is also what
-    the vllm-ascend patch is worth, since an unpatched serve computes the `off` row.
+    Two readings, and conflating them is the trap this section exists to prevent:
 
-    ``sel_bias_rms`` is printed next to the gain on purpose: a near-zero gain means something
-    completely different depending on whether the term has grown away from its zero init.
+      * ``on - sel_off`` is EXACT and answers "what does the vllm-ascend patch buy on this
+        checkpoint": same weights, same batch, one additive term removed. ``sel_off`` is
+        literally what an unpatched serve computes.
+      * It does NOT answer "was training with a select head worth it". ``sel_off`` is this
+        model with a limb removed, not a vanilla-trained model -- the backbone trained
+        knowing the limb was there and may have leaned on it. Only the paired
+        SELECT-vs-ROPEFIX comparison settles that; the mk_gain column says which story fits.
+
+    ``*_bias_rms`` sits next to the gains because a near-zero gain means opposite things
+    depending on whether the term is still at its zero init or has grown and does nothing.
     """
     if not any("train/sel_gain" in r for r in good[-1:] or good):
         return
@@ -421,38 +425,55 @@ def _print_select_ablation(good, col, median):
         v = col(good[-n:], key)
         return median(v) if v else None
 
-    print("\n-- SELECT ABLATION (additive term, on vs off; same weights/batch) " + "-" * 12)
-    on, off, g = med("train/sel_on_accept_len"), med("train/sel_off_accept_len"), med("train/sel_gain")
-    rms = med("train/sel_bias_rms")
-    w, l = med("train/sel_win"), med("train/sel_loss")
-    if on is not None and off is not None:
-        print(f"  accept_len   开 {on:.3f}   关 {off:.3f}   ★ 选择项自身 = {g:+.3f} token")
-        if w is not None:
-            print(f"  逐块         赢 {w:.1%}   输 {l:.1%}")
-    if rms is not None:
-        print(f"  bias RMS     {rms:.4f}   (零初始化起步;≈0 表示该项还没长出来)")
+    print("\n-- SELECT ABLATION (四角:markov x select,同权重同 batch) " + "-" * 14)
+    corners = [
+        ("on", "两项都在", "  ← 模型实际算的"),
+        ("sel_off", "只有 markov", "  ← 未打补丁的服务端算的就是这个"),
+        ("mk_off", "只有 select", ""),
+        ("both_off", "都去掉", "  ← 裸骨干"),
+    ]
+    al = {c: med(f"train/sel_{c}_accept_len") for c, _, _ in corners}
+    print(f"\n  {'角':<12} {'accept_len':>11} {'相对 on':>10}")
+    for c, label, tag in corners:
+        if al[c] is None:
+            continue
+        d = "" if c == "on" else f"{al[c]-al['on']:>+10.3f}"
+        print(f"  {label:<12} {al[c]:>11.3f} " + (f"{d}" if d else f"{'—':>10}") + tag)
 
-    posn = 0
-    while med(f"train/sel_on_pos{posn}_acc") is not None:
-        posn += 1
-    if posn:
-        row = lambda tag: "  ".join(
-            f"p{p}={med(f'train/sel_{tag}_pos{p}_acc'):.3f}" for p in range(posn))
-        print(f"  逐位置 开    {row('on')}")
-        print(f"  逐位置 关    {row('off')}")
+    sg, mg, bg = med("train/sel_gain"), med("train/mk_gain"), med("train/both_gain")
+    srms, mrms = med("train/sel_bias_rms"), med("train/mk_bias_rms")
+    w, l = med("train/sel_win"), med("train/sel_loss")
+    print()
+    if sg is not None:
+        print(f"  ★ sel_gain (on − sel_off) = {sg:+.3f} token   ← 服务端补丁能买到的")
+    if w is not None:
+        print(f"    逐块 赢 {w:.1%} / 输 {l:.1%}")
+    if mg is not None:
+        print(f"    mk_gain  (on − mk_off)   = {mg:+.3f}      both_gain = {bg:+.3f}")
+    if srms is not None:
+        print(f"    bias RMS  select {srms:.4f}   markov {mrms:.4f}")
 
     print("\n  ── 判读 ──")
-    if rms is not None and rms < 1e-3:
-        print("    该项仍≈零初始化 ⟹ 还没训起来。gain 无论多少都不能下结论,继续跑。")
-    elif g is None:
+    if srms is not None and srms < 1e-3:
+        print("    select 项仍≈零初始化 ⟹ 还没长起来,gain 无论多少都不能下结论。继续跑。")
+    elif sg is None:
         pass
-    elif g > 0.02:
-        print(f"    {g:+.3f} ⟹ **选择项自身为正**。这正是 vllm-ascend 那一小块补丁能买到的东西。")
-    elif g < -0.02:
-        print(f"    {g:+.3f} ⟹ 选择项在伤害接受长度,且它已经长起来了(RMS 非零)。查初始化与学习率。")
     else:
-        print(f"    {g:+.3f} ⟹ 已训练但无净效果 ⟹ 服务端那块补丁不值得做。")
-    print("    ⚠ teacher-forced:两个头看到的都是真前驱。本模型实测曝光偏差 0.014,故此处是温和上界。")
+        if sg > 0.02:
+            print(f"    {sg:+.3f} ⟹ **该项在这个检查点上是正的**,服务端补丁有东西可买。")
+        elif sg < -0.02:
+            print(f"    {sg:+.3f} ⟹ 该项已长起来却在伤害接受长度。查初始化与学习率。")
+        else:
+            print(f"    {sg:+.3f} ⟹ 已训练但无净效果 ⟹ 服务端补丁不值得做。")
+        if mg is not None and sg > 0.02:
+            share = sg / (sg + mg) if (sg + mg) > 1e-9 else float("nan")
+            print(f"    分工:select 占两项合计的 {share:.0%}。"
+                  + ("接近对半 ⟹ 骨干确实把活分给了它。" if 0.3 < share < 0.7
+                     else "偏低 ⟹ 它只承担了边角。" if share <= 0.3
+                     else "偏高 ⟹ 它接管了大部分转移建模,注意 markov 侧是否被掏空。"))
+    print("    ⚠ 这一段回答的是「补丁值多少」,**不是**「带 select 训练是否更好」——")
+    print("       sel_off 是本模型被截肢,不是 vanilla 模型。后者只有 VS BASELINE 那段能答。")
+    print("    ⚠ teacher-forced:两个头看到的都是真前驱。本模型实测曝光偏差 0.014,温和上界。")
 
 
 def _print_decoder_ablation(good, col, median):
