@@ -93,3 +93,46 @@ def has_kernel(op: str, backend: str) -> bool:
 
 def registered_ops() -> list[tuple[str, str]]:
     return sorted(_REGISTRY.keys())
+
+
+PLUGIN_GROUP = "speculators.kernels"
+
+
+def discover_plugins(group: str = PLUGIN_GROUP) -> list[str]:
+    """Import every installed distribution advertising ``group``; return the names loaded.
+
+    This is the difference between shipping an *interface* and shipping a *plugin point*.
+    With only an interface, an accelerator user has to know to import a bridge module by hand,
+    and an install that forgets to is correct but quietly on the torch reference. With an
+    entry point, ``pip install`` is the whole story: the bridge is imported here and registers
+    itself through :func:`register_kernel`, and nothing in the model or the training script
+    mentions any vendor.
+
+    Generic by construction -- no vendor name appears anywhere in this function, and a
+    codebase with no such distribution installed loads nothing and behaves exactly as before.
+    That is what makes it upstreamable where a ``torch_npu`` import is not (speculators #775
+    was closed for putting a vendor shim in ``src/``; #589 merged because it added a portable
+    option instead).
+
+    A plugin that raises is logged and skipped: a broken accelerator package must not stop
+    training that would otherwise run on the reference implementation.
+    """
+    import logging  # noqa: PLC0415
+    from importlib.metadata import entry_points  # noqa: PLC0415
+
+    log = logging.getLogger(__name__)
+    loaded: list[str] = []
+    try:
+        eps = entry_points(group=group)
+    except Exception as exc:  # noqa: BLE001 - metadata problems must not break imports
+        log.debug("kernel plugin discovery unavailable: %s", exc)
+        return loaded
+    for ep in eps:
+        try:
+            ep.load()
+            loaded.append(ep.name)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("kernel plugin %r failed to load (%s); ignoring", ep.name, exc)
+    if loaded:
+        log.info("loaded kernel plugin(s): %s", ", ".join(loaded))
+    return loaded
