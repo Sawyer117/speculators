@@ -133,7 +133,7 @@ vllm-ascend  vllm_ascend/models/deepseek_v4_dspark.py        "correction" 出现
 |---|---|
 | 实现代码 | 分支 `feat/dspark-next-port`;与基线的差异见开头的 compare 链接 |
 | 启动脚本 + PROVENANCE | `examples/ascend_npu_dflash/train_dsv4_dspark_correction.sh`(头 10–52 行) |
-| **训练权重** | `ckpt_faithful_ep_20260818_122129/0` = **1.0 epoch**,`/1` = **1.5 epoch**。**EP 分片的 DCP 格式**,不是 safetensors |
+| **训练权重** | `ckpt_faithful_ep_20260818_122129/0` = **1.0 epoch**,`/1` = **1.5 epoch**。标准 HF 格式:`config.json` + `model.safetensors`(EP 的专家是 `Shard(0)` DTensor,上游的 `DistributedCheckpointer` 存盘时已合并为完整 state dict) |
 | 本次日志 / 基线日志 | `faithful_ep_20260818_122129.log` / `faithful_ep_20260804_165215.log` |
 | 对照命令 | `python3 examples/ascend_npu_dflash/analyze_train_run.py <本次log> --baseline <基线log> --label CORRECTION --baseline-label ROPEFIX --out <目录>` |
 | 环境 | `examples/ascend_npu_dflash/install_npu_env_dspark.sh`(唯一权威安装脚本:torch/torch-npu 2.10.0、vLLM 0.23.0、vllm-ascend 从源码编) |
