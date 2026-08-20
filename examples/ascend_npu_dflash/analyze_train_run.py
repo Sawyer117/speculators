@@ -402,6 +402,59 @@ def _print_selection_headroom(good, col, median):
         print("    ⚠ 上界:此处 Markov 头吃的是真前驱 token,服务端吃的是草稿自己的选择。")
 
 
+def _print_select_ablation(good, col, median):
+    """Read select_ablation_probe.py's on/off comparison of the ADDITIVE selection term.
+
+    Silent on runs without those keys. The gain here is exact and confound-free -- same
+    weights, same batch, one term subtracted -- so it answers a question the paired
+    run-vs-baseline comparison cannot: how much the selection term itself contributes, as
+    opposed to everything that moved when the two arms trained separately. It is also what
+    the vllm-ascend patch is worth, since an unpatched serve computes the `off` row.
+
+    ``sel_bias_rms`` is printed next to the gain on purpose: a near-zero gain means something
+    completely different depending on whether the term has grown away from its zero init.
+    """
+    if not any("train/sel_gain" in r for r in good[-1:] or good):
+        return
+
+    def med(key, n=200):
+        v = col(good[-n:], key)
+        return median(v) if v else None
+
+    print("\n-- SELECT ABLATION (additive term, on vs off; same weights/batch) " + "-" * 12)
+    on, off, g = med("train/sel_on_accept_len"), med("train/sel_off_accept_len"), med("train/sel_gain")
+    rms = med("train/sel_bias_rms")
+    w, l = med("train/sel_win"), med("train/sel_loss")
+    if on is not None and off is not None:
+        print(f"  accept_len   开 {on:.3f}   关 {off:.3f}   ★ 选择项自身 = {g:+.3f} token")
+        if w is not None:
+            print(f"  逐块         赢 {w:.1%}   输 {l:.1%}")
+    if rms is not None:
+        print(f"  bias RMS     {rms:.4f}   (零初始化起步;≈0 表示该项还没长出来)")
+
+    posn = 0
+    while med(f"train/sel_on_pos{posn}_acc") is not None:
+        posn += 1
+    if posn:
+        row = lambda tag: "  ".join(
+            f"p{p}={med(f'train/sel_{tag}_pos{p}_acc'):.3f}" for p in range(posn))
+        print(f"  逐位置 开    {row('on')}")
+        print(f"  逐位置 关    {row('off')}")
+
+    print("\n  ── 判读 ──")
+    if rms is not None and rms < 1e-3:
+        print("    该项仍≈零初始化 ⟹ 还没训起来。gain 无论多少都不能下结论,继续跑。")
+    elif g is None:
+        pass
+    elif g > 0.02:
+        print(f"    {g:+.3f} ⟹ **选择项自身为正**。这正是 vllm-ascend 那一小块补丁能买到的东西。")
+    elif g < -0.02:
+        print(f"    {g:+.3f} ⟹ 选择项在伤害接受长度,且它已经长起来了(RMS 非零)。查初始化与学习率。")
+    else:
+        print(f"    {g:+.3f} ⟹ 已训练但无净效果 ⟹ 服务端那块补丁不值得做。")
+    print("    ⚠ teacher-forced:两个头看到的都是真前驱。本模型实测曝光偏差 0.014,故此处是温和上界。")
+
+
 def _print_decoder_ablation(good, col, median):
     """Read decoder_ablation_probe.py's replay of four block decoders on the same blocks.
 
@@ -1016,6 +1069,7 @@ def main() -> None:
         if v is not None:
             print(f"{lab:15}: {fmt(v)}")
     _print_selection_headroom(good, col, median)
+    _print_select_ablation(good, col, median)
     _print_decoder_ablation(good, col, median)
 
     pos_keys = detect_positions(recs)
