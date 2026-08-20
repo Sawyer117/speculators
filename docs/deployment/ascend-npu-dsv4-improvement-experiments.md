@@ -431,3 +431,82 @@ SAVE_PATH=$RUN/ckpt_faithful_ep_20260804_165215 \
 - 若 `decayN` 转正 ⟹ 之前的负值是量纲伪影,联合解码本身可用,再谈服务端落地。
 - 若归一化差值 ≈ 0 且各档仍为负 ⟹ 前缀接受与链分的错配是真的,**这条线判负**,
   头寸(pos4 +25.9pt)得靠训练侧或别的选择器去拿,不是靠换解码规则。
+
+---
+
+## 6. 读到 DFlash2 的官方实现:vllm-ascend #14533(2026-08-20)
+
+`[Feature] add DFlash2 for MRV1`,作者 chenaoxuan,2026-08-19 开,777+/1−,9 文件。
+跟的是上游 vllm#52816(未合)。权重已公开:HF collection `z-lab/dflash-2`。
+
+### 打分式子:与我们从博文推的一致
+
+`vllm_ascend/models/qwen3_dflash2.py::_score_edges` 展开:
+
+```
+S[l, p, c] = U_l(c) + Σ_r  A(a_p)[r] · H(h_l)[r] · B(b_c)[r]
+           = U_t(c) + ⟨ A(a) ⊙ H(h_t) , B(c) ⟩
+```
+
+`predecessor_codebook` = A,`successor_codebook` = B,`hidden_projection` = H。
+
+### ★★ 我们的 Markov 头就是它的两个码本
+
+| 它 | 我们已有 |
+|---|---|
+| `predecessor_codebook` [V, rank] | **`markov_w1`** [129280, 256] |
+| `successor_codebook` [V, rank] | **`markov_w2.weight`** [129280, 256] |
+| `hidden_projection` Linear(hidden→rank) | **缺** |
+
+缺口 = `Linear(4096 → 256)` = **1.05M 参数**。也对上了它 Table 2 的 +77.8M = 2×151936×256。
+
+### ★ 关键纠正:我们的 `gated` 不是它的超集,而是弱在要害
+
+| | H(h) | 值域 |
+|---|---|---|
+| 它 | `Linear(hidden → rank)` | **无界、带符号** |
+| 我们 `gated` | `σ(Linear([h ; A(a)]))` | **(0,1),只能衰减,符号不变** |
+
+sigmoid 门只能把某维关小,**永不放大、永不翻号** ⟹ gated bias 永远是 vanilla bias 的收缩版本。
+对"rank-256 会不会不堪重负"这个问题,这是决定性的差别:
+
+- sigmoid 门:只能从无条件 bigram 里做**减法**,256 维被蚕食 —— 担忧成立;
+- 线性 H:每维自由带符号缩放,每个上下文对应一个**真正不同**的 rank-256 矩阵,不是掩码子集。
+
+⟹ **不要用 `--markov-head-type gated`。** 坏的是 sigmoid,不是"让 Markov 头兼职 select"这件事。
+
+### ⚠ 它的性能表没有隔离 selector
+
+| Method | Spec Num | Mean AL | Acc-Rate per Pos(%) | Throughput(req/s) |
+|---|---|---|---|---|
+| No-Spec | — | — | — | 0.21 |
+| MTP | 8 | 6.17 | 94, 86, 77, 68, 59, 51, 44, 38 | 0.92 |
+| DFlash2 | 8 | **6.73** | 94, 87, 80, 74, 68, 62, 57, 51 | **1.02** |
+
+(Qwen3.8-27B,DP1/TP2,gsm8k 前 300,batch 16,temp 0,A2B3-NPU,eager)
+
+对照组是 **MTP(自回归逐 token)**,而 DFlash2 是**新骨干 + selector 的整包**。
+`_grouped_conv`(块内输入相关的分组因果卷积)是**草稿骨干**组件,不是 selector ——
+PR 描述把两者混为一谈。**⟹ 那 +0.56 不能记在 selection 上。**
+外部没有任何数字说明 selection 单独值多少;§2 我们自己量的头寸仍是唯一证据。
+
+### ✓ 交叉验证:它的解码器也是贪心,不是 Viterbi
+
+`dflash2_greedy_selector_walk_kernel`:`prev_idx=0` 起步,逐步取 argmax(平局取小下标)。
+我们 §5 的消融独立测出联合解码/Viterbi 在前缀接受下为负(−0.175),`decay` 优于 `viterbi`。
+**两条独立路径同一结论**,给我们的消融结果加分。
+
+### ★ 我们的服务端不需要它的 top-k 走链
+
+它算 `[B, L, top_k, top_k]` 的整表再用 Triton 核走 —— 那是**核效率**选择,不是算法需要
+(贪心每步只访问一个前驱)。我们的 `_sample_sequential` 本来就是逐步全词表 argmax,
+**算法上等价或更强**(全词表 ⊃ top-k;§5 已测 top-k 剪枝在 k=4 要花 0.496 token)。
+⟹ 服务端改动只是"`bias()` 多收一个 hidden、多一个 Linear",约 10 行,不需要 Triton 核,
+也不需要 top-k。比原先估的 30 行还小。
+
+### 对计划的影响
+
+1. **从零训**:加强。A/B 码本必须与 H **共同学出**;续训等于把 H 螺丝钉在一组从没见过调制的基底上。
+2. **谱检查(§7 脚本)照跑**,但问题变了:不是"要不要做",而是"**256 维够不够同时扛无条件 bigram + 上下文调制**"。饱和 ⟹ 新头用更大 rank,不是放弃。
+3. **实现它的形式,不用 `gated`** —— 新 head type `dflash2`。
+4. 服务端有模板,且就在 vllm-ascend 内。
