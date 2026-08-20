@@ -510,3 +510,100 @@ PR 描述把两者混为一谈。**⟹ 那 +0.56 不能记在 selection 上。**
 2. **谱检查(§7 脚本)照跑**,但问题变了:不是"要不要做",而是"**256 维够不够同时扛无条件 bigram + 上下文调制**"。饱和 ⟹ 新头用更大 rank,不是放弃。
 3. **实现它的形式,不用 `gated`** —— 新 head type `dflash2`。
 4. 服务端有模板,且就在 vllm-ascend 内。
+
+---
+
+## 7. 曝光偏差实测 0.014;谱检查;定案用**加性** SelectHead(2026-08-20)
+
+### 7.1 ★ 曝光偏差 = 0.014 token —— §5 的保真门顺带量出来了
+
+|  | 前驱来自 | accept_len |
+|---|---|---:|
+| 训练 `hard_accept_len` | **真** token(`dspark/core.py:159` `prev_token_ids = block_tokens`) | 3.946 |
+| 重放 `today` | **草稿自己的选择**(`prev = pick` 逐步喂回) | 3.932 |
+
+写重放时"喂自己的选择"是当保真度要求做的,没意识到它同时构成了对照。
+**训推曝光偏差 = 0.014 token,在噪声带内。**
+
+**而且这是结构决定的,不是运气**:`accept_len` 是**前缀**度量,第一个挑错的位置就把整块截断,
+所以"前驱是错的"只发生在**已被丢弃的位置**上 —— 前缀接受让曝光偏差自我封顶。
+`num_spec` 变大也不会线性放大,同样被截断吃掉。
+
+**★ 推论:上下文调制不新增任何暴露面。** `H(h_t)` 的输入 `h_t` 来自并行骨干的**一次**前向,
+在任何挑选发生**之前**就算完(`proposer.py:923`,`base_logits` 上一行),训练与服务完全一致;
+另一个输入就是 vanilla 已经在用的同一个 `prev`。
+⟹ 早先"更强的 select 头会因 teacher forcing 而更危险"的担心**撤回**,有实测也有机制。
+
+### 7.2 谱检查:`ep5p0-ropefix` 的 Markov 基底
+
+`markov_spectrum_probe.py`,`ckpt_faithful_ep_20260804_165215/4`:
+
+```
+w1 (前驱嵌入 A)     有效秩 255.0 / 256  (99.6%)   能量覆盖 50%->123  80%->202  90%->229  95%->242  99%->254
+w2 (后继嵌入 B)     有效秩 142.7 / 256  (55.7%)   能量覆盖 50%-> 93  80%->186  90%->220  95%->238  99%->253
+★ 转移矩阵 w2·w1ᵀ   有效秩 110.0 / 256  (43.0%)   能量覆盖 50%-> 89  80%->183  90%->218  95%->237  99%->252
+```
+
+⚠ **脚本当时的判词"基底没被吃满"过于乐观,以此处为准:**
+复合矩阵的 participation ratio 是 110(看着有余量),但**能量尾巴铺满 256 维**(99% 要 252),
+且 **A 本身 99.6% 近乎满秩**。所以不是"有 146 维闲着",而是"头部集中、但没有一块真正空着"。
+**混合信号,不构成"放心复用同一组基底"的结论。**
+
+### 7.3 定案:**加性** SelectHead,不用融合式 `dflash2` 头
+
+```
+S_t(a,b) = U_t(b) + ⟨A(a), B(b)⟩ + ⟨A′(a) ⊙ H′(h_t), B′(b)⟩
+              无条件 bigram(不变)      上下文选择项(新增)
+```
+
+两种实现**数学上等价**(同权重下 bias 逐比特相同,已验证);选加性是**工程属性**上的判断:
+
+1. **优雅退化。** 融合式若转换器漏掉 `H`,服务端会拿"在有 H 前提下训出的 w1/w2"算无 H 的
+   bias —— **静默错误**,正是 Correction 头那次的死法。加性项漏掉 = 退回今天的行为,**无增益但无错**。
+2. **它本身就是消融。** 把该项置零 = 今天的模型逐比特相同 ⟹ "selection 单独值多少"直接可测。
+   融合式永远拆不开(两臂的 w1/w2 本身就不同)。
+3. **服务端可先落地再等权重** —— 训练前恒为 0,那 10 行可以先合、先验证是 no-op。
+
+代价:`A′+B′` = 2×129280×256 = **66.2 M**,`H′` = 1.05 M。占 21B 草稿的 0.3%;
+服务端每步多一次 `[256 × 129280]` matmul,对 1.5B 激活的骨干前向可忽略。
+
+初始化 `B′ = 0` / `H′ = 1` ⟹ 整项 step 0 恒为 0,配对 A/B 从第一步就干净。
+B′ 先动、A′ 随后解冻(已验证),零初始化输出的标准形态(同 LoRA、同我们的 `--dflash-*`)。
+
+`markov_head_type="dflash2"`(融合式,忠实于 #14533)保留在树里,以后当 A/B 的另一臂。
+
+### 7.4 本轮启动命令(BEST 基线 + 本次 SELECT 臂)
+
+与产出 `ep5p0-ropefix` 的 canonical 命令**逐字段相同,只多 `SELECT_RANK=256`**
+⟹ 同种子同数据,batch 序列逐步一致,`faithful_ep_20260804_165215.log` 即免费配对基线。
+
+```bash
+# 前置:115/116 的 HS_DUMP=1 serve 必须先起着(在线取隐状态)
+cd /home/a00652497/dspark_austin/speculators
+git checkout dflash2-reproduce && git pull
+
+DSPARK_EP=1 BF16_EXPERTS=1 RECOMPUTE=1 COMPILE=0 \
+DSPARK_MOE_BALANCE=1 DSPARK_MOE_BALANCE_RATE=1e-3 DSPARK_LOG_EXPERT_LOAD=1 \
+INIT_LAYER=1 INIT_MOE_NO_ROUTER=1 \
+SELECT_RANK=256 \
+LR=2e-4 EPOCHS=5 MAX_ANCHORS=512 CKPT_FREQ=0.5 \
+DATA=/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow_0730_77w_dedup \
+  bash examples/ascend_npu_dflash/train_dsv4_dspark.sh faithful
+```
+
+启动后走开之前**必须确认两件事**:
+- 横幅里有 `select_rank=256` —— 没有就是旗标没透传,白跑 24 小时;
+- 前几十步 `hard_accept_len` 与基线同量级 —— 零初始化生效的话起步就是恒等,崩了说明没生效。
+
+读数:
+
+```bash
+RUN=/home/a00652497/dspark_austin/run
+python3 examples/ascend_npu_dflash/analyze_train_run.py \
+  $RUN/faithful_ep_<新TS>.log --baseline $RUN/faithful_ep_20260804_165215.log \
+  --label SELECT --baseline-label ROPEFIX --out $RUN/cmp_select
+```
+
+⚠ **读数的不对称**:`A′/B′` 是全新的 129280×256 嵌入表,1 epoch 内还年轻。
+**正结果决定性;打平只能说"这个预算内没看到",不能判死。**
+(参照:Correction 头 17k 步就有 +0.038,说明新模块在这套设置里确实会早早出信号。)
