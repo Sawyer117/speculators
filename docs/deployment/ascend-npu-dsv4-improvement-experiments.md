@@ -78,7 +78,7 @@ vllm-ascend vllm_ascend/models/deepseek_v4_dspark.py  "correction" 出现 0 次
 |---|---|
 | **实现代码** | `Sawyer117/speculators` 分支 **`feat/dspark-next-port`** @ `1d5827d`。自 `feat/dsv4-dspark` 分出,含 `78a0776` 合入 TYS5537/speculators@dspark_next,以及其后 6 条我们的适配提交(见下) |
 | **启动脚本 + PROVENANCE** | 同分支 `examples/ascend_npu_dflash/train_dsv4_dspark_correction.sh`,文件头 10–52 行逐条写明**拿了什么 / 没拿什么 / 每条为什么** |
-| **训练权重** | `run/ckpt_faithful_ep_20260818_122129/0`(1.0 epoch)与 `/1`(1.5 epoch)。**EP 分片的 DCP 格式**,非 safetensors;要用 speculators 的转换器转成部署格式,但见下方 ⚠ |
+| **训练权重** | `run/ckpt_faithful_ep_20260818_122129/0`(1.0 epoch)与 `/1`(1.5 epoch)。标准 HF 格式:`config.json` + `model.safetensors`(2026-08-21 在盒子上核实;先前记为「EP 分片 DCP」是错的)。仍需 `convert_dspark_to_vllm.py` 做**键名重排** `layers.* → mtp.*`,但见下方 ⚠ |
 | **本次日志** | `run/faithful_ep_20260818_122129.log` |
 | **对照基线日志** | `run/faithful_ep_20260804_165215.log`(`ep5p0-ropefix`,#942 的 OFF 臂,与本次同种子同数据) |
 | **对照命令** | `python3 examples/ascend_npu_dflash/analyze_train_run.py <本次log> --baseline <基线log> --label CORRECTION --baseline-label ROPEFIX --out <目录>` |
@@ -857,3 +857,73 @@ python3 examples/ascend_npu_dflash/analyze_train_run.py \
 平台 ≈ 0.053       ⟹ 同一种"早到",幅度大些 ⟹ 边缘,先做 top-k 降本再说
 平台 ≤ 0.03        ⟹ 死
 ```
+
+---
+
+## 10. 上游化:侵入性预算与 `train/` 的拆分(2026-08-21)
+
+维护者(`shanjiaz`,#952)的要求:拆成两份独立详细设计 —— ① DSV4-Flash DSpark 草稿模型定义、
+② 专家并行训练;判据是**「侵入性不大就能合」**。于是先量侵入面。
+
+⚠ 量之前先修一个坑:我们 fork 的 `main` 停在 2026-07-02 且是我们自己的提交,**脏了 7 周**。
+必须对**真上游** `vllm-project/speculators` 的 `main` 取 merge-base(2026-07-17,其后 88 个上游提交),
+否则统计里会混进大量上游自己的改动(peagle / eagle3 / dflash 那些都不是我们写的)。
+
+### 10.1 净改动(排除 `examples/` `docs/` `.claude/` `.github/`)
+
+| | 文件 | 增 | 删 | 性质 |
+|---|---:|---:|---:|---|
+| **A 新目录 `models/dsv4_dspark/`** | 15 | +2622 | **−0** | **纯新增,零删除** |
+| B `models/dspark/` | 4 | +93 | −16 | 小 |
+| **C ★ `train/`** | 6 | +510 | −85 | 真正的侵入面 |
+| D ★ `scripts/` | 5 | +941 | −6 | 其中 657 行是三个全新脚本 |
+| E `tests/` | 3 | +201 | −7 | |
+| **F ★ 其他共享文件** | 6 | **+98** | **−3** | 几乎可忽略 |
+
+F 类全部六处:`models/metrics.py` +53、`data_generation/preprocessing.py` +21、`model.py` +12、
+`models/utils.py` +5、`models/dflash/core.py` +4、`models/__init__.py` +3(注册)。
+
+### 10.2 `train/` 拆开:五类,其中两类与 EP/DSV4 都无关
+
+| 类别 | ~行数 | 位置 |
+|---|---:|---|
+| **① EP 通用机制** | ~140 | `distributed.py`(`shard_experts_as_dtensor`、`apply_fully_sharded` 加 mesh/ignored)、`trainer.py`(mesh 构建、专家跳过 broadcast、`bf16_experts` AMP 选项) |
+| **② 通用 QoL(与 EP/DSV4 无关)** | ~100 | `dataloader.py --no-validation`、`logger.py` 纯文本镜像、`trainer.py::_gpu_mem_stats` |
+| **③ 在线 HS 管线** | ~160 | `data.py` 的 `_hs_fetch_session` / `_fetch_hs_remote` / `_dump_generate_hs` |
+| ④ EP 诊断 | ~30 | `trainer.py` 的 align 屏障 + per-rank fetch 统计 |
+| ⑤ 大模型 meta 初始化 | ~30 | `distributed.py::build_on_meta` |
+
+### 10.3 ★★ `train/` 里对 DSV4 的硬耦合 = **3 行**
+
+```
+distributed.py:250   if type(module).__name__ != "GroupedExperts":
+trainer.py:341-342   _ep_local = getattr(self.model, "ep_local_param_keys", None)
+                     _expert_keys = set(_ep_local()) if callable(_ep_local) else set()
+```
+
+两处**都已是鸭子类型**(按类名字符串 / `getattr`+`callable` 兜底),不 import 我们的模型。
+⟹ **EP 那块本质上已经模型无关**;设计文档的核心命题就是把这两处升格为正式约定
+(一个 expert-module protocol,或显式传 predicate),侵入面便只剩
+"给 `apply_fully_sharded` 加 `mesh=` 与 `ignored_params`"。
+
+### 10.4 提交顺序建议
+
+1. **② 那 ~100 行先单独发 PR** —— 与 DSV4、与 EP 都无关的纯可用性改进,零争议,先拿小 merge 建立信任。
+2. **① 草稿模型定义**(纯新增、零删除)。建议把 `backbone/` 里的
+   `moe_ep.py` / `moe_grouped_gemm.py` / `moe_compile.py`(+545)剥给 EP 那份,
+   模型定义即为 **~2077 行纯建模代码**。代价:① 单独合入后上游**训不动**该模型,须在文中讲明。
+3. **EP 训练**(①的另一半 + `train/` 的 ①④⑤)。
+4. ③ 在线 HS 管线单独成篇,或留在 fork。
+
+### 10.5 关于「训练完能否直接推理」——现状
+
+- **上游别的模型不需要出站转换。** `src/speculators/convert/` 全是**入站**的
+  (EAGLE3 / MTP / DFlash 的研究仓 checkpoint → speculators 格式);vLLM 直接读 speculators 格式。
+- **我们的检查点也是标准 safetensors**(2026-08-21 核实:`config.json` + `model.safetensors`)。
+  上游 `checkpointer.py::DistributedCheckpointer` 用
+  `get_model_state_dict(full_state_dict=True, cpu_offload=True)` 合并后由 rank0 `save_pretrained` —
+  把专家做成与 FSDP 其余部分同 mesh 的 `Shard(0)` DTensor,正是为了让这条路不用特判。
+  **我们一行 `checkpointer.py` 都没改。**
+- ⟹ **转换那一步的唯一理由是键名重排 `layers.* → mtp.*`** ——
+  因为 vllm-ascend 的 DSV4-DSpark 加载器是照**官方发布草稿的 `mtp.*` 布局**写的。
+  **这是推理侧的选择,与 EP 无关**;若 vllm-ascend 直接认 speculators 布局,这一步即可消失。
