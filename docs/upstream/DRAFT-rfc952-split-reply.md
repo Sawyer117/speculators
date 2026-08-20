@@ -35,31 +35,26 @@ So the expert-parallel work is essentially model-agnostic already. What a design
 a proper contract for those two hooks (an expert-module protocol, or an explicit predicate)
 instead of a class-name string.
 
-### Proposed split — three, not two
+### Proposed split
 
-Measuring turned up a third group: ~100 lines in `train/` that relate to neither DSV4 nor EP.
-Keeping them out of both designs keeps each one small.
+1. **Expert-parallel training (FSDP2 + EP)** — the general one, and the one whose design
+   surface is worth discussing. Routed experts become `Shard(0)` DTensors on the same mesh as
+   the FSDP-sharded rest, so the optimizer, gradient clipping and checkpointing need no
+   plain-vs-DTensor special casing; FSDP is told to ignore them and the MoE moves tokens with
+   an all-to-all. Worth noting for the checkpoint question: this is *why*
+   `DistributedCheckpointer` still consolidates to plain safetensors with no changes to it at
+   all. The design question is what to put in place of the two duck-typed hooks above.
 
-1. **Generic training-loop improvements** — `--no-validation` (train on the full split instead
-   of silently discarding the held-out slice), a plain-text log mirror (piping through `tee`
-   makes stdout a non-tty and strips rich's colors and progress bar), and per-step device
-   memory stats. Independent of everything else here; happy to send this as an ordinary PR
-   rather than an RFC.
-
-2. **Expert-parallel training (FSDP2 + EP)** — the general one. Routed experts become
-   `Shard(0)` DTensors on the same mesh as the FSDP-sharded rest, so the optimizer, gradient
-   clipping and checkpointing need no plain-vs-DTensor special casing; FSDP is told to ignore
-   them and the MoE moves tokens with an all-to-all. Worth noting for the checkpoint question:
-   this is *why* `DistributedCheckpointer` still consolidates to plain safetensors with no
-   changes to it at all.
-
-3. **DSV4-Flash DSpark draft model definition** — the new directory. Every part of it exists to
+2. **DSV4-Flash DSpark draft model definition** — the new directory. Every part of it exists to
    keep the draft isomorphic to the target's decoder layer (MLA with q/o dual LoRA and per-head
    sinks, mHC in place of the residual, 256 routed experts + 1 shared); a smaller draft does not
    learn this target. It is a pure addition apart from three lines of registration.
 
-(2) and (3) are separable but not independent: (3) alone cannot be trained upstream without
-(2). I would rather state that plainly than pretend either stands alone.
+They are separable but not independent: (2) alone cannot be trained upstream without (1). I
+would rather state that plainly than pretend either stands alone.
 
-Suggested order: (1) first since it is uncontroversial and unblocks nothing, then (2), then
-(3). Happy to take any of it to Slack — whichever is easier for you.
+A small carve-out so it does not muddy either diff: about a hundred lines in `train/` relate to
+neither of these (a `--no-validation` flag, a plain-text log mirror, per-step device memory
+stats). I will keep those out of both and send them separately if they are wanted at all.
+
+Happy to start with either, or to take it to Slack — whichever is easier for you.
