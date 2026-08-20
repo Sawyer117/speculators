@@ -287,6 +287,16 @@ def _slope_per_1k(pts):
     return (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den) * 1000.0
 
 
+# Smoothing window for _mono_series / _series_noise, in RECORDS. Deliberately a constant.
+# Deriving it from a run's own length (max(20, min(200, len//50))) made the window depend on
+# how long the log happens to be, which broke the one thing this tool exists to do: a finished
+# 38931-step run got win=200 while a live 4500-step one got win=90, so its noise estimate was
+# 1.49x smaller for no reason but its length, and their error bars were not comparable. Worse,
+# a given step's delta drifted as the run grew -- step 500 read +0.256, then +0.253, then
+# +0.233 across four invocations of the same command on a growing log.
+_SMOOTH_WIN = 100
+
+
 def _series_noise(recs, series, key="train/accept_len", win=None):
     """Standard error of the smoothed curve: how much of it is just per-batch noise.
 
@@ -309,7 +319,7 @@ def _series_noise(recs, series, key="train/accept_len", win=None):
     if len(res) < 40:
         return None
     if win is None:
-        win = max(20, min(200, len(pts) // 50))
+        win = _SMOOTH_WIN
     # 1.253 = SE(median)/SE(mean) for a normal sample
     return 1.253 * pstdev(res) / (win ** 0.5)
 
@@ -323,9 +333,7 @@ def _mono_series(recs, key="train/accept_len", win=None):
     pts = [(step_of(r), f(r, key)) for r in recs
            if f(r, key) is not None and step_of(r) >= 0]
     if win is None:
-        # Wide enough that the rolling median is already near-monotone, so the running max
-        # below is a near no-op rather than a systematic lift.
-        win = max(20, min(200, len(pts) // 50))
+        win = _SMOOTH_WIN
     if len(pts) < win * 2:
         return []
     pts.sort()
