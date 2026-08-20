@@ -505,6 +505,13 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
         if abs(d_last) <= b_last:
             print(f"      => 末段 delta {d_last:+.3f} 在误差带 ±{b_last:.3f} 内 —— "
                   "**收敛到同一渐近线**，无净增益。")
+        elif abs(d_last) < 1.5 * b_last:
+            # ⚠ A verdict decided by clearing one's own error bar by a few percent is a
+            # threshold artefact, not a finding. Two arms landed on opposite sides of this
+            # line at 0.18 sigma apart from each other; say so instead of picking a winner.
+            print(f"      => 末段 delta {d_last:+.3f}，仅略超误差带 ±{b_last:.3f}"
+                  f"（{d_last / b_last:.2f}x）—— **边缘,判不了**。"
+                  "跨过带 10~50% 是阈值效应,不是结论;继续采样。")
         elif d_last < 0:
             print(f"      => 末段 delta {d_last:+.3f}（带 ±{b_last:.3f}）—— **比基线差**。")
         else:
@@ -514,6 +521,30 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
             print("         " + ("已走平 ⟹ 渐近线确实高出这么多。" if settled
                                  else "仍在变化 ⟹ 尚未定型，继续采样。")
                   + f"  值不值得,拿它和 §8 的回本门槛比。")
+
+    # ARM vS ARM. Each arm's verdict is against the shared baseline, so two arms can land on
+    # opposite sides of a threshold while being indistinguishable FROM EACH OTHER -- which is
+    # the comparison actually being asked for when more than one arm is passed.
+    last = {}
+    for name, pts in trend.items():
+        u = [(S, d, db) for S, d, db, *_ in pts if d is not None]
+        if u:
+            t = u[-3:]
+            last[name] = (u[-1][0], median([d for _, d, _ in t]), median([b for _, _, b in t]))
+    names = [n for n, _, _ in loaded if n in last]
+    if len(names) >= 2:
+        print()
+        print("  ── 两臂直接比较（末段）──")
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                a, b = names[i], names[j]
+                (_, da, ba), (_, db_, bb) = last[a], last[b]
+                diff = da - db_
+                comb = (ba ** 2 + bb ** 2) ** 0.5
+                sig = abs(diff) / comb if comb else float("inf")
+                print(f"    {a} − {b} = {diff:+.3f} ± {comb:.3f}   ({sig:.2f}σ) "
+                      + ("⟹ **无法区分**" if sig < 1.0 else
+                         "⟹ 有差别但不牢靠" if sig < 2.0 else "⟹ 可区分"))
 
     print()
     print("  ⚠ 这是训练侧 SOFT accept_len 的代理判据，不是裁决。裁决只能是转换后的服务端评测。")
