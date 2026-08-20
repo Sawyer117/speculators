@@ -274,6 +274,159 @@ def _load_and_skip(path: str, skip: int, quiet: bool = False, max_step: int = 0)
     return recs, checkpoint_steps(raw_text), _steps_per_epoch(recs, raw_text), raw_text
 
 
+def _slope_per_1k(pts):
+    """Least-squares slope of value vs step, scaled to Δ per 1000 steps (signed)."""
+    if len(pts) < 20:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    if den == 0:
+        return None
+    return (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den) * 1000.0
+
+
+def _mono_series(recs, key="train/accept_len", win=20):
+    """(step, value) smoothed by a rolling median and forced monotone non-decreasing.
+
+    accept_len is noisy per batch and the inversion below needs a function it can invert, so
+    the running max is applied after smoothing rather than instead of it.
+    """
+    pts = [(step_of(r), f(r, key)) for r in recs
+           if f(r, key) is not None and step_of(r) >= 0]
+    if len(pts) < win * 2:
+        return []
+    pts.sort()
+    out, run = [], None
+    for i in range(win, len(pts) + 1):
+        v = median([p[1] for p in pts[i - win:i]])
+        run = v if run is None else max(run, v)
+        out.append((pts[i - 1][0], run))
+    return out
+
+
+def _lead_steps(base_series, arm_value, at_step):
+    """HOW MANY STEPS AHEAD the arm is: invert the baseline curve at the arm's value.
+
+    Read directly as horizontal distance -- find the step at which the BASELINE first reaches
+    what the arm has reached at ``at_step`` -- rather than as delta/slope. Slope estimation
+    needs a trailing window, and on a saturating curve any window wide enough to be stable is
+    also wide enough to overstate the local slope, which makes a pure head start look like a
+    shrinking one. Inversion has no window and no bias: a curve shifted N steps left returns N
+    at every sample point.
+
+    Returns (lead, capped). ``capped`` means the arm is beyond anything the baseline reached in
+    its logged range, so the true lead is at least what is reported.
+    """
+    if arm_value is None or not base_series:
+        return None, False
+    if arm_value <= base_series[0][1]:
+        return arm_value - base_series[0][1], False  # behind before the curve starts: report ~0
+    if arm_value > base_series[-1][1]:
+        return base_series[-1][0] - at_step, True
+    lo, hi = 0, len(base_series) - 1
+    while lo < hi:                                   # first index whose value >= arm_value
+        mid = (lo + hi) // 2
+        if base_series[mid][1] < arm_value:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo == 0:
+        return base_series[0][0] - at_step, False
+    (s0, v0), (s1, v1) = base_series[lo - 1], base_series[lo]
+    frac = 0.0 if v1 == v0 else (arm_value - v0) / (v1 - v0)
+    return (s0 + frac * (s1 - s0)) - at_step, False
+
+
+def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
+    """Compare N experiment arms against ONE shared baseline, at several matched step counts.
+
+    Two arms' deltas over a common baseline are comparable only when measured over the same
+    steps, and one step count says almost nothing -- what discriminates is how each arm's lead
+    EVOLVES. So this samples a ladder of step counts and reports, per arm, the raw delta and
+    the delta expressed as an equivalent head start in steps.
+    """
+    base_recs, base_ck, _, _ = _load_and_skip(baseline_path, skip, quiet=True)
+    if not base_recs:
+        raise SystemExit(f"baseline has no metrics: {baseline_path}")
+    loaded = []
+    for name, path in arms:
+        r, ck, _, _ = _load_and_skip(path, skip, quiet=True)
+        if not r:
+            print(f"  ⚠ 跳过 {name}: 无指标 ({path})")
+            continue
+        loaded.append((name, r, ck))
+    if not loaded:
+        raise SystemExit("no usable arms")
+
+    if not at_steps:
+        longest = max(max(step_of(x) for x in r) for _, r, _ in loaded)
+        ladder = [500, 1500, 3000, 5000, 10000, 20000, 40000, 80000]
+        at_steps = [x for x in ladder if x <= longest] or [longest]
+        if at_steps[-1] < longest * 0.8:
+            at_steps.append(longest)
+
+    print()
+    print("=" * 78)
+    print(f" LEAD SCAN   共同基线 = {os.path.basename(baseline_path)}")
+    print("=" * 78)
+    base_series = _mono_series(base_recs)
+    if not base_series:
+        raise SystemExit("baseline has too few accept_len points to invert")
+    trend = {name: [] for name, _, _ in loaded}
+    for S in at_steps:
+        b = [r for r in base_recs if 0 <= step_of(r) <= S]
+        if len(b) < 40:
+            continue
+        hb = _headline(b, base_ck, spike_k)
+        if hb["accept_len"] is None:
+            continue
+        print()
+        print(f"  ── @ step ≤ {S}   基线 accept_len {hb['accept_len']:.3f} ──")
+        print(f"     {'arm':<12} {'accept_len':>10} {'delta':>8} {'d_loss':>8} {'lead(steps)':>12}")
+        for name, recs, ck in loaded:
+            a = [r for r in recs if 0 <= step_of(r) <= S]
+            if len(a) < 40:
+                continue
+            ha = _headline(a, ck, spike_k)
+            if ha["accept_len"] is None:
+                continue
+            d = ha["accept_len"] - hb["accept_len"]
+            dl = (ha["loss"] - hb["loss"]) if (ha["loss"] and hb["loss"]) else None
+            lead, capped = _lead_steps(base_series, ha["accept_len"], S)
+            trend[name].append((S, d, lead, capped))
+            lead_s = "-" if lead is None else (f">{lead:.0f}" if capped else f"{lead:.0f}")
+            print(f"     {name:<12} {ha['accept_len']:>10.3f} {d:>+8.3f} "
+                  + (f"{dl:>+8.3f}" if dl is not None else f"{'-':>8}")
+                  + f" {lead_s:>12}")
+
+    print()
+    print("  ── 判读：等效领先步数的走势 ──")
+    for name, pts in trend.items():
+        # A capped point is not a measurement: the arm is past everything the baseline logged,
+        # so its lead is unbounded below by the baseline's own remaining run, not estimated.
+        n_cap = sum(1 for *_, c in pts if c)
+        pts = [(S, d, l) for S, d, l, c in pts if l is not None and not c]
+        if len(pts) < 2:
+            print(f"    {name:<12} 可用采样点不足({len(pts)}"
+                  + (f"，另有 {n_cap} 个超出基线记录范围" if n_cap else "") + ")，再多跑一段")
+            continue
+        g = pts[-1][2] / pts[0][2] - 1 if pts[0][2] else float("nan")
+        print(f"    {name:<12} " + "  ".join(f"{S}:{l:.0f}" for S, _, l in pts)
+              + (f"   (另 {n_cap} 点超出基线范围，已排除)" if n_cap else ""))
+        if g > 0.30:
+            print(f"      => 增长 {g:+.0%} —— **水平抬升**的形状，不是单纯提前。值得走到 eval。")
+        elif g < -0.30:
+            print(f"      => 下降 {g:+.0%} —— 领先在被吃掉，比单纯提前还差。")
+        else:
+            print(f"      => 基本持平({g:+.0%})—— **纯横向提前**：同一条渐近线，只是早到。")
+    print()
+    print("  ⚠ 这是训练侧 SOFT accept_len 的代理判据，不是裁决。裁决只能是转换后的服务端评测。")
+    print("  ⚠ 各臂之间往往不止一个变量不同（Correction 还带 --no-confidence-detach-features")
+    print("     和整块 --correction-*/--dflash-*），所以这是「哪次实验推动更大」，不是「哪个头更好」。")
+
+
 def _headline(recs, ckpt_steps, spike_k=3.0) -> dict:
     """The handful of numbers we compare between two runs (cheap; recomputed per run)."""
     good = [r for r in recs if f(r, "train/loss") is not None and not isnan(f(r, "train/loss"))]
@@ -686,6 +839,11 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--recent", type=int, default=500, help="window (steps) for the recent-dynamics trend")
     ap.add_argument("--skip", type=int, default=0,
                     help="drop global_steps < N (exclude shape-warmup / resume HS-regen); applied to BOTH runs")
+    ap.add_argument("--arm", action="append", default=[], metavar="NAME=LOG",
+                    help="LEAD SCAN mode: an experiment arm to compare against the shared "
+                         "--baseline. Repeatable; the positional logfile is then unused")
+    ap.add_argument("--at", type=int, nargs="+", default=None, metavar="STEP",
+                    help="lead-scan: step counts to sample at (default: an automatic ladder)")
     ap.add_argument("--max-step", type=int, default=0, metavar="N",
                     help="drop global_steps > N; applied to BOTH runs. Use it to compare a long "
                          "finished run against a short live one AT THE SAME STEP COUNT -- two "
@@ -1006,6 +1164,18 @@ def hs_split_report(text: str) -> None:
 def main() -> None:
     args = _build_parser().parse_args()
 
+    if args.arm:
+        if not args.baseline:
+            raise SystemExit("--arm needs a shared --baseline")
+        pairs = []
+        for a in args.arm:
+            if "=" not in a:
+                raise SystemExit(f"--arm wants NAME=LOG, got {a!r}")
+            n, _, p = a.partition("=")
+            pairs.append((n, p))
+        _lead_scan(args.baseline[0], pairs, args.at, args.skip, args.spike_k)
+        return
+
     recs, ckpt_steps, steps_per_epoch, raw_text = _load_and_skip(
         args.logfile, args.skip, max_step=args.max_step)
     if recs is None:
@@ -1125,18 +1295,6 @@ def main() -> None:
 
     # ---------------- recent dynamics (is it STILL learning?) ----------------
     N = args.recent
-
-    def _slope_per_1k(pts):
-        """Least-squares slope of value vs step, scaled to Δ per 1000 steps (signed)."""
-        if len(pts) < 20:
-            return None
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
-        den = sum((x - mx) ** 2 for x in xs)
-        if den == 0:
-            return None
-        return (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den) * 1000.0
 
     def wtrend(key, higher_better):
         s = [(step_of(r), f(r, key)) for r in good if f(r, key) is not None and step_of(r) >= 0]
