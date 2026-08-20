@@ -417,6 +417,7 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
 
     arm_series = {name: _mono_series(recs) for name, recs, _ in loaded}
     arm_noise = {name: _series_noise(recs, arm_series[name]) for name, recs, _ in loaded}
+    base_noise = _series_noise(base_recs, base_series) or 0.0
     arm_last = {name: max(step_of(x) for x in recs) for name, recs, _ in loaded}
     trend = {name: [] for name, _, _ in loaded}
     for S in at_steps:
@@ -425,7 +426,7 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
             continue
         print()
         print(f"  ── @ step ≤ {S}   基线 accept_len {bv:.3f} ──")
-        print(f"     {'arm':<12} {'accept_len':>10} {'delta':>8} {'d_loss':>8} {'lead(steps)':>16}")
+        print(f"     {'arm':<12} {'accept_len':>10} {'★ delta':>8}{'':<7} {'d_loss':>8} {'lead(steps)':>16}")
         for name, recs, ck in loaded:
             # An arm that has not REACHED S has no value there. Comparing its endpoint against
             # the baseline at S is not a measurement -- it is what produced the nonsense column
@@ -455,7 +456,8 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
                 if lo is not None and hi is not None and not hc:
                     band = abs(hi - lo) / 2
             usable = band is not None and band < max(150.0, 0.8 * abs(lead or 0))
-            trend[name].append((S, d, lead, capped or not usable, band))
+            dband = 2.0 * ((se or 0.0) ** 2 + base_noise ** 2) ** 0.5
+            trend[name].append((S, d, dband, lead, capped or not usable, band))
             if lead is None:
                 lead_s = "-"
             elif capped:
@@ -464,39 +466,46 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
                 lead_s = f"{lead:.0f}?"
             else:
                 lead_s = f"{lead:.0f}±{band:.0f}" + ("" if usable else " ?")
-            print(f"     {name:<12} {av:>10.3f} {d:>+8.3f} "
+            print(f"     {name:<12} {av:>10.3f} {d:>+8.3f}±{dband:<6.3f}"
                   + (f"{dl:>+8.3f}" if dl is not None else f"{'-':>8}")
                   + f" {lead_s:>16}")
 
     print()
-    print("  ── 判读：等效领先步数的走势 ──")
+    print("  ── 判读：delta 的走势（收敛到 0 = 同一渐近线；走平在非零 = 渐近线之差）──")
     for name, pts in trend.items():
-        # A capped point is not a measurement: the arm is past everything the baseline logged,
-        # or its error bar is wider than the lead it reports.
-        n_cap = sum(1 for *_, c, _ in pts if c)
-        pts = [(S, d, l, b) for S, d, l, c, b in pts if l is not None and not c]
-        if len(pts) < 2:
-            print(f"    {name:<12} 可用采样点不足({len(pts)}"
-                  + (f"，另有 {n_cap} 个误差带过宽或超出基线范围" if n_cap else "")
-                  + ")。曲线越平这个量越不可测 —— 早期采样才有分辨力。")
+        # ⚠ THE VERDICT IS ON delta, NOT ON THE LEAD IN STEPS. The lead divides by the curve's
+        # slope, so as training saturates it both explodes and self-censors: on the Correction
+        # run -- known to converge to nothing -- every point past step 8000 was dropped for a
+        # too-wide error bar, and the surviving early points read "level lift" purely because a
+        # FLAT delta of +0.06 maps to an ever-larger horizontal distance as the slope decays.
+        # delta has no division, stays readable to the end, and says what we actually want:
+        #     converging to the SAME asymptote  <=>  delta -> 0
+        #     different asymptotes              <=>  delta -> a nonzero constant, = the gap
+        usable = [(S, d, db) for S, d, db, *_ in pts if d is not None]
+        if len(usable) < 3:
+            print(f"    {name:<12} 采样点不足({len(usable)})，再多跑一段")
             continue
-        (s0, _, l0, b0), (s1, _, l1, b1) = pts[0], pts[-1]
-        print(f"    {name:<12} " + "  ".join(f"{S}:{l:.0f}" for S, _, l, _ in pts)
-              + (f"   (另 {n_cap} 点误差带过宽/超范围，已排除)" if n_cap else ""))
-        # ⚠ A RATIO is the wrong test: when the first lead is near zero any change reads as a
-        # huge percentage, which scored an independent sample of the baseline itself as a
-        # "level lift". Compare the CHANGE against the two error bars instead.
-        change = l1 - l0
-        tol = 2.0 * ((b0 or 0.0) ** 2 + (b1 or 0.0) ** 2) ** 0.5
-        if change > tol and l1 > 0:
-            print(f"      => 领先从 {l0:.0f} 涨到 {l1:.0f}（+{change:.0f} > 误差带 {tol:.0f}）"
-                  "—— **水平抬升**的形状，不是单纯提前。值得走到 eval。")
-        elif change < -tol:
-            print(f"      => 领先从 {l0:.0f} 掉到 {l1:.0f}（{change:.0f}，超出误差带 {tol:.0f}）"
-                  "—— 领先在被吃掉，比单纯提前还差。")
+        print(f"    {name:<12} " + "  ".join(f"{S}:{d:+.3f}" for S, d, _ in usable))
+        tail = usable[-3:]
+        d_last = median([d for _, d, _ in tail])
+        b_last = median([db for _, _, db in tail])
+        head = usable[: max(1, len(usable) // 3)]
+        d_head = median([d for _, d, _ in head])
+        base_now = _at(base_series, usable[-1][0]) or 1.0
+        settled = abs(d_last - median([d for _, d, _ in usable[-min(6, len(usable)):-3]] or [d_last])) <= b_last
+
+        if abs(d_last) <= b_last:
+            print(f"      => 末段 delta {d_last:+.3f} 在误差带 ±{b_last:.3f} 内 —— "
+                  "**收敛到同一渐近线**，无净增益。")
+        elif d_last < 0:
+            print(f"      => 末段 delta {d_last:+.3f}（带 ±{b_last:.3f}）—— **比基线差**。")
         else:
-            print(f"      => 变化 {change:+.0f} 未超出误差带 {tol:.0f} —— 与**纯横向提前**一致；"
-                  "当前精度下区分不出真实抬升，需要更多/更早的采样点。")
+            pct = 100.0 * d_last / base_now
+            shrunk = "，且已从 {:+.3f} 衰减".format(d_head) if d_head - d_last > b_last else ""
+            print(f"      => 末段 delta {d_last:+.3f}（带 ±{b_last:.3f}，占当前 {pct:.1f}%）{shrunk}")
+            print("         " + ("已走平 ⟹ 渐近线确实高出这么多。" if settled
+                                 else "仍在变化 ⟹ 尚未定型，继续采样。")
+                  + f"  值不值得,拿它和 §8 的回本门槛比。")
 
     print()
     print("  ⚠ 这是训练侧 SOFT accept_len 的代理判据，不是裁决。裁决只能是转换后的服务端评测。")
