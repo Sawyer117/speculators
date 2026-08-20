@@ -60,10 +60,36 @@ moe_compile.py       120    torch.compile wrapper for the expert path
 ```
 
 Removing them leaves **~2077 lines of pure modelling code**, which is a much easier diff to
-review. But they are MoE-draft machinery rather than DSV4 machinery, so they may belong with
-the EP proposal — or in neither, if speculators would rather not carry a grouped-GEMM path at
-all and we keep that in our fork. We do not have a strong view; you have more context on how
-much MoE infrastructure the project wants to own.
+review. Having looked at how the project already handles this, we think most of it can come
+along and the vendor part cannot:
+
+| | lines | where |
+|---|---:|---|
+| `moe_ep.py` (expert-parallel all-to-all) | 177 | **upstream** — zero `torch_npu`, plain `torch.distributed` |
+| kernel registry + plugin point | ~110 | **upstream** — no vendor name appears in it |
+| `_grouped_matmul_torch` (reference, and the parity oracle) | ~30 | **upstream** |
+| `moe_grouped_gemm.py`'s NPU half | ~200 | out-of-tree bridge |
+| `moe_compile.py` | 120 | out-of-tree bridge |
+
+The reasoning is your own precedent. **#775** ("opt-in `transfer_to_npu`") was closed unmerged
+after two days for putting a vendor shim in `src/`; **#589** ("selectable attention backend
+(sdpa/eager)") merged because it solved the same class of problem — flex attention unavailable
+on Ascend — by adding a portable option instead. And `src/` today has zero direct `torch_npu`
+calls and zero `is_cuda` branches, going through `torch.accelerator` throughout. We read that
+as: portable in, vendor out.
+
+So the model ships a registry with a pure-torch reference for every heavy op, resolved at call
+time, and **is correct with zero accelerated kernels registered** — the reference is also the
+parity oracle the kernels are validated against. That turns the Ascend kernels from a
+dependency into a pluggable accelerator: nobody needs Ascend hardware to work on this code.
+
+One request attached to that. Shipping only an *interface* leaves an accelerator user having
+to know to import a bridge by hand, and an install that forgets is correct but quietly slower
+with nothing saying so. A ~15-line `discover_plugins()` scanning a `speculators.kernels` entry
+point group would make `pip install` the whole story, with no vendor name anywhere in the
+scanning code and no behaviour change when no such distribution is installed. We would propose
+it as part of this, but it is equally fine as its own small PR if you would rather look at it
+separately.
 
 ## Serving
 
