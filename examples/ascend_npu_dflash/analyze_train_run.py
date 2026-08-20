@@ -287,7 +287,34 @@ def _slope_per_1k(pts):
     return (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den) * 1000.0
 
 
-def _mono_series(recs, key="train/accept_len", win=20):
+def _series_noise(recs, series, key="train/accept_len", win=None):
+    """Standard error of the smoothed curve: how much of it is just per-batch noise.
+
+    Needed because the horizontal-distance metric below DIVIDES by the curve's slope, and on a
+    saturating curve the slope goes to zero -- so once training flattens, a noise-sized change
+    in value maps to a huge change in step. Without this band the metric confidently reports a
+    four-figure "lead" for a run compared against an independent sample of ITSELF.
+    """
+    pts = [(step_of(r), f(r, key)) for r in recs
+           if f(r, key) is not None and step_of(r) >= 0]
+    if len(pts) < 40 or not series:
+        return None
+    pts.sort()
+    lut = dict(series)
+    res = []
+    for st, v in pts:
+        sm = lut.get(st)
+        if sm is not None:
+            res.append(v - sm)
+    if len(res) < 40:
+        return None
+    if win is None:
+        win = max(20, min(200, len(pts) // 50))
+    # 1.253 = SE(median)/SE(mean) for a normal sample
+    return 1.253 * pstdev(res) / (win ** 0.5)
+
+
+def _mono_series(recs, key="train/accept_len", win=None):
     """(step, value) smoothed by a rolling median and forced monotone non-decreasing.
 
     accept_len is noisy per batch and the inversion below needs a function it can invert, so
@@ -295,6 +322,10 @@ def _mono_series(recs, key="train/accept_len", win=20):
     """
     pts = [(step_of(r), f(r, key)) for r in recs
            if f(r, key) is not None and step_of(r) >= 0]
+    if win is None:
+        # Wide enough that the rolling median is already near-monotone, so the running max
+        # below is a near no-op rather than a systematic lift.
+        win = max(20, min(200, len(pts) // 50))
     if len(pts) < win * 2:
         return []
     pts.sort()
@@ -374,53 +405,99 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
     base_series = _mono_series(base_recs)
     if not base_series:
         raise SystemExit("baseline has too few accept_len points to invert")
+
+    def _at(series, S):
+        """The series value at the last point with step <= S (None if it starts after S)."""
+        v = None
+        for st, val in series:
+            if st > S:
+                break
+            v = val
+        return v
+
+    arm_series = {name: _mono_series(recs) for name, recs, _ in loaded}
+    arm_noise = {name: _series_noise(recs, arm_series[name]) for name, recs, _ in loaded}
+    arm_last = {name: max(step_of(x) for x in recs) for name, recs, _ in loaded}
     trend = {name: [] for name, _, _ in loaded}
     for S in at_steps:
-        b = [r for r in base_recs if 0 <= step_of(r) <= S]
-        if len(b) < 40:
-            continue
-        hb = _headline(b, base_ck, spike_k)
-        if hb["accept_len"] is None:
+        bv = _at(base_series, S)
+        if bv is None:
             continue
         print()
-        print(f"  ── @ step ≤ {S}   基线 accept_len {hb['accept_len']:.3f} ──")
-        print(f"     {'arm':<12} {'accept_len':>10} {'delta':>8} {'d_loss':>8} {'lead(steps)':>12}")
+        print(f"  ── @ step ≤ {S}   基线 accept_len {bv:.3f} ──")
+        print(f"     {'arm':<12} {'accept_len':>10} {'delta':>8} {'d_loss':>8} {'lead(steps)':>16}")
         for name, recs, ck in loaded:
+            # An arm that has not REACHED S has no value there. Comparing its endpoint against
+            # the baseline at S is not a measurement -- it is what produced the nonsense column
+            # of growing negative leads the first time this ran.
+            if arm_last[name] < S * 0.95:
+                print(f"     {name:<12} {'(未跑到)':>10}")
+                continue
+            av = _at(arm_series[name], S)
+            if av is None:
+                continue
             a = [r for r in recs if 0 <= step_of(r) <= S]
-            if len(a) < 40:
-                continue
-            ha = _headline(a, ck, spike_k)
-            if ha["accept_len"] is None:
-                continue
-            d = ha["accept_len"] - hb["accept_len"]
-            dl = (ha["loss"] - hb["loss"]) if (ha["loss"] and hb["loss"]) else None
-            lead, capped = _lead_steps(base_series, ha["accept_len"], S)
-            trend[name].append((S, d, lead, capped))
-            lead_s = "-" if lead is None else (f">{lead:.0f}" if capped else f"{lead:.0f}")
-            print(f"     {name:<12} {ha['accept_len']:>10.3f} {d:>+8.3f} "
+            b = [r for r in base_recs if 0 <= step_of(r) <= S]
+            dl = None
+            if len(a) >= 40 and len(b) >= 40:
+                ha, hb = _headline(a, ck, spike_k), _headline(b, base_ck, spike_k)
+                if ha["loss"] and hb["loss"]:
+                    dl = ha["loss"] - hb["loss"]
+            d = av - bv
+            lead, capped = _lead_steps(base_series, av, S)
+            # Propagate the value noise through the inversion: where the curve is flat the band
+            # blows up, and a lead wider than its own error bar is not a measurement.
+            se = arm_noise.get(name) or 0.0
+            band = None
+            if se and lead is not None and not capped:
+                lo, _ = _lead_steps(base_series, av - 2 * se, S)
+                hi, hc = _lead_steps(base_series, av + 2 * se, S)
+                if lo is not None and hi is not None and not hc:
+                    band = abs(hi - lo) / 2
+            usable = band is not None and band < max(150.0, 0.8 * abs(lead or 0))
+            trend[name].append((S, d, lead, capped or not usable, band))
+            if lead is None:
+                lead_s = "-"
+            elif capped:
+                lead_s = f">{lead:.0f}"
+            elif band is None:
+                lead_s = f"{lead:.0f}?"
+            else:
+                lead_s = f"{lead:.0f}±{band:.0f}" + ("" if usable else " ?")
+            print(f"     {name:<12} {av:>10.3f} {d:>+8.3f} "
                   + (f"{dl:>+8.3f}" if dl is not None else f"{'-':>8}")
-                  + f" {lead_s:>12}")
+                  + f" {lead_s:>16}")
 
     print()
     print("  ── 判读：等效领先步数的走势 ──")
     for name, pts in trend.items():
         # A capped point is not a measurement: the arm is past everything the baseline logged,
-        # so its lead is unbounded below by the baseline's own remaining run, not estimated.
-        n_cap = sum(1 for *_, c in pts if c)
-        pts = [(S, d, l) for S, d, l, c in pts if l is not None and not c]
+        # or its error bar is wider than the lead it reports.
+        n_cap = sum(1 for *_, c, _ in pts if c)
+        pts = [(S, d, l, b) for S, d, l, c, b in pts if l is not None and not c]
         if len(pts) < 2:
             print(f"    {name:<12} 可用采样点不足({len(pts)}"
-                  + (f"，另有 {n_cap} 个超出基线记录范围" if n_cap else "") + ")，再多跑一段")
+                  + (f"，另有 {n_cap} 个误差带过宽或超出基线范围" if n_cap else "")
+                  + ")。曲线越平这个量越不可测 —— 早期采样才有分辨力。")
             continue
-        g = pts[-1][2] / pts[0][2] - 1 if pts[0][2] else float("nan")
-        print(f"    {name:<12} " + "  ".join(f"{S}:{l:.0f}" for S, _, l in pts)
-              + (f"   (另 {n_cap} 点超出基线范围，已排除)" if n_cap else ""))
-        if g > 0.30:
-            print(f"      => 增长 {g:+.0%} —— **水平抬升**的形状，不是单纯提前。值得走到 eval。")
-        elif g < -0.30:
-            print(f"      => 下降 {g:+.0%} —— 领先在被吃掉，比单纯提前还差。")
+        (s0, _, l0, b0), (s1, _, l1, b1) = pts[0], pts[-1]
+        print(f"    {name:<12} " + "  ".join(f"{S}:{l:.0f}" for S, _, l, _ in pts)
+              + (f"   (另 {n_cap} 点误差带过宽/超范围，已排除)" if n_cap else ""))
+        # ⚠ A RATIO is the wrong test: when the first lead is near zero any change reads as a
+        # huge percentage, which scored an independent sample of the baseline itself as a
+        # "level lift". Compare the CHANGE against the two error bars instead.
+        change = l1 - l0
+        tol = 2.0 * ((b0 or 0.0) ** 2 + (b1 or 0.0) ** 2) ** 0.5
+        if change > tol and l1 > 0:
+            print(f"      => 领先从 {l0:.0f} 涨到 {l1:.0f}（+{change:.0f} > 误差带 {tol:.0f}）"
+                  "—— **水平抬升**的形状，不是单纯提前。值得走到 eval。")
+        elif change < -tol:
+            print(f"      => 领先从 {l0:.0f} 掉到 {l1:.0f}（{change:.0f}，超出误差带 {tol:.0f}）"
+                  "—— 领先在被吃掉，比单纯提前还差。")
         else:
-            print(f"      => 基本持平({g:+.0%})—— **纯横向提前**：同一条渐近线，只是早到。")
+            print(f"      => 变化 {change:+.0f} 未超出误差带 {tol:.0f} —— 与**纯横向提前**一致；"
+                  "当前精度下区分不出真实抬升，需要更多/更早的采样点。")
+
     print()
     print("  ⚠ 这是训练侧 SOFT accept_len 的代理判据，不是裁决。裁决只能是转换后的服务端评测。")
     print("  ⚠ 各臂之间往往不止一个变量不同（Correction 还带 --no-confidence-detach-features")
