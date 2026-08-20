@@ -253,9 +253,9 @@ def _default_label(path: str) -> str:
     return os.path.splitext(base)[0] or base
 
 
-def _load_and_skip(path: str, skip: int, quiet: bool = False):
-    """resolve → load → drop steps < skip. Returns (recs, ckpt_steps, steps_per_epoch) — the last two
-    are None when there are no metrics / no epoch length is discoverable."""
+def _load_and_skip(path: str, skip: int, quiet: bool = False, max_step: int = 0):
+    """resolve → load → keep skip <= step <= max_step. Returns (recs, ckpt_steps, steps_per_epoch,
+    raw_text) — the middle two are None when there are no metrics / no epoch length is discoverable."""
     recs, raw_text = load(resolve_log(path))
     if not recs:
         return None, None, None, None
@@ -264,6 +264,12 @@ def _load_and_skip(path: str, skip: int, quiet: bool = False):
         if kept:
             if not quiet:
                 print(f"(--skip {skip}: dropped {len(recs) - len(kept)} warmup/regen steps; analyzing {len(kept)})")
+            recs = kept
+    if max_step > 0:
+        kept = [r for r in recs if step_of(r) <= max_step]
+        if kept:
+            if not quiet:
+                print(f"(--max-step {max_step}: dropped {len(recs) - len(kept)} later steps; analyzing {len(kept)})")
             recs = kept
     return recs, checkpoint_steps(raw_text), _steps_per_epoch(recs, raw_text), raw_text
 
@@ -680,6 +686,11 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--recent", type=int, default=500, help="window (steps) for the recent-dynamics trend")
     ap.add_argument("--skip", type=int, default=0,
                     help="drop global_steps < N (exclude shape-warmup / resume HS-regen); applied to BOTH runs")
+    ap.add_argument("--max-step", type=int, default=0, metavar="N",
+                    help="drop global_steps > N; applied to BOTH runs. Use it to compare a long "
+                         "finished run against a short live one AT THE SAME STEP COUNT -- two "
+                         "experiments' deltas over the same baseline are only comparable when "
+                         "measured over the same steps, since a delta drifts as the curve flattens")
     return ap
 
 
@@ -995,7 +1006,8 @@ def hs_split_report(text: str) -> None:
 def main() -> None:
     args = _build_parser().parse_args()
 
-    recs, ckpt_steps, steps_per_epoch, raw_text = _load_and_skip(args.logfile, args.skip)
+    recs, ckpt_steps, steps_per_epoch, raw_text = _load_and_skip(
+        args.logfile, args.skip, max_step=args.max_step)
     if recs is None:
         print("!! no metric records parsed — is this a trainer.py rich-logger log?")
         return
@@ -1011,7 +1023,7 @@ def main() -> None:
         blabels = args.baseline_label or []
         for i, bpath in enumerate(args.baseline):
             blabel = blabels[i] if i < len(blabels) else _default_label(bpath)
-            brecs, bckpt, _, _ = _load_and_skip(bpath, args.skip, quiet=True)
+            brecs, bckpt, _, _ = _load_and_skip(bpath, args.skip, quiet=True, max_step=args.max_step)
             if brecs is None:
                 print(f"!! baseline '{bpath}' had no metrics — skipping")
                 continue
