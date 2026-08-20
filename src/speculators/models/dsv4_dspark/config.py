@@ -51,6 +51,7 @@ class DSparkDraftConfig:
     noise_token_id: int = 128799  # fills draft_input_ids[:, 1:] (the gamma mask slots)
     target_layer_ids: tuple[int, ...] = (40, 41, 42)  # verifier layers -> main_proj
     markov_rank: int = 256
+    select_rank: int = 0  # additive selection head; 0 = absent
 
     # ---- multi-head latent attention (MLA) ----------------------------------
     num_heads: int = 64

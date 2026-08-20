@@ -45,6 +45,15 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "Set to 0 to disable the sequential head (pure DFlash drafting)."
         ),
     )
+    select_rank: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "DSpark: rank of the ADDITIVE selection head, <A'(a) * H'(h_t), B'(b)>, added "
+            "on top of the Markov bias. 0 disables it. Separate from the Markov head so it "
+            "degrades gracefully if unconverted and can be ablated by zeroing one term."
+        ),
+    )
     markov_head_type: Literal["vanilla", "gated", "rnn", "dflash2"] = Field(
         default="vanilla",
         description=(

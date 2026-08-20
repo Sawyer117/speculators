@@ -72,8 +72,8 @@ def map_released_key(key: str, n_draft_layers: int = 3) -> str | None:
     # ---- last-stage extras (output head) -> model level ----
     if rest == "norm.weight":
         return "norm.weight"
-    if rest.startswith("markov_head."):
-        return rest  # markov_head.markov_w1.weight / markov_head.markov_w2.weight
+    if rest.startswith(("markov_head.", "select_head.")):
+        return rest  # markov_head.markov_w1.weight / select_head.select_w1.weight / ...
     if rest == "confidence_head.proj.weight":
         return "confidence_head.proj.weight"
     hh = re.match(r"^hc_head_(fn|base|scale)$", rest)
@@ -113,6 +113,13 @@ def expected_draft_keys(cfg: DSparkDraftConfig) -> set[str]:
         keys |= {
             "markov_head.hidden_projection.weight",
             "markov_head.hidden_projection.bias",
+        }
+    if getattr(cfg, "select_rank", 0) > 0:
+        keys |= {
+            "select_head.select_w1.weight",
+            "select_head.select_w2.weight",
+            "select_head.select_hidden.weight",
+            "select_head.select_hidden.bias",
         }
     for n in range(cfg.n_draft_layers):
         p = f"layers.{n}."
@@ -162,6 +169,12 @@ def expected_draft_shapes(cfg: DSparkDraftConfig) -> dict[str, list[int]]:
     if getattr(cfg, "markov_head_type", "vanilla") == "dflash2":
         s["markov_head.hidden_projection.weight"] = [mr, H]
         s["markov_head.hidden_projection.bias"] = [mr]
+    sr = getattr(cfg, "select_rank", 0)
+    if sr > 0:
+        s["select_head.select_w1.weight"] = [V, sr]
+        s["select_head.select_w2.weight"] = [V, sr]
+        s["select_head.select_hidden.weight"] = [sr, H]
+        s["select_head.select_hidden.bias"] = [sr]
     for n in range(cfg.n_draft_layers):
         p = f"layers.{n}."
         s |= {

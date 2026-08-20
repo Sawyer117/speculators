@@ -107,6 +107,67 @@ class MarkovHead(nn.Module):
         return torch.stack(outputs, dim=1)
 
 
+class SelectHead(nn.Module):
+    """An ADDITIVE, context-dependent transition term, kept separate from the Markov head.
+
+        S_t(a, b) = U_t(b) + <A(a), B(b)>            <- MarkovHead, unconditional bigram
+                           + <A'(a) * H'(h_t), B'(b)>  <- this, the selection term
+
+    WHY SEPARATE RATHER THAN FOLDED INTO MarkovHead (which `markov_head_type="dflash2"`
+    does, matching the released DFlash2 selector exactly):
+
+      * It DEGRADES GRACEFULLY. Fused, a converter that drops H leaves the serve computing
+        an unconditioned bias from weights trained WITH conditioning -- silently wrong, and
+        precisely how the Correction-head experiment became unevaluable. Additive, dropping
+        this head falls back to today's exact behaviour: no gain, but no error.
+      * It IS the ablation. `logits = base + markov_bias + select_bias`; zeroing the last
+        term reproduces today's model bit for bit, so "what is selection alone worth" is
+        directly measurable. A fused head can never be split that way, because the two arms
+        train different w1/w2 in the first place.
+      * The serve patch can land BEFORE the weights exist -- the term is identically zero
+        until trained, so the port is verifiable as a no-op.
+
+    Measured motivation (a 5-epoch `ep5p0-ropefix` checkpoint): the Markov head's own
+    predecessor codebook already runs at 99.6% effective rank, with 99% of the composed
+    transition matrix's energy spread over 252 of its 256 dimensions. There is no idle block
+    of directions for a modulation to borrow, which is the case for giving selection its own.
+
+    Init is the exact identity: B' = 0 makes the whole term vanish at step 0, so a paired A/B
+    starts from the same point. B' moves first and A' unfreezes once it is nonzero -- the
+    standard zero-init-output pattern, as in LoRA and in the zero-initialised --dflash-* flags.
+    """
+
+    def __init__(
+        self,
+        *,
+        verifier_vocab_size: int,
+        draft_vocab_size: int,
+        select_rank: int,
+        hidden_size: int,
+    ) -> None:
+        super().__init__()
+        if select_rank <= 0:
+            raise ValueError(f"select_rank must be > 0, got {select_rank}")
+        self.select_rank = select_rank
+        self.select_w1 = nn.Embedding(verifier_vocab_size, select_rank)  # A'
+        self.select_w2 = nn.Linear(select_rank, draft_vocab_size, bias=False)  # B'
+        self.select_hidden = nn.Linear(hidden_size, select_rank)  # H'
+        nn.init.zeros_(self.select_w2.weight)
+        nn.init.zeros_(self.select_hidden.weight)
+        nn.init.ones_(self.select_hidden.bias)
+
+    def block_bias(
+        self,
+        *,
+        prev_token_ids: torch.Tensor,  # [N, block_size]
+        hidden_states: torch.Tensor,  # [N, block_size, hidden]
+    ) -> torch.Tensor:
+        """Return the per-position selection bias, shape [N, block_size, draft_vocab]."""
+        prev_emb = self.select_w1(prev_token_ids.long())
+        hidden_states = hidden_states.to(prev_emb.dtype)
+        return self.select_w2(prev_emb * self.select_hidden(hidden_states))
+
+
 class ConfidenceHead(nn.Module):
     """Per-position acceptance-probability predictor (linear -> scalar logit).
 

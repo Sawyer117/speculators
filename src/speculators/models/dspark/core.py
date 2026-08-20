@@ -7,7 +7,11 @@ from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.metrics import compute_metrics
-from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
+from speculators.models.dspark.model_definitions import (
+    ConfidenceHead,
+    MarkovHead,
+    SelectHead,
+)
 from speculators.models.metrics import LossConfig, kl_div_loss, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile
 
@@ -44,6 +48,15 @@ class DSparkDraftModel(DFlashDraftModel):
                 head_type=config.markov_head_type,
             )
 
+        self.select_head: SelectHead | None = None
+        if config.select_rank > 0:
+            self.select_head = SelectHead(
+                verifier_vocab_size=self.verifier_vocab_size,
+                draft_vocab_size=self.draft_vocab_size,
+                select_rank=config.select_rank,
+                hidden_size=hidden_size,
+            )
+
         self.confidence_head: ConfidenceHead | None = None
         if config.enable_confidence_head:
             if config.confidence_head_with_markov and self.markov_head is None:
@@ -72,6 +85,7 @@ class DSparkDraftModel(DFlashDraftModel):
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
+            select_rank=kwargs.get("select_rank", 0),
             enable_confidence_head=(
                 True
                 if enable_confidence_head_arg is None
@@ -176,6 +190,16 @@ class DSparkDraftModel(DFlashDraftModel):
                 prev_emb=prev_emb,
             )
             logits = (logits.view(num_blocks, block, -1) + markov_bias).view(
+                1, mask_tokens_size, -1
+            )
+
+        if self.select_head is not None:
+            # Additive and zero at init, so this is an exact no-op until it is trained.
+            select_bias = self.select_head.block_bias(
+                prev_token_ids=prev_token_ids,
+                hidden_states=hidden_blocks,
+            )
+            logits = (logits.view(num_blocks, block, -1) + select_bias).view(
                 1, mask_tokens_size, -1
             )
 

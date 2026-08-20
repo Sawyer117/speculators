@@ -191,6 +191,10 @@ if [ -n "$FROM_PRETRAINED" ]; then EXTRA="$EXTRA --from-pretrained $FROM_PRETRAI
 # nor rejected -- exactly the trap already documented above for --sliding-window-non-causal.
 # To change the head type on a warm start you MUST edit the copied dir's config.json.
 if [ -n "${MARKOV_HEAD_TYPE:-}" ]; then EXTRA="$EXTRA --markov-head-type $MARKOV_HEAD_TYPE"; fi
+# SELECT_RANK=256 -> the ADDITIVE selection head. Zero-initialised: an exact no-op until
+# trained, and ablatable by zeroing the term rather than retraining. Same FROM_PRETRAINED
+# caveat as above -- on a warm start, set it in the copied dir's config.json.
+if [ -n "${SELECT_RANK:-}" ]; then EXTRA="$EXTRA --select-rank $SELECT_RANK"; fi
 
 # AMP experts: resolve "auto" -> downgrade to bf16 experts ONLY on the faithful+EP=0 path (rank0
 # materialises the full unsharded model; fp32 experts would OOM). EP=1 / reduced keep option A.

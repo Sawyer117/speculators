@@ -1423,6 +1423,16 @@ def parse_args():
         help="DSpark: low-rank dim of the Markov logit-bias head (0 disables it).",
     )
     parser.add_argument(
+        "--select-rank",
+        type=int,
+        default=0,
+        help=(
+            "DSpark: rank of the ADDITIVE selection head <A'(a)*H'(h_t), B'(b)>, added on "
+            "top of the Markov bias (0 = off). Zero-initialised, so it is an exact no-op "
+            "until trained; ablate by zeroing it rather than retraining."
+        ),
+    )
+    parser.add_argument(
         "--markov-head-type",
         type=str,
         default="vanilla",
