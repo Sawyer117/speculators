@@ -927,3 +927,87 @@ trainer.py:341-342   _ep_local = getattr(self.model, "ep_local_param_keys", None
 - ⟹ **转换那一步的唯一理由是键名重排 `layers.* → mtp.*`** ——
   因为 vllm-ascend 的 DSV4-DSpark 加载器是照**官方发布草稿的 `mtp.*` 布局**写的。
   **这是推理侧的选择,与 EP 无关**;若 vllm-ascend 直接认 speculators 布局,这一步即可消失。
+
+---
+
+## 11. 上游 vllm-ascend / vLLM 现状,以及 `method: "mtp"` vs `"dspark"`(2026-08-21)
+
+### 11.1 上游已原生支持 DSV4 DSpark,但只认发布布局
+
+`vllm_ascend/models/deepseek_v4/dspark.py`(`DSparkDeepseekV4ForCausalLM`)读 `mtp.{i}.*`,
+做的是 **DeepSeek 研究命名 → vLLM 命名**的映射(`.attn.→.self_attn.`、`.w1.→.gate_proj.` …)。
+**`speculators` 出现 0 次。**
+
+而 **vLLM 本体早有通用 speculators 注册表** `vllm/transformers_utils/configs/speculators/algos.py`:
+
+```
+eagle3 → Eagle3LlamaForCausalLM / Eagle3Qwen3ForCausalLM     ← 按目标模型分支
+peagle → PeagleLlamaForCausalLM / PeagleQwen3ForCausalLM
+dflash → DFlashDraftModel
+dspark → Qwen3DSparkModel                                     ← 写死 Qwen3
+```
+
+`dspark` 那条原样透传的正是我们的字段:`markov_rank` / `markov_head_type` / `block_size` /
+`enable_confidence_head` / `confidence_head_with_markov`。
+
+⟹ **转换器现在仍需要**(§10.5),但补上它只有两处:
+vLLM `algos.py` 加一条按目标模型的架构分支(`eagle3`/`peagle` 已有先例),
+vllm-ascend `load_weights` 除 `mtp.*` 外也接受 speculators 布局。
+
+### 11.2 ★ PR #12968 不是性能优化,是 MRV2 适配
+
+`[Feature][MRV2] Support DSV4 Dspark`,wxsIcey,2026-08-20 合入,231+/31−,11 文件。
+用**发布草稿**(w4a8)在 gsm8k/400 prompts/num_spec=5/temp0/eager:
+
+| | mean accept_len | 吞吐 |
+|---|---:|---:|
+| mrv1 | 4.33 | 877.16 tok/s |
+| mrv2 | 4.32 | **1191.79 tok/s** |
+
+逐位置接受率几乎一致(0.8951/0.7780/… vs 0.8960/0.7719/…)⟹ **纯引擎侧收益,与草稿无关。**
+diff 全是接线:非因果并行草稿的 `dspark_swa_indices`、`SupportsEagle3` 接口、
+把 RoPE positions 转发进草稿 attn metadata 的上下文管理器、量化配置继承补丁。
+
+⟹ **那 36% 是"换 ModelRunner"拿的,不是"改草稿"拿的**,对任何模型都成立。
+我们停在 `pr-12006`,既无 MRV2 也无此 PR。**这条应列为与 select 线并行的独立待办**
+—— 不需要训练,收益量级又高一档。
+（注:他们那份发布草稿 gsm8k 4.33 vs 我们自测同一草稿 4.658,差别在他们目标模型是 w4a8 量化,不可直接比。)
+
+### 11.3 `method: "mtp"` vs `"dspark"` —— **proposer 内相同,vLLM 内核不同**
+
+`get_spec_decode_method`:
+
+```python
+elif method in ("mtp", "dspark") and getattr(...hf_config, "dspark_block_size", False):
+    return AscendDeepSeekV4DSparkProposer(...)      # 两个别名同等
+```
+
+且 `AscendDeepSeekV4DSparkProposer(AscendDsparkProposer)` 在 `__init__:57` 无条件
+`self.method = "dflash"` ⟹ `llm_base_proposer` 里所有 method 分支两者一致。
+
+**但 vLLM 内核在 proposer 存在之前就已按字符串分叉**(`vllm/config/speculative.py`):
+
+| | `"mtp"`(我们现在) | `"dspark"` |
+|---|---|---|
+| `use_eagle()` | True | True(相同) |
+| `use_dspark()` | **False** | True |
+| parallel drafting | 内核**不设** | 内核**自动开启** |
+| `dspark_draft_topk` 校验 | 跳过 | 执行 |
+| MTP 整除检查 `num_spec % n_predict` | **执行**(无意义) | 不执行 |
+
+★ 并行草稿本该由内核按 method 打开,我们靠 ascend proposer 在 `__init__:58` 手动补
+`self.parallel_drafting = True`。**能跑,但是在用下游补丁弥补上游未触发的配置。**
+
+★ 顺带:**内核里已有 `dspark_draft_topk`** —— 即 §8.8 讨论的 top-k 草稿打分,上游可能已铺好路,值得单独看。
+
+★ **上游缺口(适合一行 PR)**:自动识别写的是
+`"dspark" in model_name.lower() or "Qwen3DSparkModel" in architectures`,
+不覆盖 `DSparkDeepseekV4ForCausalLM` ⟹ 我们的草稿永远无法被自动识别。
+
+### 11.4 待测变体
+
+`examples/ascend_npu_dflash/serve_dsv4_a3_singlenode_specmethod.sh` —— 母本逐字节相同,
+只把 `"method":"mtp"` 换成 `"${SPEC_METHOD:-dspark}"`。
+⚠ **不是零风险改名**,它改变 vLLM 内核行为,必须实测。
+验收:逐位置接受率与 `ep5p0-ropefix`(gsm8k 4.849)在噪声内一致,且 tok/s 不降。
+115/116 现在在给训练供 HS,等空出来再跑。
