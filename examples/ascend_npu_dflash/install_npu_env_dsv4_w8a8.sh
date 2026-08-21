@@ -86,6 +86,16 @@ CANN_VER="$(cat "${ASCEND_HOME_PATH:-/nonexistent}/version.cfg" 2>/dev/null | tr
 echo "CANN reported: ${CANN_VER}   (vllm-ascend main is built on 9.1.0)"
 case "$CANN_VER" in *9.1.0*) : ;; *) echo "⚠ NOT 9.1.0 — if the op build in step 4 fails, upgrade CANN first." ;; esac
 
+# ⚠ conda-forge envs need their OWN libstdc++ to win over the system one. conda-forge's
+# libsqlite is built with the ICU extension, so `import sqlite3` pulls libicui18n.so.78, which
+# needs CXXABI_1.3.15 -- newer than /usr/lib64/libstdc++.so.6. The env already ships
+# libstdcxx-16.1.0; it just loses the search order, because CANN's set_env puts system paths
+# ahead of it. Prepending $CONDA_PREFIX/lib fixes it. Symptom without this, at the END of a
+# long pip log and easy to miss under the dependency-conflict noise:
+#   ImportError: /usr/lib64/libstdc++.so.6: version `CXXABI_1.3.15' not found
+#   RuntimeError: Failed to load the backend extension: torch_npu
+[ -n "${CONDA_PREFIX:-}" ] && export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+
 echo "== 1. build deps + torch/torch-npu 2.10.0 + numpy $NUMPY_VER + CANN backfill =="
 # Self-heal a pip-less env (conda-forge python ships without it) instead of dying here.
 python -m pip --version >/dev/null 2>&1 || { echo "no pip in this env — bootstrapping via ensurepip"; python -m ensurepip --upgrade; }

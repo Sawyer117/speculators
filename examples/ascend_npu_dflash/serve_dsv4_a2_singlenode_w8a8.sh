@@ -85,6 +85,16 @@ for e in "$CANN_HOME/ascend-toolkit/set_env.sh" "$CANN_HOME/nnal/atb/set_env.sh"
   [ -f "$e" ] && { source "$e"; echo "sourced $e"; } || echo "⚠ missing $e — expect libatb/Mki::Dl errors"
 done
 
+# ⚠ conda-forge envs need their OWN libstdc++ to win over the system one. conda-forge's
+# libsqlite is built with the ICU extension, so `import sqlite3` pulls libicui18n.so.78, which
+# needs CXXABI_1.3.15 -- newer than /usr/lib64/libstdc++.so.6. The env already ships
+# libstdcxx-16.1.0; it just loses the search order, because CANN's set_env puts system paths
+# ahead of it. Prepending $CONDA_PREFIX/lib fixes it. Symptom without this, at the END of a
+# long pip log and easy to miss under the dependency-conflict noise:
+#   ImportError: /usr/lib64/libstdc++.so.6: version `CXXABI_1.3.15' not found
+#   RuntimeError: Failed to load the backend extension: torch_npu
+[ -n "${CONDA_PREFIX:-}" ] && export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+
 # Official env block, verbatim.
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
