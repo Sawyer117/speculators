@@ -37,7 +37,9 @@
 #          # `defaults` channel answers HTTP 403 Forbidden (repo.anaconda.com is licence-gated),
 #          # and conda leaves NO env behind when it fails, so a plain `conda create` looks like
 #          # it worked until `conda activate` says EnvironmentNameNotFound.
-#          conda create -n dsv4-w8a8 -c conda-forge --override-channels python=3.11 -y
+#          # ⚠ ask for `pip` EXPLICITLY: conda-forge's python does not pull it in the way
+#          # the defaults channel's does, and step 1 then dies with "No module named pip".
+#          conda create -n dsv4-w8a8 -c conda-forge --override-channels python=3.11 pip -y
 #          conda activate dsv4-w8a8
 #          bash examples/ascend_npu_dflash/install_npu_env_dsv4_w8a8.sh
 # OVERRIDES (env):
@@ -85,6 +87,8 @@ echo "CANN reported: ${CANN_VER}   (vllm-ascend main is built on 9.1.0)"
 case "$CANN_VER" in *9.1.0*) : ;; *) echo "⚠ NOT 9.1.0 — if the op build in step 4 fails, upgrade CANN first." ;; esac
 
 echo "== 1. build deps + torch/torch-npu 2.10.0 + numpy $NUMPY_VER + CANN backfill =="
+# Self-heal a pip-less env (conda-forge python ships without it) instead of dying here.
+python -m pip --version >/dev/null 2>&1 || { echo "no pip in this env — bootstrapping via ensurepip"; python -m ensurepip --upgrade; }
 python -m pip install -U pip setuptools "setuptools-scm>=8" wheel packaging "cmake>=3.26" ninja jinja2 setuptools-rust pybind11
 python -m pip install "${IDX[@]}" torch==2.10.0 torch-npu==2.10.0.post4 pyyaml
 python -m pip install "numpy==$NUMPY_VER"
