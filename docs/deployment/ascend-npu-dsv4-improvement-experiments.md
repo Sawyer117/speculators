@@ -1310,3 +1310,116 @@ U_t  +  vanilla bigram  +  select(上下文调制)  +  小 causal attention(块�
 
 ⚠ 前置:§13.5 那个"t−2 探测"应当先做 —— 它区分"信息缺"与"误差累积",
 是上面所有加项值不值得做的共同前提。
+
+---
+
+## 15. 官方 DFlash2 参考实现:块内动态因果卷积(2026-08-21)
+
+### 15.1 先纠正我自己的一处误判
+
+我曾说 vllm-ascend #14533 的 conv 实现"与官方有实质性差异"。**那是我的误读** ——
+第一次只抓到 `_grouped_conv` 这个 helper、没抓到调用点,就推断成"骨干输出后加一层"。
+拿到调用点后确认:它也是 `attention_conv`/`mlp_conv` 两组 + `prepare`/`finish`,**与官方同构**。
+
+两边数学也等价:
+
+```
+官方        output += base[o]*values;  output = addcmul(output, dynamic[o], values)
+              ⟹ Σ_o (base[o] + dynamic[o]) * values
+vllm-ascend coefficients = base + delta;  output += coefficients[tap]*shifted*(position>=tap)
+              ⟹ 同式
+```
+
+**唯一差别是布局**:官方 `[B, L, D]` 靠 batch 维天然隔离块;vllm-ascend 拍平成 `[T, D]`,
+用 `position % block_size` 掩码补偿(`p < tap` 时屏蔽上一块的尾巴)。**等价,不是错误。**
+
+⟹ 训练侧用官方写法(无掩码);**服务端必须用掩码写法**(那边张量拍平且有 ACLGraph padding)。
+
+### 15.2 官方源:`github.com/z-lab/dflash`
+
+从 HF 模型卡拿到(`z-lab/Qwen3.8-27B-DFlash2`)。模型卡直陈用途:
+
+> *"two-tap dynamic convolutions in the backbone **keep the draft from decaying toward the
+> end of the block**."*
+
+**这正是我们的问题**:本轮 p1 0.688 → p5 0.282;#12968 里官方发布草稿到第 8 位已 51%。
+而且块宽 16 时更严重(§14.1)。
+
+官方配置(`config.json`):
+
+```
+block_size 8 · selector_rank 256 · selector_top_k 16 · conv_kernel_size 2 · conv_group_size 16
+无任何 markov 字段 —— 只有一个 selector
+```
+
+参考实现 `dflash/model.py`:
+
+```python
+def _grouped_dynamic_convolve(hidden, dynamic, base, group_size):
+    blocks = hidden.view(batch, length, groups, group_size)      # [B, L, D] 三维,天然分块
+    out = torch.zeros_like(blocks)
+    for offset in range(taps):
+        values = blocks if offset == 0 else F.pad(blocks[:, :-offset], (0,0,0,0,offset,0))
+        out = out + base[offset].view(1,1,groups,group_size) * values      # 静态,per-channel
+        out = torch.addcmul(out, dynamic[:,:,offset], values)             # 动态,per-group
+```
+
+`base_kernel[2, kernel_size, hidden]` 的 **2 = prepare / finish 两侧**;
+`kernel_projection` 在 `prepare` 里**一次算出两侧系数**,`finish` 复用 ⟹ 每个子层只投影一次。
+
+### 15.3 位置:与 mHC 的对应(选定 B)
+
+```
+官方(普通残差)                          我们(mHC)
+residual = h                              residual = streams        [N,γ,hc,D]
+h = input_layernorm(h)                    post,comb,x = attn_hc(streams);  x = attn_norm(x)   [N,γ,D]
+h,k = conv.prepare(h)                 ★   x,k = attn_conv.prepare(x)
+h = sublayer(h)                           x = attn(x, ...)
+h = conv.finish(h,k)                  ★   x = attn_conv.finish(x,k)
+h = residual + h                          streams = place(x, residual, post, comb)
+```
+
+`place()` 的 docstring 明写 `out [B,S,D]` ⟹ `x` 天然是 `[N, γ, dim]`,
+**正是官方 conv 要的形状,不需要 reshape、不需要 mask**(块由 batch 维隔离)。
+
+⚠ 一处 mHC 特有的后果:`place` 会先把子层输出乘上 `post` 再折回多流,官方是直接相加。
+恒等初始化时无影响,但**该模块的输出在下游被重新缩放** —— 梯度看着偏小时想起这条。
+
+### 15.4 落地(`6ea8899`)
+
+```
+新增  backbone/block_conv.py     GroupedDynamicCausalConv,逐比特对齐官方
+改    backbone/block.py          位置 B,两处;ks=0 时 conv=None ⟹ 前向逐比特不变
+改    config ×2 / weights.py / train.py / launcher
+旗标  BLOCK_CONV_TAPS=2  BLOCK_CONV_GROUP=16      默认全关
+```
+
+**恒等初始化**:零延迟静态系数 = 1、其余 tap = 0、动态投影置零 ⟹ step 0 与不加 conv 逐比特相同。
+五项验证:恒等 ✓ / 梯度到两边 ✓ / 块内因果 ✓ / 块间隔离(无 mask)✓ / **对官方参考逐比特 ✓**。
+
+参数:每组 4.21 M × 每层 2 组 × 3 层 = **25.3 M**(对比 select 一对码本 66 M)。
+
+★ **而且服务端不额外读码本** —— 它在本来就要做的并行前向里,不像 markov/select 每步要付
+一次 V 宽 GEMV(conc1 下 66 MB/位置,§8.7)。**同一个弱点,两种机制,价格差一个量级。**
+
+### 15.5 单头收敛:vanilla 与 select 没有理由共存
+
+`H'(h) ≡ c` 时 `⟨A'(a)⊙c, B'(b)⟩` 就是一个固定低秩双线性型 ⟹ **vanilla 是 select 的严格特例**。
+官方 config 也印证:**只有 selector,没有 markov**,两者是同一槽位的两代做法,不是叠加。
+
+预算对比(V=129280):
+
+| | 码本 | V宽 GEMV/位置 | 访存 |
+|---|---:|---:|---:|
+| 现在 vanilla(256)+select(256) | 132.4 M | **2 次** | 264.8 MB |
+| 单个 select rank 512 | 132.4 M | **1 次** | 264.8 MB |
+| 单个 select rank 256(官方档) | 66.2 M | 1 次 | 132.4 MB |
+
+我原先主张加性双头的三条理由(优雅退化 / 结构性消融 / 服务端可先落地)**都是实验脚手架**,
+不是最终设计的属性;第四条"样本效率"最弱 —— `H'` 用 `weight=0,bias=1` 初始化时,
+**单头本来就从纯 bigram 起步**,"先学简单的"在一个头里自然发生。
+
+⚠ **但 rank 512 没有直接证据**:官方在 V=248320(近我们两倍)上只用 **256**。
+所以收敛到单头是对的,**默认应先试 rank 256**,512 作为 A/B 的另一臂。
+
+⚠ **不要动正在跑的 run** —— 加性双头正是让它 A/B 可读的东西。采纳时点是 `block_size` 8/16 那次重训。
