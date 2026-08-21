@@ -52,6 +52,8 @@ class DSparkDraftConfig:
     target_layer_ids: tuple[int, ...] = (40, 41, 42)  # verifier layers -> main_proj
     markov_rank: int = 256
     select_rank: int = 0  # additive selection head; 0 = absent
+    block_conv_kernel_size: int = 0  # DFlash2 two-tap dynamic causal conv; 0 = absent
+    block_conv_group_size: int = 16  # channels sharing one dynamic coefficient
 
     # ---- multi-head latent attention (MLA) ----------------------------------
     num_heads: int = 64

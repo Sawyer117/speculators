@@ -195,6 +195,10 @@ if [ -n "${MARKOV_HEAD_TYPE:-}" ]; then EXTRA="$EXTRA --markov-head-type $MARKOV
 # trained, and ablatable by zeroing the term rather than retraining. Same FROM_PRETRAINED
 # caveat as above -- on a warm start, set it in the copied dir's config.json.
 if [ -n "${SELECT_RANK:-}" ]; then EXTRA="$EXTRA --select-rank $SELECT_RANK"; fi
+# BLOCK_CONV_TAPS=2 -> the DFlash2 dynamic causal convolutions around each sublayer.
+# Identity-initialised; same FROM_PRETRAINED silent-ignore caveat as the flags above.
+if [ -n "${BLOCK_CONV_TAPS:-}" ]; then EXTRA="$EXTRA --block-conv-kernel-size $BLOCK_CONV_TAPS"; fi
+if [ -n "${BLOCK_CONV_GROUP:-}" ]; then EXTRA="$EXTRA --block-conv-group-size $BLOCK_CONV_GROUP"; fi
 
 # AMP experts: resolve "auto" -> downgrade to bf16 experts ONLY on the faithful+EP=0 path (rank0
 # materialises the full unsharded model; fp32 experts would OOM). EP=1 / reduced keep option A.

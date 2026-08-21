@@ -1423,6 +1423,23 @@ def parse_args():
         help="DSpark: low-rank dim of the Markov logit-bias head (0 disables it).",
     )
     parser.add_argument(
+        "--block-conv-kernel-size",
+        type=int,
+        default=0,
+        help=(
+            "DSpark/DFlash2: taps of the dynamic causal convolution wrapped around each "
+            "sublayer (0 = off). The reference z-lab/dflash uses 2 and describes it as "
+            "keeping the draft from decaying toward the end of the block. Identity-"
+            "initialised, so step 0 matches a run without it."
+        ),
+    )
+    parser.add_argument(
+        "--block-conv-group-size",
+        type=int,
+        default=16,
+        help="DSpark/DFlash2: channels sharing one dynamic conv coefficient (reference: 16).",
+    )
+    parser.add_argument(
         "--select-rank",
         type=int,
         default=0,

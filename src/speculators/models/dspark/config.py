@@ -45,6 +45,24 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "Set to 0 to disable the sequential head (pure DFlash drafting)."
         ),
     )
+    block_conv_kernel_size: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "DSpark/DFlash2: taps of the dynamic causal convolution wrapped around each "
+            "sublayer, mixing a block position's hidden state with its predecessors. 0 "
+            "disables it. The reference (z-lab/dflash) uses 2, and states its purpose as "
+            "keeping the draft from decaying toward the end of the block."
+        ),
+    )
+    block_conv_group_size: int = Field(
+        default=16,
+        gt=0,
+        description=(
+            "Channels sharing one dynamic coefficient. Larger = cheaper projection, coarser "
+            "modulation. The reference uses 16."
+        ),
+    )
     select_rank: int = Field(
         default=0,
         ge=0,

@@ -121,6 +121,13 @@ def expected_draft_keys(cfg: DSparkDraftConfig) -> set[str]:
             "select_head.select_hidden.weight",
             "select_head.select_hidden.bias",
         }
+    if getattr(cfg, "block_conv_kernel_size", 0) > 0:
+        for n in range(cfg.n_draft_layers):
+            for site in ("attn_conv", "ffn_conv"):
+                keys |= {
+                    f"layers.{n}.{site}.base_kernel",
+                    f"layers.{n}.{site}.kernel_projection.weight",
+                }
     for n in range(cfg.n_draft_layers):
         p = f"layers.{n}."
         keys |= {
@@ -169,6 +176,13 @@ def expected_draft_shapes(cfg: DSparkDraftConfig) -> dict[str, list[int]]:
     if getattr(cfg, "markov_head_type", "vanilla") == "dflash2":
         s["markov_head.hidden_projection.weight"] = [mr, H]
         s["markov_head.hidden_projection.bias"] = [mr]
+    bks = getattr(cfg, "block_conv_kernel_size", 0)
+    if bks > 0:
+        bgs = getattr(cfg, "block_conv_group_size", 16)
+        for n in range(cfg.n_draft_layers):
+            for site in ("attn_conv", "ffn_conv"):
+                s[f"layers.{n}.{site}.base_kernel"] = [2, bks, H]
+                s[f"layers.{n}.{site}.kernel_projection.weight"] = [2 * bks * (H // bgs), H]
     sr = getattr(cfg, "select_rank", 0)
     if sr > 0:
         s["select_head.select_w1.weight"] = [V, sr]

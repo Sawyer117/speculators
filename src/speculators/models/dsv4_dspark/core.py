@@ -91,6 +91,8 @@ class DSV4DSparkConfig(DSparkSpeculatorConfig):
             target_layer_ids=tuple(self.aux_hidden_state_layer_ids or (0, 1, 2)),
             markov_rank=self.markov_rank,
             select_rank=getattr(self, "select_rank", 0),
+            block_conv_kernel_size=getattr(self, "block_conv_kernel_size", 0),
+            block_conv_group_size=getattr(self, "block_conv_group_size", 16),
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             rope_head_dim=self.rope_head_dim,
@@ -182,6 +184,8 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
             select_rank=kwargs.get("select_rank", 0),
+            block_conv_kernel_size=kwargs.get("block_conv_kernel_size", 0),
+            block_conv_group_size=kwargs.get("block_conv_group_size", 16),
             enable_confidence_head=kwargs.get("enable_confidence_head", True),
             confidence_head_with_markov=kwargs.get("confidence_head_with_markov", True),
             # DSV4-Flash: the released mtp.* layout has NO confidence_head.proj.bias.

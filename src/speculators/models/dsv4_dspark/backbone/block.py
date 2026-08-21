@@ -20,6 +20,7 @@ import torch
 from torch import nn
 
 from .attention import LatentAttention
+from .block_conv import GroupedDynamicCausalConv
 from .hyper import HyperConnection, place
 from .moe import MoE
 from .norm import RMSNorm
@@ -64,6 +65,16 @@ class MhcDecoderBlock(nn.Module):
         self.ffn_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.attn_hc = HyperConnection(cfg)
         self.ffn_hc = HyperConnection(cfg)
+        # DFlash2 block convolutions. Absent (and this block bit-identical to before) unless
+        # block_conv_kernel_size > 0; identity-initialised when present, so even enabled the
+        # first step matches a run without them.
+        ks = getattr(cfg, "block_conv_kernel_size", 0)
+        gs = getattr(cfg, "block_conv_group_size", 16)
+        self.attn_conv: GroupedDynamicCausalConv | None = None
+        self.ffn_conv: GroupedDynamicCausalConv | None = None
+        if ks > 0:
+            self.attn_conv = GroupedDynamicCausalConv(cfg.hidden_size, ks, gs)
+            self.ffn_conv = GroupedDynamicCausalConv(cfg.hidden_size, ks, gs)
 
     def forward(
         self,
@@ -83,7 +94,14 @@ class MhcDecoderBlock(nn.Module):
         if _sub is not None: _sub["hc_pre_attn"] = x.detach().float().cpu()
         x = self.attn_norm(x)
         if _sub is not None: _sub["attn_norm"] = x.detach().float().cpu()
+        # Placement B: after the norm (the reference wraps between input_layernorm and the
+        # residual add; here "produce the sublayer input" is attn_hc + attn_norm).
+        attn_kernel = None
+        if self.attn_conv is not None:
+            x, attn_kernel = self.attn_conv.prepare(x)
         x = _prof("MLA.attn", lambda: self.attn(x, context_x, block_freqs, context_freqs, attn_bias))
+        if attn_kernel is not None:
+            x = self.attn_conv.finish(x, attn_kernel)
         if _sub is not None: _sub["attn_out"] = x.detach().float().cpu()
         streams = place(x, residual, post, comb)
         if _sub is not None: _sub["post_attn"] = streams.detach().float().cpu()
@@ -93,7 +111,12 @@ class MhcDecoderBlock(nn.Module):
         if _sub is not None: _sub["hc_pre_ffn"] = x.detach().float().cpu()
         x = self.ffn_norm(x)
         if _sub is not None: _sub["ffn_norm"] = x.detach().float().cpu()
+        ffn_kernel = None
+        if self.ffn_conv is not None:
+            x, ffn_kernel = self.ffn_conv.prepare(x)
         x = _prof("MoE.ffn", lambda: self.ffn(x))
+        if ffn_kernel is not None:
+            x = self.ffn_conv.finish(x, ffn_kernel)
         if _sub is not None: _sub["moe_out"] = x.detach().float().cpu()
         streams = place(x, residual, post, comb)
         if _sub is not None:
