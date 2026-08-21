@@ -1423,3 +1423,114 @@ h = residual + h                          streams = place(x, residual, post, com
 所以收敛到单头是对的,**默认应先试 rank 256**,512 作为 A/B 的另一臂。
 
 ⚠ **不要动正在跑的 run** —— 加性双头正是让它 A/B 可读的东西。采纳时点是 `block_size` 8/16 那次重训。
+
+---
+
+## 16. ★ SELECT 判决:空结果。以及为什么下一步是 conv(2026-08-21)
+
+### 16.1 判决
+
+`faithful_ep_20260820_231654`(SELECT_RANK=256,从零训)对配对基线
+`faithful_ep_20260804_165215`(ropefix),25844 步时读数:
+
+```
+        5000    9000   13000   17000   21000   25000     误差带
+SELECT  +0.068  +0.034  +0.028  +0.022  +0.033  +0.020   ±0.079
+CORREC  +0.062  +0.011  +0.019  +0.015  +0.033  +0.022   ±0.080
+```
+
+**末段 +0.020 ± 0.079。** §9.6 预注册门槛「≤ +0.03 = 死」⟹ **SELECT 死。**
+
+预注册时我的预测是 **+0.053(边缘)**;**实测比预测还差**。记在这里,免得以后把"我早就说
+它不行"当成先见之明 —— 当时的判断是「大概率边缘,值得跑一次看」,实际落在更下面一档。
+
+### 16.2 ★ 最硬的证据不是那个数,是两臂逐点重合
+
+SELECT 和 CORRECTION 是**毫不相干的两个机制**(一个是转移项的低秩交叉项,一个是块后
+1 层因果 Transformer),却在**六个采样点上逐点重合**,末段差 **+0.000 ± 0.113(0.00σ)**。
+
+而且 SELECT **精确复刻了 Correction 的形状** —— 早期 +0.068、单调衰减、收敛到 +0.02。
+Correction 当初正是我们立的校准标尺(§12.1:「早期上涨什么都不能说明」),**SELECT 一步
+不差地走完了同一条路**。标尺经受住了它的第二次检验。
+
+⚠ **误差带 ±0.113 偏保守。** 两臂同种子同数据、batch 序列逐步一致 ⟹ 逐 batch 噪声是
+**相关**的,配对差的方差远小于两个独立带的合成。也就是说真实可区分度比工具报的**更低**,
+结论只会更硬。**工具改进项**:两臂比较应走配对差序列,不是独立带合成。
+
+### 16.3 机制线索:降 loss,不改 argmax
+
+`d_loss` 每一点都是**负的**(SELECT −0.013…−0.060),`accept_len` 却不动。
+
+我们是 greedy / temp=0(见 [[dspark-rollout-greedy-temp0]]),接受与否只看 argmax。
+markov-select 和 correction **都是在固定表征上做重排/打分**:把正确 token 的概率抬高了
+(所以 loss 降),却没把它从第二名顶到第一名(所以 accept_len 不动)。**这类项对
+accept_len 近乎不可见**,而这正是两次实验都空的共同原因。
+
+⟹ **conv 是另一种东西:它改的是 `h_t` 本身**,即生成候选的特征,不是候选的分数。
+它至少**有资格**改变 argmax。这是选它作为下一步的机制理由,不是"还没试过所以试试"。
+
+### 16.4 为什么在 K=5 试,而不是等 block-16
+
+我最初主张把 conv 并进 block-16 重训(理由:官方说 conv 治的是"块尾衰减",K=5 下这个
+机制最弱)。**用户否掉了,理由成立且我算错了账**:
+
+```
+K=5  复用现成的 08-04 配对基线   = 1 次训练,配对关系还在
+K=16 基线也得重跑               = 2 次训练,且无配对
+```
+
+**成本差一倍,而且 K=16 那次拿不到干净的 A/B。** 先在 K=5 拿一个便宜的读数是对的。
+
+### 16.5 本轮启动命令(CONV 臂)
+
+与 canonical **逐字段相同,只把 `SELECT_RANK=256` 换成两个 conv 旗标**:
+
+```bash
+cd /home/a00652497/dspark_austin/speculators
+git checkout dflash2-reproduce && git pull
+
+DSPARK_EP=1 BF16_EXPERTS=1 RECOMPUTE=1 COMPILE=0 \
+DSPARK_MOE_BALANCE=1 DSPARK_MOE_BALANCE_RATE=1e-3 DSPARK_LOG_EXPERT_LOAD=1 \
+INIT_LAYER=1 INIT_MOE_NO_ROUTER=1 \
+BLOCK_CONV_TAPS=2 BLOCK_CONV_GROUP=16 \
+LR=2e-4 EPOCHS=5 MAX_ANCHORS=512 CKPT_FREQ=0.5 \
+DATA=/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow_0730_77w_dedup \
+  bash examples/ascend_npu_dflash/train_dsv4_dspark.sh faithful
+```
+
+走开前必须确认(与 SELECT 那次同一个坑,`--from-pretrained` 会静默吞掉旗标):
+
+```bash
+head -40 $RUN/faithful_ep_<新TS>.log | grep -i block_conv   # 须见 block_conv_kernel_size=2
+```
+
+以及前几十步 `hard_accept_len` 与基线同量级 —— conv 是**恒等初始化**,起步就该是恒等;
+崩了说明没生效或插错位置。
+
+盯显存:conv 多 25.3 M 参数,但真正吃的是 `kernel_projection` 的激活,
+每站 `[B·L, 4096] × [4096, 1024]`,**六站**(3 层 × 2 站)。`RECOMPUTE=1` 在。
+
+### 16.6 ★ 这次的主指标不是总 accept_len,是逐位置准确率
+
+官方对 conv 的原话是 "keep the draft from decaying **toward the end of the block**"。
+所以总量之外必须看 `train/position_{k}_acc`:
+
+```
+pos4/pos5 抬得比 pos1/pos2 多   ⟹ 机制对上了。即使总量只 +0.02,也说明 K=16 下会放大
+全位置均匀微抬                 ⟹ 又一个「降 loss 不改 argmax」,与 §16.3 同类
+```
+
+**同时读基线的逐位置**(零成本,`analyze_train_run.py $RUN/faithful_ep_20260804_165215.log`):
+知道 K=5 下块尾到底掉多少,才能判断 +0.02 是「机制无效」还是「机制有效但 K=5 空间就这么点」
+—— **这两者对 K=16 的推论完全相反**,而这正是这次实验最值钱的产出。
+
+### 16.7 分析器:一个真 bug,但它不是那次挂死的原因
+
+`checkpoint_steps()` 是**二次**的:每遇一个 `Saving checkpoint` 标记就把全文切一刀
+(整块内存拷贝)再全文正则扫一遍,收集全部 `global_step=` 只为取最后一个。
+代价 = `标记数 × 日志字节数`,两者都随步数线性增长。已改为单次前向扫描(`73ee372`),
+6k–26k 步合成日志上逐位等价,258 存档 / 15.8 MB 时快 26×,倍数随日志大小线性长。
+
+⚠ **但它不是 25844 步那次挂死的原因。** traceback 指向 `load()` 的 `_PAIR.findall`,
+在 `checkpoint_steps` **之前**;真实原因是冷页缓存下首次读大日志慢,`^C` 按早了。
+**工具当时没坏,只是慢。** 记下来,免得以后把这个修复当成"修好了挂死"。
