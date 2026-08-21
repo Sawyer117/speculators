@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Installer for the DSV4-Flash **W8A8 single-node serve** stack: vLLM v0.27.1 +
+# vllm-ascend UPSTREAM main, pinned. A SEPARATE env from the DSpark training/HS stack.
+#
+# ⚠ THIS IS NOT A REPLACEMENT for install_npu_env_dspark.sh. That script stays the SSOT for
+# the training / HS-dump / eval stack (vLLM v0.23.0 + our fork's dspark-dsv4 branch) and must
+# keep working -- `austin` is feeding hidden states to a live training run. Install this into
+# a NEW conda env; never re-run it over an existing one.
+#
+# WHY A NEW STACK AT ALL. Three upstream merges we need are all from the last 36 hours and
+# none are in our v0.23.0 base:
+#   #12968  2026-08-20  MRV2 supports DSV4 DSpark        877 -> 1192 tok/s, engine-side only
+#   #14490  2026-08-21  fix dsv4 quant NAME mismatch     hit directly by a quantized deploy
+#   #14696  2026-08-21  fix DSpark spec-decode on MRV2   two crashes: NoneType hidden buffer
+#                                                        in the profiling dummy run, and a
+#                                                        missing block_size in SWA indices
+# ⚠ #14696 merged the morning this was written, so MRV2+DSpark has ~zero soak time. The pin
+# below is the FLOOR (its merge commit). Keep MRV1 as the fallback if the serve misbehaves.
+#
+# ⚠ KNOWN-BROKEN UPSTREAM: the official single-node DSpark command errors with
+#   "Can't determine cudagraph shapes that are both a multiple of 6 (num_speculative_tokens+1)
+#    ... and 4 (tensor_parallel_size) required by sequence parallelism"   (issue #14260, OPEN)
+# Their workaround is num_speculative_tokens 5 -> 7, which we CANNOT use: our draft is trained
+# at block_size 5 and emits exactly 5. Use serve_dsv4_a2_singlenode_w8a8.sh, which picks a TP
+# that divides num_spec+1 instead. See that script for the arithmetic.
+#
+# DIFFERS FROM install_npu_env_dspark.sh in exactly these places:
+#   vLLM         v0.23.0                    -> v0.27.1        (vllm-ascend main's Dockerfile pin)
+#   vllm-ascend  Sawyer117 fork/dspark-dsv4 -> UPSTREAM main @ VA_COMMIT (no fork patches needed:
+#                                              the HS-dump patches are training-only)
+#   torch-npu    2.10.0                     -> 2.10.0.post4   (main's requirements.txt)
+#   triton-ascend 3.2.1                     -> 3.2.2
+#   CANN         9.0.0                      -> 9.1.0          ⚠ OS-level, NOT pip. See step 0.
+#
+# PREREQS: a py3.11 env you just created and activated; CANN at OS level.
+# USAGE:   conda create -n dsv4-w8a8 python=3.11 -y && conda activate dsv4-w8a8
+#          bash examples/ascend_npu_dflash/install_npu_env_dsv4_w8a8.sh
+# OVERRIDES (env):
+#   ROOT / VLLM_DIR / VA_DIR   as in the sibling script
+#   VA_COMMIT   vllm-ascend commit to pin (default: the #14696 merge commit = the floor)
+#   VA_REPO     default upstream; point at the fork only if you need fork patches
+#   NUMPY_VER   default 2.3.5
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"                 # the speculators checkout
+ROOT="${ROOT:-$(cd "$REPO_ROOT/.." && pwd)}"                 # code root (installation/ + speculators/)
+VLLM_DIR="${VLLM_DIR:-$ROOT/installation/vllm-v0.27.1}"
+VA_DIR="${VA_DIR:-$ROOT/installation/vllm-ascend-main}"
+VA_REPO="${VA_REPO:-https://github.com/vllm-project/vllm-ascend.git}"
+# FLOOR = the #14696 merge commit. Anything older crashes DSpark on MRV2.
+VA_COMMIT="${VA_COMMIT:-4ce367a7d12db55c3dbe9b670eff52b2e14b3b9a}"
+NUMPY_VER="${NUMPY_VER:-2.3.5}"
+CANN_ENV="${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
+HW_PYPI="https://mirrors.huaweicloud.com/repository/pypi/simple"
+HW_ASCEND="https://mirrors.huaweicloud.com/ascend/repos/pypi"
+IDX=(--extra-index-url "$HW_PYPI" --extra-index-url "$HW_ASCEND")
+
+echo "==================================================================="
+echo " DSV4-Flash W8A8 serve stack  (vLLM v0.27.1 + vllm-ascend ${VA_COMMIT:0:12}, numpy=$NUMPY_VER)"
+echo "==================================================================="
+
+echo "== 0. sanity: py311 + source CANN =="
+python -c "import sys; assert sys.version_info[:2]==(3,11), 'need py3.11, got %s'%sys.version" \
+  || { echo "Activate your py3.11 env first."; exit 1; }
+[ -f "$CANN_ENV" ] && { source "$CANN_ENV"; echo "sourced CANN: $CANN_ENV"; } \
+  || echo "WARN: CANN set_env not at $CANN_ENV — set CANN_ENV=... (needed to compile the ops)"
+# vllm-ascend main builds its image on CANN 9.1.0; our other envs are on 9.0.0. The ops compile
+# against CANN headers, so a mismatch surfaces as an opbuild failure in step 4, not here.
+# Warn loudly rather than abort: 9.0.0 may well work, but if step 4 dies this is the first suspect.
+CANN_VER="$(cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg 2>/dev/null | tr -d ' \n' || true)"
+echo "CANN reported: ${CANN_VER:-unknown}   (vllm-ascend main is built on 9.1.0)"
+case "$CANN_VER" in *9.1.0*) : ;; *) echo "⚠ NOT 9.1.0 — if the op build in step 4 fails, upgrade CANN first." ;; esac
+
+echo "== 1. build deps + torch/torch-npu 2.10.0 + numpy $NUMPY_VER + CANN backfill =="
+python -m pip install -U pip setuptools "setuptools-scm>=8" wheel packaging "cmake>=3.26" ninja jinja2 setuptools-rust pybind11
+python -m pip install "${IDX[@]}" torch==2.10.0 torch-npu==2.10.0.post4 pyyaml
+python -m pip install "numpy==$NUMPY_VER"
+# CANN op compiler (TBE/TVM) imports these DURING the build (step 4) — install BEFORE it.
+python -m pip install decorator "scipy>=1.7.3" ml-dtypes attrs psutil pyyaml matplotlib openpyxl tornado
+python -c "import torch, torch_npu, torchgen.model, numpy as n; print('torch', torch.__version__, '| numpy', n.__version__, '| npu', torch_npu.npu.is_available())"
+
+echo "== 2. host toolchain: system gcc + CANN (NO conda compilers) =="
+# The vllm-ascend op build (build_aclnn.sh) shells out to `patch` and wants SYSTEM gcc +
+# CANN's own lld/ccec/bisheng. Conda gxx hijacks CMake (opbuild ABI fail); never export CC/CXX.
+conda remove -y gxx_linux-aarch64 gcc_linux-aarch64 clang clangxx lld >/dev/null 2>&1 || true  # unhijack CMake
+unset CC CXX || true
+if ! command -v patch >/dev/null || ! command -v gcc >/dev/null || ! command -v make >/dev/null; then
+  echo "installing host build utils (needs sudo)…"
+  sudo yum install -y patch gcc gcc-c++ make || {
+    echo "!! could not auto-install. Ask admin: sudo yum install -y patch gcc gcc-c++ make"
+    echo "   (\`patch\` is the usual 'FAILED: [code=127]' culprit in the op build.)"; exit 1; }
+fi
+for t in gcc g++ make patch; do command -v "$t" >/dev/null || { echo "!! missing host tool: $t"; exit 1; }; done
+echo "toolchain OK: gcc=$(command -v gcc) | patch=$(command -v patch) | lld=$(command -v lld 2>/dev/null || echo 'from CANN')"
+
+echo "== 3. vLLM v0.27.1 (empty build, editable) =="
+[ -d "$VLLM_DIR/.git" ] || git clone --depth 1 --branch v0.27.1 https://github.com/vllm-project/vllm "$VLLM_DIR"
+( cd "$VLLM_DIR" && TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_TARGET_DEVICE=empty \
+    python -m pip install -e . --no-build-isolation -v )
+
+echo "== 4. vllm-ascend @ ${VA_COMMIT:0:12} — FROM SOURCE (compiles the V4/SAS CANN ops) =="
+# Pin a COMMIT, not a branch: main moves several times a day and #14696 landed only hours
+# before this pin, so "whatever main is today" is not a reproducible stack.
+[ -d "$VA_DIR/.git" ] || git clone "$VA_REPO" "$VA_DIR"
+( cd "$VA_DIR" && git fetch origin && git checkout --detach "$VA_COMMIT" && git --no-pager log --oneline -1 )
+( cd "$VA_DIR" && rm -rf csrc/build && pip install -e . --no-deps --no-build-isolation -v )
+
+echo "== 5. vllm-ascend runtime extras (--no-deps protects torch) =="
+python -m pip install numba einops pandas msgpack
+python -m pip install --no-deps torchvision==0.25.0 torchaudio==2.10.0 --extra-index-url "$HW_PYPI"
+# triton-ascend REQUIRED (block_table slot-mapping kernel at runtime); it pins numpy<2 -> re-forced in step 7.
+python -m pip install triton-ascend==3.2.2 "${IDX[@]}"
+
+echo "== 6. speculators (--no-deps) + train/rollout deps =="
+python -m pip install --no-deps -e "$ROOT/speculators" 2>/dev/null || python -m pip install --no-deps -e "$REPO_ROOT"
+python -m pip install datasets loguru typer pydantic-settings tensorboard aiohttp
+
+echo "== 7. FORCE numpy $NUMPY_VER (LAST pip op — triton-ascend<2 downgraded it) + verify =="
+python -m pip install --no-deps "numpy==$NUMPY_VER"
+NUMPY_VER="$NUMPY_VER" python - <<'PY'
+import os, numpy, torch, torch_npu, torchgen.model, vllm, vllm_ascend, speculators
+want = os.environ["NUMPY_VER"]
+print("numpy      ", numpy.__version__, "(want", want + ")", "OK" if numpy.__version__ == want else "!! MISMATCH")
+print("torch      ", torch.__version__, "| vllm", vllm.__version__)
+print("vllm_ascend", vllm_ascend.__file__)   # must be under your code root, not someone else's
+print("speculators", speculators.__file__)
+print("OK: DSpark/DSV4 stack imports cleanly")
+PY
+
+echo "==================================================================="
+echo " DONE. Expect: numpy $NUMPY_VER | torch 2.10.0 | vllm 0.27.1 | vllm-ascend ${VA_COMMIT:0:12}"
+echo " NEXT: bash examples/ascend_npu_dflash/serve_dsv4_a2_singlenode_w8a8.sh"
+echo " NOTE: serve also needs the CANN nnal/atb set_env sourced in a CLEAN shell."
+echo "==================================================================="
