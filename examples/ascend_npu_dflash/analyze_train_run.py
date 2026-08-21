@@ -121,13 +121,22 @@ def checkpoint_steps(text: str) -> set[int]:
     """Steps where a checkpoint SAVE happened (the save cost gets misread as a fetch/step spike).
 
     The 'Saving checkpoint' log line has no global_step of its own, so attribute it to the last
-    step logged before it; the save shows up on that step or the next one."""
+    step logged before it; the save shows up on that step or the next one.
+
+    ⚠ ONE forward pass, deliberately. The obvious form -- for each save marker, re-scan
+    ``text[:m.start()]`` for the last ``global_step=`` -- is O(#saves x len(text)), and BOTH
+    factors grow linearly with the run, so the cost is QUADRATIC in step count. It was free at
+    4.5k steps and hung the tool at 26k (and _load_and_skip pays it once per log, so a lead scan
+    pays it three times). Interleaving both patterns in a single finditer is exactly equivalent:
+    matches arrive in position order, so the most recently seen global_step IS the last one
+    before the marker."""
     steps: set[int] = set()
-    for m in re.finditer(r"Saving checkpoint|Checkpoint saved", text):
-        gs = re.findall(r"global_step=(\d+)", text[: m.start()])
-        if gs:
-            s = int(gs[-1])
-            steps |= {s, s + 1}
+    last: int | None = None
+    for m in re.finditer(r"global_step=(\d+)|Saving checkpoint|Checkpoint saved", text):
+        if m.group(1) is not None:
+            last = int(m.group(1))
+        elif last is not None:
+            steps |= {last, last + 1}
     return steps
 
 
