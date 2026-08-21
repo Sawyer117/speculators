@@ -45,6 +45,9 @@
 #   VA_COMMIT   vllm-ascend commit to pin (default: the #14696 merge commit = the floor)
 #   VA_REPO     default upstream; point at the fork only if you need fork patches
 #   NUMPY_VER   default 2.3.5
+#   CANN_ENV    path to ascend-toolkit/set_env.sh. ⚠ NOT /usr/local on these boxes -- CANN sits
+#               under the shared account, e.g.
+#               CANN_ENV=/home/a00652497/CANN/9.0.0.0430/ascend-toolkit/set_env.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,8 +76,12 @@ python -c "import sys; assert sys.version_info[:2]==(3,11), 'need py3.11, got %s
 # vllm-ascend main builds its image on CANN 9.1.0; our other envs are on 9.0.0. The ops compile
 # against CANN headers, so a mismatch surfaces as an opbuild failure in step 4, not here.
 # Warn loudly rather than abort: 9.0.0 may well work, but if step 4 dies this is the first suspect.
-CANN_VER="$(cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg 2>/dev/null | tr -d ' \n' || true)"
-echo "CANN reported: ${CANN_VER:-unknown}   (vllm-ascend main is built on 9.1.0)"
+# Read the version from where CANN ACTUALLY is, not a hardcoded /usr/local: on these boxes it
+# lives under the shared account, e.g. /home/a00652497/CANN/9.0.0.0430/ascend-toolkit. set_env.sh
+# exports ASCEND_HOME_PATH, so derive from that and fall back to the path itself.
+CANN_VER="$(cat "${ASCEND_HOME_PATH:-/nonexistent}/version.cfg" 2>/dev/null | tr -d ' \n' || true)"
+[ -n "$CANN_VER" ] || CANN_VER="${ASCEND_HOME_PATH:-unknown}"
+echo "CANN reported: ${CANN_VER}   (vllm-ascend main is built on 9.1.0)"
 case "$CANN_VER" in *9.1.0*) : ;; *) echo "⚠ NOT 9.1.0 — if the op build in step 4 fails, upgrade CANN first." ;; esac
 
 echo "== 1. build deps + torch/torch-npu 2.10.0 + numpy $NUMPY_VER + CANN backfill =="

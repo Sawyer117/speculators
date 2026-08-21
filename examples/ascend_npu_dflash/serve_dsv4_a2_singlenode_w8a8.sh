@@ -76,6 +76,15 @@ echo " model=$MODEL"
 echo " 📋 log -> $LOG"
 echo "==================================================================="
 
+# CANN + the nnal/atb set_env. Serving needs BOTH; sourcing only ascend-toolkit surfaces later
+# as `libatb.so: cannot open shared object` or a `Mki::Dl` error deep in the engine, which reads
+# like a model bug and is not one. On these boxes CANN is NOT under /usr/local -- it sits in the
+# shared account, so point CANN_HOME at it.
+CANN_HOME="${CANN_HOME:-/home/a00652497/CANN/9.0.0.0430}"
+for e in "$CANN_HOME/ascend-toolkit/set_env.sh" "$CANN_HOME/nnal/atb/set_env.sh"; do
+  [ -f "$e" ] && { source "$e"; echo "sourced $e"; } || echo "⚠ missing $e — expect libatb/Mki::Dl errors"
+done
+
 # Official env block, verbatim.
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
