@@ -33,7 +33,12 @@
 #   CANN         9.0.0                      -> 9.1.0          ⚠ OS-level, NOT pip. See step 0.
 #
 # PREREQS: a py3.11 env you just created and activated; CANN at OS level.
-# USAGE:   conda create -n dsv4-w8a8 python=3.11 -y && conda activate dsv4-w8a8
+# USAGE:   # ⚠ -c conda-forge --override-channels is REQUIRED on these boxes: the Anaconda
+#          # `defaults` channel answers HTTP 403 Forbidden (repo.anaconda.com is licence-gated),
+#          # and conda leaves NO env behind when it fails, so a plain `conda create` looks like
+#          # it worked until `conda activate` says EnvironmentNameNotFound.
+#          conda create -n dsv4-w8a8 -c conda-forge --override-channels python=3.11 -y
+#          conda activate dsv4-w8a8
 #          bash examples/ascend_npu_dflash/install_npu_env_dsv4_w8a8.sh
 # OVERRIDES (env):
 #   ROOT / VLLM_DIR / VA_DIR   as in the sibling script
