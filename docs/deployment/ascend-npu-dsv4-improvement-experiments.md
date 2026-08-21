@@ -1534,3 +1534,66 @@ pos4/pos5 抬得比 pos1/pos2 多   ⟹ 机制对上了。即使总量只 +0.02,
 ⚠ **但它不是 25844 步那次挂死的原因。** traceback 指向 `load()` 的 `_PAIR.findall`,
 在 `checkpoint_steps` **之前**;真实原因是冷页缓存下首次读大日志慢,`^C` 按早了。
 **工具当时没坏,只是慢。** 记下来,免得以后把这个修复当成"修好了挂死"。
+
+---
+
+## 17. CONV 臂起跑,以及起跑时暴露的两个流程缺陷(2026-08-21)
+
+### 17.1 run
+
+`faithful_ep_20260821_225635`,`--block-conv-kernel-size 2 --block-conv-group-size 16`,
+从零训 5 epoch。旗标已双重确认:`pgrep` 的进程命令行、以及 `train_command.txt`
+(其 `Git SHA: 6114b56` 与树一致 ⟹ 这个 checkpoint 可精确复现)。
+
+配对基线两条,都要读:
+
+```
+CONV vs faithful_ep_20260804_165215   与历史可比(ropefix)
+CONV vs faithful_ep_20260820_231654   ★ SELECT 已判空 ⟹ 它就是「什么都没加」的对照线,
+                                        且同数据、同 init 旗标,只差一个头
+```
+
+### 17.2 ⚠ 缺陷一:探针会覆盖训练 run 的 `train_command.txt`
+
+`scripts/train.py:702` 的 `save_train_command(args.save_path)` 在 rank0 无条件写入。
+我们后来用 **`LR=0` 探针**对着同一个 `--save-path` 复跑检查点时,它**又写了一遍** ——
+`ckpt_faithful_ep_20260804_165215/train_command.txt` 现在装的是
+`decoder_ablation_probe.py --lr 0 --max-anchors 128 ...`,**08-04 那次训练的复现存档已丢失**。
+
+后果不止丢档:我们据它做「只差一个变量」的 diff,得到 8 处差异,其中
+`arrow_0720_77w` vs `arrow_0730_77w_dedup` 一度像是数据集混淆 ——
+**是假警报**,探针自己的参数。真话在日志里:`grep -o "arrow_[a-z0-9_]*"` 三条 run 全是
+`arrow_0730_`,**无数据集混淆**,§16.2 的结论不受影响。
+
+**修法(未做)**:探针类脚本应指向独立 `--save-path`;或 `save_train_command` 遇到
+已存在文件时改写 `train_command.<ts>.txt` 而非覆盖。
+
+**教训**:验证「两次 run 只差一个变量」时,`train_command.txt` **不是可信来源** ——
+任何人对着同一个 save-path 跑过东西,它就被改写了。可信来源是日志本身。
+
+### 17.3 ⚠ 缺陷二:`hard_accept_len` 早期恒等检查是废的
+
+我给的走开前检查是「前几十步 `hard_accept_len` 与基线同量级」。实际输出是连着三十行
+`hard_accept_len=1.000` —— **1.000 是地板**,从零训的开局不管有没有 conv 都是这个数。
+**这个门区分不了任何东西。**
+
+有效的替代:头对头的 **soft `accept_len` 差**。@200 步读到
+`ROPEFIX 1.037 / CONV 1.031, Δ −0.006` —— 噪声量级,与恒等初始化一致。
+
+⚠ 同时 `loss +0.248`(2.074 vs 1.826)偏大。早期 loss 从 5.12 陡降到 2.05,该区间任何
+微小错位都会放大,**200 步不下结论**;2500 步若不收拢,回头查 §15.3 记的那条:
+`place` 会用 `post` 缩放子层输出,而官方是不缩放直接加。
+
+### 17.4 起跑时的 serve-bound 读数(待复核)
+
+```
+                    基线      CONV
+HS fetch %          0.1%     27.4%
+HS straggler %     35.7%     25.4%
+serve-bound 合计   35.8%     52.8%     effective 4503ms vs steady 2090ms = 2.2x
+```
+
+工具判词 `HS/SERVING-bound`,真实 fwd 仅 1%。**但开局现象为主**(启动 217s 计入,
+真实 HS 停顿集中在 steps [-1,1,2,14] = 滚动缓冲刚开始填)。
+**跑满一个 epoch 后加 `--skip` 重看再定。** 若仍 ~50%,对策是抬 `--max-anchors`
+(让每步更重以匹配 serve 产出速率),**不是动 conv**。
