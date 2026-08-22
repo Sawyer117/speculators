@@ -152,7 +152,14 @@ def main() -> int:
         print(f"  absent (may be fine): {missing_nice}")
 
     # --- 2. index ------------------------------------------------------------------------
-    index_path = os.path.join(root, "model.safetensors.index.json")
+    # The index is NOT always HF's model.safetensors.index.json: Ascend quantized checkpoints
+    # (msmodelslim output, loaded with --quantization ascend) ship
+    # quant_model_weights.safetensors.index.json instead. Looking only for the HF name reports
+    # a complete checkpoint as "sharded with no index", which is both wrong and alarming.
+    indices = sorted(f for f in os.listdir(root) if f.endswith(".safetensors.index.json"))
+    index_path = os.path.join(root, indices[0]) if indices else os.path.join(root, "model.safetensors.index.json")
+    if len(indices) > 1:
+        print(f"  note: {len(indices)} index files present, using {indices[0]}: {indices}")
     on_disk = sorted(f for f in os.listdir(root) if f.endswith(".safetensors"))
     expected_shards, weight_map = set(), {}
     if os.path.isfile(index_path):
@@ -162,12 +169,13 @@ def main() -> int:
         expected_shards = set(weight_map.values())
         total_declared = (index.get("metadata") or {}).get("total_size")
         print(f"\n-- index --")
+        print(f"  file             : {os.path.basename(index_path)}")
         print(f"  tensors promised : {len(weight_map)}")
         print(f"  shards promised  : {len(expected_shards)}")
         if total_declared:
             print(f"  total_size       : {human(int(total_declared))}")
     else:
-        print(f"\n-- index --\n  no model.safetensors.index.json "
+        print(f"\n-- index --\n  no *.safetensors.index.json "
               f"({'single-file checkpoint' if len(on_disk) == 1 else 'UNEXPECTED for a sharded model'})")
         if len(on_disk) > 1:
             problems.append("sharded checkpoint with no index — cannot prove completeness")
