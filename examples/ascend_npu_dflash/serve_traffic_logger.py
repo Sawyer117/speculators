@@ -98,6 +98,7 @@ _want_spec = True
 _keys: dict[str, str] = {}        # token -> person; empty = open access
 _upstream_key = ""
 _max_field = 4000                 # chars kept per logged text field
+_metrics_only = False             # record what only the server knows, and none of the text
 _seen_systems: set[str] = set()   # system-prompt digests already written out in full
 
 
@@ -170,7 +171,8 @@ def _summarise_request(req):
     summary = {
         "model": req.get("model"),
         "turns": len(msgs),
-        "last_message": last,
+        "last_message": None if _metrics_only else last,
+        "last_message_chars": len(_blocks_text(msgs[-1].get("content"))) if msgs else None,
         "roles": [m.get("role") for m in msgs][-6:],
         "system_digest": sys_dig,
         "system_chars": len(sys_txt) or None,
@@ -181,6 +183,8 @@ def _summarise_request(req):
     # The system prompt is identical across every turn of a session; write it once and refer
     # to it by digest from then on.
     first_sight = None
+    if _metrics_only:
+        return summary, None
     if sys_dig and sys_dig not in _seen_systems:
         _seen_systems.add(sys_dig)
         first_sight = {"digest": sys_dig, "text": _clip(sys_txt, 20000),
@@ -418,7 +422,8 @@ class Handler(BaseHTTPRequestHandler):
             # an agent session logs the same 30 KB preamble on every one of its turns.
             "system_prompt_first_seen": _first_system,
             "request": _summary,
-            "response_text": _clip(text),
+            "response_text": None if _metrics_only else _clip(text),
+            "response_chars": len(text) if isinstance(text, str) else None,
             "usage": usage,
             "spec": _spec_record(before, after, alone),
             "error": err,
@@ -446,13 +451,20 @@ def main() -> int:
     ap.add_argument("--max-field", type=int, default=4000, metavar="N",
                     help="chars kept per logged text field (default 4000). Harness turns are "
                          "long; a log too big to open answers no questions.")
+    ap.add_argument("--metrics-only", action="store_true",
+                    help="record NO message text -- identity, conversation id, timings, token "
+                         "counts and accept length only. The harnesses already keep complete "
+                         "local transcripts, so content here is a second copy; accept length "
+                         "and latency exist only at request time on this side and cannot be "
+                         "reconstructed from anyone's local files afterwards.")
     ap.add_argument("--no-spec", action="store_true",
                     help="skip the /metrics reads (one extra local request per exchange)")
     args = ap.parse_args()
 
-    global _keys, _upstream_key, _max_field
+    global _keys, _upstream_key, _max_field, _metrics_only
     _upstream_key = args.upstream_key
     _max_field = args.max_field
+    _metrics_only = args.metrics_only
     if args.keys:
         with open(args.keys) as fh:
             for line in fh:
@@ -472,7 +484,7 @@ def main() -> int:
     print(f" 📋 {path}")
     print(f" spec attribution: {'on (exact only while a request is alone)' if _want_spec else 'off'}")
     print(f" auth: {f'{len(_keys)} key(s) -> ' + ', '.join(sorted(set(_keys.values()))) if _keys else 'OPEN (identity is self-declared/observed only)'}")
-    print(f" field cap: {_max_field} chars   system prompts: stored once per digest")
+    print(f" mode: {'METRICS ONLY — no message text is written' if _metrics_only else f'full, field cap {_max_field} chars, system prompts once per digest'}")
     print(" harness env:  ANTHROPIC_BASE_URL / OPENAI_BASE_URL -> this port, key per person")
     print(" point clients at the LISTEN port; the engine port keeps working unlogged.")
     print("=" * 72)
