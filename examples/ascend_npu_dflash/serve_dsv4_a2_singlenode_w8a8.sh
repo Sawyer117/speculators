@@ -43,6 +43,13 @@
 #   NPUS        device count (default 8)      TP  tensor parallel (default = NPUS, i.e. DP=1)
 #   NUM_SPEC    speculative tokens (default 5 = the released draft's block width)
 #   MAX_LEN     default 800000                BLOCK_SIZE     default 128
+#   GPU_UTIL    default 0.9 (the recipe's). ⚠ 0.9 leaves memory on the table here: the AR run
+#               reported 17.41 GiB of KV against 22.6 GiB actually free. Raising it is the
+#               knob for longer context; it costs headroom for activation spikes.
+#   KV_MEM      exact KV bytes, e.g. KV_MEM=20000000000. Overrides GPU_UTIL and is what vLLM
+#               itself suggests in the "Replace gpu_memory_utilization with --kv-cache-memory"
+#               line -- more predictable than a fraction, since the fraction is of TOTAL
+#               memory while what matters is what is left after the weights.
 #   MAX_BATCHED default 8192                  MAX_SEQS       default 32
 #   NOSPEC=1    AUTOREGRESSIVE BASELINE: drop --speculative-config entirely and change
 #               nothing else. A speedup ratio needs a denominator measured on THIS stack,
@@ -66,6 +73,8 @@ MAX_LEN="${MAX_LEN:-800000}"
 BLOCK_SIZE="${BLOCK_SIZE:-128}"
 MAX_BATCHED="${MAX_BATCHED:-8192}"
 MAX_SEQS="${MAX_SEQS:-32}"
+GPU_UTIL="${GPU_UTIL:-0.9}"
+KV_MEM="${KV_MEM:-}"
 EXTRA_CFG="${EXTRA_CFG:-}"
 LOG="${LOG:-$PWD/serve_dsv4_w8a8_$(date +%Y%m%d_%H%M%S).log}"
 
@@ -99,6 +108,12 @@ else
   echo " num_spec=$NUM_SPEC  method=$SPEC_METHOD"
 fi
 echo " max_model_len=$MAX_LEN  block_size=$BLOCK_SIZE  seqs=$MAX_SEQS"
+echo " gpu_util=$GPU_UTIL${KV_MEM:+  (overridden by kv_cache_memory=$KV_MEM)}"
+# ⚠ The 800000 in the upstream A2 recipe was measured on DeepSeek-V4-Flash-DSpark-w4a8-test.
+# That is a w4a8 model: roughly half the weight bytes, hence roughly 20 GB more KV per card.
+# On w8a8 with a draft loaded (38.9 GB/card) the same 800000 misses by ~0.13 GiB at
+# gpu_util 0.9, and the engine's own estimate lands at 780800. Raise GPU_UTIL or set KV_MEM
+# rather than assuming the recipe's context length transfers across quantizations.
 echo " hybrid KV cache manager: ON   additional-config: ${EXTRA_CFG:-<none, per the A2 recipe>}"
 echo " method=$SPEC_METHOD   draft=${DRAFT:-<mtp.* inside the checkpoint>}"
 echo " model=$MODEL"
@@ -164,7 +179,8 @@ nohup vllm serve "$MODEL" \
     --max-model-len "$MAX_LEN" \
     --max-num-batched-tokens "$MAX_BATCHED" \
     --served-model-name dsv4 \
-    --gpu-memory-utilization 0.9 \
+    --gpu-memory-utilization "$GPU_UTIL" \
+    ${KV_MEM:+--kv-cache-memory "$KV_MEM"} \
     --max-num-seqs "$MAX_SEQS" \
     --data-parallel-size "$DP" \
     --tensor-parallel-size "$TP" \
