@@ -44,6 +44,9 @@
 #   NUM_SPEC    speculative tokens (default 5 = the released draft's block width)
 #   MAX_LEN     default 800000                BLOCK_SIZE     default 128
 #   MAX_BATCHED default 8192                  MAX_SEQS       default 32
+#   NOSPEC=1    AUTOREGRESSIVE BASELINE: drop --speculative-config entirely and change
+#               nothing else. A speedup ratio needs a denominator measured on THIS stack,
+#               and every other field staying byte-identical is what makes it mean anything.
 #   DRAFT       our own converted draft dir; unset = the mtp.* head inside MODEL
 #   SPEC_METHOD "dspark" (default) or "mtp" -- NOT a rename, it changes vLLM kernel behaviour
 #               (parallel drafting, dspark_draft_topk). See worklog section 11.3.
@@ -80,13 +83,22 @@ if [ -n "$EXTRA_CFG" ] && [ $((WINDOW % TP)) -ne 0 ]; then
   echo "    \"Can't determine cudagraph shapes that are both a multiple of $WINDOW ...\""
 fi
 
-SPEC_CFG="{\"method\":\"$SPEC_METHOD\",\"num_speculative_tokens\":$NUM_SPEC,\"enforce_eager\":true"
-[ -n "${DRAFT:-}" ] && SPEC_CFG="$SPEC_CFG,\"model\":\"$DRAFT\""
-SPEC_CFG="$SPEC_CFG}"
+if [ "${NOSPEC:-0}" = "1" ]; then
+  SPEC_CFG=""
+else
+  SPEC_CFG="{\"method\":\"$SPEC_METHOD\",\"num_speculative_tokens\":$NUM_SPEC,\"enforce_eager\":true"
+  [ -n "${DRAFT:-}" ] && SPEC_CFG="$SPEC_CFG,\"model\":\"$DRAFT\""
+  SPEC_CFG="$SPEC_CFG}"
+fi
 
 echo "==================================================================="
 echo " DSV4-Flash W8A8 + DSpark   NPUS=$NPUS  ->  DP=$DP x TP=$TP   (EP on)"
-echo " num_spec=$NUM_SPEC  max_model_len=$MAX_LEN  block_size=$BLOCK_SIZE  seqs=$MAX_SEQS"
+if [ "${NOSPEC:-0}" = "1" ]; then
+  echo " ★ AR BASELINE (no speculative decoding) — every other field identical"
+else
+  echo " num_spec=$NUM_SPEC  method=$SPEC_METHOD"
+fi
+echo " max_model_len=$MAX_LEN  block_size=$BLOCK_SIZE  seqs=$MAX_SEQS"
 echo " hybrid KV cache manager: ON   additional-config: ${EXTRA_CFG:-<none, per the A2 recipe>}"
 echo " method=$SPEC_METHOD   draft=${DRAFT:-<mtp.* inside the checkpoint>}"
 echo " model=$MODEL"
@@ -161,7 +173,7 @@ nohup vllm serve "$MODEL" \
     --quantization ascend \
     --port "$PORT" \
     --block-size "$BLOCK_SIZE" \
-    --speculative-config "$SPEC_CFG" \
+    ${SPEC_CFG:+--speculative-config "$SPEC_CFG"} \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     ${EXTRA_CFG:+--additional-config "$EXTRA_CFG"} \
     > "$LOG" 2>&1 &
