@@ -158,6 +158,31 @@ python -m pip install --no-deps torchvision==0.25.0 torchaudio==2.10.0 --extra-i
 # triton-ascend REQUIRED (block_table slot-mapping kernel at runtime); it pins numpy<2 -> re-forced in step 7.
 python -m pip install triton-ascend==3.2.2 "${IDX[@]}"
 
+echo "== 5b. align transformers with what vllm-ascend pins =="
+# vLLM 0.27.1 asks for transformers>=5.5.3 and pulls the newest; vllm-ascend pins an EXACT
+# version. Both constraints are satisfiable at vllm-ascend's pin, so honour it -- the DSV4
+# model/config code lives in vllm-ascend and there is no reason to run it on a transformers
+# it was never tested against. Read the pin from the installed package rather than hardcoding
+# it, so this stays correct when VA_COMMIT moves.
+# (The fastapi conflict is NOT resolvable the same way: vllm-ascend wants <0.124.0 while vLLM
+#  0.27.1 requires >=0.133.0 -- upstream's own pins contradict. Keep vLLM's; it serves the HTTP
+#  API. Symptom if that ever bites: serve returns 500 with a `_IncludedRouter` traceback.)
+TF_REQ="$(python - <<'PY2'
+import importlib.metadata as m
+try:
+    reqs = m.requires("vllm_ascend") or []
+except Exception:
+    reqs = []
+print(next((r.split(";")[0].strip() for r in reqs if r.startswith("transformers")), ""))
+PY2
+)"
+if [ -n "$TF_REQ" ]; then
+  echo "vllm-ascend pins: $TF_REQ"
+  python -m pip install --no-deps "$TF_REQ" || echo "WARN: could not apply $TF_REQ — continuing"
+else
+  echo "no transformers pin found in vllm_ascend metadata — leaving as installed"
+fi
+
 echo "== 6. speculators (--no-deps) + train/rollout deps =="
 python -m pip install --no-deps -e "$ROOT/speculators" 2>/dev/null || python -m pip install --no-deps -e "$REPO_ROOT"
 python -m pip install datasets loguru typer pydantic-settings tensorboard aiohttp
