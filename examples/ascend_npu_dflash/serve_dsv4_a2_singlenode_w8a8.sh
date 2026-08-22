@@ -50,19 +50,43 @@ NPUS="${NPUS:-8}"
 NUM_SPEC="${NUM_SPEC:-5}"
 SPEC_METHOD="${SPEC_METHOD:-dspark}"
 PORT="${PORT:-8900}"
+MAX_LEN="${MAX_LEN:-65536}"
+FLASHCOMM="${FLASHCOMM:-1}"
 LOG="${LOG:-$PWD/serve_dsv4_w8a8_$(date +%Y%m%d_%H%M%S).log}"
 
-# ---- pick TP: largest divisor of NPUS that also divides (NUM_SPEC+1) --------------------
+# ---- parallelism ----------------------------------------------------------------------
+# TP unset -> the largest divisor of NPUS that also divides (NUM_SPEC+1), i.e. the widest TP
+# that cannot trip #14260 while sequence parallelism is on.
+#
+# ⚠ THAT DEFAULT IS OFTEN THE WRONG TRADE. It maximises DP, and DP only pays off under high
+# concurrency: each replica holds its own copy of every non-expert weight. Measured here at
+# DP4 x TP2, each card loaded 46.0 GB while the whole checkpoint is 293 GB -- 368 GB resident,
+# so ~75 GB is pure duplication, and it came straight out of the KV cache budget (4.84 GiB
+# left, against 17.85 GiB needed for a 1M context).
+#
+# For a handful of concurrent users prefer TP=8 / DP=1: weights shard 8 ways with no replica,
+# and low-concurrency latency is better because every card works on the same token. Set TP=8
+# explicitly. If that trips the #14260 cudagraph error, also set FLASHCOMM=0 -- Flash Comm V1
+# IS vllm-ascend's sequence parallelism for non-VL quantized models (its own docs call FC1 "an
+# enhanced version of Sequence Parallelism"), and the constraint disappears with it, at the
+# cost of FC1's halved-allgather communication saving.
 WINDOW=$((NUM_SPEC + 1))
-TP=""
-for c in $(seq "$NPUS" -1 1); do
-  if [ $((NPUS % c)) -eq 0 ] && [ $((WINDOW % c)) -eq 0 ]; then TP="$c"; break; fi
-done
-[ -n "$TP" ] || { echo "!! no TP divides both NPUS=$NPUS and num_spec+1=$WINDOW"; exit 1; }
+if [ -z "${TP:-}" ]; then
+  for c in $(seq "$NPUS" -1 1); do
+    if [ $((NPUS % c)) -eq 0 ] && [ $((WINDOW % c)) -eq 0 ]; then TP="$c"; break; fi
+  done
+  [ -n "${TP:-}" ] || { echo "!! no TP divides both NPUS=$NPUS and num_spec+1=$WINDOW"; exit 1; }
+fi
+[ $((NPUS % TP)) -eq 0 ] || { echo "!! TP=$TP does not divide NPUS=$NPUS"; exit 1; }
 DP=$((NPUS / TP))
 
-# Fail HERE with the reason, not 20 minutes later with the cudagraph message.
-[ $((WINDOW % TP)) -eq 0 ] || { echo "!! (num_spec+1)=$WINDOW not a multiple of TP=$TP — see #14260"; exit 1; }
+# Warn -- do not abort -- when TP does not divide the spec window. With FLASHCOMM=0 this is
+# fine; with it on, expect the #14260 cudagraph error.
+if [ $((WINDOW % TP)) -ne 0 ] && [ "$FLASHCOMM" = "1" ]; then
+  echo "⚠ (num_spec+1)=$WINDOW is NOT a multiple of TP=$TP and FLASHCOMM=1."
+  echo "  Expect: \"Can't determine cudagraph shapes that are both a multiple of $WINDOW ...\""
+  echo "  If that fires, re-run with FLASHCOMM=0."
+fi
 
 SPEC_CFG="{\"method\":\"$SPEC_METHOD\",\"num_speculative_tokens\":$NUM_SPEC,\"enforce_eager\":true"
 [ -n "${DRAFT:-}" ] && SPEC_CFG="$SPEC_CFG,\"model\":\"$DRAFT\""
@@ -70,7 +94,7 @@ SPEC_CFG="$SPEC_CFG}"
 
 echo "==================================================================="
 echo " DSV4-Flash W8A8 + DSpark   NPUS=$NPUS  ->  DP=$DP x TP=$TP   (EP on)"
-echo " num_spec=$NUM_SPEC  window=$WINDOW  ($WINDOW % $TP == 0, so #14260 does not fire)"
+echo " num_spec=$NUM_SPEC  window=$WINDOW  |  max_model_len=$MAX_LEN  |  flashcomm1=$FLASHCOMM"
 echo " method=$SPEC_METHOD   draft=${DRAFT:-<mtp.* inside the checkpoint>}"
 echo " model=$MODEL"
 echo " 📋 log -> $LOG"
@@ -127,7 +151,7 @@ export HCCL_OP_EXPANSION_MODE="AIV"
 export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096
 
 nohup vllm serve "$MODEL" \
-    --max-model-len 1048576 \
+    --max-model-len "$MAX_LEN" \
     --max-num-batched-tokens 10240 \
     --served-model-name dsv4 \
     --gpu-memory-utilization 0.9 \
@@ -152,7 +176,7 @@ nohup vllm serve "$MODEL" \
         },
         "enable_cpu_binding": true,
         "enable_dsa_cp": true,
-        "enable_flashcomm1": true,
+        "enable_flashcomm1": '"$([ "$FLASHCOMM" = "1" ] && echo true || echo false)"',
         "multistream_overlap_shared_expert": true
     }' > "$LOG" 2>&1 &
 
