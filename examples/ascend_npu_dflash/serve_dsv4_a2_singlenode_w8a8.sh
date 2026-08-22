@@ -108,7 +108,19 @@ done
 export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2:${LD_PRELOAD:-}
+# jemalloc: RESOLVE it, do not hardcode. The official command's path is the Debian/Ubuntu
+# multiarch layout (/usr/lib/aarch64-linux-gnu); on a RHEL-family box the library lives in
+# /usr/lib64 or is absent, and ld.so then prints six copies of
+#   ERROR: ld.so: object '.../libjemalloc.so.2' from LD_PRELOAD cannot be preloaded: ignored
+# -- alarming, non-fatal, and it silently drops the allocator the recipe wanted.
+JEMALLOC="${JEMALLOC:-$(ldconfig -p 2>/dev/null | awk '/libjemalloc\.so\.2/{print $NF; exit}')}"
+if [ -n "$JEMALLOC" ] && [ -f "$JEMALLOC" ]; then
+  export LD_PRELOAD="$JEMALLOC:${LD_PRELOAD:-}"
+  echo "jemalloc: $JEMALLOC"
+else
+  echo "note: libjemalloc.so.2 not found — running with the system allocator."
+  echo "      (fine to start; install jemalloc if long runs fragment memory)"
+fi
 export HCCL_BUFFSIZE=1024
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
