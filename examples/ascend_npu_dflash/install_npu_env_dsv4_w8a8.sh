@@ -73,6 +73,26 @@ echo "==================================================================="
 echo "== 0. sanity: py311 + source CANN =="
 python -c "import sys; assert sys.version_info[:2]==(3,11), 'need py3.11, got %s'%sys.version" \
   || { echo "Activate your py3.11 env first."; exit 1; }
+# ⚠ ABORT on a MIXED CANN shell. set_env.sh PREPENDS to PATH/LD_LIBRARY_PATH rather than
+# replacing, so sourcing 9.1.0 into a shell that already sourced 9.0.0 leaves the older ccec
+# and headers ahead of the newer ones. The build then takes ~40 minutes and fails in exactly
+# the place it failed before, which reads like "the upgrade did not help" and is not.
+# Cost of getting this wrong is 40 minutes; cost of the check is instant. Use a FRESH shell.
+_cann_root="$(cd "$(dirname "$(dirname "$CANN_ENV")")" 2>/dev/null && pwd || true)"
+if [ -n "${ASCEND_HOME_PATH:-}" ] && [ -n "$_cann_root" ]; then
+  case "$ASCEND_HOME_PATH" in
+    "$_cann_root"*) : ;;
+    *)
+      echo "!! this shell ALREADY has a different CANN sourced:"
+      echo "     already active : $ASCEND_HOME_PATH"
+      echo "     you asked for  : $CANN_ENV"
+      echo "   set_env.sh prepends, so the old one would still win and the op build would fail"
+      echo "   ~40 minutes from now. Open a FRESH shell, activate the env, and re-run:"
+      echo "     conda activate \$(basename \"${CONDA_PREFIX:-<env>}\")"
+      echo "     CANN_ENV=$CANN_ENV bash \$0"
+      exit 1 ;;
+  esac
+fi
 [ -f "$CANN_ENV" ] && { source "$CANN_ENV"; echo "sourced CANN: $CANN_ENV"; } \
   || echo "WARN: CANN set_env not at $CANN_ENV — set CANN_ENV=... (needed to compile the ops)"
 # vllm-ascend main builds its image on CANN 9.1.0; our other envs are on 9.0.0. The ops compile
