@@ -18,6 +18,21 @@ proxy tracks concurrency and records `spec.attributable: false` when it was not 
 than reporting a precise-looking number that is actually several requests blended. At
 concurrency 1 -- how we benchmark -- every record is exact.
 
+WHO SENT IT. Three kinds of identity, and the record keeps them apart because they are not
+equally trustworthy:
+  * VERIFIED -- an API key the caller had to be given. With --keys the proxy becomes the auth
+    point: each person gets their own token, the proxy checks it, labels the record with their
+    name, and forwards using the upstream key (if any). vLLM itself needs no change. Only the
+    label and a short digest are logged, never the token.
+  * SELF-DECLARED -- the OpenAI `user` body field, X-User / X-Client headers. Free when clients
+    bother to set them, and trivially spoofable. Recorded, never trusted.
+  * OBSERVED -- client IP and User-Agent. Useful corroboration, but NAT collapses a whole team
+    onto one address and one person moves between several.
+Conversations are grouped too: every turn of a chat resends the history, so hashing the leading
+system+first-user message gives a stable id across the turns of one conversation. Two people
+opening with the exact same first message would collide; that is the price of not needing the
+client to cooperate.
+
 STREAMING is forwarded chunk by chunk, never buffered, so time-to-first-token stays real; the
 text is reassembled for the log as it passes. Token counts come from the response's `usage`
 when present -- for streaming the client must send stream_options {"include_usage": true},
@@ -25,6 +40,8 @@ otherwise the record says tokens are unknown instead of guessing from chunk coun
 
 USAGE
   python3 examples/ascend_npu_dflash/serve_traffic_logger.py            # :8901 -> :8900
+  # per-person keys: one "token name" per line, blank lines and # comments ignored
+  python3 examples/ascend_npu_dflash/serve_traffic_logger.py --keys /path/keys.txt
   python3 examples/ascend_npu_dflash/serve_traffic_logger.py --listen 9000 --upstream 8900 \
       --log /home/a00652497/2026/dspark/logs/traffic_dspark5.jsonl
   # then point clients at :8901 instead of :8900
@@ -38,6 +55,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import hashlib
 import re
 import sys
 import threading
@@ -60,6 +78,31 @@ _inflight = 0
 _logfh = None
 _upstream = "http://127.0.0.1:8900"
 _want_spec = True
+_keys: dict[str, str] = {}        # bearer token -> person; empty = open access
+_upstream_key = ""
+
+
+def _short(s: str) -> str:
+    """A stable 8-hex handle for a value we must never write down in full."""
+    return hashlib.sha256(s.encode()).hexdigest()[:8]
+
+
+def _conversation_id(req) -> str | None:
+    """Stable across the turns of one chat: every turn resends the history, so the leading
+    system + first user message is the part that does not change."""
+    if not isinstance(req, dict):
+        return None
+    msgs = req.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    seed = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        seed.append(f"{m.get('role')}:{m.get('content')}")
+        if m.get("role") == "user":
+            break                  # stop at the FIRST user turn; later turns vary
+    return _short("|".join(seed))
 
 
 def _log(rec: dict) -> None:
@@ -120,6 +163,22 @@ class Handler(BaseHTTPRequestHandler):
         if n:
             body = self.rfile.read(n)
 
+        # --- identity -----------------------------------------------------------------
+        auth = self.headers.get("Authorization") or ""
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        who = _keys.get(token) if _keys else None
+        if _keys and who is None:
+            msg = b'{"error":{"message":"unknown or missing API key","type":"invalid_request_error"}}'
+            self.send_response(401); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(msg))); self.end_headers()
+            self.wfile.write(msg)
+            _log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "path": self.path, "status": 401,
+                  "identity": {"verified": None, "key_digest": _short(token) if token else None,
+                               "client_ip": self.client_address[0],
+                               "user_agent": self.headers.get("User-Agent")},
+                  "error": "rejected: unknown API key"})
+            return
+
         with _state:
             _inflight += 1
             alone = _inflight == 1
@@ -145,6 +204,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             if body:
                 fwd.add_header("Content-Length", str(len(body)))
+            if _upstream_key:
+                fwd.add_header("Authorization", f"Bearer {_upstream_key}")
             with _OPENER.open(fwd, timeout=3600) as up:
                 status = up.status
                 self.send_response(status)
@@ -222,6 +283,16 @@ class Handler(BaseHTTPRequestHandler):
             "ttft_s": round(ttft, 4) if ttft is not None else None,
             "streaming": raw.startswith("data:"),
             "peak_concurrency": peak,
+            "identity": {
+                "verified": who,                                   # from the API key; trustworthy
+                "key_digest": _short(token) if token else None,    # never the token itself
+                "declared_user": (req_json or {}).get("user")
+                                 if isinstance(req_json, dict) else None,
+                "declared_header": self.headers.get("X-User") or self.headers.get("X-Client"),
+                "client_ip": self.client_address[0],
+                "user_agent": self.headers.get("User-Agent"),
+            },
+            "conversation_id": _conversation_id(req_json),
             "request": req_json,
             "response_text": text,
             "usage": usage,
@@ -242,10 +313,27 @@ def main() -> int:
     ap.add_argument("--upstream", type=int, default=8900, help="the vLLM serve port")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--log", default=None, help="JSONL path (default ./traffic_<ts>.jsonl)")
+    ap.add_argument("--keys", default=None, metavar="FILE",
+                    help="'token name' per line. Enables auth: unknown tokens get 401, and every "
+                         "record carries the verified person. Without it access is open and only "
+                         "self-declared/observed identity is available.")
+    ap.add_argument("--upstream-key", default="", metavar="KEY",
+                    help="key to present to vLLM, if the engine itself was started with --api-key")
     ap.add_argument("--no-spec", action="store_true",
                     help="skip the /metrics reads (one extra local request per exchange)")
     args = ap.parse_args()
 
+    global _keys, _upstream_key
+    _upstream_key = args.upstream_key
+    if args.keys:
+        with open(args.keys) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                tok, _, name = line.partition(" ")
+                if tok:
+                    _keys[tok] = name.strip() or "unnamed"
     _upstream = f"http://127.0.0.1:{args.upstream}"
     _want_spec = not args.no_spec
     path = args.log or os.path.join(os.getcwd(), f"traffic_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
@@ -255,6 +343,7 @@ def main() -> int:
     print(f" traffic logger  {args.host}:{args.listen}  ->  {_upstream}")
     print(f" 📋 {path}")
     print(f" spec attribution: {'on (exact only while a request is alone)' if _want_spec else 'off'}")
+    print(f" auth: {f'{len(_keys)} key(s) -> ' + ', '.join(sorted(set(_keys.values()))) if _keys else 'OPEN (identity is self-declared/observed only)'}")
     print(" point clients at the LISTEN port; the engine port keeps working unlogged.")
     print("=" * 72)
     ThreadingHTTPServer((args.host, args.listen), Handler).serve_forever()
