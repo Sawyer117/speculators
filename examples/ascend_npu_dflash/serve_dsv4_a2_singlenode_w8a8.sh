@@ -81,8 +81,17 @@ echo "==================================================================="
 # like a model bug and is not one. On these boxes CANN is NOT under /usr/local -- it sits in the
 # shared account, so point CANN_HOME at it.
 CANN_HOME="${CANN_HOME:-/home/a00652497/CANN/9.0.0.0430}"
+# ⚠ set +u around the source. CANN's own set_env.sh scripts are NOT written for `nounset`
+# -- nnal/atb/set_env.sh reads $ZSH_VERSION to detect the shell, which under `set -u` is a
+# FATAL "unbound variable" and kills us before the server ever starts. Turn nounset off for
+# the source alone, then restore it.
 for e in "$CANN_HOME/ascend-toolkit/set_env.sh" "$CANN_HOME/nnal/atb/set_env.sh"; do
-  [ -f "$e" ] && { source "$e"; echo "sourced $e"; } || echo "⚠ missing $e — expect libatb/Mki::Dl errors"
+  if [ -f "$e" ]; then
+    set +u; . "$e"; set -u
+    echo "sourced $e"
+  else
+    echo "⚠ missing $e — expect libatb.so / Mki::Dl errors deep in the engine"
+  fi
 done
 
 # ⚠ conda-forge envs need their OWN libstdc++ to win over the system one. conda-forge's

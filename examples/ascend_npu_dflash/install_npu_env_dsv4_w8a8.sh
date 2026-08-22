@@ -93,8 +93,16 @@ if [ -n "${ASCEND_HOME_PATH:-}" ] && [ -n "$_cann_root" ]; then
       exit 1 ;;
   esac
 fi
-[ -f "$CANN_ENV" ] && { source "$CANN_ENV"; echo "sourced CANN: $CANN_ENV"; } \
-  || echo "WARN: CANN set_env not at $CANN_ENV — set CANN_ENV=... (needed to compile the ops)"
+# ⚠ set +u around the source. CANN's own set_env.sh scripts are NOT written for `nounset`
+# -- nnal/atb/set_env.sh reads $ZSH_VERSION to detect the shell, which under `set -u` is a
+# FATAL "unbound variable" and kills us before the server ever starts. Turn nounset off for
+# the source alone, then restore it.
+if [ -f "$CANN_ENV" ]; then
+  set +u; . "$CANN_ENV"; set -u
+  echo "sourced CANN: $CANN_ENV"
+else
+  echo "WARN: CANN set_env not at $CANN_ENV — set CANN_ENV=... (needed to compile the ops)"
+fi
 # vllm-ascend main builds its image on CANN 9.1.0; our other envs are on 9.0.0. The ops compile
 # against CANN headers, so a mismatch surfaces as an opbuild failure in step 4, not here.
 # Warn loudly rather than abort: 9.0.0 may well work, but if step 4 dies this is the first suspect.
