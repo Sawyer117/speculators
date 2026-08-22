@@ -38,16 +38,24 @@ REASON_PROMPT = (
 )
 
 
+# ⚠ NEVER go through a proxy. These boxes keep an http_proxy exported for outbound access,
+# urllib honours it, and the request to 127.0.0.1 then leaves the machine and comes back as
+# `HTTP Error 504: Gateway Time-out` -- which reads like the server is wedged when it is
+# serving perfectly. An empty ProxyHandler disables proxying for this opener only.
+# (curl needs --noproxy '*' for the same reason.)
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def post(url: str, payload: dict, timeout: int = 600):
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         return json.load(r)
 
 
 def get_text(base: str, path: str, timeout: int = 30) -> str:
-    with urllib.request.urlopen(base + path, timeout=timeout) as r:
+    with _OPENER.open(base + path, timeout=timeout) as r:
         return r.read().decode(errors="ignore")
 
 
