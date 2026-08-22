@@ -1597,3 +1597,170 @@ serve-bound 合计   35.8%     52.8%     effective 4503ms vs steady 2090ms = 2.2
 真实 HS 停顿集中在 steps [-1,1,2,14] = 滚动缓冲刚开始填)。
 **跑满一个 epoch 后加 `--skip` 重看再定。** 若仍 ~50%,对策是抬 `--max-anchors`
 (让每步更重以匹配 serve 产出速率),**不是动 conv**。
+
+---
+
+## 18. 新机器:DSV4-Flash **w8a8** 单机 A2 服务栈,从零到 2.35×(2026-08-22)
+
+与前十七节是**另一条线**:那些是训练侧的草稿改进,这节是服务侧的部署。同一天并行进行,
+互不占用机器(109 在跑 CONV,115/116 在供 HS,这是第四台)。
+
+### 18.1 机器与栈
+
+```
+登录用户  f00518697       ⚠ 仓库在共享账号下:/home/a00652497/2026/dspark/speculators
+conda     /home/f00518697/miniconda3/envs/dsv4-w8a8      ← 两个不同的家目录
+权重      /data/ckpt/DeepSeek-V4-Flash-0731-w8a8         293 GB / 74 分片 / 107851 张量
+CANN      9.1.0.0627 (beta.3)   ⚠ 9.0.0 不行,见 18.2
+vLLM      v0.27.1
+vllm-ascend  上游 main @ 4ce367a(#14696 的合入 commit = 地板)
+```
+
+**为什么必须是这三个近期合入**(我们原来的 v0.23.0 一个都没有):
+
+```
+#12968  08-20  MRV2 支持 DSV4 DSpark          877 → 1192 tok/s(纯引擎侧)
+#14490  08-21  修 dsv4 量化名不匹配            量化部署直接踩
+#14696  08-21  修 MRV2 上 DSpark 两处崩溃      ★ 当天上午才合,即地板
+```
+
+⚠ #14696 合入当天就被我们用上,**MRV2+DSpark 基本零 soak**。出怪事先怀疑它,MRV1 是退路。
+
+### 18.2 ★ 环境六坑,全部已固化进脚本
+
+新机器照 `install_npu_env_dsv4_w8a8.sh` 跑不会再撞。按撞上的顺序:
+
+| # | 症状 | 真因 | 处置 |
+|---|---|---|---|
+| 1 | `CondaHTTPError: 403` | Anaconda `defaults` 频道许可证门禁;**失败后不留 env**,报错推迟到下一条 `activate` 才以 `EnvironmentNameNotFound` 出现 | `-c conda-forge --override-channels` |
+| 2 | `No module named pip` | conda-forge 的 python 不像 defaults 那样带 pip | 创建时显式要 `pip`;脚本内 `ensurepip` 自愈 |
+| 3 | `CXXABI_1.3.15 not found` → `Failed to load torch_npu` | conda-forge 的 `libsqlite` 带 ICU 扩展,`import sqlite3` 拉 `libicui18n.so.78`,而链接器命中系统旧 `libstdc++`(CANN 的 set_env 把系统路径排前面) | `$CONDA_PREFIX/lib` 提到 `LD_LIBRARY_PATH` 最前 |
+| 4 | 23 个 `错误:'aclmdlRITask' was not declared` | **不是 vllm-ascend 的代码**,是 torch-npu `2.10.0.post4` 自带的 `acl_rt.h` 引用了 CANN 9.1.0 才有的类型 | 升 CANN 9.1.0(唯一要动手装的) |
+| 5 | 升级后仍挂在同一处 | `set_env.sh` 是**前置**到 PATH 不是替换,旧 CANN 仍在前面 | 脚本比对 `ASCEND_HOME_PATH` 与目标 CANN,不符**当场退出**(否则白编 40 分钟) |
+| 6 | `ZSH_VERSION:未绑定的变量` | CANN 的 `nnal/atb/set_env.sh` 读 `$ZSH_VERSION`,而我们开着 `set -u` | source 时临时 `set +u` |
+
+外加两个非致命但会误导的:
+- `libjemalloc.so.2 cannot be preloaded` —— 官方命令写的是 Debian 的 multiarch 路径,
+  这台是 RHEL 系(库其实在 `/usr/lib64`)。改成 `ldconfig` 查找后真正用上了。
+- `hs_connectors` 缺失让 `import speculators` 挂 —— 它是 uv workspace 成员,`--no-deps` 跳过了。
+  而且从仓库根目录跑时,Python 把 `hs_connectors/` **目录**当命名空间包找到,报
+  `cannot import name FileTransfer ... (unknown location)`,**读起来像装坏了而不是没装**。
+  ⟹ 服务环境根本不需要 speculators(它只用于转换我们自己的草稿),自检改为不因它失败。
+
+**⚠ 两处上游 pin 互相矛盾,只能二选一:**
+```
+fastapi        vllm-ascend 要 <0.124.0,vLLM 0.27.1 要 >=0.133.0   ⟹ 保 vLLM 的(它在服务 HTTP)
+transformers   vllm-ascend 要 ==5.14.1,vLLM 只要 >=5.5.3          ⟹ 取 5.14.1(两边都满足)
+scipy/numpy    triton-ascend 钉 scipy==1.13.1,我们钉 numpy 2.3.5  ⟹ 留着警告,服务路径不用 scipy
+```
+
+### 18.3 ★ 配方不能跨机型、跨量化照搬 —— 三处代价
+
+**(a) 我最初照的是 A3 的命令。** `DeepSeek-V4-Flash-DSpark.md` 的单机命令是 A3(16 卡,DP4×TP4);
+A2 的配方在**另一份文档** `DeepSeek-V4-Flash.md` 的 "A2 series with dspark" 里,我没找到,
+自己手推了拓扑。代价不只是并行度错,还漏了两个更要紧的设置。
+
+**(b) `--no-disable-hybrid-kv-cache-manager` 才是长上下文的钥匙。**
+DSV4 是混合注意力(Compress-4 / Compress-128),混合管理器按层型分配 KV;不开就按最坏情况
+给每层分配:
+```
+不开:Available KV cache memory 4.84 GiB,需 17.85 GiB,建议 max_len 8794
+开  :17.41 GiB,KV 池 1,036,629 tokens
+```
+**这看起来像并行度问题,其实不是。** TP=8 只多腾约 9 GB,补不上这个数量级的缺口。
+
+**(c) 官方 A2 命令的 `--max-model-len 800000` 是 w4a8 的数。**
+它服务的是 `DeepSeek-V4-Flash-DSpark-w4a8-test`,权重约一半。我们 w8a8 + 草稿是 38.99 GB/卡,
+同样 800000 在 `gpu_util=0.9` 下**差 0.13 GiB**(引擎自估上限 780288)。
+⟹ `GPU_UTIL=0.95` 解决(0.95×60.96 − 38.99 − 1.9 = 17.03 GiB > 14.05)。
+**上下文长度不跨量化迁移。**
+
+**拓扑结论(用户先提出,数据支持):**
+```
+DP4 × TP2   每卡 46.0 GB,而权重共 293 GB ⟹ 驻留 368 GB,约 75 GB 是复制
+DP1 × TP8   每卡 35.95 GB = 293/8,零复制;且低并发下延迟更好
+```
+DP 只在高并发下回本;1–4 人用,三个副本闲着还各占一份非专家权重。
+⚠ TP=8 之所以可行,是因为 A2 配方**整块不带 `--additional-config`** ⟹ 没有 `enable_flashcomm1`
+⟹ 没有 sequence parallelism ⟹ #14260 那个 "cudagraph 尺寸要同时是 num_spec+1 和 TP 的倍数"
+的约束根本不产生。(FC1 就是 vllm-ascend 对非 VL 量化模型的 SP —— 其文档原话是
+"an enhanced version of Sequence Parallelism";pass 式 SP 不支持量化。)
+
+### 18.4 三轮基准(conc-1,同一台机同一个栈,逐字段只差投机配置)
+
+```
+                tok/s    accept len   acceptance   每步耗时    加速比
+AR (NOSPEC=1)    35.1        —            —        28.5 ms      1.00
+dspark@5         82.4      4.778        75.6%      58.0 ms    ★ 2.35
+dspark@7         77.6      5.326        61.8%      68.6 ms      2.21
+```
+
+**num_spec=5 是这份权重在这台机器上的最优点。** 7 的接受长度更高却更慢:
+```
+accept length  4.778 → 5.326   +11.5%
+每步耗时        58.0 → 68.6 ms  +18.3%   ← 涨得更快
+第 6、7 位边际接受率 27.4%,而前五位平均 75.6%
+```
+官方 A2 那行写 7,又是"另一份 w4a8 权重"的数。
+
+⚠ **这三个数不进 eval ledger。** 它们是单条高度结构化的数学题(分数、编号步骤、LaTeX)
+重复三次量出来的,而 ledger 里的 3.94 / 4.628 / 上游 4.32 都是 gsm8k 几百条的均值。
+**4.778 证明的是"这套栈把草稿跑对了",不是"我们的接受长度更好"。** 要可比的数得跑真评测。
+
+★ 待查:这份草稿记录在案是 `block_size=5`,却能吐 7(1008/144 正好 7)。若原生块宽就是 5,
+则第 6、7 位是外推的、对该头分布外 —— 27.4% 的边际接受率正好是这个解释。查 `config.json`
+的 `dspark_block_size` 即可判定。**这对我们自己的草稿(训的 block 5、目标 16)意义不同。**
+
+### 18.5 工具(全部在 `examples/ascend_npu_dflash/`)
+
+```
+install_npu_env_dsv4_w8a8.sh      ← 18.2 六坑已固化;⚠ 与 install_npu_env_dspark.sh 无关,后者不可动
+serve_dsv4_a2_singlenode_w8a8.sh  ← 官方 A2 配方 + TP/MAX_LEN/GPU_UTIL/KV_MEM/NUM_SPEC/NOSPEC 旗标
+verify_model_weights.py           ← 起服务前证明权重完整
+quick_serve_check.py              ← 一条命令出三个数
+serve_traffic_logger.py           ← 记录流量(见 18.6)
+```
+
+**`verify_model_weights.py` 当场立功**:74 个分片、293 GB 一个没坏,唯独漏了那个 4 KB 的
+`quant_model_weights.safetensors.index.json`(85 个上游文件里就缺这一个)。
+少了它 `--quantization ascend` 根本找不到权重。**光看文件数和总大小永远发现不了。**
+顺带发现昇腾量化权重的索引名不是 HF 的 `model.safetensors.index.json`。
+
+**`quick_serve_check.py` 的两条设计**(都栽过跟头):
+- 先验对错再验速度,而且用"数到 40" —— 重复/跳号/漂移一眼可见,流畅的散文会把错误藏起来。
+- **所有请求走对话模板。** 第一版走裸 `/v1/completions`,instruct 模型当文档续写吐了 HTML,
+  探针报了假警报;**真正的危害是 accept length 强依赖文本分布**,在离群续写上量的不是我们要的东西。
+
+### 18.6 流量记录:内容留本地,指标必须留服务端
+
+同事都用 harness(Claude Code / Codex / dsh)连这台机器。三个 harness 特有的问题:
+```
+Claude Code 走 /v1/messages(Anthropic 协议),认证用 x-api-key   ← 只认 Bearer 会直接 401
+content 是块结构 [{type:text},{type:tool_use},{type:tool_result}] ← 按字符串抽会抽空
+系统提示 + 工具定义每轮全量重发,一次会话几十轮                    ← 逐字记就是 GB/天
+```
+
+⟹ 系统提示按摘要**只存一次**(实测 3 KB 系统提示:首条 10501 B,之后每轮 772 B,**13.6×**);
+工具结果只留长度 + 300 字头。
+
+**身份分三类存,不合并**:`verified`(API key,对方必须出示,唯一可信)/ `declared`
+(`user` 字段、自定义头,随手可改)/ `observed`(IP、UA,NAT 后一堆人共用)。
+合成一个字段就把可信的和不可信的搅在一起了。
+
+**★ 最终取舍(用户决定):内容留 harness 本地,服务端只记指标(`--metrics-only`)。**
+理由是内容在本地已经是全的,服务端再存是第二份副本;而
+```
+accept length / ttft / 并发相互影响  ← 只存在于请求发生的那一刻的服务端,事后谁的本地文件都重建不出来
+```
+`--metrics-only` 一条记录 809 字节,不含任何正文(实测:请求里写"机密内容",日志 grep 不到),
+但保留长度、轮数、时延、usage 与投机归因。
+
+⚠ **投机数字只在独占时精确。** vLLM 的计数器是引擎级累计,响应体无 per-request 接受长度;
+并发 >1 时差值是几条请求混在一起的 —— 那种记录标 `attributable: false` 并说明原因,
+**而不是给一个看起来精确的错数**。
+
+**`conversation_id` 故意设计成纯内容哈希**(系统提示 + 第一条 user),不用随机 UUID:
+将来串本地 transcript 时,本地那份同样算一遍就能 join 上服务端指标,两边都不必存内容。
+
+⚠ 前提:大家真的走代理端口。**直连引擎端口的请求没有任何服务端记录,事后补不回来。**
+（我们自己做基准要绕开代理 —— 多一跳就多一份噪声。）
