@@ -185,18 +185,36 @@ fi
 
 echo "== 6. speculators (--no-deps) + train/rollout deps =="
 python -m pip install --no-deps -e "$ROOT/speculators" 2>/dev/null || python -m pip install --no-deps -e "$REPO_ROOT"
+# hs_connectors is a uv WORKSPACE MEMBER of speculators (its own pyproject.toml + src/), and a
+# hard dependency of speculators.train.data -- so --no-deps skips it and `import speculators`
+# dies. Worse, from the repo root Python finds the hs_connectors/ DIRECTORY as an implicit
+# namespace package and reports "cannot import name FileTransfer ... (unknown location)",
+# which reads like a broken install rather than a missing one.
+[ -f "$REPO_ROOT/hs_connectors/pyproject.toml" ] \
+  && python -m pip install --no-deps -e "$REPO_ROOT/hs_connectors" \
+  || echo "note: no hs_connectors workspace member here — skipping"
 python -m pip install datasets loguru typer pydantic-settings tensorboard aiohttp
 
 echo "== 7. FORCE numpy $NUMPY_VER (LAST pip op — triton-ascend<2 downgraded it) + verify =="
 python -m pip install --no-deps "numpy==$NUMPY_VER"
 NUMPY_VER="$NUMPY_VER" python - <<'PY'
-import os, numpy, torch, torch_npu, torchgen.model, vllm, vllm_ascend, speculators
+import os, numpy, torch, torch_npu, torchgen.model, vllm, vllm_ascend
 want = os.environ["NUMPY_VER"]
 print("numpy      ", numpy.__version__, "(want", want + ")", "OK" if numpy.__version__ == want else "!! MISMATCH")
 print("torch      ", torch.__version__, "| vllm", vllm.__version__)
 print("vllm_ascend", vllm_ascend.__file__)   # must be under your code root, not someone else's
-print("speculators", speculators.__file__)
-print("OK: DSpark/DSV4 stack imports cleanly")
+import transformers
+print("transformers", transformers.__version__)
+# speculators is OPTIONAL in a serve-only env -- it is needed to CONVERT our own trained draft,
+# not to serve. Its import pulls the training stack (hs_connectors, datasets), so a failure
+# here must not condemn a serving install that is otherwise complete. Report and continue.
+try:
+    import speculators
+    print("speculators", speculators.__file__)
+except Exception as exc:
+    print("speculators  NOT importable:", type(exc).__name__, exc)
+    print("             (fine for SERVING; needed only to convert our own draft)")
+print("OK: vLLM + vllm-ascend import cleanly and the ascend platform plugin registers")
 PY
 
 echo "==================================================================="
