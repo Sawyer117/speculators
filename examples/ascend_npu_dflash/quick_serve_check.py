@@ -10,6 +10,12 @@ WHAT IT DOES
      repeat, gap, or drift is visible at a glance, where a fluent-looking paragraph is not.
      A server that starts is not a server that computes -- an over-batched bf16 DSV4 once
      served confident garbage for hours.
+     ⚠ EVERY request goes through /v1/chat/completions. DSV4-Flash is an instruct model;
+     handed a bare prompt on /v1/completions it document-continues, and the first version of
+     this script duly reported HTML boilerplate as corruption while the very next test, on
+     the chat endpoint, reasoned flawlessly. The false alarm was the small harm. The real one
+     is that ACCEPT LENGTH depends strongly on text distribution, so measuring the draft
+     against off-template continuation measures the wrong thing entirely.
   2. Conc-1 decode throughput, with ignore_eos so the token count is exactly what we asked
      for and the rate is not an artefact of where the model chose to stop. Prefill is
      excluded by timing against the completion tokens only, and a warm-up request is thrown
@@ -31,7 +37,7 @@ import re
 import time
 import urllib.request
 
-COUNT_PROMPT = "Count from 1 to 40, separated by single spaces. Output only the numbers.\n"
+COUNT_PROMPT = "Count from 1 to 40, separated by single spaces. Output only the numbers, nothing else."
 REASON_PROMPT = (
     "A tank has two inlet pipes. Pipe A alone fills it in 6 hours, pipe B alone in 4 hours. "
     "How long to fill it with both open? Show your reasoning."
@@ -90,7 +96,6 @@ def main() -> int:
     ap.add_argument("--skip-gen", action="store_true", help="only measure, skip the two text checks")
     args = ap.parse_args()
 
-    comp = f"{args.base}/v1/completions"
     chat = f"{args.base}/v1/chat/completions"
     tag = f"[{args.label}] " if args.label else ""
     print("=" * 72)
@@ -99,11 +104,13 @@ def main() -> int:
 
     if not args.skip_gen:
         print("\n-- 1. counting to 40 (corruption detector) --")
-        txt = post(comp, {"model": args.model, "prompt": COUNT_PROMPT,
-                          "max_tokens": 160, "temperature": 0})["choices"][0]["text"]
+        txt = post(chat, {"model": args.model,
+                          "messages": [{"role": "user", "content": COUNT_PROMPT}],
+                          "max_tokens": 300, "temperature": 0}
+                   )["choices"][0]["message"]["content"] or ""
         nums = [int(n) for n in re.findall(r"\d+", txt)]
         ok = nums[:40] == list(range(1, 41))
-        print(f"  {txt.strip()[:200]}")
+        print(f"  {txt.strip()[:220]}")
         print(f"  ⟹ {'✓ exactly 1..40' if ok else '✗ NOT 1..40 — do NOT trust any throughput number from this server'}")
         if not ok and nums:
             print(f"     got {len(nums)} numbers, first 10: {nums[:10]}")
@@ -117,17 +124,20 @@ def main() -> int:
         print(f"  ⟹ the answer should be 2.4 hours (12/5).")
 
     print(f"\n-- 3. conc-1 decode throughput ({args.reps} reps x {args.tokens} tokens) --")
-    warm = {"model": args.model, "prompt": "Hello.", "max_tokens": 16,
-            "temperature": 0, "ignore_eos": True}
-    post(comp, warm)   # discard: compilation + allocator growth must not land in the numbers
+    warm = {"model": args.model, "messages": [{"role": "user", "content": "Hi."}],
+            "max_tokens": 16, "temperature": 0, "ignore_eos": True}
+    post(chat, warm)   # discard: compilation + allocator growth must not land in the numbers
 
     before = metrics_counters(args.base)
     rates = []
     for i in range(args.reps):
-        payload = {"model": args.model, "prompt": REASON_PROMPT, "max_tokens": args.tokens,
-                   "temperature": 0, "ignore_eos": True}
+        # Chat endpoint, on purpose: this is the same distribution the draft will be judged
+        # on, and accept length is not transferable across distributions.
+        payload = {"model": args.model,
+                   "messages": [{"role": "user", "content": REASON_PROMPT}],
+                   "max_tokens": args.tokens, "temperature": 0, "ignore_eos": True}
         t0 = time.perf_counter()
-        resp = post(comp, payload)
+        resp = post(chat, payload)
         dt = time.perf_counter() - t0
         n = (resp.get("usage") or {}).get("completion_tokens") or args.tokens
         rates.append(n / dt)
