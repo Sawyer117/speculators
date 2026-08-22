@@ -18,6 +18,17 @@ proxy tracks concurrency and records `spec.attributable: false` when it was not 
 than reporting a precise-looking number that is actually several requests blended. At
 concurrency 1 -- how we benchmark -- every record is exact.
 
+BUILT FOR CODING HARNESSES (Claude Code, Codex, dsh) pointed at this server, which is a very
+different shape of traffic from a chat box:
+  * Claude Code speaks the ANTHROPIC protocol on /v1/messages and authenticates with an
+    `x-api-key` header, not `Authorization: Bearer`. Accepting only Bearer rejects it outright.
+  * Message content is a LIST OF BLOCKS ({type:text}, {type:tool_use}, {type:tool_result}),
+    not a string, so naive text extraction yields nothing.
+  * The system prompt and tool definitions are resent in full on EVERY turn, and one agent
+    loop is dozens of turns. Logged verbatim that is gigabytes a day of the same bytes. The
+    system prompt is therefore stored ONCE per distinct digest and referenced afterwards, and
+    long fields are capped -- a log too big to open answers no questions.
+
 WHO SENT IT. Three kinds of identity, and the record keeps them apart because they are not
 equally trustworthy:
   * VERIFIED -- an API key the caller had to be given. With --keys the proxy becomes the auth
@@ -42,6 +53,12 @@ USAGE
   python3 examples/ascend_npu_dflash/serve_traffic_logger.py            # :8901 -> :8900
   # per-person keys: one "token name" per line, blank lines and # comments ignored
   python3 examples/ascend_npu_dflash/serve_traffic_logger.py --keys /path/keys.txt
+  # harnesses on other machines need a reachable bind:
+  python3 ... --host 0.0.0.0 --keys /path/keys.txt --max-field 2000
+
+HARNESS SETUP (each person uses their own key, so every record is attributable)
+  Claude Code : ANTHROPIC_BASE_URL=http://<host>:8901  ANTHROPIC_AUTH_TOKEN=sk-alice-...
+  Codex / SDK : OPENAI_BASE_URL=http://<host>:8901/v1  OPENAI_API_KEY=sk-alice-...
   python3 examples/ascend_npu_dflash/serve_traffic_logger.py --listen 9000 --upstream 8900 \
       --log /home/a00652497/2026/dspark/logs/traffic_dspark5.jsonl
   # then point clients at :8901 instead of :8900
@@ -78,13 +95,90 @@ _inflight = 0
 _logfh = None
 _upstream = "http://127.0.0.1:8900"
 _want_spec = True
-_keys: dict[str, str] = {}        # bearer token -> person; empty = open access
+_keys: dict[str, str] = {}        # token -> person; empty = open access
 _upstream_key = ""
+_max_field = 4000                 # chars kept per logged text field
+_seen_systems: set[str] = set()   # system-prompt digests already written out in full
 
 
 def _short(s: str) -> str:
     """A stable 8-hex handle for a value we must never write down in full."""
     return hashlib.sha256(s.encode()).hexdigest()[:8]
+
+
+def _clip(s, limit=None):
+    """Keep a field readable without keeping all of it."""
+    if not isinstance(s, str):
+        return s
+    lim = limit or _max_field
+    return s if len(s) <= lim else s[:lim] + f"…[truncated, {len(s)} chars total]"
+
+
+def _blocks_text(content) -> str:
+    """Anthropic content is a list of typed blocks; OpenAI content is a string. Handle both,
+    and note the non-text blocks rather than dropping them silently -- in an agent loop the
+    tool traffic IS most of the conversation."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    out = []
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        kind = b.get("type")
+        if kind == "text":
+            out.append(b.get("text") or "")
+        elif kind == "tool_use":
+            out.append(f"[tool_use {b.get('name')}]")
+        elif kind == "tool_result":
+            out.append("[tool_result]")
+    return "".join(out)
+
+
+def _system_text(req) -> str:
+    """/v1/messages carries `system` at the top level (string or block list); the OpenAI shape
+    puts it in messages[0]."""
+    if not isinstance(req, dict):
+        return ""
+    s = req.get("system")
+    if s:
+        return _blocks_text(s)
+    msgs = req.get("messages") or []
+    if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
+        return _blocks_text(msgs[0].get("content"))
+    return ""
+
+
+def _summarise_request(req):
+    """What is worth keeping from a harness request: the last turn in full-ish, the shape of
+    everything before it, and a reference to the system prompt instead of another copy."""
+    if not isinstance(req, dict):
+        return None, None
+    sys_txt = _system_text(req)
+    sys_dig = _short(sys_txt) if sys_txt else None
+    msgs = [m for m in (req.get("messages") or []) if isinstance(m, dict)]
+    last = _clip(_blocks_text(msgs[-1].get("content"))) if msgs else None
+    tools = req.get("tools") or []
+    summary = {
+        "model": req.get("model"),
+        "turns": len(msgs),
+        "last_message": last,
+        "roles": [m.get("role") for m in msgs][-6:],
+        "system_digest": sys_dig,
+        "system_chars": len(sys_txt) or None,
+        "n_tools": len(tools) if isinstance(tools, list) else None,
+        "stream": bool(req.get("stream")),
+        "max_tokens": req.get("max_tokens"),
+    }
+    # The system prompt is identical across every turn of a session; write it once and refer
+    # to it by digest from then on.
+    first_sight = None
+    if sys_dig and sys_dig not in _seen_systems:
+        _seen_systems.add(sys_dig)
+        first_sight = {"digest": sys_dig, "text": _clip(sys_txt, 20000),
+                       "tool_names": [t.get("name") for t in tools if isinstance(t, dict)][:64]}
+    return summary, first_sight
 
 
 def _conversation_id(req) -> str | None:
@@ -95,11 +189,11 @@ def _conversation_id(req) -> str | None:
     msgs = req.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    seed = []
+    seed = [_system_text(req)[:4000]]
     for m in msgs:
         if not isinstance(m, dict):
             continue
-        seed.append(f"{m.get('role')}:{m.get('content')}")
+        seed.append(f"{m.get('role')}:{_blocks_text(m.get('content'))[:4000]}")
         if m.get("role") == "user":
             break                  # stop at the FIRST user turn; later turns vary
     return _short("|".join(seed))
@@ -164,8 +258,14 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(n)
 
         # --- identity -----------------------------------------------------------------
+        # Bearer for OpenAI-shaped clients, x-api-key for Anthropic-shaped ones (Claude Code
+        # sends only the latter), and a query parameter as the last resort for tools that
+        # cannot set headers at all.
         auth = self.headers.get("Authorization") or ""
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        token = token or (self.headers.get("x-api-key") or "").strip()
+        if not token and "api_key=" in self.path:
+            token = re.search(r"api_key=([^&]+)", self.path).group(1)
         who = _keys.get(token) if _keys else None
         if _keys and who is None:
             msg = b'{"error":{"message":"unknown or missing API key","type":"invalid_request_error"}}'
@@ -206,6 +306,7 @@ class Handler(BaseHTTPRequestHandler):
                 fwd.add_header("Content-Length", str(len(body)))
             if _upstream_key:
                 fwd.add_header("Authorization", f"Bearer {_upstream_key}")
+                fwd.add_header("x-api-key", _upstream_key)
             with _OPENER.open(fwd, timeout=3600) as up:
                 status = up.status
                 self.send_response(status)
@@ -249,6 +350,7 @@ class Handler(BaseHTTPRequestHandler):
         with _state:
             _inflight -= 1
 
+        _summary, _first_system = _summarise_request(req_json)
         raw = "".join(chunks)
         resp_json, usage, text = None, None, None
         try:
@@ -257,8 +359,11 @@ class Handler(BaseHTTPRequestHandler):
             pass
         if isinstance(resp_json, dict):
             usage = resp_json.get("usage")
-            ch = (resp_json.get("choices") or [{}])[0]
-            text = ch.get("text") or (ch.get("message") or {}).get("content")
+            if "content" in resp_json and "choices" not in resp_json:
+                text = _blocks_text(resp_json.get("content"))      # Anthropic /v1/messages
+            else:
+                ch = (resp_json.get("choices") or [{}])[0]
+                text = ch.get("text") or (ch.get("message") or {}).get("content")
         elif raw.startswith("data:"):
             # SSE: stitch the deltas back together and pick up usage if the client asked for it
             parts = []
@@ -271,6 +376,15 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 if ev.get("usage"):
                     usage = ev["usage"]
+                # Anthropic streams content_block_delta {delta:{type:text_delta,text:...}}
+                # and reports usage inside message_start / message_delta.
+                if ev.get("type", "").startswith(("content_block", "message")):
+                    d = ev.get("delta") or {}
+                    parts.append(d.get("text") or "")
+                    for holder in (ev.get("message") or {}, ev):
+                        if isinstance(holder, dict) and holder.get("usage"):
+                            usage = holder["usage"]
+                    continue
                 c = (ev.get("choices") or [{}])[0]
                 parts.append(c.get("text") or (c.get("delta") or {}).get("content") or "")
             text = "".join(parts)
@@ -293,8 +407,11 @@ class Handler(BaseHTTPRequestHandler):
                 "user_agent": self.headers.get("User-Agent"),
             },
             "conversation_id": _conversation_id(req_json),
-            "request": req_json,
-            "response_text": text,
+            # Written once per distinct system prompt, then referenced by digest. Without this
+            # an agent session logs the same 30 KB preamble on every one of its turns.
+            "system_prompt_first_seen": _first_system,
+            "request": _summary,
+            "response_text": _clip(text),
             "usage": usage,
             "spec": _spec_record(before, after, alone),
             "error": err,
@@ -319,12 +436,16 @@ def main() -> int:
                          "self-declared/observed identity is available.")
     ap.add_argument("--upstream-key", default="", metavar="KEY",
                     help="key to present to vLLM, if the engine itself was started with --api-key")
+    ap.add_argument("--max-field", type=int, default=4000, metavar="N",
+                    help="chars kept per logged text field (default 4000). Harness turns are "
+                         "long; a log too big to open answers no questions.")
     ap.add_argument("--no-spec", action="store_true",
                     help="skip the /metrics reads (one extra local request per exchange)")
     args = ap.parse_args()
 
-    global _keys, _upstream_key
+    global _keys, _upstream_key, _max_field
     _upstream_key = args.upstream_key
+    _max_field = args.max_field
     if args.keys:
         with open(args.keys) as fh:
             for line in fh:
@@ -344,6 +465,8 @@ def main() -> int:
     print(f" 📋 {path}")
     print(f" spec attribution: {'on (exact only while a request is alone)' if _want_spec else 'off'}")
     print(f" auth: {f'{len(_keys)} key(s) -> ' + ', '.join(sorted(set(_keys.values()))) if _keys else 'OPEN (identity is self-declared/observed only)'}")
+    print(f" field cap: {_max_field} chars   system prompts: stored once per digest")
+    print(" harness env:  ANTHROPIC_BASE_URL / OPENAI_BASE_URL -> this port, key per person")
     print(" point clients at the LISTEN port; the engine port keeps working unlogged.")
     print("=" * 72)
     ThreadingHTTPServer((args.host, args.listen), Handler).serve_forever()
