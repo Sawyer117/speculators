@@ -133,8 +133,14 @@ done
 #   RuntimeError: Failed to load the backend extension: torch_npu
 [ -n "${CONDA_PREFIX:-}" ] && export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
-# Official env block, verbatim.
-export OMP_PROC_BIND=false
+# The env block from the A2-with-dspark recipe, verbatim.
+# ⚠ It is NOT the same block as the A3/DSpark doc uses, and mixing them is a real bug, not a
+# cosmetic one: that block exports VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096, and with
+# block-size 128 the scheduler block size is 16384, so the engine dies AFTER a full weight
+# load and warmup with
+#   ValueError: VLLM_PREFIX_CACHE_RETENTION_INTERVAL (4096) must be non-negative and a
+#               multiple of scheduler_block_size (16384)
+# The A2 recipe also omits OMP_PROC_BIND. Take the whole block from one recipe or the other.
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 # jemalloc: RESOLVE it, do not hardcode. The official command's path is the Debian/Ubuntu
@@ -153,7 +159,6 @@ fi
 export HCCL_BUFFSIZE=1024
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
-export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096
 
 nohup vllm serve "$MODEL" \
     --max-model-len "$MAX_LEN" \
