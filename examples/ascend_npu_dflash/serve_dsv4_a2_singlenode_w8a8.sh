@@ -1,48 +1,57 @@
 #!/usr/bin/env bash
-# DeepSeek-V4-Flash-0731-**w8a8** single-node serve WITH DSpark speculative decoding.
+# DeepSeek-V4-Flash-0731-**w8a8** single-node serve WITH DSpark speculative decoding, on A2.
 #
-# Transcribed from the official single-node command in vllm-ascend
-# docs/source/tutorials/models/DeepSeek-V4-Flash-DSpark.md (branch releases/v0.25.1rc),
-# with ONE substantive change: the parallelism split. See "THE TP CONSTRAINT" below.
+# Transcribed from the "A2 series with dspark" recipe in vllm-ascend
+# docs/source/tutorials/models/DeepSeek-V4-Flash.md (main). ⚠ That is a DIFFERENT recipe from
+# the single-node command in DeepSeek-V4-Flash-DSpark.md, which is written for A3 (16 devices,
+# DP4 x TP4). Adapting the A3 one to 8 cards by hand -- which is what the first version of this
+# script did -- gets the parallelism wrong AND misses two settings that matter more than the
+# parallelism does. What the A2 recipe actually says:
 #
-# ⚠ THE OFFICIAL COMMAND DOES NOT RUN AS WRITTEN. Issue #14260 (OPEN since 2026-08-14):
+#   --tensor-parallel-size 8 --data-parallel-size 1
+#       No DP. DP replicates every non-expert weight per replica and only pays off under high
+#       concurrency. Measured here at DP4 x TP2: 46.0 GB resident per card against a 293 GB
+#       checkpoint = 368 GB, ~75 GB of pure duplication, taken straight out of the KV budget.
 #
-#   RuntimeError: Can't determine cudagraph shapes that are both a multiple of 6
-#   (num_speculative_tokens + 1) required by spec-decode and 4 (tensor_parallel_size)
-#   required by sequence parallelism
+#   --no-disable-hybrid-kv-cache-manager
+#       ★ The one that unlocks long context. DSV4 is a HYBRID attention model (Compress-4 and
+#       Compress-128); the hybrid manager sizes KV per layer type instead of assuming the
+#       worst case for every layer. Without it the engine refused to start: 4.84 GiB available
+#       against 17.85 GiB "needed", and it suggested a max length of 8794.
 #
-# The reporter's fix was num_speculative_tokens 5 -> 7, because 7+1=8 is a multiple of 4.
-# ⚠ WE CANNOT USE THAT. Our draft is trained at block_size 5 and emits exactly 5 tokens;
-# asking for 7 asks it for something it does not produce. (It is fine for the RELEASED draft
-# only if that draft's own block size allows it -- do not assume.)
+#   no --additional-config at all
+#       So no enable_flashcomm1 -- and FC1 IS vllm-ascend's sequence parallelism for non-VL
+#       quantized models (their docs call it "an enhanced version of Sequence Parallelism";
+#       the pass-based SP does not support quantization). With SP off, the cudagraph
+#       constraint behind issue #14260 -- "shapes that are both a multiple of
+#       num_speculative_tokens+1 and of tensor_parallel_size" -- simply does not arise, which
+#       is why the official A2 recipe can run TP=8 at all.
 #
-# THE TP CONSTRAINT. With sequence parallelism on, vLLM needs a cudagraph batch size that is
-# a common multiple of (num_spec + 1) and tensor_parallel_size. Holding num_spec = 5 fixed:
+#   --block-size 128, --max-num-batched-tokens 8192, --max-num-seqs 32, --max-model-len 800000
 #
-#     (5 + 1) % TP == 0   =>   TP divides 6   =>   TP in {1, 2, 3, 6}
-#     TP must also divide the device count    =>   on any 2^n node, TP in {1, 2}
-#
-# So on 8- or 16-card nodes, **TP is capped at 2** as long as num_spec is 5 and SP is on.
-# This script picks the largest TP satisfying both and derives DP = NPUS / TP. The official
-# A3 command is DP4 x TP4 = 16 ranks; ours is DP(NPUS/2) x TP2, which keeps EP the same width.
-#
-# ⚠ The third option -- keep TP=4 and DISABLE sequence parallelism -- is not wired here
-# because I have not confirmed which switch turns SP on in this config (enable_flashcomm1 and
-# the compilation config are both suspects). If you want TP=4, find that first; do not guess.
+# ⚠ num_speculative_tokens: the upstream A2 recipe says 7, but it serves a different weight
+# (DeepSeek-V4-Flash-DSpark-w4a8-test). The 0731 released draft is trained at block_size 5 and
+# emits 5, so NUM_SPEC defaults to 5 here. Do not raise it without checking the draft's own
+# block width -- asking for more tokens than it produces is not a tuning knob.
 #
 # ⚠ MACHINE. This occupies a whole node. Do NOT run it on a box that is dumping hidden states
 # for a live training run -- the trainer's --vllm-endpoint dies with it.
 #
-# USAGE:  bash examples/ascend_npu_dflash/serve_dsv4_a2_singlenode_w8a8.sh
+# USAGE:  MODEL=/data/ckpt/DeepSeek-V4-Flash-0731-w8a8 bash examples/ascend_npu_dflash/serve_dsv4_a2_singlenode_w8a8.sh
 # ENV:
-#   MODEL      w8a8 weights dir (required)
-#   NPUS       device count (default 8)
-#   NUM_SPEC   speculative tokens (default 5 = our draft's block width)
-#   DRAFT      our own converted draft dir; unset = use the mtp.* head inside MODEL
+#   MODEL       w8a8 weights dir (required)
+#   NPUS        device count (default 8)      TP  tensor parallel (default = NPUS, i.e. DP=1)
+#   NUM_SPEC    speculative tokens (default 5 = the released draft's block width)
+#   MAX_LEN     default 800000                BLOCK_SIZE     default 128
+#   MAX_BATCHED default 8192                  MAX_SEQS       default 32
+#   DRAFT       our own converted draft dir; unset = the mtp.* head inside MODEL
 #   SPEC_METHOD "dspark" (default) or "mtp" -- NOT a rename, it changes vLLM kernel behaviour
-#              (parallel drafting, dspark_draft_topk validation). See worklog section 11.3.
-#   PORT       default 8900
-#   LOG        default $PWD/serve_dsv4_w8a8_<ts>.log
+#               (parallel drafting, dspark_draft_topk). See worklog section 11.3.
+#   EXTRA_CFG   raw JSON for --additional-config. OFF by default, matching the A2 recipe.
+#               Setting it re-enables whatever you put in, including flashcomm1 -- and with
+#               that, the #14260 constraint comes back.
+#   CANN_HOME   default /home/a00652497/CANN/9.1.0.0627
+#   PORT        default 8900        LOG  default ./serve_dsv4_w8a8_<ts>.log
 set -euo pipefail
 
 MODEL="${MODEL:?set MODEL=/path/to/DeepSeek-V4-Flash-0731-w8a8}"
@@ -50,42 +59,25 @@ NPUS="${NPUS:-8}"
 NUM_SPEC="${NUM_SPEC:-5}"
 SPEC_METHOD="${SPEC_METHOD:-dspark}"
 PORT="${PORT:-8900}"
-MAX_LEN="${MAX_LEN:-65536}"
-FLASHCOMM="${FLASHCOMM:-1}"
+MAX_LEN="${MAX_LEN:-800000}"
+BLOCK_SIZE="${BLOCK_SIZE:-128}"
+MAX_BATCHED="${MAX_BATCHED:-8192}"
+MAX_SEQS="${MAX_SEQS:-32}"
+EXTRA_CFG="${EXTRA_CFG:-}"
 LOG="${LOG:-$PWD/serve_dsv4_w8a8_$(date +%Y%m%d_%H%M%S).log}"
 
 # ---- parallelism ----------------------------------------------------------------------
-# TP unset -> the largest divisor of NPUS that also divides (NUM_SPEC+1), i.e. the widest TP
-# that cannot trip #14260 while sequence parallelism is on.
-#
-# ⚠ THAT DEFAULT IS OFTEN THE WRONG TRADE. It maximises DP, and DP only pays off under high
-# concurrency: each replica holds its own copy of every non-expert weight. Measured here at
-# DP4 x TP2, each card loaded 46.0 GB while the whole checkpoint is 293 GB -- 368 GB resident,
-# so ~75 GB is pure duplication, and it came straight out of the KV cache budget (4.84 GiB
-# left, against 17.85 GiB needed for a 1M context).
-#
-# For a handful of concurrent users prefer TP=8 / DP=1: weights shard 8 ways with no replica,
-# and low-concurrency latency is better because every card works on the same token. Set TP=8
-# explicitly. If that trips the #14260 cudagraph error, also set FLASHCOMM=0 -- Flash Comm V1
-# IS vllm-ascend's sequence parallelism for non-VL quantized models (its own docs call FC1 "an
-# enhanced version of Sequence Parallelism"), and the constraint disappears with it, at the
-# cost of FC1's halved-allgather communication saving.
-WINDOW=$((NUM_SPEC + 1))
-if [ -z "${TP:-}" ]; then
-  for c in $(seq "$NPUS" -1 1); do
-    if [ $((NPUS % c)) -eq 0 ] && [ $((WINDOW % c)) -eq 0 ]; then TP="$c"; break; fi
-  done
-  [ -n "${TP:-}" ] || { echo "!! no TP divides both NPUS=$NPUS and num_spec+1=$WINDOW"; exit 1; }
-fi
+# Default TP = NPUS (so DP = 1), matching the official A2 recipe. The spec-window divisibility
+# rule from #14260 only binds while sequence parallelism is on, i.e. only if you re-enable
+# flashcomm1 through EXTRA_CFG -- so warn about it there and nowhere else.
+TP="${TP:-$NPUS}"
 [ $((NPUS % TP)) -eq 0 ] || { echo "!! TP=$TP does not divide NPUS=$NPUS"; exit 1; }
 DP=$((NPUS / TP))
-
-# Warn -- do not abort -- when TP does not divide the spec window. With FLASHCOMM=0 this is
-# fine; with it on, expect the #14260 cudagraph error.
-if [ $((WINDOW % TP)) -ne 0 ] && [ "$FLASHCOMM" = "1" ]; then
-  echo "⚠ (num_spec+1)=$WINDOW is NOT a multiple of TP=$TP and FLASHCOMM=1."
-  echo "  Expect: \"Can't determine cudagraph shapes that are both a multiple of $WINDOW ...\""
-  echo "  If that fires, re-run with FLASHCOMM=0."
+WINDOW=$((NUM_SPEC + 1))
+if [ -n "$EXTRA_CFG" ] && [ $((WINDOW % TP)) -ne 0 ]; then
+  echo "⚠ EXTRA_CFG is set and (num_spec+1)=$WINDOW is not a multiple of TP=$TP."
+  echo "  If it turns flashcomm1 on, expect issue #14260:"
+  echo "    \"Can't determine cudagraph shapes that are both a multiple of $WINDOW ...\""
 fi
 
 SPEC_CFG="{\"method\":\"$SPEC_METHOD\",\"num_speculative_tokens\":$NUM_SPEC,\"enforce_eager\":true"
@@ -94,7 +86,8 @@ SPEC_CFG="$SPEC_CFG}"
 
 echo "==================================================================="
 echo " DSV4-Flash W8A8 + DSpark   NPUS=$NPUS  ->  DP=$DP x TP=$TP   (EP on)"
-echo " num_spec=$NUM_SPEC  window=$WINDOW  |  max_model_len=$MAX_LEN  |  flashcomm1=$FLASHCOMM"
+echo " num_spec=$NUM_SPEC  max_model_len=$MAX_LEN  block_size=$BLOCK_SIZE  seqs=$MAX_SEQS"
+echo " hybrid KV cache manager: ON   additional-config: ${EXTRA_CFG:-<none, per the A2 recipe>}"
 echo " method=$SPEC_METHOD   draft=${DRAFT:-<mtp.* inside the checkpoint>}"
 echo " model=$MODEL"
 echo " 📋 log -> $LOG"
@@ -152,10 +145,10 @@ export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096
 
 nohup vllm serve "$MODEL" \
     --max-model-len "$MAX_LEN" \
-    --max-num-batched-tokens 10240 \
+    --max-num-batched-tokens "$MAX_BATCHED" \
     --served-model-name dsv4 \
     --gpu-memory-utilization 0.9 \
-    --max-num-seqs 64 \
+    --max-num-seqs "$MAX_SEQS" \
     --data-parallel-size "$DP" \
     --tensor-parallel-size "$TP" \
     --enable-expert-parallel \
@@ -163,22 +156,15 @@ nohup vllm serve "$MODEL" \
     --tool-call-parser deepseek_v4 \
     --enable-auto-tool-choice \
     --reasoning-parser deepseek_v4 \
+    --no-disable-hybrid-kv-cache-manager \
     --model-loader-extra-config='{"enable_multithread_load": true, "num_threads": 128}' \
     --quantization ascend \
     --port "$PORT" \
-    --block-size 32 \
+    --block-size "$BLOCK_SIZE" \
     --speculative-config "$SPEC_CFG" \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
-    --additional-config '{
-        "ascend_compilation_config": {
-            "enable_npugraph_ex": true,
-            "enable_static_kernel": false
-        },
-        "enable_cpu_binding": true,
-        "enable_dsa_cp": true,
-        "enable_flashcomm1": '"$([ "$FLASHCOMM" = "1" ] && echo true || echo false)"',
-        "multistream_overlap_shared_expert": true
-    }' > "$LOG" 2>&1 &
+    ${EXTRA_CFG:+--additional-config "$EXTRA_CFG"} \
+    > "$LOG" 2>&1 &
 
 PID=$!
 echo ">>> started PID $PID  |  tail -f $LOG"
