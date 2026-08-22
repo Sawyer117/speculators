@@ -130,9 +130,16 @@ def _blocks_text(content) -> str:
         if kind == "text":
             out.append(b.get("text") or "")
         elif kind == "tool_use":
-            out.append(f"[tool_use {b.get('name')}]")
+            arg = json.dumps(b.get("input") or {}, ensure_ascii=False)
+            out.append(f"[tool_use {b.get('name')} {arg[:200]}]")
         elif kind == "tool_result":
-            out.append("[tool_result]")
+            # Tool output is what the model actually saw, so a bare marker loses the reason it
+            # answered as it did. It is also the bulkiest thing in an agent turn (file dumps,
+            # command output) and the likeliest to hold something private -- so keep its size
+            # and a short head, not the body. The harness's own transcript has the full text.
+            inner = b.get("content")
+            txt = inner if isinstance(inner, str) else _blocks_text(inner)
+            out.append(f"[tool_result {len(txt)}c: {txt[:300]}]" if txt else "[tool_result]")
     return "".join(out)
 
 
