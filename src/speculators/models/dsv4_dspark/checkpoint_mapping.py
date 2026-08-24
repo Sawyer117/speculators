@@ -17,10 +17,8 @@ checkpoints to a stacked expert parameter.
 
 DIRECTION: ``source_patterns`` are CHECKPOINT keys, ``target_patterns`` are MODULE names.
 
-THE MAPPING, verified key by key against the released standalone draft
-(``released_draft_bf16_standalone``, 2378 tensors) and a 5-epoch reproduction checkpoint
-(84 tensors). Every shape matches; the counts reconcile exactly:
-``84 - 1 (confidence bias) - 9 (stacked) + 2304 (per-expert) = 2378``.
+THE MAPPING, verified key by key against the released draft's own weight index
+(4711 keys quantized; 2382 once the ``.scale`` companions are dropped):
 
     embed.weight                          <-> embed_tokens.weight        [129280, 4096]
     head.weight                           <-> lm_head.weight             [129280, 4096]
@@ -36,14 +34,22 @@ THE MAPPING, verified key by key against the released standalone draft
     mtp.{i}.ffn.experts.{e}.w{k}.weight   <-> layers.{i}.ffn.experts.w{k}   [256, ...]
     mtp.{i}.<everything else>             <-> layers.{i}.<same>   (attn.*, *_norm, shared_experts)
 
-NOTE ON ``{last}`` -- the rules below match any stage index rather than hardcoding 2. Those
-suffixes exist on exactly one stage in the released layout, so matching ``\\d+`` is unambiguous
-and keeps the mapping independent of ``n_draft_layers``.
+WHY THE STAGE INDICES ARE PINNED RATHER THAN ``\\d+``
+The conditioning projection sits on the FIRST stage and the output heads on the LAST one, and
+that placement is not recoverable from the module name -- ``fc.weight`` carries no stage. A
+pattern like ``mtp\\.\\d+\\.main_proj\\.`` matches fine when loading and then reverses into the
+literal key ``mtp.\\d+.main_proj.weight`` when saving, because ``\\d+`` is not a capturing
+group. Only a concrete index round-trips, so the rules are built for a given depth. For the
+same reason each ``{base,fn,scale}`` alternation is spelled out: a transform may carry at most
+one capturing group, and the stage index has to be it.
 
 NOTE ON ``confidence_head.proj.bias`` -- present in our module when
 ``confidence_head_bias=True``, absent from the released layout, which has no slot for it. The
-config defaults to False, so it does not normally exist; enabling it is opting out of a
-byte-identical released layout, which is the caller's choice to make.
+config defaults to False, so a normal run never creates it and save / resume / serve all agree;
+enabling it is opting out of a byte-identical released layout, which is the caller's choice.
+
+The released top-level ``norm.weight`` and ``hc_head_{base,fn,scale}`` (duplicates of the
+``mtp.{last}`` ones, absent from the standalone bf16 draft) are deliberately unmapped.
 """
 
 from __future__ import annotations
@@ -51,6 +57,10 @@ from __future__ import annotations
 import logging
 
 logger = logging.getLogger(__name__)
+
+# The number of decoder stages in the released DSV4-Flash draft. Pinned rules are built for
+# this depth by default; ``build_mapping`` takes the depth so a different one is expressible.
+RELEASED_N_LAYERS = 3
 
 # These live on a semi-private path: not exported at the ``transformers`` top level, and the
 # module moved between 4.x and 5.x. Failing to register must degrade to "checkpoints stay in
@@ -68,26 +78,54 @@ except ImportError:  # pragma: no cover - depends on the installed transformers
     _AVAILABLE = False
 
 
-def build_mapping() -> list:
-    """The rules, most specific first: a later catch-all must not shadow an earlier rename."""
+def build_mapping(n_layers: int = RELEASED_N_LAYERS) -> list:
+    """The rules. ORDER IS GENERIC-FIRST -- see the note above; this is not a typo."""
+    last = n_layers - 1
     rules: list = [
+        # --- per-stage, generic before specific (reverse order is the constraint) ---
+        WeightRenaming(source_patterns=r"^mtp\.(\d+)\.attn\.", target_patterns=r"layers.\1.attn."),
+        WeightRenaming(source_patterns=r"^mtp\.(\d+)\.attn_norm\.", target_patterns=r"layers.\1.attn_norm."),
+        WeightRenaming(source_patterns=r"^mtp\.(\d+)\.ffn_norm\.", target_patterns=r"layers.\1.ffn_norm."),
+        WeightRenaming(
+            source_patterns=r"^mtp\.(\d+)\.ffn\.shared_experts\.",
+            target_patterns=r"layers.\1.ffn.shared_experts.",
+        ),
+        WeightRenaming(
+            source_patterns=r"^mtp\.(\d+)\.ffn\.experts\.", target_patterns=r"layers.\1.ffn.experts."
+        ),
+        # the router is called `gate` in the release
+        WeightRenaming(source_patterns=r"^mtp\.(\d+)\.ffn\.gate\.", target_patterns=r"layers.\1.ffn.router."),
+    ]
+    # --- per-stage: hyper-connections are flat in the release, nested in the module ---
+    for flat, nested in (("hc_attn", "attn_hc"), ("hc_ffn", "ffn_hc")):
+        for part in ("base", "fn", "scale"):
+            rules.append(
+                WeightRenaming(
+                    source_patterns=rf"^mtp\.(\d+)\.{flat}_{part}$",
+                    target_patterns=rf"layers.\1.{nested}.{part}",
+                )
+            )
+    rules += [
         # --- top level (no stage prefix on the checkpoint side) ---
         WeightRenaming(source_patterns=r"^embed\.weight$", target_patterns="embed_tokens.weight"),
         WeightRenaming(source_patterns=r"^head\.weight$", target_patterns="lm_head.weight"),
-        # --- stage-0 only: the target-hidden conditioning ---
-        WeightRenaming(source_patterns=r"^mtp\.\d+\.main_proj\.", target_patterns="fc."),
-        WeightRenaming(source_patterns=r"^mtp\.\d+\.main_norm\.", target_patterns="hidden_norm."),
-        # --- last-stage only: heads that sit outside the layer stack ---
-        WeightRenaming(source_patterns=r"^mtp\.\d+\.norm\.", target_patterns="norm."),
-        WeightRenaming(source_patterns=r"^mtp\.\d+\.markov_head\.", target_patterns="markov_head."),
-        WeightRenaming(source_patterns=r"^mtp\.\d+\.confidence_head\.", target_patterns="confidence_head."),
-        WeightRenaming(source_patterns=r"^mtp\.\d+\.hc_head_(base|fn|scale)$", target_patterns=r"hc_head.hc_\1"),
-        # --- per-stage: hyper-connections are flat in the release, nested in the module ---
-        WeightRenaming(source_patterns=r"^mtp\.(\d+)\.hc_attn_(base|fn|scale)$", target_patterns=r"layers.\1.attn_hc.\2"),
-        WeightRenaming(source_patterns=r"^mtp\.(\d+)\.hc_ffn_(base|fn|scale)$", target_patterns=r"layers.\1.ffn_hc.\2"),
-        # --- per-stage: the router is called `gate` in the release ---
-        WeightRenaming(source_patterns=r"^mtp\.(\d+)\.ffn\.gate\.", target_patterns=r"layers.\1.ffn.router."),
+        # --- first stage only: the target-hidden conditioning ---
+        WeightRenaming(source_patterns=r"^mtp\.0\.main_proj\.", target_patterns="fc."),
+        WeightRenaming(source_patterns=r"^mtp\.0\.main_norm\.", target_patterns="hidden_norm."),
+        # --- last stage only: heads that sit outside the layer stack ---
+        WeightRenaming(source_patterns=rf"^mtp\.{last}\.norm\.", target_patterns="norm."),
+        WeightRenaming(source_patterns=rf"^mtp\.{last}\.markov_head\.", target_patterns="markov_head."),
+        WeightRenaming(
+            source_patterns=rf"^mtp\.{last}\.confidence_head\.", target_patterns="confidence_head."
+        ),
     ]
+    for part in ("base", "fn", "scale"):
+        rules.append(
+            WeightRenaming(
+                source_patterns=rf"^mtp\.{last}\.hc_head_{part}$",
+                target_patterns=f"hc_head.hc_{part}",
+            )
+        )
     # --- the one real transformation: per-expert tensors -> one stacked parameter ---
     for w in ("w1", "w2", "w3"):
         rules.append(
@@ -97,12 +135,12 @@ def build_mapping() -> list:
                 operations=[MergeModulelist(dim=0)],
             )
         )
-    # --- catch-all LAST: attn.*, attn_norm, ffn_norm, ffn.shared_experts keep their names ---
-    rules.append(WeightRenaming(source_patterns=r"^mtp\.(\d+)\.", target_patterns=r"layers.\1."))
     return rules
 
 
-def register(class_name: str = "DSV4DSparkDraftModel") -> bool:
+def register(
+    class_name: str = "DSV4DSparkDraftModel", n_layers: int = RELEASED_N_LAYERS
+) -> bool:
     """Register the mapping. Returns whether it took, so a caller can log rather than guess."""
     if not _AVAILABLE:
         logger.warning(
@@ -111,7 +149,9 @@ def register(class_name: str = "DSV4DSparkDraftModel") -> bool:
         )
         return False
     try:
-        register_checkpoint_conversion_mapping(class_name, build_mapping(), overwrite=True)
+        register_checkpoint_conversion_mapping(
+            class_name, build_mapping(n_layers), overwrite=True
+        )
     except Exception as exc:  # pragma: no cover - defensive; a bad rule must not break import
         logger.warning("could not register the DSV4-DSpark checkpoint mapping: %s", exc)
         return False
