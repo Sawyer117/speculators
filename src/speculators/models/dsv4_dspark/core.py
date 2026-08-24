@@ -173,16 +173,37 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         """Translate a released-layout checkpoint back into our module names.
 
         ``save_pretrained`` writes the released ``mtp.*`` layout so vLLM can load our
-        checkpoints unconverted, but the trainer resumes by reading the safetensors
-        directly, against parameters named ``layers.*``. Without this the raw keys match
-        nothing and ``strict=False`` makes that silent. Checkpoints already in module
-        layout (saved before this, or with the mapping unavailable) pass through.
+        checkpoints unconverted, but training does not resume through
+        ``from_pretrained``: it reads the safetensors directly, against parameters named
+        ``layers.*``. This has to run BEFORE ``set_model_state_dict``, not inside
+        ``load_state_dict``, because that call already sharded the tensors it prepared
+        into DTensors matching our placements -- handing it a full tensor afterwards
+        would be a plain-vs-DTensor copy.
+
+        The guard is not belt-and-braces. Resume passes ``strict=False`` (the verifier
+        weights are absent by design), which turns a layout mismatch into a silent
+        no-op: measured 85 missing / 110 unexpected / zero tensors loaded, no exception,
+        and training continuing from random initialisation.
+
+        Checkpoints already in module layout pass through: their keys match no rule.
         """
         if not checkpoint_mapping.is_released_layout(state_dict):
             return state_dict
-        return checkpoint_mapping.to_module_layout(
+        translated = checkpoint_mapping.to_module_layout(
             state_dict, n_layers=self.backbone_cfg.n_draft_layers
         )
+        uncovered = sorted(
+            name
+            for name, _ in self.named_parameters()
+            if name not in translated and not name.startswith("verifier_")
+        )
+        if uncovered:
+            raise RuntimeError(
+                f"a released-layout checkpoint left {len(uncovered)} parameters with "
+                f"no source, e.g. {uncovered[:3]}. Loading it would leave them at "
+                f"their initial values."
+            )
+        return translated
 
     @classmethod
     def from_training_args(

@@ -282,36 +282,12 @@ def state_dict_from_checkpoint(model: PreTrainedModel, state_dict: dict) -> dict
     model may deliberately write keys that are not its parameter names -- the DSV4
     DSpark draft writes the released ``mtp.*`` per-expert layout so vLLM can load it
     unconverted. Resume reads those keys raw, so it has to ask rather than assume.
+
+    A model that does not define the method gets back the object it passed in.
     """
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
     hook = getattr(raw_model, "state_dict_from_checkpoint", None)
     return state_dict if hook is None else hook(state_dict)
-
-
-def check_resume_loaded(incompatible, state_dict: dict, path: Path) -> None:
-    """Refuse a resume where nothing actually loaded.
-
-    Both resume paths pass ``strict=False``, which is needed because the verifier
-    weights are absent from the checkpoint by design -- but it also turns a wholesale
-    key mismatch into a silent no-op, and the run continues from random
-    initialisation with nothing in the log to say so.
-    """
-    unexpected = list(getattr(incompatible, "unexpected_keys", None) or [])
-    if not unexpected:
-        return
-    if len(unexpected) == len(state_dict):
-        raise RuntimeError(
-            f"resuming from {path}: not one of its {len(state_dict)} tensors matched a "
-            f"model parameter (e.g. {unexpected[:3]}). Continuing would silently train "
-            f"from random initialisation."
-        )
-    logger.warning(
-        "resuming from %s: %d of %d checkpoint tensors matched no parameter, e.g. %s",
-        path,
-        len(unexpected),
-        len(state_dict),
-        unexpected[:5],
-    )
 
 
 def patch_config_dtype(config_path: Path, float_dtype: torch.dtype) -> None:
@@ -339,15 +315,16 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         self, model: PreTrainedModel, float_dtype: torch.dtype | None = None
     ):
         device = get_current_device()
-        path = self.model_path(self.previous_epoch)
-        full_state_dict = load_safetensors_state_dict(path, device)
+        full_state_dict = load_safetensors_state_dict(
+            self.model_path(self.previous_epoch),
+            device,
+        )
         full_state_dict = state_dict_from_checkpoint(model, full_state_dict)
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
         )
         # Note: `strict=False` because we don't load the verifier weights
-        incompatible = model.load_state_dict(full_state_dict, strict=False)
-        check_resume_loaded(incompatible, full_state_dict, path)
+        model.load_state_dict(full_state_dict, strict=False)
 
     def load_optimizer_state_dict(
         self,
@@ -399,22 +376,22 @@ class DistributedCheckpointer(BaseCheckpointer):
     def load_model_state_dict(
         self, model: PreTrainedModel, float_dtype: torch.dtype | None = None
     ):
-        path = self.model_path(self.previous_epoch)
-        full_state_dict = load_safetensors_state_dict(path, "cpu")
+        full_state_dict = load_safetensors_state_dict(
+            self.model_path(self.previous_epoch), "cpu"
+        )
         full_state_dict = state_dict_from_checkpoint(model, full_state_dict)
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
         )
 
         # Note: `strict=False` because we don't load the verifier weights
-        incompatible = set_model_state_dict(
+        set_model_state_dict(
             model,
             full_state_dict,  # type: ignore[arg-type]
             options=StateDictOptions(
                 full_state_dict=True, broadcast_from_rank0=True, strict=False
             ),
         )
-        check_resume_loaded(incompatible, full_state_dict, path)
         dist.barrier()
 
     def load_optimizer_state_dict(

@@ -17,12 +17,11 @@ models/dsv4_dspark/
     hyper.py     117   rotary.py    105     norm.py       48
 ```
 
-Two shared files are touched, both by a few lines and both no-ops for every other model:
-three lines of registration in `models/__init__.py`, and in `train/checkpointer.py` an
-optional model hook so a resume can read back the layout the model chose to write (a model
-that does not define it gets today's behaviour, unchanged), plus a check that refuses a
-resume in which not one checkpoint tensor matched a parameter — see the checkpoint-layout
-section for why that one is not hypothetical.
+Two shared files are touched, by 20 lines between them, with no deletions and no
+behaviour change for any other model: three lines of registration in `models/__init__.py`,
+and in `train/checkpointer.py` an optional hook that lets a model translate its own
+on-disk layout when a run resumes. A model that does not define the method gets back the
+object it was passed — that is a test, not a claim.
 
 **Deliberately not in this proposal.** Our tree has four more files under `backbone/` —
 expert-parallel dispatch, a grouped GEMM over the stacked expert weights, a kernel registry,

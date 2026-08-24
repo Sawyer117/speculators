@@ -192,7 +192,6 @@ def test_experts_are_stacked_in_the_module_and_per_expert_on_disk(tmp_path, regi
 def test_resume_reads_back_the_layout_it_wrote(tmp_path, registered):
     """The trainer resumes from raw safetensors keys, not through `from_pretrained`."""
     from speculators.train.checkpointer import (
-        check_resume_loaded,
         load_safetensors_state_dict,
         state_dict_from_checkpoint,
     )
@@ -201,18 +200,13 @@ def test_resume_reads_back_the_layout_it_wrote(tmp_path, registered):
     trained.save_pretrained(tmp_path)
 
     raw = load_safetensors_state_dict(tmp_path / "model.safetensors", "cpu")
-    assert any(k.startswith("mtp.") for k in raw), (
-        "expected the released layout on disk"
-    )
+    assert any(k.startswith("mtp.") for k in raw), "expected the released layout"
 
-    resumed = (
-        tiny_model()
-    )  # different seed path: parameters must actually be overwritten
+    resumed = tiny_model()  # zeroed, so parameters must actually be overwritten
     for param in resumed.parameters():
         torch.nn.init.zeros_(param)
     converted = state_dict_from_checkpoint(resumed, raw)
-    incompatible = resumed.load_state_dict(converted, strict=False)
-    check_resume_loaded(incompatible, converted, tmp_path)
+    resumed.load_state_dict(converted, strict=False)
 
     shared = {"verifier_lm_head.weight", "verifier_norm.weight"}
     for key, value in trained.state_dict().items():
@@ -222,20 +216,95 @@ def test_resume_reads_back_the_layout_it_wrote(tmp_path, registered):
 
 
 @pytest.mark.smoke
-def test_a_resume_that_loads_nothing_is_refused(tmp_path):
-    """strict=False is needed for the verifier weights; it must not hide a mismatch."""
-    from speculators.train.checkpointer import check_resume_loaded
+def test_the_distributed_resume_path_loads_the_same_weights(tmp_path, registered):
+    """The FSDP checkpointer resumes through `set_model_state_dict`, which shards
+    what it is given into DTensors before calling `load_state_dict` -- which is why
+    the translation happens before that call and not inside it."""
+    import torch.distributed as dist
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        set_model_state_dict,
+    )
 
-    class Incompatible:
-        unexpected_keys = ["mtp.0.attn.wq_a.weight", "mtp.0.attn_norm.weight"]
+    from speculators.train.checkpointer import (
+        load_safetensors_state_dict,
+        state_dict_from_checkpoint,
+    )
 
-    with pytest.raises(RuntimeError, match="random initialisation"):
-        check_resume_loaded(
-            Incompatible(), dict.fromkeys(Incompatible.unexpected_keys), tmp_path
+    trained = tiny_model()
+    trained.save_pretrained(tmp_path)
+    raw = load_safetensors_state_dict(tmp_path / "model.safetensors", "cpu")
+
+    dist.init_process_group(
+        backend="gloo", store=dist.HashStore(), rank=0, world_size=1
+    )
+    try:
+        resumed = tiny_model()
+        for param in resumed.parameters():
+            torch.nn.init.zeros_(param)
+        set_model_state_dict(
+            resumed,
+            state_dict_from_checkpoint(resumed, raw),
+            options=StateDictOptions(
+                full_state_dict=True, broadcast_from_rank0=True, strict=False
+            ),
         )
+    finally:
+        dist.destroy_process_group()
 
-    # a partial mismatch is a warning, not a refusal
-    check_resume_loaded(Incompatible(), dict.fromkeys(["a", "b", "c"]), tmp_path)
+    shared = {"verifier_lm_head.weight", "verifier_norm.weight"}
+    for key, value in trained.state_dict().items():
+        if key in shared:
+            continue
+        assert torch.equal(value, resumed.state_dict()[key]), key
+
+
+@pytest.mark.smoke
+def test_a_released_checkpoint_that_covers_nothing_is_refused(registered):
+    """strict=False is needed for the verifier weights; it must not hide a mismatch."""
+    model = tiny_model()
+    with pytest.raises(RuntimeError, match="no source"):
+        model.state_dict_from_checkpoint({"mtp.0.attn.wq_a.weight": torch.zeros(1)})
+
+
+@pytest.mark.smoke
+def test_the_checkpointer_hook_is_a_no_op_for_other_models():
+    """The one shared file this touches must not change behaviour for anything else."""
+    import transformers
+
+    from speculators.models.dspark.config import DSparkSpeculatorConfig
+    from speculators.models.dspark.core import DSparkDraftModel
+    from speculators.train.checkpointer import state_dict_from_checkpoint
+
+    layer_config = transformers.Qwen3Config(
+        hidden_size=64,
+        vocab_size=97,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        sliding_window=8,
+        layer_types=["full_attention"] * 2,
+    )
+    other = DSparkDraftModel(
+        DSparkSpeculatorConfig(
+            transformer_layer_config=layer_config,
+            block_size=3,
+            mask_token_id=5,
+            markov_rank=8,
+            aux_hidden_state_layer_ids=[0, 1],
+            speculators_config=SpeculatorsConfig(
+                algorithm="dspark",
+                proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=3)],
+                default_proposal_method="greedy",
+                verifier=VerifierConfig.from_config(layer_config, name_or_path=None),
+            ),
+        )
+    )
+    assert not hasattr(other, "state_dict_from_checkpoint")
+    state = dict(other.state_dict())
+    assert state_dict_from_checkpoint(other, state) is state  # same object, untouched
 
 
 @pytest.mark.smoke
