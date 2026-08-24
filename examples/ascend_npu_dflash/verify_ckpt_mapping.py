@@ -44,6 +44,18 @@ def st_shapes(path: str) -> dict[str, list[int]]:
     return out
 
 
+def _find_flag(cfg: dict, name: str):
+    """The flag may sit at the top level or inside a nested speculator/draft config."""
+    if name in cfg:
+        return cfg[name]
+    for v in cfg.values():
+        if isinstance(v, dict):
+            found = _find_flag(v, name)
+            if found is not None:
+                return found
+    return None
+
+
 def apply_rules_by_hand(released_keys, n_experts_hint=256):
     """Predict what the declared rules SHOULD produce, independent of transformers.
 
@@ -114,6 +126,23 @@ def main() -> int:
     missing = sorted(want - got)          # our module has it, the mapping produces nothing
     extra = sorted(got - want)            # the mapping produces a name our checkpoint lacks
 
+    # One difference is legitimate and config-gated rather than a mapping bug: the released
+    # DSV4 layout has no confidence_head.proj.bias, while the Qwen3 DSpark family does, so the
+    # field exists and defaults to False. A checkpoint trained with it True carries a key the
+    # released layout cannot represent -- documented behaviour, dropped at conversion. Decide
+    # from the checkpoint's own config rather than a hardcoded allowance, so that the same key
+    # appearing when the config says False stays an error.
+    allowed: list[str] = []
+    cfg_path = os.path.join(args.ours, "config.json")
+    bias_on = None
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as fh:
+            cfg = json.load(fh)
+        bias_on = _find_flag(cfg, "confidence_head_bias")
+    if bias_on and "confidence_head.proj.bias" in missing:
+        allowed.append("confidence_head.proj.bias")
+        missing = [k for k in missing if k != "confidence_head.proj.bias"]
+
     print(f"\n-- mapping the released keys through the table --")
     print(f"  released keys           : {len(rel)}")
     print(f"  distinct targets        : {len(got)}")
@@ -125,6 +154,12 @@ def main() -> int:
         print(f"  ✗ ours with no released source ({len(missing)}): {missing[:8]}")
     if extra:
         print(f"  ✗ produced but not in ours ({len(extra)}): {extra[:8]}")
+    if allowed:
+        print(f"  • expected, config-gated ({len(allowed)}): {allowed}")
+        print(f"    confidence_head_bias={bias_on} in this checkpoint's config; the released "
+              f"layout has no slot for it and it is dropped. Not a mapping defect.")
+    elif bias_on is False:
+        print(f"  • confidence_head_bias=False — no bias key expected, and none found")
 
     # Expert fan-in is the one many-to-one rule; check the arity is what MergeModulelist needs.
     fan = {t: len(s) for t, s in predicted.items() if ".ffn.experts.w" in t}
