@@ -81,33 +81,24 @@ head in particular trains a mapping the target never uses.
 
 Three layers, ~21B total parameters, ~1.5B active per token.
 
-## Expert-utilization counters, shipped as a feature
+## Two more of @zihanlin-ai's model-side points
 
-@zihanlin-ai asked for per-layer / per-slot expert-utilization counters in the model
-definition from day one, because routing collapse is invisible in the loss curve. We agree,
-we have them, and this proposal promotes them from a debug flag to a documented feature.
+**Expert-utilization counters.** Asked for in the model definition from day one, because
+routing collapse is invisible in the loss curve. We have them — per-layer used/dead counts,
+normalized entropy, effective expert count, and the hot-expert set across steps so a *fixed*
+collapsed subset can be told apart from a rotating one — and this proposal makes them a
+documented feature rather than a debug flag. Their 13–22 of 256 matches what we measured on a
+different verifier family (~14 effective of 256), which is worth more than either number
+alone.
 
-They report deep draft slots using 13–22 of 256 experts. We measured the same shape on a
-different verifier family: normalized routing entropy falling to ~0.52 in the last layer,
-about 14 effective experts of 256. Independent agreement across two verifier families is
-worth more than either measurement alone.
+**Initialization.** `--init-layer-from-target` and `--init-{moe,attn,hc,norm}-from-target`
+stay opt-in beside a from-scratch default. They audited the released weights and found MTP
+lineage only in Flash-family layer 0; we found the released draft's router `gate.bias`
+balanced only in layer 0 and untouched elsewhere, yet scoring 4.42. Neither collapse nor MTP
+inheritance is the binding constraint, so neither should be the default.
 
-What is logged per layer: used/dead expert counts, normalized entropy, effective expert count
-(`E^entropy`, which is the honest number — "used" is misleading at a few hundred tokens per
-rank per step), and the hot-expert set across steps. That last one matters: single-step
-entropy cannot tell a *fixed* collapsed subset apart from a rotating one, and only the first
-is a real collapse.
-
-## Initialization: from scratch by default
-
-`--init-layer-from-target` and `--init-{moe,attn,hc,norm}-from-target` initialize draft
-layers from chosen verifier layers. They stay **opt-in beside a from-scratch default**.
-
-@zihanlin-ai audited the released V4 DSpark weights and found detectable MTP lineage only in
-Flash-family layer 0. We reached the same conclusion from a different direction: the released
-draft's router `gate.bias` is balanced only in layer 0 and left untouched elsewhere, yet it
-scores 4.42 acceptance length. Neither routing collapse nor MTP inheritance is the binding
-constraint, so neither should be the default.
+Their other three points bear on expert-parallel training and are answered in the companion
+design.
 
 ## Performance, stated plainly
 
