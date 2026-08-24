@@ -158,10 +158,12 @@ def main() -> int:
         print(f"  • known unrepresentable, not a mapping defect ({len(allowed)}): {allowed}")
         print(f"    confidence_head_bias in this checkpoint's config: {bias_on!r}"
               f"{' (field absent — predates it)' if bias_on is None else ''}")
-        print(f"    The released DSV4 layout has no slot for this key, the Qwen3 DSpark family")
-        print(f"    does, hence the config field. Nothing is lost at serve: the whole")
-        print(f"    confidence head is dropped there, so its bias reaches no computation.")
-        print(f"    ⚠ It IS lost for resuming training from a released-layout checkpoint.")
+        print(f"    The released DSV4 layout has no slot for this key; the Qwen3 DSpark")
+        print(f"    family has one, hence the config field. At the default (False) a run")
+        print(f"    never creates this parameter, so save / resume / serve all agree and")
+        print(f"    nothing is lost. This checkpoint predates the field and was built with")
+        print(f"    the bias unconditionally, which is why it shows up here. Opting in to")
+        print(f"    True chooses a parameter the released layout cannot carry.")
 
     # Expert fan-in is the one many-to-one rule; check the arity is what MergeModulelist needs.
     fan = {t: len(s) for t, s in predicted.items() if ".ffn.experts.w" in t}
