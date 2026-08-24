@@ -7,14 +7,14 @@
 Add a `dsv4_dspark` speculator: the DSpark algorithm (block drafting, a Markov transition
 head, a confidence head) on a draft whose backbone mirrors DeepSeek-V4-Flash's decoder layer.
 
-One new directory, **~2090 lines across 11 files, zero deletions**.
+One new directory, **2183 lines across 12 files, zero deletions**.
 
 ```
 models/dsv4_dspark/
-  config.py    142     core.py      785     checkpoint_mapping.py 279
+  __init__.py   18   config.py   139   core.py   886   checkpoint_mapping.py  259
   backbone/
-    attention.py 176   moe.py       268     block.py     125
-    hyper.py     117   rotary.py    105     norm.py       48
+    __init__.py 17   attention.py 182  moe.py    329   block.py   64
+    hyper.py   120   rotary.py    120  norm.py    49
 ```
 
 Two shared files are touched, by 20 lines between them, with no deletions and no
@@ -23,16 +23,27 @@ and in `train/checkpointer.py` an optional hook that lets a model translate its 
 on-disk layout when a run resumes. A model that does not define the method gets back the
 object it was passed — that is a test, not a claim.
 
-**Deliberately not in this proposal.** Our tree has four more files under `backbone/` —
-expert-parallel dispatch, a grouped GEMM over the stacked expert weights, a kernel registry,
-and a `torch.compile` wrapper for the expert path (~640 lines together). None of them are
-modelling, and none are needed for this model to be correct: the expert compute here is the
-plain-PyTorch reference, and the model runs on any accelerator with no vendor code involved.
+**Deliberately not in this proposal.** Our tree carries four more files under `backbone/`
+— expert-parallel dispatch, a grouped GEMM over the stacked expert weights, a kernel
+registry, and a `torch.compile` wrapper for the expert path — and none of them are here.
+Not just the files: the dispatch points are gone too, so each heavy op calls its reference
+implementation directly rather than looking one up. There is no plugin seam in this diff to
+review, and no vendor call anywhere in it.
 
-The dispatch belongs to the companion expert-parallel design. The other three are an
-accelerator story with its own API surface and its own precedent question, and folding them
-in here would be a second proposal riding along inside the first. We would rather land the
-model on its own merits and bring that up separately, if there is interest at all.
+The expert-parallel dispatch belongs to the companion design. The rest is an accelerator
+story with its own API surface and its own precedent question; folding it in here would be
+a second proposal riding along inside the first. We would rather land the model on its own
+merits and bring that up separately, if there is interest at all.
+
+**Three environment switches, and two of them we are happy to move.** The model reads
+`DSPARK_RECOMPUTE` (activation checkpointing per draft layer), `DSPARK_MOE_BALANCE` with
+`DSPARK_MOE_BALANCE_RATE` (the aux-loss-free `noaux_tc` bias update), and
+`DSPARK_LOG_EXPERT_LOAD` (the expert-utilisation counters). The counters we would keep here,
+since routing collapse is invisible in the loss curve and that is a property of this model.
+The other two are training-recipe features that happen to live in the model file — if you
+would rather see them as their own PR, or promoted to config fields rather than environment
+reads, we will do either; tell us which you prefer. One thing to know either way: the
+acceptance numbers below come from runs with both of them enabled.
 
 ## It no longer depends on the expert-parallel proposal
 
