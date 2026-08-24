@@ -2,14 +2,14 @@
 
 Two independent checks, because either one alone passes on a broken mapping:
 
-* ``test_round_trip_is_bit_identical`` — save then load returns the same tensors. This
-  catches a mapping that loses data, but NOT one that is self-consistently wrong: a rule
-  and its own inverse agree with each other whatever they emit.
+* ``test_round_trip_is_bit_identical`` — save then load returns the same tensors. It
+  catches a mapping that loses data, but NOT one that is self-consistently wrong: a
+  rule and its own inverse agree with each other whatever they emit.
 * ``test_saved_keys_match_the_released_draft`` — the emitted key set equals the released
-  draft's own key set. This is the check that has standing, and it is the one that caught
-  a catch-all rule shadowing every specific rule in the reverse direction (the artifact
-  came out with ``attn_hc.base`` / ``ffn.router.*`` while the release has ``hc_attn_base``
-  / ``ffn.gate.*``, and the round trip was perfectly happy).
+  draft's own key set. This is the check with standing, and the one that caught a
+  catch-all rule shadowing every specific rule in the reverse direction: the
+  artifact came out with ``attn_hc.base`` / ``ffn.router.*`` where the release has
+  ``hc_attn_base`` / ``ffn.gate.*``, and the round trip was perfectly happy.
 
 The released key set is stated here rather than read from a checkpoint so the test runs
 anywhere; it is transcribed from the released draft's ``model.safetensors.index.json``
@@ -32,7 +32,7 @@ from speculators.proposals.greedy import GreedyTokenProposalConfig  # noqa: E402
 N_LAYERS = 3
 N_EXPERTS = 4  # the release has 256; the mapping does not depend on how many
 
-# Per stage, exactly what the released draft carries (verified against its weight index).
+# Per stage, what the released draft carries (checked against its weight index).
 _PER_STAGE = [
     "attn.attn_sink",
     "attn.kv_norm.weight",
@@ -141,7 +141,6 @@ def saved_keys(path) -> set[str]:
 @pytest.fixture
 def registered():
     assert checkpoint_mapping.register(n_layers=N_LAYERS)
-    yield
 
 
 @pytest.mark.smoke
@@ -152,14 +151,16 @@ def test_saved_keys_match_the_released_draft(tmp_path, registered):
     produced = saved_keys(tmp_path)
     expected = released_key_set(N_LAYERS, N_EXPERTS)
 
-    assert produced - _SPECULATORS_EXTRA - expected == set(), "keys the release does not have"
+    assert produced - _SPECULATORS_EXTRA - expected == set(), (
+        "keys the release does not have"
+    )
     assert expected - produced == set(), "released keys we failed to produce"
 
 
 @pytest.mark.smoke
 def test_round_trip_is_bit_identical(tmp_path, registered):
     model = tiny_model()
-    # verifier_* are re-read from the verifier at load, so they are deliberately not saved.
+    # verifier_* are re-read from the verifier at load, so they are not saved at all.
     shared = {"verifier_lm_head.weight", "verifier_norm.weight"}
     before = {k: v.clone() for k, v in model.state_dict().items() if k not in shared}
 
@@ -168,7 +169,9 @@ def test_round_trip_is_bit_identical(tmp_path, registered):
     after = {k: v for k, v in reloaded.state_dict().items() if k not in shared}
 
     assert set(before) == set(after)
-    mismatched = [k for k, v in before.items() if not torch.equal(v, after[k].to(v.dtype))]
+    mismatched = [
+        k for k, v in before.items() if not torch.equal(v, after[k].to(v.dtype))
+    ]
     assert mismatched == []
 
 
@@ -180,7 +183,9 @@ def test_experts_are_stacked_in_the_module_and_per_expert_on_disk(tmp_path, regi
     model.save_pretrained(tmp_path)
     on_disk = saved_keys(tmp_path)
     assert "layers.0.ffn.experts.w1" not in on_disk
-    assert sum(1 for k in on_disk if k.startswith("mtp.0.ffn.experts.")) == N_EXPERTS * 3
+    assert (
+        sum(1 for k in on_disk if k.startswith("mtp.0.ffn.experts.")) == N_EXPERTS * 3
+    )
 
 
 @pytest.mark.smoke
@@ -196,9 +201,13 @@ def test_resume_reads_back_the_layout_it_wrote(tmp_path, registered):
     trained.save_pretrained(tmp_path)
 
     raw = load_safetensors_state_dict(tmp_path / "model.safetensors", "cpu")
-    assert any(k.startswith("mtp.") for k in raw), "expected the released layout on disk"
+    assert any(k.startswith("mtp.") for k in raw), (
+        "expected the released layout on disk"
+    )
 
-    resumed = tiny_model()  # different seed path: parameters must actually be overwritten
+    resumed = (
+        tiny_model()
+    )  # different seed path: parameters must actually be overwritten
     for param in resumed.parameters():
         torch.nn.init.zeros_(param)
     converted = state_dict_from_checkpoint(resumed, raw)
@@ -214,14 +223,16 @@ def test_resume_reads_back_the_layout_it_wrote(tmp_path, registered):
 
 @pytest.mark.smoke
 def test_a_resume_that_loads_nothing_is_refused(tmp_path):
-    """strict=False is needed for the verifier weights; it must not hide a total mismatch."""
+    """strict=False is needed for the verifier weights; it must not hide a mismatch."""
     from speculators.train.checkpointer import check_resume_loaded
 
     class Incompatible:
         unexpected_keys = ["mtp.0.attn.wq_a.weight", "mtp.0.attn_norm.weight"]
 
     with pytest.raises(RuntimeError, match="random initialisation"):
-        check_resume_loaded(Incompatible(), dict.fromkeys(Incompatible.unexpected_keys), tmp_path)
+        check_resume_loaded(
+            Incompatible(), dict.fromkeys(Incompatible.unexpected_keys), tmp_path
+        )
 
     # a partial mismatch is a warning, not a refusal
     check_resume_loaded(Incompatible(), dict.fromkeys(["a", "b", "c"]), tmp_path)
@@ -236,7 +247,9 @@ def test_module_layout_checkpoints_still_load(tmp_path, registered):
     trained = tiny_model()
     shared = {"verifier_lm_head.weight", "verifier_norm.weight"}
     state = {k: v for k, v in trained.state_dict().items() if k not in shared}
-    save_file({k: v.contiguous() for k, v in state.items()}, tmp_path / "model.safetensors")
+    save_file(
+        {k: v.contiguous() for k, v in state.items()}, tmp_path / "model.safetensors"
+    )
     trained.config.save_pretrained(tmp_path)
 
     reloaded = DSV4DSparkDraftModel.from_pretrained(tmp_path)

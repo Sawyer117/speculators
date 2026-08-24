@@ -162,8 +162,8 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         )
         self._init_backbone_params()
 
-        # The released layout puts the conditioning projection on the first stage and the
-        # heads on the last, which a rule can only express with a concrete index. The
+        # The released layout puts the conditioning projection on the first stage and
+        # the heads on the last, which a rule can only express with a concrete index. The
         # module-level registration below covers the released depth; a draft of another
         # depth re-registers for its own.
         if bb.n_draft_layers != checkpoint_mapping.RELEASED_N_LAYERS:
@@ -176,7 +176,7 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         checkpoints unconverted, but the trainer resumes by reading the safetensors
         directly, against parameters named ``layers.*``. Without this the raw keys match
         nothing and ``strict=False`` makes that silent. Checkpoints already in module
-        layout (anything saved before this, or with the mapping unavailable) pass through.
+        layout (saved before this, or with the mapping unavailable) pass through.
         """
         if not checkpoint_mapping.is_released_layout(state_dict):
             return state_dict
@@ -780,6 +780,6 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
 
 
 # Registering at import is what makes ``save_pretrained`` write the released layout and
-# ``from_pretrained`` read it, with no converter in between. It is a no-op for every other
-# model, and degrades to "checkpoints keep module names" if the transformers API moves.
+# ``from_pretrained`` read it, with no converter in between. It is a no-op for every
+# other model, and degrades to "keep module names" if the transformers API moves.
 checkpoint_mapping.register()

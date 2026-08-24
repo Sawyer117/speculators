@@ -278,10 +278,10 @@ def load_safetensors_state_dict(path: Path, device: str) -> dict[str, torch.Tens
 def state_dict_from_checkpoint(model: PreTrainedModel, state_dict: dict) -> dict:
     """Let a model translate its own on-disk layout back into module names.
 
-    A speculators checkpoint is also the artifact the inference engine loads, so a model
-    may deliberately write keys that are not its parameter names -- the DSV4 DSpark draft
-    writes the released ``mtp.*`` per-expert layout so vLLM can load it unconverted.
-    Resume reads those keys raw, so it has to ask the model rather than assume.
+    A speculators checkpoint is also the artifact the inference engine loads, so a
+    model may deliberately write keys that are not its parameter names -- the DSV4
+    DSpark draft writes the released ``mtp.*`` per-expert layout so vLLM can load it
+    unconverted. Resume reads those keys raw, so it has to ask rather than assume.
     """
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
     hook = getattr(raw_model, "state_dict_from_checkpoint", None)
@@ -291,10 +291,10 @@ def state_dict_from_checkpoint(model: PreTrainedModel, state_dict: dict) -> dict
 def check_resume_loaded(incompatible, state_dict: dict, path: Path) -> None:
     """Refuse a resume where nothing actually loaded.
 
-    Both resume paths pass ``strict=False``, which is needed because the verifier weights
-    are absent from the checkpoint by design -- but it also turns a wholesale key mismatch
-    into a silent no-op, and the run continues from random initialisation with nothing in
-    the log to say so.
+    Both resume paths pass ``strict=False``, which is needed because the verifier
+    weights are absent from the checkpoint by design -- but it also turns a wholesale
+    key mismatch into a silent no-op, and the run continues from random
+    initialisation with nothing in the log to say so.
     """
     unexpected = list(getattr(incompatible, "unexpected_keys", None) or [])
     if not unexpected:
