@@ -172,13 +172,13 @@ mapping can round-trip perfectly and still write a layout no loader recognises. 
 the key set was compared against the release. Whatever layout you choose, the test worth having
 is the one that compares to the target convention, not to itself.
 
-What A does not fix is `config.json`. The serve reads `dspark_block_size`, `dspark_markov_rank`,
-`dspark_noise_token_id`, `dspark_target_layer_ids`, `sliding_window` and
-`eagle_aux_hidden_state_layer_ids`, and every one of them fails *silently* when absent — a
-missing `dspark_noise_token_id` fills the mask slots with token 0 and quietly caps acceptance;
-missing aux layer ids fall back to EAGLE3's four, which is a dimension mismatch against a
-three-layer `main_proj`. This is the same gap as the `algos.py` note below, and it is the part
-that still needs a vLLM-side change whichever layout wins.
+A is also what keeps serving out of this proposal's scope, which is worth being explicit
+about. DeepSeek ships the DSV4 draft *inside* the target checkpoint — one directory,
+67,606 target tensors and 4,705 `mtp.*` draft tensors under one `config.json` that already
+carries the `dspark_*` fields. A draft trained here writes exactly those 4,705 tensors, so
+it is a drop-in for the ones already there and nothing has to describe it: the target's own
+config still applies. Under B the checkpoint would instead need vLLM to grow a way to route
+and configure it, and that work would belong to this proposal.
 
 We would still rather you chose than we did, because it is a convention question about your
 library. And one thing about A deserves saying out loud rather than being discovered later:
@@ -186,12 +186,11 @@ it propagates a prefix that upstream is currently fighting (#52165 above), into 
 that are not MTP at all. If you would rather we emit the native layout and take the loader
 changes as follow-up work, we will do that instead and are happy to write them.
 
-Separately: `algos.py::update_dspark` currently allows `{Qwen3DSparkModel, Qwen3OmniDSparkModel}`
-and falls back to `Qwen3DSparkModel`, while `DSparkDraftModel` is registered to
-`DSparkDeepseekV4ForCausalLM`. Whichever layout is chosen, a DSV4 checkpoint needs to reach
-the right architecture — `eagle3` and `peagle` in that same file already branch on
-`model_type`, so there is a pattern to follow. That is a vLLM-side change; we are happy to
-propose it.
+One boundary, stated so it is not mistaken for an omission. Serving a *speculators-format*
+DSV4 checkpoint is a separate matter: `algos.py::update_dspark` falls back to
+`Qwen3DSparkModel`, so such a checkpoint reaches the wrong architecture. That is a vLLM-side
+concern and not part of this proposal — and choosing A is precisely what means nothing here
+depends on it. We are raising it because a reviewer will notice, not because this needs it.
 
 ## Evidence
 
