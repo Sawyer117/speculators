@@ -90,9 +90,38 @@ def build_mapping(n_layers: int = RELEASED_N_LAYERS) -> list:
     """The rules. ORDER IS GENERIC-FIRST -- see the note above; this is not a typo."""
     last = n_layers - 1
     rules: list = [
-        # --- per-stage, generic before specific (reverse order is the constraint) ---
+        # --- per-stage ---
         WeightRenaming(
-            source_patterns=r"^mtp\.(\d+)\.attn\.", target_patterns=r"layers.\1.attn."
+            source_patterns=r"^mtp\.(\d+)\.attn\.wq_a\.",
+            target_patterns=r"layers.\1.attn.wq_a.",
+        ),
+        WeightRenaming(
+            source_patterns=r"^mtp\.(\d+)\.attn\.wq_b\.",
+            target_patterns=r"layers.\1.attn.wq_b.",
+        ),
+        WeightRenaming(
+            source_patterns=r"^mtp\.(\d+)\.attn\.wkv\.",
+            target_patterns=r"layers.\1.attn.wkv.",
+        ),
+        WeightRenaming(
+            source_patterns=r"^mtp\.(\d+)\.attn\.wo_a\.",
+            target_patterns=r"layers.\1.attn.wo_a.",
+        ),
+        WeightRenaming(
+            source_patterns=r"^mtp\.(\d+)\.attn\.wo_b\.",
+            target_patterns=r"layers.\1.attn.wo_b.",
+        ),
+        WeightRenaming(
+            source_patterns=r"^mtp\.(\d+)\.attn\.q_norm\.",
+            target_patterns=r"layers.\1.attn.q_norm.",
+        ),
+        WeightRenaming(
+            source_patterns=r"^mtp\.(\d+)\.attn\.kv_norm\.",
+            target_patterns=r"layers.\1.attn.kv_norm.",
+        ),
+        WeightRenaming(
+            source_patterns=r"^mtp\.(\d+)\.attn\.attn_sink$",
+            target_patterns=r"layers.\1.attn.attn_sink",
         ),
         WeightRenaming(
             source_patterns=r"^mtp\.(\d+)\.attn_norm\.",

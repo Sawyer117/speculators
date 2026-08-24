@@ -82,7 +82,7 @@ def released_key_set(n_layers: int, n_experts: int) -> set[str]:
     return keys
 
 
-def tiny_model(n_layers: int = N_LAYERS) -> DSV4DSparkDraftModel:
+def tiny_model(n_layers: int = N_LAYERS, **recipe) -> DSV4DSparkDraftModel:
     """A DSV4 draft small enough for CPU, structurally identical to the real one."""
     layer_config = transformers.LlamaConfig(
         hidden_size=64,
@@ -112,6 +112,7 @@ def tiny_model(n_layers: int = N_LAYERS) -> DSV4DSparkDraftModel:
         block_size=3,
         mask_token_id=5,
         aux_hidden_state_layer_ids=list(range(n_layers)),
+        **recipe,
         speculators_config=SpeculatorsConfig(
             algorithm="dsv4_dspark",
             proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=3)],
@@ -323,4 +324,32 @@ def test_module_layout_checkpoints_still_load(tmp_path, registered):
 
     reloaded = DSV4DSparkDraftModel.from_pretrained(tmp_path)
     for key, value in state.items():
+        assert torch.equal(value, reloaded.state_dict()[key]), key
+
+
+@pytest.mark.smoke
+def test_a_changed_recipe_survives_the_round_trip(tmp_path, registered):
+    """A recipe the released draft does not have must still save and load losslessly.
+
+    The released layout has no slot for a block convolution or a selection head, so
+    those parameters keep their module names rather than being forced into `mtp.*`.
+    Getting this wrong is silent: reversing a rule unescapes its dots, so
+    `layers.N.attn.` matched `layers.N.attn_conv.base_kernel` and wrote it out as
+    `mtp.N.attn.conv.base_kernel` -- a key that matched no parameter coming back.
+    """
+    recipe = {"block_conv_kernel_size": 2, "block_conv_group_size": 4, "select_rank": 4}
+    trained = tiny_model(**recipe)
+    trained.save_pretrained(tmp_path)
+
+    on_disk = saved_keys(tmp_path)
+    added = {k for k in trained.state_dict() if "conv" in k or "select_head" in k}
+    assert added, "expected the recipe to add parameters"
+    assert added <= on_disk, "recipe parameters must be saved under their own names"
+    assert not any(".attn.conv" in k or ".ffn.conv" in k for k in on_disk)
+
+    reloaded = DSV4DSparkDraftModel.from_pretrained(tmp_path)
+    shared = {"verifier_lm_head.weight", "verifier_norm.weight"}
+    for key, value in trained.state_dict().items():
+        if key in shared:
+            continue
         assert torch.equal(value, reloaded.state_dict()[key]), key
