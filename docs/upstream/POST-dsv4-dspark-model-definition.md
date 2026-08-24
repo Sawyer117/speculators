@@ -115,18 +115,49 @@ validated against. If the project ever wants an in-tree way for accelerators to 
 have an opinion and some working code, and we would bring it as its own proposal where it can
 be judged on its own.
 
-## Serving
+## Checkpoint layout — a question for you, not a decision we should make
 
-`vllm/transformers_utils/configs/speculators/algos.py` already registers `dspark` and already
-passes through exactly the fields this model needs — `markov_rank`, `markov_head_type`,
-`block_size`, `enable_confidence_head`, `confidence_head_with_markov`. It maps them to
-`Qwen3DSparkModel`, a hardcoded architecture.
+Two conventions exist for a DSpark draft, and they disagree. We are the first
+speculators-trained DSV4 draft, so this combination has not come up before.
 
-A checkpoint trained by this proposal is therefore a standard speculators checkpoint that
-vLLM *almost* knows how to serve; what is missing is an architecture branch, in the same
-shape `eagle3` and `peagle` already have. We currently bridge that with a converter in our
-fork. It is a stopgap and a vLLM-side change, so it is out of scope here — mentioned only so
-the picture is complete.
+| loader | reads |
+|---|---|
+| `vllm/models/deepseek_v4/nvidia/dspark.py` | `mtp.{0,1,2}.*` from the target checkpoint |
+| `vllm_ascend/models/deepseek_v4/dspark.py` | `mtp.{i}.*` |
+| `vllm/model_executor/models/qwen3_dspark.py` | speculators-native (`layers.*`, `d2t`/`t2d`) |
+
+The split is not by hardware — GPU and Ascend agree for DSV4. It is by **provenance**: drafts
+released by DeepSeek live in the target checkpoint's `mtp.*` namespace, and drafts trained by
+speculators (Qwen3, Gemma4) use this library's own layout.
+
+The `mtp.*` prefix is a release artifact rather than a statement about the algorithm, and it
+is already causing real trouble upstream. vLLM #52165, open now, opens with: *"DeepSeek-V4-Flash-0731
+and DeepSeek-V4-Pro-0813 do not have MTP heads — their `mtp.*` tensors are DSpark drafters.
+vLLM routes them to `DeepSeekV4MTPModel` anyway and dies deep in the weight loader."*
+
+**Three ways to go:**
+
+| | today | cost |
+|---|---|---|
+| **A** emit `mtp.*` | loads on GPU and Ascend unchanged | a speculators checkpoint that does not look like one; the misleading prefix spreads |
+| **B** emit speculators-native | nothing serves it | needs a loader branch in both vLLM and vllm-ascend |
+| **C** emit native, ship an exporter | one documented step to serve | the export step exists until B lands |
+
+We lean to **C**: the default stays consistent with every other draft this library produces,
+the exporter makes it usable today, and it keeps the door open to B without stranding anyone.
+The exporter would be tested in-tree rather than living in a fork, and would be deleted once
+the loaders can read the native layout.
+
+But this is a convention question about your library, and both existing conventions have a
+reason behind them. If you would rather we emit `mtp.*` and match what the DSV4 loaders
+already expect, say so and we will — we would rather follow your call than pick for you.
+
+Separately: `algos.py::update_dspark` currently allows `{Qwen3DSparkModel, Qwen3OmniDSparkModel}`
+and falls back to `Qwen3DSparkModel`, while `DSparkDraftModel` is registered to
+`DSparkDeepseekV4ForCausalLM`. Whichever layout is chosen, a DSV4 checkpoint needs to reach
+the right architecture — `eagle3` and `peagle` in that same file already branch on
+`model_type`, so there is a pattern to follow. That is a vLLM-side change; we are happy to
+propose it.
 
 ## Evidence
 
