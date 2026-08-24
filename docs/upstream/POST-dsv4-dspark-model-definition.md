@@ -143,14 +143,20 @@ vLLM routes them to `DeepSeekV4MTPModel` anyway and dies deep in the weight load
 | **B** emit speculators-native | nothing serves it | needs a loader branch in both vLLM and vllm-ascend |
 | **C** emit native, ship an exporter | one documented step to serve | the export step exists until B lands |
 
-We lean to **C**: the default stays consistent with every other draft this library produces,
-the exporter makes it usable today, and it keeps the door open to B without stranding anyone.
-The exporter would be tested in-tree rather than living in a fork, and would be deleted once
-the loaders can read the native layout.
+**We lean to A**, and the reason is that speculators and vLLM are one project. A checkpoint
+this library trains should be one the sibling inference engine can load; if it is not, that is
+a defect in the pair, whichever layout is tidier. B does not exist yet, and C does not
+actually fix that — under C the native checkpoint is just as unloadable, and the export step
+is a tax every user pays until B lands, which it may never do.
 
-But this is a convention question about your library, and both existing conventions have a
-reason behind them. If you would rather we emit `mtp.*` and match what the DSV4 loaders
-already expect, say so and we will — we would rather follow your call than pick for you.
+So: emit `mtp.*`, and a draft trained here is a drop-in replacement for the released DeepSeek
+draft on both GPU and Ascend, with nothing to convert and nothing to explain.
+
+We would still rather you chose than we did, because it is a convention question about your
+library. And one thing about A deserves saying out loud rather than being discovered later:
+it propagates a prefix that upstream is currently fighting (#52165 above), into checkpoints
+that are not MTP at all. If you would rather we emit the native layout and take the loader
+changes as follow-up work, we will do that instead and are happy to write them.
 
 Separately: `algos.py::update_dspark` currently allows `{Qwen3DSparkModel, Qwen3OmniDSparkModel}`
 and falls back to `Qwen3DSparkModel`, while `DSparkDraftModel` is registered to
