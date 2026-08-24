@@ -1,10 +1,11 @@
 # WITHDRAWN — "fail a resume in which no checkpoint tensor matched a parameter"
 
-> Drafted 2026-08-25, then withdrawn the same day. Branch
-> `Sawyer117/speculators@pr/resume-key-mismatch` (worktree `/workspace/pr_resume`), one
-> commit on `upstream/main@2aec948`. **No PR opened, and none should be.**
+> Drafted 2026-08-25 and withdrawn the same day. No PR was opened. The branch
+> (`pr/resume-key-mismatch`) and its worktree are deleted, on the fork and locally; the
+> change is small enough to rebuild from this page if a real case ever turns up.
 >
-> Kept as a record so the idea is not proposed again without the measurement below.
+> Filed under WITHDRAWN, not POST, so nobody picks it up and sends it. Kept as a record
+> so the idea is not proposed again without the measurement below.
 
 ## What was proposed
 
