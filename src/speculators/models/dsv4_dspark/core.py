@@ -142,6 +142,15 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         # run by slowing the step to the serve's HS-production rate). See _backbone_forward.
         self.grad_checkpoint = bool(int(os.environ.get("DSPARK_RECOMPUTE", "0")))
 
+        # The released DSV4 layout has no slot for a bias on the confidence head, and
+        # upstream's ConfidenceHead always builds one. Replace the projection rather than
+        # changing how that head is built for every other DSpark draft.
+        if self.confidence_head is not None and not getattr(
+            config, "confidence_head_bias", False
+        ):
+            proj = self.confidence_head.proj
+            self.confidence_head.proj = nn.Linear(proj.in_features, 1, bias=False)
+
         # Swap the decoder stack for our DSV4-native blocks + the mHC head.
         self.layers = nn.ModuleList(MhcDecoderBlock(bb) for _ in range(bb.n_draft_layers))
         self.hc_head = HyperHead(bb)
