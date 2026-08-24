@@ -354,6 +354,37 @@ def _mono_series(recs, key="train/accept_len", win=None):
     return out
 
 
+def _paired_delta(base_recs, arm_recs, key="train/accept_len", win=None):
+    """PER-STEP difference, smoothed -- and its own noise, not two independent bands combined.
+
+    These runs share a seed and a data order, so at any given step both saw the SAME batch.
+    Whatever that batch does to accept_len it does to both, and subtracting cancels it. The
+    combined-independent-bands estimate ignores that and is therefore far too wide: it asks
+    "how much does each curve wobble", when the question is "how much does their DIFFERENCE
+    wobble". With a +/-0.08 band we cannot resolve the +0.03..0.27 range that decides whether
+    a head pays for itself at concurrency 1, so the instrument, not the head, is what is
+    reporting 'indistinguishable'.
+
+    Returns (series, se) where series is [(step, smoothed_diff)] and se is the standard error
+    of that smoothed difference. Only steps present in BOTH runs are used.
+    """
+    win = win or _SMOOTH_WIN
+    b = {step_of(r): f(r, key) for r in base_recs if f(r, key) is not None and step_of(r) >= 0}
+    a = {step_of(r): f(r, key) for r in arm_recs if f(r, key) is not None and step_of(r) >= 0}
+    common = sorted(set(a) & set(b))
+    if len(common) < win * 2:
+        return [], None
+    d = [(st, a[st] - b[st]) for st in common]
+    out, res = [], []
+    for i in range(win, len(d) + 1):
+        w = [x[1] for x in d[i - win:i]]
+        m = median(w)
+        out.append((d[i - 1][0], m))
+        res.append(d[i - 1][1] - m)
+    se = 1.253 * pstdev(res) / (win ** 0.5) if len(res) >= win else None
+    return out, se
+
+
 def _lead_steps(base_series, arm_value, at_step):
     """HOW MANY STEPS AHEAD the arm is: invert the baseline curve at the arm's value.
 
@@ -439,6 +470,7 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
         return v
 
     arm_series = {name: _mono_series(recs) for name, recs, _ in loaded}
+    paired = {name: _paired_delta(base_recs, recs) for name, recs, _ in loaded}
     arm_noise = {name: _series_noise(recs, arm_series[name]) for name, recs, _ in loaded}
     base_noise = _series_noise(base_recs, base_series) or 0.0
     arm_last = {name: max(step_of(x) for x in recs) for name, recs, _ in loaded}
@@ -500,6 +532,34 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
                   + f" {lead_s:>16}")
 
     print()
+    # ── PAIRED difference: the estimate that can actually resolve the range we care about ──
+    print()
+    print("  ── ★ 配对差（同种子同数据 ⟹ 逐步相减,批次噪声抵消）──")
+    print("     上面那个 ± 是两条独立曲线的带子合成,问的是「每条曲线抖多少」;")
+    print("     真正该问的是「它们的差抖多少」。配对差直接测后者,窄得多。")
+    any_paired = False
+    for name, _, _ in loaded:
+        ser, se = paired.get(name, ([], None))
+        if not ser:
+            print(f"    {name:<12} 样本不足")
+            continue
+        any_paired = True
+        band = 2 * se if se else None
+        head = ser[len(ser) // 20][1] if len(ser) > 20 else ser[0][1]
+        tail = ser[-1][1]
+        at = ser[-1][0]
+        verdict = "—"
+        if band is not None:
+            verdict = ("**超出误差带 ⟹ 真有差异**" if abs(tail) > band
+                       else "在误差带内 ⟹ 无法区分")
+        print(f"    {name:<12} @{at:<6} 末段 {tail:+.4f} ± {band:.4f}   (早段 {head:+.4f})   {verdict}"
+              if band is not None else
+              f"    {name:<12} @{at:<6} 末段 {tail:+.4f}   (早段 {head:+.4f})")
+    if any_paired:
+        print("     ⚠ 前提:两条 run 同种子、同数据、同 batch 顺序。任何一条不成立,配对差就无效,")
+        print("        这时以上面那个保守的独立带为准。")
+    print()
+
     print("  ── 判读：delta 的走势（收敛到 0 = 同一渐近线；走平在非零 = 渐近线之差）──")
     for name, pts in trend.items():
         # ⚠ THE VERDICT IS ON delta, NOT ON THE LEAD IN STEPS. The lead divides by the curve's
