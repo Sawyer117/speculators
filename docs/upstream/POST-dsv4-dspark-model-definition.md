@@ -144,9 +144,12 @@ The run is fully annealed (cosine to zero at 5 epochs) and the last three checkp
 
 ## Open questions
 
-1. **Does the project want a model this size in-tree at all?** It is a pure addition, but
-   2622 lines is a maintenance commitment. A plausible alternative is that DSV4-scale drafts
-   live out-of-tree and speculators owns only the mechanisms. We would not argue against it.
+1. **What would you want to see before taking ~1940 lines in-tree?** It is a pure addition
+   touching no shared file, and it reaches the released DeepSeek draft's acceptance length on
+   the same serving stack — but it is still code someone has to own. What we
+   commit to: maintaining it, keeping it working as the training stack moves, and testing it
+   on the hardware we have. If there is a bar for a model this size — a test, a doc, a
+   second-platform run — tell us what it is and we will meet it.
 2. **Is the reference expert implementation acceptable in-tree**, given it is portable and
    correct but not fast? We think yes for a first landing, and that performance is a separate
    conversation, but it is your call whether a slow path is worth having.
