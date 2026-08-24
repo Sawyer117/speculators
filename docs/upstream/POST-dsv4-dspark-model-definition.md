@@ -7,16 +7,22 @@
 Add a `dsv4_dspark` speculator: the DSpark algorithm (block drafting, a Markov transition
 head, a confidence head) on a draft whose backbone mirrors DeepSeek-V4-Flash's decoder layer.
 
-It is a pure addition — one new directory, **~1940 lines across 11 files, zero deletions**,
-plus three lines of registration in `models/__init__.py`. No shared file is modified.
+One new directory, **~2040 lines across 11 files, zero deletions**.
 
 ```
 models/dsv4_dspark/
-  config.py    139     core.py      750     weights.py   234
+  config.py    142     core.py      785     checkpoint_mapping.py 230
   backbone/
-    attention.py 176   moe.py       268     block.py     102
+    attention.py 176   moe.py       268     block.py     125
     hyper.py     117   rotary.py    105     norm.py       48
 ```
+
+Two shared files are touched, both by a few lines and both no-ops for every other model:
+three lines of registration in `models/__init__.py`, and in `train/checkpointer.py` an
+optional model hook so a resume can read back the layout the model chose to write (a model
+that does not define it gets today's behaviour, unchanged), plus a check that refuses a
+resume in which not one checkpoint tensor matched a parameter — see the checkpoint-layout
+section for why that one is not hypothetical.
 
 **Deliberately not in this proposal.** Our tree has four more files under `backbone/` —
 expert-parallel dispatch, a grouped GEMM over the stacked expert weights, a kernel registry,

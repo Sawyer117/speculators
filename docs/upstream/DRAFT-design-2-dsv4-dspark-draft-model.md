@@ -16,7 +16,7 @@ zero deletions**, plus three lines of registration in `models/__init__.py`.
 
 ```
 models/dsv4_dspark/
-  config.py    139     core.py      750     weights.py   234
+  config.py    139     core.py      750     checkpoint_mapping.py 150
   backbone/
     attention.py 176   moe.py       268     block.py     102
     hyper.py     117   rotary.py    105     norm.py       48

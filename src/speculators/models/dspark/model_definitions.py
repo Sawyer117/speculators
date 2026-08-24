@@ -173,7 +173,7 @@ class ConfidenceHead(nn.Module):
 
     ``bias`` is family-dependent, so it is a config knob rather than a constant. The
     released DSV4-Flash draft layout carries only ``confidence_head.proj.weight`` (see
-    ``dsv4_dspark/weights.py::expected_draft_keys``) — hence the ``False`` default; the
+    ``dsv4_dspark/checkpoint_mapping.py``) — hence the ``False`` default; the
     Qwen3 DSpark draft does carry a bias. vLLM's own ``DSparkConfidenceHead`` makes the
     same split: its DSV4 construction takes the ``bias=False`` default while the Qwen3
     one passes ``bias=True``. A bias the serving layout cannot represent trains fine but

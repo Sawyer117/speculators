@@ -14,7 +14,7 @@ them internally (``_remap_dspark_name``: ``.attn.``->``.self_attn.``, ``.ffn.``-
 ``.mlp.``, ``.w1.``->``.gate_proj.`` ...).
 
 So this conversion is exactly the INVERSE of
-``speculators/src/speculators/models/dsv4_dspark/weights.py::map_released_key``
+``speculators/src/speculators/models/dsv4_dspark/checkpoint_mapping.py``
 (released ``mtp.*`` -> ours ``layers.*``), PLUS unstacking the ``GroupedExperts``
 weights back to per-expert tensors. Nothing is quantized — the draft is bf16, so the
 released fp8/fp4 ``.scale`` sidecars do not apply.
