@@ -7,11 +7,11 @@
 Add a `dsv4_dspark` speculator: the DSpark algorithm (block drafting, a Markov transition
 head, a confidence head) on a draft whose backbone mirrors DeepSeek-V4-Flash's decoder layer.
 
-One new directory, **~2040 lines across 11 files, zero deletions**.
+One new directory, **~2090 lines across 11 files, zero deletions**.
 
 ```
 models/dsv4_dspark/
-  config.py    142     core.py      785     checkpoint_mapping.py 230
+  config.py    142     core.py      785     checkpoint_mapping.py 279
   backbone/
     attention.py 176   moe.py       268     block.py     125
     hyper.py     117   rotary.py    105     norm.py       48
@@ -61,7 +61,7 @@ Two things we should be straight about:
 ## Why this needs its own model definition
 
 A draft mirrors its target — that part needs no defending. The question worth answering is
-why ~1940 lines rather than a config on top of something that exists.
+why ~2000 lines of modelling rather than a config on top of something that exists.
 
 **The attention is not expressible by any fused path.** The draft's MLA carries a per-head
 learnable *sink*: a synthetic key whose logit is added to the softmax denominator,
@@ -180,6 +180,13 @@ it is a drop-in for the ones already there and nothing has to describe it: the t
 config still applies. Under B the checkpoint would instead need vLLM to grow a way to route
 and configure it, and that work would belong to this proposal.
 
+The line we would draw, since it is easier to agree on now than later: what this proposal
+guarantees is the checkpoint, not the engine. A run that changes the recipe — a block
+convolution over the draft positions, a selection head, a different block width — saves and
+reloads losslessly, and whatever the released layout has no slot for keeps its module name
+instead of being forced into `mtp.*` under an invented one. Whether a given inference engine
+understands a recipe it has never seen is that engine's concern.
+
 We would still rather you chose than we did, because it is a convention question about your
 library. And one thing about A deserves saying out loud rather than being discovered later:
 it propagates a prefix that upstream is currently fighting (#52165 above), into checkpoints
@@ -213,12 +220,12 @@ The run is fully annealed (cosine to zero at 5 epochs) and the last three checkp
 
 ## Open questions
 
-1. **What would you want to see before taking ~1940 lines in-tree?** It is a pure addition
-   touching no shared file, and it reaches the released DeepSeek draft's acceptance length on
-   the same serving stack — but it is still code someone has to own. What we
-   commit to: maintaining it, keeping it working as the training stack moves, and testing it
-   on the hardware we have. If there is a bar for a model this size — a test, a doc, a
-   second-platform run — tell us what it is and we will meet it.
+1. **What would you want to see before taking ~2000 lines in-tree?** It is a new directory
+   plus twenty lines in two shared files, and it reaches the released DeepSeek draft's
+   acceptance length on the same serving stack — but it is still code someone has to own.
+   What we commit to: maintaining it, keeping it working as the training stack moves, and
+   testing it on the hardware we have. If there is a bar for a model this size — a test, a
+   doc, a second-platform run — tell us what it is and we will meet it.
 2. **Is the reference expert implementation acceptable in-tree**, given it is portable and
    correct but not fast? We think yes for a first landing, and that performance is a separate
    conversation, but it is your call whether a slow path is worth having.
