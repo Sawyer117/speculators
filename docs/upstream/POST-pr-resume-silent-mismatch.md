@@ -1,9 +1,9 @@
 # PR draft — fail a resume in which no checkpoint tensor matched a parameter
 
-> Branch `pr/loud-resume-mismatch` (worktree `/workspace/pr_resume`), one commit on top of
-> `upstream/main@2aec948`. **Not pushed, no PR opened.**
-> Target: `vllm-project/speculators`. Independent of the DSV4 work — it was found there,
-> but nothing in it is DSV4-specific.
+> Branch `Sawyer117/speculators@pr/resume-key-mismatch` (worktree `/workspace/pr_resume`),
+> one commit on top of `upstream/main@2aec948`. Pushed to the fork; **no PR opened.**
+> Target when opened: `vllm-project/speculators` <- `Sawyer117:pr/resume-key-mismatch`.
+> Independent of the DSV4 work — found there, but nothing in it is DSV4-specific.
 
 ---
 
