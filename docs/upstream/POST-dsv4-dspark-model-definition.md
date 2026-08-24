@@ -152,6 +152,29 @@ is a tax every user pays until B lands, which it may never do.
 So: emit `mtp.*`, and a draft trained here is a drop-in replacement for the released DeepSeek
 draft on both GPU and Ascend, with nothing to convert and nothing to explain.
 
+A is implemented, and it needs no save override: the layout is a list of `WeightRenaming` /
+`WeightConverter` rules registered for the model class, exactly as `transformers` already does
+for every MoE checkpoint it ships. `from_pretrained` applies them and `save_pretrained` applies
+the reverse, so one declaration covers both directions and `MergeModulelist(dim=0)` is the same
+operation that bridges Mixtral's per-expert checkpoints to a stacked parameter. The emitted key
+set equals the released draft's own weight index exactly, and the tensors survive a save/load
+round trip bit-identically; checkpoints written before the mapping existed still load, because
+their keys match no rule and pass through. All three are tests, on a CPU-sized model.
+
+One caveat found while building it, in case it bears on your answer. A round trip is not a
+sufficient check: a rule and its own inverse agree with each other whatever they emit, so a
+mapping can round-trip perfectly and still write a layout no loader recognises. Ours did, until
+the key set was compared against the release. Whatever layout you choose, the test worth having
+is the one that compares to the target convention, not to itself.
+
+What A does not fix is `config.json`. The serve reads `dspark_block_size`, `dspark_markov_rank`,
+`dspark_noise_token_id`, `dspark_target_layer_ids`, `sliding_window` and
+`eagle_aux_hidden_state_layer_ids`, and every one of them fails *silently* when absent — a
+missing `dspark_noise_token_id` fills the mask slots with token 0 and quietly caps acceptance;
+missing aux layer ids fall back to EAGLE3's four, which is a dimension mismatch against a
+three-layer `main_proj`. This is the same gap as the `algos.py` note below, and it is the part
+that still needs a vLLM-side change whichever layout wins.
+
 We would still rather you chose than we did, because it is a convention question about your
 library. And one thing about A deserves saying out loud rather than being discovered later:
 it propagates a prefix that upstream is currently fighting (#52165 above), into checkpoints
