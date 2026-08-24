@@ -1,7 +1,8 @@
 # DRAFT — Design: DeepSeek-V4-Flash DSpark draft model (NOT SENT)
 
 > 状态:草稿,给用户过目用。按 [[no-community-push]] 不外发。
-> 依赖 [DRAFT-design-1-expert-parallel-training.md](./DRAFT-design-1-expert-parallel-training.md)。
+> 2026-08-24 修订:按 @shanjiaz(#952,拆成两份独立设计)与 @zihanlin-ai(#952,五条下游经验)。
+> **不再依赖** [DRAFT-design-1](./DRAFT-design-1-expert-parallel-training.md) —— 见「Standing on its own」。
 
 ---
 
@@ -44,11 +45,60 @@ The result is 3 layers but ~21B total parameters, ~1.5B active per token.
 Three lines in `models/__init__.py` (registration). Nothing else — no shared file is modified
 by this proposal.
 
+## Standing on its own — thanks to @zihanlin-ai
+
+An earlier version of this said the model could not be trained upstream without the
+expert-parallel proposal, and offered that as an honest limitation. @zihanlin-ai pointed out
+(#952) that a first-class **experts-frozen** switch removes the dependency, and they are
+right — that is a better design than the one we brought.
+
+With the routed experts frozen (train attention, mHC, Markov head, confidence head and the
+projections only), there is nothing to shard: every rank holds the same read-only expert
+weights and ordinary FSDP over the trainable remainder is enough. So this proposal now ships
+
+```
+--freeze-experts        routed experts require_grad=False, excluded from the optimizer
+                        ⟹ no EP, no all-to-all, no new FSDP hooks. Plain upstream recipe.
+```
+
+**Two things we should be straight about.** First, the memory does not disappear, it only
+stops being sharded: ~21B parameters of frozen bf16 experts is ~42 GB resident per rank, so
+this is an 80 GB-class recipe, not a laptop one. Second, **we have not trained this way** —
+every number below comes from full-expert EP training, and we are not going to claim a frozen
+run reaches the same acceptance length when we have not measured it. What the switch buys is
+that the model definition becomes reviewable and runnable on its own, which is what was asked
+for; the EP proposal then becomes what makes *full* expert training practical rather than
+what makes this model usable at all.
+
+## Two of @zihanlin-ai's observations match ours independently
+
+Worth saying explicitly, because independent confirmation from a different verifier family is
+stronger evidence than either of us has alone:
+
+**Routing collapse at initialization.** They saw deep draft slots using 13–22 of 256 experts.
+We measured the same shape on DSV4 — normalized entropy falling to ~0.52 in the last layer,
+about 14 effective experts of 256 — and it is invisible in the loss curve, exactly as they
+say. We already ship the counters they ask for (per-layer used/dead expert counts, normalized
+entropy, and the hot-expert set across steps so a *fixed* collapsed subset can be told apart
+from a rotating one, which per-step entropy alone cannot). This proposal makes them a
+documented feature rather than a debug flag.
+
+**Initialization lineage.** They audited the released V4 DSpark weights and found detectable
+MTP lineage only in Flash-family layer 0. We arrived at the same place from a different
+direction: the released draft's router `gate.bias` is balanced only in layer 0 and left
+untouched elsewhere, yet it scores 4.42 — which told us that neither collapse nor MTP
+inheritance is the binding constraint. So `--init-layer-from-target` stays **opt-in beside a
+from-scratch default**, not the recommended path.
+
+Their remaining three points (DDP router dropping out of the autograd graph, fp32 sharded
+originals per #711, and the two training regimes) bear on the EP design and are answered in
+[DRAFT-design-1](./DRAFT-design-1-expert-parallel-training.md).
+
 ## Relationship to the EP proposal
 
-**(2) cannot be trained upstream without (1).** The 256-expert backbone does not fit a pure
-FSDP recipe. We would rather say that plainly than land a model definition that nobody can
-train.
+With `--freeze-experts` the two are independent and can be reviewed in either order. EP is
+what makes **full** expert training practical: pure FSDP all-gathers every expert on every
+rank on every step when each token needs 8 of them.
 
 There is one boundary we would like your call on. Three files in `backbone/` are
 parallelism, not modelling:

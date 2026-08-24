@@ -2,6 +2,7 @@
 
 > 状态:草稿,给用户过目用。按 [[no-community-push]] 不外发。
 > 事实依据均已对**真上游** `vllm-project/speculators@main` 核实(merge-base 2026-07-17)。
+> 2026-08-24 修订:按 @shanjiaz(#952,拆成两份独立设计)与 @zihanlin-ai(#952)。
 
 ---
 
@@ -93,6 +94,37 @@ class-name string is not a contract. Options we see:
 (3) is the smallest and we lean toward it, but you have more context on where this lands
 relative to other parallelism work. If expert parallelism is already planned in some other
 shape, we would rather adapt to it than land a second mechanism.
+
+## Three points raised by @zihanlin-ai (#952)
+
+They raised five observations from training an MoE drafter downstream; two bear on the model
+definition and are answered there. These three are ours.
+
+**Two training regimes — and this proposal is only needed for one of them.** They are right,
+and it changed the shape of the pair: with routed experts frozen, every rank holds the same
+read-only weights, there is nothing to shard, and plain FSDP over the trainable remainder is
+enough. The companion model proposal now ships `--freeze-experts` and no longer depends on
+this one. **So the question here is narrower than it was**: this is what makes *full* expert
+training practical, not what makes an MoE draft trainable at all. If the project would rather
+have the model first and decide about EP later, that is now a coherent choice.
+
+**The router dropping out of the autograd graph.** Their case is plain DDP, which hangs
+without `find_unused_parameters=True`. We have not hit it, and we think the reason is that
+the recipe here is FSDP2 (`fully_shard`), which does not have DDP's all-params-must-be-used
+requirement — so we would rather say "not observed on this path" than claim it cannot happen.
+The related thing that *is* real under EP: on any given step a rank-local expert can receive
+zero tokens and therefore get no gradient at all. That is normal and dropless routing does
+not prevent it; what it means is that an optimizer or clipping implementation must tolerate a
+`None` gradient on a parameter that is otherwise perfectly live. Keeping the local slice as a
+`Shard(0)` DTensor rather than a plain tensor is what makes that a non-event here, because
+nothing downstream has a plain-vs-DTensor branch to get it wrong in.
+
+**fp32 sharded originals (#711).** Agreed, and more so under EP than they may realize. With
+256 experts and top-8 routing, an individual expert sees roughly 1/32 of the tokens, so its
+gradients are correspondingly smaller — exactly the regime where a bf16 master weight
+silently swallows the update. #711 having already moved upstream to fp32 originals plus
+autocast is the right foundation; this proposal adds one knob on top of it (below) rather
+than a second precision story.
 
 ## Footprint
 
