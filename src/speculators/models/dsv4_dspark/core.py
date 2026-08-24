@@ -519,7 +519,10 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         # statically parses this file's RELATIVE imports to bundle them for trust_remote_code
         # and mishandles ``from .backbone ...`` (looks for backbone.py) -> save_pretrained
         # crashes at checkpoint time. Keep backbone imports absolute.
-        from speculators.models.dsv4_dspark.backbone import moe_ep  # noqa: PLC0415
+        try:
+            from speculators.models.dsv4_dspark.backbone import moe_ep  # noqa: PLC0415
+        except ImportError:  # a build without the expert-parallel module is not EP
+            return False
         return moe_ep._EP is not None and moe_ep._EP.size > 1
 
     def fsdp_ignored_params(self) -> set:

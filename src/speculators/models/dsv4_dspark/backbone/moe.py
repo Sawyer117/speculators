@@ -238,9 +238,14 @@ class MoE(nn.Module):
         # (n_routed_experts // EP), seeded per-rank. self.experts.num_local_experts is the
         # local count; ep_expert_offset maps local idx -> global expert id. Non-EP builds
         # all n_routed_experts.
-        from . import moe_ep  # noqa: PLC0415  (function-local: reads the live EP context)
+        # Function-local, and optional: it reads the live EP context, and a build without
+        # the expert-parallel module is simply not expert-parallel.
+        try:
+            from . import moe_ep  # noqa: PLC0415
 
-        ep = moe_ep._EP
+            ep = moe_ep._EP
+        except ImportError:
+            ep = None
         if ep is not None and ep.size > 1:
             n_local = cfg.n_routed_experts // ep.size
             self.ep_expert_offset = ep.rank * n_local

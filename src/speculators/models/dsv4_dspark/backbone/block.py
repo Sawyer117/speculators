@@ -20,7 +20,6 @@ import torch
 from torch import nn
 
 from .attention import LatentAttention
-from .block_conv import GroupedDynamicCausalConv
 from .hyper import HyperConnection, place
 from .moe import MoE
 from .norm import RMSNorm
@@ -70,9 +69,13 @@ class MhcDecoderBlock(nn.Module):
         # first step matches a run without them.
         ks = getattr(cfg, "block_conv_kernel_size", 0)
         gs = getattr(cfg, "block_conv_group_size", 16)
-        self.attn_conv: GroupedDynamicCausalConv | None = None
-        self.ffn_conv: GroupedDynamicCausalConv | None = None
+        self.attn_conv: nn.Module | None = None
+        self.ffn_conv: nn.Module | None = None
         if ks > 0:
+            # Imported here, not at module scope: the convolution is an opt-in variant, so
+            # the block must build without it present.
+            from .block_conv import GroupedDynamicCausalConv  # noqa: PLC0415
+
             self.attn_conv = GroupedDynamicCausalConv(cfg.hidden_size, ks, gs)
             self.ffn_conv = GroupedDynamicCausalConv(cfg.hidden_size, ks, gs)
 
