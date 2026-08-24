@@ -398,6 +398,12 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
     base_recs, base_ck, _, _ = _load_and_skip(baseline_path, skip, quiet=True)
     if not base_recs:
         raise SystemExit(f"baseline has no metrics: {baseline_path}")
+    # ⚠ The baseline needs the same "did it get there?" guard the arms have. _at() returns the
+    # last point at or before S, so sampling past the baseline's own end silently compares an
+    # arm's step-80000 value against the baseline's step-38931 ENDPOINT -- every step the arm
+    # ran beyond the baseline's reach is then counted as lead. That is not a small distortion;
+    # it is the difference between "our change works" and "our baseline is shorter".
+    base_last = max(step_of(x) for x in base_recs)
     loaded = []
     for name, path in arms:
         r, ck, _, _ = _load_and_skip(path, skip, quiet=True)
@@ -417,7 +423,7 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
 
     print()
     print("=" * 78)
-    print(f" LEAD SCAN   共同基线 = {os.path.basename(baseline_path)}")
+    print(f" LEAD SCAN   共同基线 = {os.path.basename(baseline_path)}  (跑到 {base_last} 步)")
     print("=" * 78)
     base_series = _mono_series(base_recs)
     if not base_series:
@@ -438,6 +444,12 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
     arm_last = {name: max(step_of(x) for x in recs) for name, recs, _ in loaded}
     trend = {name: [] for name, _, _ in loaded}
     for S in at_steps:
+        if S > base_last:
+            print()
+            print(f"  ── @ step ≤ {S}   ⚠ 跳过:基线只跑到 {base_last} 步 ──")
+            print(f"     在基线终点之外采样 = 拿基线的终点和臂的当前值比,"
+                  f"臂多跑的 {S - base_last} 步会被整个算成领先。")
+            continue
         bv = _at(base_series, S)
         if bv is None:
             continue
