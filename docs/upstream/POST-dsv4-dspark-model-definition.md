@@ -7,7 +7,7 @@
 Add a `dsv4_dspark` speculator: the DSpark algorithm (block drafting, a Markov transition
 head, a confidence head) on a draft whose backbone mirrors DeepSeek-V4-Flash's decoder layer.
 
-It is a pure addition — one new directory, **+2622 lines across 15 files, zero deletions**,
+It is a pure addition — one new directory, **~1940 lines across 11 files, zero deletions**,
 plus three lines of registration in `models/__init__.py`. No shared file is modified.
 
 ```
@@ -16,9 +16,18 @@ models/dsv4_dspark/
   backbone/
     attention.py 176   moe.py       268     block.py     102
     hyper.py     117   rotary.py    105     norm.py       48
-    kernels.py    95   moe_ep.py    177     moe_grouped_gemm.py 248
-    moe_compile.py 120
 ```
+
+**Deliberately not in this proposal.** Our tree has four more files under `backbone/` —
+expert-parallel dispatch, a grouped GEMM over the stacked expert weights, a kernel registry,
+and a `torch.compile` wrapper for the expert path (~640 lines together). None of them are
+modelling, and none are needed for this model to be correct: the expert compute here is the
+plain-PyTorch reference, and the model runs on any accelerator with no vendor code involved.
+
+The dispatch belongs to the companion expert-parallel design. The other three are an
+accelerator story with its own API surface and its own precedent question, and folding them
+in here would be a second proposal riding along inside the first. We would rather land the
+model on its own merits and bring that up separately, if there is interest at all.
 
 ## It no longer depends on the expert-parallel proposal
 
@@ -86,45 +95,20 @@ draft's router `gate.bias` is balanced only in layer 0 and left untouched elsewh
 scores 4.42 acceptance length. Neither routing collapse nor MTP inheritance is the binding
 constraint, so neither should be the default.
 
-## The boundary we would like your call on
+## Performance, stated plainly
 
-Three files under `backbone/` are parallelism and performance, not modelling:
+The expert compute in this proposal is a straightforward reference implementation: correct,
+portable, and not fast. We are not going to quote a speedup here, because the only clean
+measurement we have is of a different thing — wrapping the expert path in `torch.compile`
+came out at about 1.74x on our hardware — and we have not yet benchmarked a fused grouped
+GEMM against this reference. Quoting the first number as though it were the second is exactly
+the kind of thing that should not go in a design document.
 
-```
-moe_ep.py            177    expert-parallel dispatch / all-to-all
-moe_grouped_gemm.py  248    grouped GEMM over the stacked expert weights
-moe_compile.py       120    torch.compile wrapper for the expert path
-```
-
-Removing them leaves ~2077 lines of pure modelling code, a much easier diff. Our reading of
-how this project already handles the question:
-
-| | lines | proposed home |
-|---|---:|---|
-| `moe_ep.py` (expert-parallel all-to-all) | 177 | in-tree — zero `torch_npu`, plain `torch.distributed` |
-| kernel registry + plugin point | ~110 | in-tree — no vendor name appears in it |
-| `_grouped_matmul_torch` (reference implementation, and the parity oracle) | ~30 | in-tree |
-| the NPU half of `moe_grouped_gemm.py` | ~200 | out-of-tree bridge |
-| `moe_compile.py` | 120 | out-of-tree bridge |
-
-The reasoning is your own precedent. #775 ("opt-in `transfer_to_npu`") was closed unmerged
-for putting a vendor shim in `src/`; #589 ("selectable attention backend") merged because it
-solved the same class of problem — flex attention unavailable on some accelerators — with a
-portable option instead. `src/` today has zero direct `torch_npu` calls and zero `is_cuda`
-branches, going through `torch.accelerator` throughout. We read that as: portable in, vendor
-out.
-
-So the model ships a registry with a pure-torch reference for every heavy op, resolved at
-call time, and **is correct with zero accelerated kernels registered**. The reference is also
-the parity oracle those kernels are validated against, which means nobody needs the hardware
-to work on this code.
-
-One request attached to that: shipping only an interface leaves an accelerator user having to
-import a bridge by hand, and an install that forgets is correct but quietly slower with
-nothing saying so. A ~15-line `discover_plugins()` scanning a `speculators.kernels` entry
-point group makes `pip install` the whole story, with no vendor name in the scanning code and
-no behaviour change when no such distribution is installed. Happy to fold it in here or send
-it separately, whichever you prefer.
+What we can say without hedging: nothing in this proposal is vendor-specific, it runs on any
+accelerator, and the reference is also the oracle any faster implementation would be
+validated against. If the project ever wants an in-tree way for accelerators to plug in, we
+have an opinion and some working code, and we would bring it as its own proposal where it can
+be judged on its own.
 
 ## Serving
 
@@ -163,6 +147,8 @@ The run is fully annealed (cosine to zero at 5 epochs) and the last three checkp
 1. **Does the project want a model this size in-tree at all?** It is a pure addition, but
    2622 lines is a maintenance commitment. A plausible alternative is that DSV4-scale drafts
    live out-of-tree and speculators owns only the mechanisms. We would not argue against it.
-2. **The `backbone/` boundary above** — which of those three files, if any, belong in-tree.
+2. **Is the reference expert implementation acceptable in-tree**, given it is portable and
+   correct but not fast? We think yes for a first landing, and that performance is a separate
+   conversation, but it is your call whether a slow path is worth having.
 3. **Whether `--freeze-experts` should be the documented default** for anyone reproducing
    this without expert-parallel hardware, given we have not measured its quality.

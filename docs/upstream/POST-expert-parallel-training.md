@@ -97,6 +97,16 @@ trade, off by default, and it exists because on 64 GB-class devices the fp32 ori
 256 experts do not fit alongside everything else. On larger memory it should stay off, for
 the reason in the paragraph above.
 
+## What the model proposal leaves to this one
+
+The companion model design deliberately ships only portable modelling code — the expert
+compute there is a plain-PyTorch reference. The expert-parallel dispatch (~180 lines of
+`torch.distributed` all-to-all, no vendor code) is not modelling and belongs here rather than
+there, so it comes with this proposal if this proposal is wanted.
+
+Accelerated kernels are in neither: they are an accelerator story with its own API surface,
+and we would rather bring that separately than have it ride along inside either of these.
+
 ## Footprint
 
 The change to shared code is small and additive: `apply_fully_sharded()` gains an optional
