@@ -550,8 +550,21 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
         at = ser[-1][0]
         verdict = "—"
         if band is not None:
-            verdict = ("**超出误差带 ⟹ 真有差异**" if abs(tail) > band
-                       else "在误差带内 ⟹ 无法区分")
+            # ⚠ Significance is not worth. A paired band lands around +/-0.005, so almost any
+            # systematic difference clears it -- and reading "**真有差异**" as "ship it" is
+            # exactly the trap a tighter ruler creates. State the magnitude against something
+            # real: at concurrency 1 a codebook-reading head must buy +0.03..0.27 tokens to
+            # pay for its own memory traffic (worklog 12.1). A head that costs nothing
+            # sequential -- the block convolution -- has a much lower bar, so the economics
+            # are per-arm and this only flags the common case.
+            if abs(tail) <= band:
+                verdict = "带内 ⟹ 与基线无异"
+            elif abs(tail) < 0.03:
+                verdict = f"显著但微小(<0.03 回本线) ⟹ **别据此上线**"
+            else:
+                verdict = "★ 显著且过回本线量级"
+            if abs(head) > abs(tail) * 1.3:
+                verdict += f"；且在衰减 {head:+.4f}→{tail:+.4f}"
         print(f"    {name:<12} @{at:<6} 末段 {tail:+.4f} ± {band:.4f}   (早段 {head:+.4f})   {verdict}"
               if band is not None else
               f"    {name:<12} @{at:<6} 末段 {tail:+.4f}   (早段 {head:+.4f})")
