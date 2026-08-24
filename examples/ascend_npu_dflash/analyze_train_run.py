@@ -418,7 +418,7 @@ def _lead_steps(base_series, arm_value, at_step):
     return (s0 + frac * (s1 - s0)) - at_step, False
 
 
-def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
+def _lead_scan(baseline_path, arms, at_steps, skip, spike_k, max_step=0):
     """Compare N experiment arms against ONE shared baseline, at several matched step counts.
 
     Two arms' deltas over a common baseline are comparable only when measured over the same
@@ -426,7 +426,12 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
     EVOLVES. So this samples a ladder of step counts and reports, per arm, the raw delta and
     the delta expressed as an equivalent head start in steps.
     """
-    base_recs, base_ck, _, _ = _load_and_skip(baseline_path, skip, quiet=True)
+    # ⚠ max_step must reach BOTH the baseline and every arm. Arms run to different lengths
+    # and the paired gains DECAY, so an untruncated comparison reads each arm at whatever step
+    # it happens to have reached -- which flatters the short ones. Before this was wired up the
+    # flag was accepted and silently ignored: the paired section still reported CONV at 81737
+    # and CORRECTION at 38931 while the user had asked for 26320.
+    base_recs, base_ck, _, _ = _load_and_skip(baseline_path, skip, quiet=True, max_step=max_step)
     if not base_recs:
         raise SystemExit(f"baseline has no metrics: {baseline_path}")
     # ⚠ The baseline needs the same "did it get there?" guard the arms have. _at() returns the
@@ -437,7 +442,7 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
     base_last = max(step_of(x) for x in base_recs)
     loaded = []
     for name, path in arms:
-        r, ck, _, _ = _load_and_skip(path, skip, quiet=True)
+        r, ck, _, _ = _load_and_skip(path, skip, quiet=True, max_step=max_step)
         if not r:
             print(f"  ⚠ 跳过 {name}: 无指标 ({path})")
             continue
@@ -454,7 +459,8 @@ def _lead_scan(baseline_path, arms, at_steps, skip, spike_k):
 
     print()
     print("=" * 78)
-    print(f" LEAD SCAN   共同基线 = {os.path.basename(baseline_path)}  (跑到 {base_last} 步)")
+    print(f" LEAD SCAN   共同基线 = {os.path.basename(baseline_path)}  (跑到 {base_last} 步)"
+          + (f"   [--max-step {max_step}: 各臂已截齐]" if max_step else ""))
     print("=" * 78)
     base_series = _mono_series(base_recs)
     if not base_series:
@@ -1392,7 +1398,7 @@ def main() -> None:
                 raise SystemExit(f"--arm wants NAME=LOG, got {a!r}")
             n, _, p = a.partition("=")
             pairs.append((n, p))
-        _lead_scan(args.baseline[0], pairs, args.at, args.skip, args.spike_k)
+        _lead_scan(args.baseline[0], pairs, args.at, args.skip, args.spike_k, args.max_step)
         return
 
     recs, ckpt_steps, steps_per_epoch, raw_text = _load_and_skip(
