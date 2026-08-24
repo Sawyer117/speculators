@@ -53,17 +53,31 @@ Two things we should be straight about:
 - **We have not trained this way.** Every number below comes from full-expert EP training. We
   are not going to attach an acceptance-length claim to a regime we have not measured.
 
-## Why the architecture is what it is
+## Why this needs its own model definition
 
-The draft's job is to guess what the target will say. Each choice below exists because the
-target has it:
+A draft mirrors its target — that part needs no defending. The question worth answering is
+why ~1940 lines rather than a config on top of something that exists.
 
-| | why |
-|---|---|
-| MLA with q/o dual LoRA, per-head attention sinks | the target's attention is MLA; a draft with ordinary MHA has to learn a different function of the same hidden states |
-| manifold-constrained hyper-connections instead of a plain residual stream | same reason |
-| 256 routed + 1 shared expert per layer | the released DeepSeek draft has this shape and reproducing its acceptance length was the bar |
-| full 129,280 vocabulary, no draft-vocab reduction | the released draft does not reduce, and a reduced head trains a mapping the target never uses |
+**The attention is not expressible by any fused path.** The draft's MLA carries a per-head
+learnable *sink*: a synthetic key whose logit is added to the softmax denominator,
+`p_j = exp(s_j) / (Σ exp(s_j) + exp(sink))`. SDPA has no way to say that, and neither does
+any flash-style kernel — the sink is not a mask, a bias, or an extra key that can be
+concatenated, it is a term the normalization has to know about. So the reference here is an
+eager einsum with fp32 accumulation rather than a call into `scaled_dot_product_attention`,
+and that alone rules out reuse of every attention module in the ecosystem.
+
+**The attention pattern is a block drafter's, not a decoder's.** Queries are the gamma-wide
+draft block, attending non-causally within the block and over a sliding window of target
+context, with no KV cache at all (training is teacher-forced from target hidden states).
+HF's DeepSeek-V4 module is a causal decoder with a cache and the target's own sparse
+attention; it answers a different question and cannot be pointed at this one.
+
+**Everything else follows from the target and could not be shrunk.** MLA with q/o dual LoRA,
+manifold-constrained hyper-connections in place of the residual stream, 256 routed + 1 shared
+expert per layer with `sqrtsoftplus` scoring and `noaux_tc` top-k, and the full 129,280
+vocabulary with no draft-vocab reduction. We did not try smaller shapes: the released
+DeepSeek draft has this shape and matching its acceptance length was the bar. A reduced vocab
+head in particular trains a mapping the target never uses.
 
 Three layers, ~21B total parameters, ~1.5B active per token.
 
