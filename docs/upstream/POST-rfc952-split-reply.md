@@ -19,20 +19,23 @@ proposal now ships `--freeze-experts`. So the pair can be reviewed in either ord
 That also narrows the second proposal honestly: expert parallelism is what makes *full*
 expert training practical, not what makes an MoE draft trainable at all.
 
-**1. [DSV4-Flash DSpark draft model definition](#)** — one new directory, ~2090 lines across
+**1. DSV4-Flash DSpark draft model definition** (next comment) — one new directory, ~2090 lines across
 11 files, zero deletions, plus twenty lines in two shared files: three lines of registration
 in `models/__init__.py`, and an optional hook in `train/checkpointer.py` that lets a model
 translate its own on-disk layout when a run resumes. A model that does not define the hook
 gets back the object it was passed; that is a test, not a claim.
 
-**2. [Expert-parallel training for MoE drafts](#)** — three optional model-side hooks and one
+**2. Expert-parallel training for MoE drafts** (comment after that) — three optional
+model-side hooks and one
 `DeviceMesh` parameter on `apply_fully_sharded()`. A model that defines none of them gets
 exactly today's behaviour. The two coupling points to the model are currently duck-typed and
 neither imports our model:
 
 ```python
-distributed.py:250   if type(module).__name__ != "GroupedExperts":
-trainer.py:341       _ep_local = getattr(self.model, "ep_local_param_keys", None)
+# train/distributed.py
+if type(module).__name__ != "GroupedExperts":
+# train/trainer.py
+_ep_local = getattr(self.model, "ep_local_param_keys", None)
 ```
 
 The mechanism is model-agnostic already; what the design adds is a real contract in place of
