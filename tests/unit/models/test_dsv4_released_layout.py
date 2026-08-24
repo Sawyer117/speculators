@@ -181,3 +181,64 @@ def test_experts_are_stacked_in_the_module_and_per_expert_on_disk(tmp_path, regi
     on_disk = saved_keys(tmp_path)
     assert "layers.0.ffn.experts.w1" not in on_disk
     assert sum(1 for k in on_disk if k.startswith("mtp.0.ffn.experts.")) == N_EXPERTS * 3
+
+
+@pytest.mark.smoke
+def test_resume_reads_back_the_layout_it_wrote(tmp_path, registered):
+    """The trainer resumes from raw safetensors keys, not through `from_pretrained`."""
+    from speculators.train.checkpointer import (
+        check_resume_loaded,
+        load_safetensors_state_dict,
+        state_dict_from_checkpoint,
+    )
+
+    trained = tiny_model()
+    trained.save_pretrained(tmp_path)
+
+    raw = load_safetensors_state_dict(tmp_path / "model.safetensors", "cpu")
+    assert any(k.startswith("mtp.") for k in raw), "expected the released layout on disk"
+
+    resumed = tiny_model()  # different seed path: parameters must actually be overwritten
+    for param in resumed.parameters():
+        torch.nn.init.zeros_(param)
+    converted = state_dict_from_checkpoint(resumed, raw)
+    incompatible = resumed.load_state_dict(converted, strict=False)
+    check_resume_loaded(incompatible, converted, tmp_path)
+
+    shared = {"verifier_lm_head.weight", "verifier_norm.weight"}
+    for key, value in trained.state_dict().items():
+        if key in shared:
+            continue
+        assert torch.equal(value, resumed.state_dict()[key]), key
+
+
+@pytest.mark.smoke
+def test_a_resume_that_loads_nothing_is_refused(tmp_path):
+    """strict=False is needed for the verifier weights; it must not hide a total mismatch."""
+    from speculators.train.checkpointer import check_resume_loaded
+
+    class Incompatible:
+        unexpected_keys = ["mtp.0.attn.wq_a.weight", "mtp.0.attn_norm.weight"]
+
+    with pytest.raises(RuntimeError, match="random initialisation"):
+        check_resume_loaded(Incompatible(), dict.fromkeys(Incompatible.unexpected_keys), tmp_path)
+
+    # a partial mismatch is a warning, not a refusal
+    check_resume_loaded(Incompatible(), dict.fromkeys(["a", "b", "c"]), tmp_path)
+
+
+@pytest.mark.smoke
+def test_module_layout_checkpoints_still_load(tmp_path, registered):
+    """Every checkpoint written before this mapping existed uses module names with the
+    experts stacked. Those keys match no rule, so they pass through and still load."""
+    from safetensors.torch import save_file
+
+    trained = tiny_model()
+    shared = {"verifier_lm_head.weight", "verifier_norm.weight"}
+    state = {k: v for k, v in trained.state_dict().items() if k not in shared}
+    save_file({k: v.contiguous() for k, v in state.items()}, tmp_path / "model.safetensors")
+    trained.config.save_pretrained(tmp_path)
+
+    reloaded = DSV4DSparkDraftModel.from_pretrained(tmp_path)
+    for key, value in state.items():
+        assert torch.equal(value, reloaded.state_dict()[key]), key

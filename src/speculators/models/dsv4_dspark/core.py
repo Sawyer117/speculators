@@ -33,6 +33,7 @@ from speculators.models.dspark.core import DSparkDraftModel
 # config module's RELATIVE imports to bundle them for trust_remote_code, and
 # mishandles two-level ones (``from .backbone.block`` -> looks for the file
 # ``backbone.block.py``). Absolute imports are not parsed, so save_pretrained works.
+from speculators.models.dsv4_dspark import checkpoint_mapping
 from speculators.models.dsv4_dspark.backbone.block import MhcDecoderBlock
 from speculators.models.dsv4_dspark.backbone.hyper import HyperHead
 from speculators.models.dsv4_dspark.backbone.rotary import precompute_freqs_cis
@@ -160,6 +161,28 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             persistent=False,
         )
         self._init_backbone_params()
+
+        # The released layout puts the conditioning projection on the first stage and the
+        # heads on the last, which a rule can only express with a concrete index. The
+        # module-level registration below covers the released depth; a draft of another
+        # depth re-registers for its own.
+        if bb.n_draft_layers != checkpoint_mapping.RELEASED_N_LAYERS:
+            checkpoint_mapping.register(n_layers=bb.n_draft_layers)
+
+    def state_dict_from_checkpoint(self, state_dict: dict) -> dict:
+        """Translate a released-layout checkpoint back into our module names.
+
+        ``save_pretrained`` writes the released ``mtp.*`` layout so vLLM can load our
+        checkpoints unconverted, but the trainer resumes by reading the safetensors
+        directly, against parameters named ``layers.*``. Without this the raw keys match
+        nothing and ``strict=False`` makes that silent. Checkpoints already in module
+        layout (anything saved before this, or with the mapping unavailable) pass through.
+        """
+        if not checkpoint_mapping.is_released_layout(state_dict):
+            return state_dict
+        return checkpoint_mapping.to_module_layout(
+            state_dict, n_layers=self.backbone_cfg.n_draft_layers
+        )
 
     @classmethod
     def from_training_args(
@@ -754,3 +777,9 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         while mask.dim() > 3:
             mask = mask.squeeze(1)
         return mask
+
+
+# Registering at import is what makes ``save_pretrained`` write the released layout and
+# ``from_pretrained`` read it, with no converter in between. It is a no-op for every other
+# model, and degrades to "checkpoints keep module names" if the transformers API moves.
+checkpoint_mapping.register()

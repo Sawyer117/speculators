@@ -66,11 +66,14 @@ RELEASED_N_LAYERS = 3
 # module moved between 4.x and 5.x. Failing to register must degrade to "checkpoints stay in
 # module-name layout", never to an import error at model-registration time.
 try:
+    import torch
     from transformers.conversion_mapping import register_checkpoint_conversion_mapping
     from transformers.core_model_loading import (
         MergeModulelist,
         WeightConverter,
         WeightRenaming,
+        dot_natural_key,
+        rename_source_key,
     )
 
     _AVAILABLE = True
@@ -156,3 +159,40 @@ def register(
         logger.warning("could not register the DSV4-DSpark checkpoint mapping: %s", exc)
         return False
     return True
+
+
+def is_released_layout(state_dict: dict) -> bool:
+    """Released-layout checkpoints put every stage under ``mtp.``; ours use ``layers.``."""
+    return any(key.startswith("mtp.") for key in state_dict)
+
+
+def to_module_layout(state_dict: dict, n_layers: int = RELEASED_N_LAYERS) -> dict:
+    """Released layout -> module names, applying the SAME rules in the load direction.
+
+    ``save_pretrained`` writes the released layout and ``from_pretrained`` reads it, but the
+    trainer resumes by reading the safetensors directly and calling ``load_state_dict`` /
+    ``set_model_state_dict`` on the raw keys. Those see ``mtp.*`` against a model whose
+    parameters are ``layers.*``, and both are called with ``strict=False`` -- so without this
+    a resume loads NOTHING and silently continues from random initialisation.
+
+    This is not a second copy of the mapping: it runs the rule objects from
+    :func:`build_mapping` through ``transformers``' own ``rename_source_key``.
+    """
+    if not _AVAILABLE:
+        return state_dict
+    rules = build_mapping(n_layers)
+    renamings = [r for r in rules if not isinstance(r, WeightConverter)]
+    converters = [r for r in rules if isinstance(r, WeightConverter)]
+
+    converted: dict = {}
+    to_stack: dict[str, list] = {}
+    # dot_natural_key, not sorted(): experts must stack 0,1,2,...,10 not 0,1,10,2.
+    for key in sorted(state_dict, key=dot_natural_key):
+        new_key, matched_converter = rename_source_key(key, renamings, converters)
+        if matched_converter is None:
+            converted[new_key] = state_dict[key]
+        else:
+            to_stack.setdefault(new_key, []).append(state_dict[key])
+    for key, tensors in to_stack.items():
+        converted[key] = torch.stack(tensors, dim=0)  # what MergeModulelist(dim=0) does
+    return converted
