@@ -87,12 +87,17 @@ Three layers, ~21B total parameters, ~1.5B active per token.
 ## Two more of @zihanlin-ai's model-side points
 
 **Expert-utilization counters.** Asked for in the model definition from day one, because
-routing collapse is invisible in the loss curve. We have them — per-layer used/dead counts,
-normalized entropy, effective expert count, and the hot-expert set across steps so a *fixed*
-collapsed subset can be told apart from a rotating one — and this proposal makes them a
-documented feature rather than a debug flag. Their 13–22 of 256 matches what we measured on a
-different verifier family (~14 effective of 256), which is worth more than either number
-alone.
+routing collapse is invisible in the loss curve. This proposal has them as a documented
+feature rather than a debug flag: per-layer used/dead counts, normalized entropy, effective
+expert count, and the hot-expert set across steps, so a *fixed* collapsed subset can be told
+apart from a rotating one. **Per-slot is not there** — the counters aggregate over a whole
+forward, and recovering the block position would need the router to see it. Say the word and
+we will add it.
+
+Worth noting that the two of us saw the same shape from opposite directions: they measured
+13–22 of 256 on a different verifier family with the draft layers initialized from the
+verifier's MTP layers; we measured ~14 effective of 256 on DSV4 training from scratch.
+Different setups, same failure mode.
 
 **Initialization.** `--init-from-target attn moe hc norm` (or `all`) stays opt-in beside a
 from-scratch default. They audited the released weights and found MTP lineage only in
@@ -136,9 +141,10 @@ released by DeepSeek live in the target checkpoint's `mtp.*` namespace, and draf
 speculators (Qwen3, Gemma4) use this library's own layout.
 
 The `mtp.*` prefix is a release artifact rather than a statement about the algorithm, and it
-is already causing real trouble upstream. vLLM #52165, open now, opens with: *"DeepSeek-V4-Flash-0731
-and DeepSeek-V4-Pro-0813 do not have MTP heads — their `mtp.*` tensors are DSpark drafters.
-vLLM routes them to `DeepSeekV4MTPModel` anyway and dies deep in the weight loader."*
+is already causing real trouble upstream. vLLM PR #52165 (open, closing issue #52111)
+describes it as: *"DeepSeek-V4-Flash-0731 and DeepSeek-V4-Pro-0813 do not have MTP heads —
+their `mtp.*` tensors are DSpark drafters. vLLM routes them to `DeepSeekV4MTPModel` anyway
+and dies deep in the weight loader."*
 
 **Three ways to go:**
 
