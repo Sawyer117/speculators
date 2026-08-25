@@ -160,23 +160,15 @@ three checkpoints span 0.014 on the five-set mean.
 
 ## Tests
 
-`ruff~=0.15.20` and `mypy~=2.1.0`, the versions `pyproject.toml` pins:
-
 ```
-$ ruff check
-All checks passed!
-
-$ ruff format --check
-224 files already formatted
-
-$ mypy --check-untyped-defs
-no errors in the files this PR adds or touches
-
 $ pytest tests/unit -q
 797 passed, 5 skipped in 3:23
 ```
 
-Eleven of those are new and run on a CPU-sized model in about a second:
+`make quality` passes as well, against the `ruff` and `mypy` versions `pyproject.toml`
+pins.
+
+Eleven of those tests are new and run on a CPU-sized model in about a second:
 
 | test | what it pins |
 |---|---|
