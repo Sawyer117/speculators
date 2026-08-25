@@ -72,29 +72,22 @@ Two things we should be straight about:
 
 ## Why this needs its own model definition
 
-A draft mirrors its target — that part needs no defending. The question worth answering is
-why ~2000 lines of modelling rather than a config on top of something that exists.
+Two things rule out building this on an existing attention module.
 
-**The attention is not expressible by any fused path.** The draft's MLA carries a per-head
-learnable *sink*: a synthetic key whose logit is added to the softmax denominator,
-`p_j = exp(s_j) / (Σ exp(s_j) + exp(sink))`. SDPA has no way to say that, and neither does
-any flash-style kernel — the sink is not a mask, a bias, or an extra key that can be
-concatenated, it is a term the normalization has to know about. So the reference here is an
-eager einsum with fp32 accumulation rather than a call into `scaled_dot_product_attention`,
-and that alone rules out reuse of every attention module in the ecosystem.
+**The per-head sink is a term in the softmax denominator** —
+`p_j = exp(s_j) / (Σ exp(s_j) + exp(sink))`. It is not a mask, a bias, or an extra key,
+so SDPA and every flash-style kernel are unable to express it. The reference here is an
+eager einsum with fp32 accumulation.
 
-**The attention pattern is a block drafter's, not a decoder's.** Queries are the gamma-wide
-draft block, attending non-causally within the block and over a sliding window of target
-context, with no KV cache at all (training is teacher-forced from target hidden states).
-HF's DeepSeek-V4 module is a causal decoder with a cache and the target's own sparse
-attention; it answers a different question and cannot be pointed at this one.
+**The attention pattern is a block drafter's.** Queries are the gamma-wide draft block,
+attending non-causally within the block and over a sliding window of target context,
+with no KV cache — training is teacher-forced from target hidden states. HF's
+DeepSeek-V4 module is a causal decoder with a cache; it answers a different question.
 
-**Everything else follows from the target and could not be shrunk.** MLA with q/o dual LoRA,
-manifold-constrained hyper-connections in place of the residual stream, 256 routed + 1 shared
-expert per layer with `sqrtsoftplus` scoring and `noaux_tc` top-k, and the full 129,280
-vocabulary with no draft-vocab reduction. We did not try smaller shapes: the released
-DeepSeek draft has this shape and matching its acceptance length was the bar. A reduced vocab
-head in particular trains a mapping the target never uses.
+The rest follows from the target: MLA with q/o dual LoRA, hyper-connections in place of
+the residual stream, 256 routed + 1 shared expert per layer, and the full 129,280
+vocabulary. We did not try smaller shapes — the released draft has this one, and
+matching its acceptance length was the bar.
 
 Three layers, ~21B total parameters, ~1.5B active per token.
 
