@@ -7,21 +7,22 @@
 Add a `dsv4_dspark` speculator: the DSpark algorithm (block drafting, a Markov transition
 head, a confidence head) on a draft whose backbone mirrors DeepSeek-V4-Flash's decoder layer.
 
-One new directory, **2183 lines across 12 files, zero deletions**.
+One new directory, **2072 lines across 12 files**, plus 334 lines of tests. Zero
+deletions anywhere.
 
 ```
 models/dsv4_dspark/
-  __init__.py   18   config.py   139   core.py   886   checkpoint_mapping.py  259
+  __init__.py   19   config.py   130   core.py   823   checkpoint_mapping.py  242
   backbone/
-    __init__.py 17   attention.py 182  moe.py    329   block.py   64
-    hyper.py   120   rotary.py    120  norm.py    49
+    __init__.py 16   attention.py 171  moe.py    321   block.py   70
+    hyper.py   119   rotary.py    112  norm.py    49
 ```
 
-Two shared files are touched, by 20 lines between them, with no deletions and no
-behaviour change for any other model: three lines of registration in `models/__init__.py`,
-and in `train/checkpointer.py` an optional hook that lets a model translate its own
-on-disk layout when a run resumes. A model that does not define the method gets back the
-object it was passed — that is a test, not a claim.
+Three shared files are touched, by 27 lines between them and with no behaviour change
+for any other model: three lines of registration in `models/__init__.py`, one flag in
+`train/config/schema.py`, and in `train/checkpointer.py` an optional hook that lets a
+model translate its own on-disk layout when a run resumes. A model that does not define
+the hook gets back the object it was passed — that is a test, not a claim.
 
 **Deliberately not in this proposal.** Our tree carries four more files under `backbone/`
 — expert-parallel dispatch, a grouped GEMM over the stacked expert weights, a kernel
@@ -231,8 +232,9 @@ The run is fully annealed (cosine to zero at 5 epochs) and the last three checkp
 
 ## Open questions
 
-1. **What would you want to see before taking ~2000 lines in-tree?** It is a new directory
-   plus twenty lines in two shared files, and it reaches the released DeepSeek draft's
+1. **What would you want to see before taking ~2000 lines in-tree?** It is a new
+   directory plus twenty-seven lines in three shared files, and it reaches the released
+   DeepSeek draft's
    acceptance length on the same serving stack — but it is still code someone has to own.
    What we commit to: maintaining it, keeping it working as the training stack moves, and
    testing it on the hardware we have. If there is a bar for a model this size — a test, a
