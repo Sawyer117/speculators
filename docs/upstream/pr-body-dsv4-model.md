@@ -50,27 +50,19 @@ way: the acceptance numbers below come from runs with both of them enabled.
 
 ## It no longer depends on the expert-parallel proposal
 
-An earlier version of this said the model could not be trained upstream without expert
-parallelism, and offered that as an honest limitation. @zihanlin-ai pointed out that a
-first-class **experts-frozen** switch removes the dependency. They are right, and it is a
-better design than the one we brought, so it is now part of this proposal:
+@zihanlin-ai's suggestion — a first-class experts-frozen switch — removes the dependency.
+Taken:
 
 ```
---freeze-experts     routed experts require_grad=False and are excluded from the optimizer
-                     => nothing to shard, no all-to-all, no new FSDP hooks
+--freeze-experts     routed experts require_grad=False, excluded from the optimizer
 ```
 
-With the routed experts read-only, every rank holds the same weights and ordinary FSDP over
-the trainable remainder (attention, mHC, Markov head, confidence head, projections) is enough.
-The two designs can now be reviewed in either order, and "take the model, decide about EP
-later" is a coherent choice rather than a broken one.
+Nothing left to shard, so the two designs can be reviewed in either order.
 
-Two things we should be straight about:
-
-- **The memory does not disappear, it stops being sharded.** ~21B parameters of frozen bf16
-  experts is ~42 GB resident per rank. This is an 80 GB-class recipe.
-- **We have not trained this way.** Every number below comes from full-expert EP training. We
-  are not going to attach an acceptance-length claim to a regime we have not measured.
+Two caveats. The memory does not go away, it stops being sharded: ~42 GB of frozen bf16
+experts resident per rank, an 80 GB-class recipe. And we have not trained this way — every
+number below is full-expert EP training, and we are not attaching an acceptance-length
+claim to a regime we have not measured.
 
 ## Why this needs its own model definition
 
