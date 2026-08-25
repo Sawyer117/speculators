@@ -21,10 +21,11 @@ models/dsv4_dspark/
 ```
 
 Three shared files are touched, by 34 lines between them and with no behaviour change
-for any other model: three lines of registration in `models/__init__.py`, one flag in
-`train/config/schema.py`, and in `train/checkpointer.py` an optional hook that lets a
-model translate its own on-disk layout when a run resumes. A model that does not define
-the hook gets back the object it was passed — that is a test, not a claim.
+for any other model: three lines of registration in `models/__init__.py`, two flags in
+`train/config/schema.py` that only this model reads (`DraftArgs` already carries several
+of those), and in `train/checkpointer.py` an optional hook that lets a model translate its
+own on-disk layout when a run resumes. A model that does not define the hook gets back the
+object it was passed — that is a test, not a claim.
 
 **Deliberately not in this proposal.** Our tree carries four more files under `backbone/`
 — expert-parallel dispatch, a grouped GEMM over the stacked expert weights, a kernel
