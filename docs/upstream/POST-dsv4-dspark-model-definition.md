@@ -72,22 +72,15 @@ Two things we should be straight about:
 
 ## Why this needs its own model definition
 
-Two things rule out building this on an existing attention module.
+Nothing in the ecosystem fits the draft's attention. The per-head sink lives in the
+softmax denominator, so no fused path takes it, and the access pattern is a block
+drafter's — gamma-wide non-causal queries over a sliding window of target context, no KV
+cache — rather than a decoder's. HF's DeepSeek-V4 module answers the other question.
 
-**The per-head sink is a term in the softmax denominator** —
-`p_j = exp(s_j) / (Σ exp(s_j) + exp(sink))`. It is not a mask, a bias, or an extra key,
-so SDPA and every flash-style kernel are unable to express it. The reference here is an
-eager einsum with fp32 accumulation.
-
-**The attention pattern is a block drafter's.** Queries are the gamma-wide draft block,
-attending non-causally within the block and over a sliding window of target context,
-with no KV cache — training is teacher-forced from target hidden states. HF's
-DeepSeek-V4 module is a causal decoder with a cache; it answers a different question.
-
-The rest follows from the target: MLA with q/o dual LoRA, hyper-connections in place of
-the residual stream, 256 routed + 1 shared expert per layer, and the full 129,280
-vocabulary. We did not try smaller shapes — the released draft has this one, and
-matching its acceptance length was the bar.
+The rest follows from the target: MLA with q/o dual LoRA, hyper-connections instead of a
+residual stream, 256 routed + 1 shared expert per layer, full 129,280 vocabulary. We did
+not try smaller — the released draft has this shape, and matching its acceptance length
+was the bar.
 
 Three layers, ~21B total parameters, ~1.5B active per token.
 
