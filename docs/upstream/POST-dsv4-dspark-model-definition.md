@@ -146,14 +146,10 @@ and dies deep in the weight loader."*
 | **B** emit speculators-native | nothing serves it | needs a loader branch in both vLLM and vllm-ascend |
 | **C** emit native, ship an exporter | one documented step to serve | the export step exists until B lands |
 
-**We lean to A**, and the reason is that speculators and vLLM are one project. A checkpoint
-this library trains should be one the sibling inference engine can load; if it is not, that is
-a defect in the pair, whichever layout is tidier. B does not exist yet, and C does not
-actually fix that — under C the native checkpoint is just as unloadable, and the export step
-is a tax every user pays until B lands, which it may never do.
-
-So: emit `mtp.*`, and a draft trained here is a drop-in replacement for the released DeepSeek
-draft on both GPU and Ascend, with nothing to convert and nothing to explain.
+**We lean to A**: speculators and vLLM are one project, so a checkpoint this library
+trains should be one the sibling engine can load. B does not exist, and C leaves the
+checkpoint just as unloadable with an export step in front of it. Under A a draft trained
+here is a drop-in for the released DeepSeek draft on both GPU and Ascend.
 
 A is implemented as registered `WeightRenaming` / `WeightConverter` rules, the way
 `transformers` handles Mixtral — no save override. Three tests, on a CPU-sized model: the
@@ -186,11 +182,10 @@ it propagates a prefix that upstream is currently fighting (#52165 above), into 
 that are not MTP at all. If you would rather we emit the native layout and take the loader
 changes as follow-up work, we will do that instead and are happy to write them.
 
-One boundary, stated so it is not mistaken for an omission. Serving a *speculators-format*
-DSV4 checkpoint is a separate matter: `algos.py::update_dspark` falls back to
-`Qwen3DSparkModel`, so such a checkpoint reaches the wrong architecture. That is a vLLM-side
-concern and not part of this proposal — and choosing A is precisely what means nothing here
-depends on it. We are raising it because a reviewer will notice, not because this needs it.
+One boundary, so it does not read as an omission: `algos.py::update_dspark` falls back to
+`Qwen3DSparkModel`, so a *speculators-format* DSV4 checkpoint reaches the wrong
+architecture. That is vLLM-side, and choosing A is what keeps this proposal independent
+of it.
 
 ## Evidence
 
