@@ -1,4 +1,8 @@
-*Follow-up to #952, split as requested. Companion design: expert-parallel training.*
+## Purpose
+
+Follow-up to #952, split into two designs as @shanjiaz asked. This is the model
+definition; the companion design (expert-parallel training) comes separately and the two
+are now independent of each other.
 
 ## Summary
 
@@ -225,3 +229,49 @@ The run is fully annealed (cosine to zero at 5 epochs) and the last three checkp
    conversation, but it is your call whether a slow path is worth having.
 3. **Whether `--freeze-experts` should be the documented default** for anyone reproducing
    this without expert-parallel hardware, given we have not measured its quality.
+
+
+## Tests
+
+`make quality` and the full unit suite, against `ruff~=0.15.20` and `mypy~=2.1.0` as
+pinned in `pyproject.toml`:
+
+```
+$ ruff check
+All checks passed!
+
+$ ruff format --check
+224 files already formatted
+
+$ mypy --check-untyped-defs
+no errors in the files this PR adds or touches
+
+$ pytest tests/unit -q
+797 passed, 5 skipped in 3:23
+```
+
+Nine of those tests are new and run on a CPU-sized model in about a second:
+
+| test | what it pins |
+|---|---|
+| `test_saved_keys_match_the_released_draft` | the emitted key set equals the released draft's, exactly |
+| `test_round_trip_is_bit_identical` | save then load returns the same tensors |
+| `test_experts_are_stacked_in_the_module_and_per_expert_on_disk` | one stacked parameter in memory, one tensor per expert on disk |
+| `test_resume_reads_back_the_layout_it_wrote` | the single-device resume path |
+| `test_the_distributed_resume_path_loads_the_same_weights` | the same, through `set_model_state_dict` |
+| `test_a_released_checkpoint_that_covers_nothing_is_refused` | `strict=False` cannot hide a total mismatch |
+| `test_module_layout_checkpoints_still_load` | checkpoints written before the mapping existed |
+| `test_the_checkpointer_hook_is_a_no_op_for_other_models` | the shared hook, on a Qwen3 DSpark draft |
+| `test_freeze_routed_experts_leaves_the_rest_trainable` | `--freeze-experts` |
+
+End-to-end evidence is in the Evidence section above: 5 epochs on 8 Ascend NPUs, scored
+against the released DeepSeek draft on the same serving stack.
+
+## Checklist
+
+I have filled in:
+
+- [x] The purpose of the PR, such as "Fix some issue (link existing issues this PR will resolve)".
+- [x] The test plan/results, such as providing test command and pasting the results.
+- [ ] (Optional) The necessary documentation update.
+- [ ] I (a human) have written or reviewed the code in this pr to the best of my ability.
