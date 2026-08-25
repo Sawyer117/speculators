@@ -37,14 +37,14 @@ a second proposal riding along inside the first. We would rather land the model 
 merits and bring that up separately, if there is interest at all.
 
 **Three environment switches, and two of them we are happy to move.** The model reads
-`DSPARK_RECOMPUTE` (activation checkpointing per draft layer), `DSPARK_MOE_BALANCE` with
-`DSPARK_MOE_BALANCE_RATE` (the aux-loss-free `noaux_tc` bias update), and
-`DSPARK_LOG_EXPERT_LOAD` (the expert-utilisation counters). The counters we would keep here,
-since routing collapse is invisible in the loss curve and that is a property of this model.
-The other two are training-recipe features that happen to live in the model file — if you
-would rather see them as their own PR, or promoted to config fields rather than environment
-reads, we will do either; tell us which you prefer. One thing to know either way: the
-acceptance numbers below come from runs with both of them enabled.
+`DSPARK_RECOMPUTE` (activation checkpointing per draft layer), `DSPARK_MOE_BALANCE_RATE`
+(the aux-loss-free `noaux_tc` bias update — the rate is also the switch), and
+`DSPARK_LOG_EXPERT_LOAD` (the expert-utilisation counters). The counters we would keep
+here, since routing collapse is invisible in the loss curve and that is a property of this
+model. The other two are training-recipe features that happen to live in the model file —
+if you would rather see them as their own PR, or promoted to config fields rather than
+environment reads, we will do either; tell us which you prefer. One thing to know either
+way: the acceptance numbers below come from runs with both of them enabled.
 
 ## It no longer depends on the expert-parallel proposal
 
@@ -94,11 +94,18 @@ documented feature rather than a debug flag. Their 13–22 of 256 matches what w
 different verifier family (~14 effective of 256), which is worth more than either number
 alone.
 
-**Initialization.** `--init-layer-from-target` and `--init-{moe,attn,hc,norm}-from-target`
-stay opt-in beside a from-scratch default. They audited the released weights and found MTP
-lineage only in Flash-family layer 0; we found the released draft's router `gate.bias`
-balanced only in layer 0 and untouched elsewhere, yet scoring 4.42. Neither collapse nor MTP
-inheritance is the binding constraint, so neither should be the default.
+**Initialization.** `--init-from-target attn moe hc norm` (or `all`) stays opt-in beside a
+from-scratch default. They audited the released weights and found MTP lineage only in
+Flash-family layer 0; we found the released draft's router `gate.bias` balanced only in
+layer 0 and untouched elsewhere, yet scoring 4.42. Neither collapse nor MTP inheritance is
+the binding constraint, so neither should be the default.
+
+One asymmetry inside it, in case you disagree: the MoE router is never warm-started, only
+its experts. The verifier's `gate.weight` was fitted to a much wider hidden distribution
+and concentrates the draft's routing on a few experts, and its balance bias solves for the
+verifier's own load. That is an argument rather than a measurement — we have not A/B'd
+inheriting the router — so it is stated here rather than left as a flag whose default we
+could not defend.
 
 Their other three points bear on expert-parallel training and are answered in the companion
 design.
