@@ -103,20 +103,15 @@ inheritance is the binding constraint, so neither should be the default.
 Their other three points bear on expert-parallel training and are answered in the companion
 design.
 
-## Performance, stated plainly
+## Performance
 
-The expert compute in this proposal is a straightforward reference implementation: correct,
-portable, and not fast. We are not going to quote a speedup here, because the only clean
-measurement we have is of a different thing — wrapping the expert path in `torch.compile`
-came out at about 1.74x on our hardware — and we have not yet benchmarked a fused grouped
-GEMM against this reference. Quoting the first number as though it were the second is exactly
-the kind of thing that should not go in a design document.
+The expert compute here is the reference implementation: correct, portable, not fast. We
+are not quoting a speedup, because we have not benchmarked a fused grouped GEMM against
+it — the one clean number we have is for `torch.compile` over the expert path, which is
+a different thing.
 
-What we can say without hedging: nothing in this proposal is vendor-specific, it runs on any
-accelerator, and the reference is also the oracle any faster implementation would be
-validated against. If the project ever wants an in-tree way for accelerators to plug in, we
-have an opinion and some working code, and we would bring it as its own proposal where it can
-be judged on its own.
+If the project ever wants an in-tree way for accelerators to plug in, we have working
+code and would bring it as its own proposal.
 
 ## Checkpoint layout — a question for you, not a decision we should make
 
@@ -155,23 +150,18 @@ is a tax every user pays until B lands, which it may never do.
 So: emit `mtp.*`, and a draft trained here is a drop-in replacement for the released DeepSeek
 draft on both GPU and Ascend, with nothing to convert and nothing to explain.
 
-A is implemented, and it needs no save override: the layout is a list of `WeightRenaming` /
-`WeightConverter` rules registered for the model class, exactly as `transformers` already does
-for every MoE checkpoint it ships. `from_pretrained` applies them and `save_pretrained` applies
-the reverse, so one declaration covers both directions and `MergeModulelist(dim=0)` is the same
-operation that bridges Mixtral's per-expert checkpoints to a stacked parameter. The emitted key
-set equals the released draft's own weight index exactly, and the tensors survive a save/load
-round trip bit-identically; checkpoints written before the mapping existed still load, because
-their keys match no rule and pass through. All three are tests, on a CPU-sized model.
+A is implemented as registered `WeightRenaming` / `WeightConverter` rules, the way
+`transformers` handles Mixtral — no save override. Three tests, on a CPU-sized model: the
+emitted key set equals the released draft's weight index, tensors survive a save/load
+round trip bit-identically, and checkpoints written before the mapping still load.
 
-One caveat found while building it, in case it bears on your answer. A round trip is not a
-sufficient check: a rule and its own inverse agree with each other whatever they emit, so a
-mapping can round-trip perfectly and still write a layout no loader recognises. Ours did, until
-the key set was compared against the release. Whatever layout you choose, the test worth having
-is the one that compares to the target convention, not to itself.
+One thing worth passing on: a round trip is not a sufficient check. A rule and its own
+inverse agree whatever they emit, so a mapping can round-trip perfectly and still write a
+layout no loader recognises — ours did, until the key set was compared against the
+release. Whichever layout you choose, the test that has standing compares to the target
+convention, not to itself.
 
-A is also what keeps serving out of this proposal's scope, which is worth being explicit
-about. DeepSeek ships the DSV4 draft *inside* the target checkpoint — one directory,
+A is also what keeps serving out of scope. DeepSeek ships the DSV4 draft *inside* the target checkpoint — one directory,
 67,606 target tensors and 4,705 `mtp.*` draft tensors under one `config.json` that already
 carries the `dspark_*` fields. A draft trained here writes exactly those 4,705 tensors, so
 it is a drop-in for the ones already there and nothing has to describe it: the target's own
