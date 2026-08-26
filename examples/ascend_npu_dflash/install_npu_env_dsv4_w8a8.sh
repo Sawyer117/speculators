@@ -158,7 +158,12 @@ echo "== 4. vllm-ascend @ ${VA_COMMIT:0:12} — FROM SOURCE (compiles the V4/SAS
 # before this pin, so "whatever main is today" is not a reproducible stack.
 [ -d "$VA_DIR/.git" ] || git clone "$VA_REPO" "$VA_DIR"
 ( cd "$VA_DIR" && git fetch origin && git checkout --detach "$VA_COMMIT" && git --no-pager log --oneline -1 )
-( cd "$VA_DIR" && rm -rf csrc/build && pip install -e . --no-deps --no-build-isolation -v )
+# ⚠ `python -m pip`, never a bare `pip`. On a box where ~/.local carries a pip for the
+# SYSTEM python, that one can win the PATH even inside an activated conda env, and this
+# step then builds against python 3.9 and dies with "Package 'vllm-ascend' requires a
+# different Python: 3.9.9 not in '>=3.10'" -- which reads like a version-pin problem and
+# is really an interpreter problem. Every other pip call here already goes through python.
+( cd "$VA_DIR" && rm -rf csrc/build && python -m pip install -e . --no-deps --no-build-isolation -v )
 
 echo "== 5. vllm-ascend runtime extras (--no-deps protects torch) =="
 python -m pip install numba einops pandas msgpack
