@@ -415,6 +415,19 @@ class TrainerArgs(_Group):
         "parameters are fully replicated (DDP-like). Enable when the model does not "
         "fit in a single GPU's memory.",
     )
+    expert_parallel: bool = Field(
+        default=False,
+        description="Partition an MoE draft's routed experts across ranks, whole "
+        "experts per rank, and move tokens to their expert's owner. Requires a draft "
+        "that supports it and a world size that divides the expert count. Off by "
+        "default: every other model replicates its experts.",
+    )
+    bf16_experts: bool = Field(
+        default=False,
+        description="Keep the expert-parallel routed experts in bf16 rather than "
+        "giving them fp32 master weights. A memory/fidelity trade for devices where "
+        "the fp32 originals do not fit; no effect without --expert-parallel.",
+    )
     max_steps: int | None = Field(
         default=None,
         ge=1,

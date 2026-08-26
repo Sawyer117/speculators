@@ -11,6 +11,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     set_model_state_dict,
 )
+from torch.distributed.device_mesh import init_device_mesh
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from tqdm import TqdmExperimentalWarning
@@ -31,6 +32,8 @@ from speculators.train.distributed import (
     get_local_rank,
     get_rank,
     is_distributed,
+    rank_local_param_keys,
+    shard_rank_local_params,
 )
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
@@ -122,6 +125,10 @@ class TrainerConfig(NamedTuple):
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     fsdp_shard: bool = False
+    # Keep the rank-local expert originals in bf16 instead of fp32. FSDP2's
+    # MixedPrecisionPolicy treats the pre-shard dtype as the master weight, so this
+    # trades their fp32 master for the memory it costs.
+    bf16_experts: bool = False
     max_steps: int | None = None
 
 
@@ -297,12 +304,32 @@ class Trainer:
             self._setup_model_ddp(load_checkpoint)
 
     def _setup_model_fsdp(self, load_checkpoint: bool):
+        # Parameters the model partitions across ranks itself rather than replicating
+        # (expert-parallel routed experts). Empty for every model that does not opt in.
+        ep_local = rank_local_param_keys(self.model)
+
         # Capture full state dict on rank 0 before FSDP sharding
         full_state_dict = {}
         if not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
+            # Rank 0 holds only its own slice of these, so there is nothing global to
+            # broadcast; every rank keeps the slice it built.
+            for key in ep_local:
+                full_state_dict.pop(key, None)
 
-        apply_fully_sharded(self.model, param_dtype=self.config.hidden_states_dtype)
+        mesh = None
+        if ep_local:
+            self.model.to(self.local_rank)  # type: ignore[arg-type]
+            if self.config.bf16_experts:
+                for key in ep_local:
+                    param = self.model.get_parameter(key)
+                    param.data = param.data.to(torch.bfloat16)
+            mesh = init_device_mesh(self.device_type, (dist.get_world_size(),))
+            shard_rank_local_params(self.model, mesh, ep_local)
+
+        apply_fully_sharded(
+            self.model, param_dtype=self.config.hidden_states_dtype, mesh=mesh
+        )
 
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)

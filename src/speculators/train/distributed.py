@@ -194,12 +194,59 @@ def maybe_destroy_distributed() -> None:
     _dp_group = None
 
 
+def rank_local_param_keys(model: torch.nn.Module) -> set[str]:
+    """``state_dict`` names of the parameters this model keeps rank-local.
+
+    A model declares them by defining ``ep_local_param_keys() -> set[str]``. Under
+    expert parallelism the routed experts are partitioned, not replicated: each rank
+    builds and owns a disjoint slice, so those names must be skipped by the rank-0
+    broadcast, sharded explicitly rather than by FSDP, and kept out of FSDP entirely.
+    A model that does not define the hook has no rank-local parameters.
+    """
+    hook = getattr(model, "ep_local_param_keys", None)
+    return set(hook()) if callable(hook) else set()
+
+
+def shard_rank_local_params(model: torch.nn.Module, mesh, param_keys: set[str]) -> None:
+    """Wrap each rank-local parameter as a ``Shard(0)`` DTensor on ``mesh``.
+
+    The rank already holds only its slice, so this states the global shape rather than
+    moving any data. The point is uniformity: with the slice wrapped on the same mesh
+    FSDP shards the rest over, every parameter in the model is a DTensor, and the
+    optimizer, gradient clipping and distributed checkpointing need no
+    plain-tensor-versus-DTensor branch. The model's forward reads ``.to_local()`` and
+    moves activations itself instead of relying on an FSDP all-gather.
+    """
+    from torch.distributed.tensor import DTensor, Shard  # noqa: PLC0415
+
+    for key in sorted(param_keys):
+        module_path, _, attr = key.rpartition(".")
+        module = model.get_submodule(module_path)
+        param = getattr(module, attr)
+        if isinstance(param.data, DTensor):
+            continue
+        local = DTensor.from_local(param.data, mesh, [Shard(0)], run_check=False)
+        setattr(
+            module, attr, torch.nn.Parameter(local, requires_grad=param.requires_grad)
+        )
+
+
 def apply_fully_sharded(
-    model: torch.nn.Module, param_dtype: torch.dtype = torch.bfloat16
+    model: torch.nn.Module,
+    param_dtype: torch.dtype = torch.bfloat16,
+    mesh=None,
 ):
     """Applies torch FSDP fully_shard to the model, wrapping layers in FSDPModule.
 
-    Assumes the model has a `layers` attribute containing the decoder layers.
+    Assumes the model has a `layers` attribute containing the decoder layers, unless it
+    defines ``fsdp_wrap_plan() -> list[nn.Module]`` to declare the unit granularity
+    itself (children before parents).
+
+    Parameters the model declares rank-local (:func:`rank_local_param_keys`) are kept
+    out of FSDP: they are already sharded, on their own axis. ``mesh``, when given, is
+    the ``DeviceMesh`` every ``fully_shard`` call uses — pass the same one they were
+    sharded on, so expert and non-expert parameters live on a single mesh.
+
     Model should be validated with SpeculatorModel.verify_training_compatible()
     before calling this function.
     """
@@ -208,9 +255,19 @@ def apply_fully_sharded(
         reduce_dtype=torch.float32,
     )
 
-    for layer in model.layers:  # type: ignore[union-attr]
-        fully_shard(layer, mp_policy=mp_policy)
+    plan = getattr(model, "fsdp_wrap_plan", None)
+    modules = plan() if callable(plan) else list(model.layers)  # type: ignore[union-attr,arg-type]
 
-    fully_shard(model, mp_policy=mp_policy)
+    shard_kwargs: dict = {"mp_policy": mp_policy}
+    if mesh is not None:
+        shard_kwargs["mesh"] = mesh
+    ignored = {model.get_parameter(k) for k in rank_local_param_keys(model)}
+    if ignored:
+        shard_kwargs["ignored_params"] = ignored
+
+    for module in modules:
+        fully_shard(module, **shard_kwargs)
+
+    fully_shard(model, **shard_kwargs)
 
     return model

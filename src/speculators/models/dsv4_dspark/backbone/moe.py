@@ -22,8 +22,12 @@ import torch
 from torch import nn
 from torch.nn import functional
 
+from speculators.train import expert_parallel
+
 # Small-normal init for the projections created with torch.empty.
 _INIT_STD = 0.02
+# Base for the per-rank expert init stream (see GroupedExperts).
+_EP_INIT_SEED = 0xE9E9
 
 
 class Router(nn.Module):
@@ -195,7 +199,12 @@ class GroupedExperts(nn.Module):
     """
 
     def __init__(
-        self, dim: int, inter_dim: int, n_local: int, swiglu_limit: float
+        self,
+        dim: int,
+        inter_dim: int,
+        n_local: int,
+        swiglu_limit: float,
+        seed: int | None = None,
     ) -> None:
         super().__init__()
         self.num_local_experts = n_local
@@ -209,11 +218,18 @@ class GroupedExperts(nn.Module):
         # nn.Linear's default init is kaiming_uniform_(a=sqrt(5)) -> U(-1/sqrt(fan_in));
         # applied per expert (fan_in is dim for w1/w3, inter for w2, the same for every
         # expert, so one fill matches).
+        # ``seed`` makes each rank's slice draw from a different stream. Without it
+        # every expert-parallel rank builds an identical set of experts from the shared
+        # global seed, and the partition starts as E copies of the same expert.
         b1, b2 = 1.0 / math.sqrt(dim), 1.0 / math.sqrt(inter_dim)
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device=self.w1.device)
+            gen.manual_seed(seed)
         with torch.no_grad():
-            self.w1.uniform_(-b1, b1)
-            self.w3.uniform_(-b1, b1)
-            self.w2.uniform_(-b2, b2)
+            self.w1.uniform_(-b1, b1, generator=gen)
+            self.w3.uniform_(-b1, b1, generator=gen)
+            self.w2.uniform_(-b2, b2, generator=gen)
 
     def local_weights(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(w1, w3, w2) as local tensors (``.to_local()`` for Shard(0) DTensors)."""
@@ -268,8 +284,28 @@ class MoE(nn.Module):
             cfg.n_routed_experts
         )  # GLOBAL count (router + dispatch use it)
         self.router = Router(cfg)
+        # Expert-parallel: hold only this rank's disjoint slice of whole experts.
+        # ``expert_offset`` maps a local index to its global expert id -- the id the
+        # router emits, the checkpoint names, and the dispatch routes on.
+        ep = expert_parallel.context()
+        if ep is not None and ep.size > 1:
+            if cfg.n_routed_experts % ep.size:
+                raise ValueError(
+                    f"expert parallelism needs n_routed_experts "
+                    f"({cfg.n_routed_experts}) divisible by the expert-parallel size "
+                    f"({ep.size})."
+                )
+            n_local = cfg.n_routed_experts // ep.size
+            self.expert_offset = ep.rank * n_local
+            self.expert_parallel = True
+            seed: int | None = _EP_INIT_SEED + ep.rank
+        else:
+            n_local = cfg.n_routed_experts
+            self.expert_offset = 0
+            self.expert_parallel = False
+            seed = None
         self.experts = GroupedExperts(
-            cfg.hidden_size, cfg.moe_inter_dim, cfg.n_routed_experts, cfg.swiglu_limit
+            cfg.hidden_size, cfg.moe_inter_dim, n_local, cfg.swiglu_limit, seed=seed
         )
         # The released config carries exactly one shared expert; the checkpoint key is
         # ``ffn.shared_experts.{w1,w2,w3}`` (a single expert), so this is a single
@@ -286,6 +322,11 @@ class MoE(nn.Module):
         shape = x.shape
         x = x.reshape(-1, self.dim)
         weights, indices = self.router(x)
-        y = _moe_dispatch(x, weights, indices, self.experts, self.n_routed_experts)
+        if self.expert_parallel:
+            from .moe_ep import moe_dispatch_ep  # noqa: PLC0415 - optional path
+
+            y = moe_dispatch_ep(x, weights, indices, self.experts)
+        else:
+            y = _moe_dispatch(x, weights, indices, self.experts, self.n_routed_experts)
         y = y + self.shared_experts(x)
         return y.type_as(x).view(shape)

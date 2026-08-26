@@ -241,6 +241,45 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         return frozen
 
     @property
+    def expert_parallel(self) -> bool:
+        """True when the routed experts are partitioned across ranks."""
+        return bool(getattr(self.blocks[0].ffn, "expert_parallel", False))
+
+    def fsdp_wrap_plan(self) -> list[nn.Module]:
+        """FSDP units for :func:`apply_fully_sharded`, children before parents.
+
+        The stacked routed experts are one unit per layer, attention another, and the
+        block itself is then left with only the small remainder -- norms,
+        hyper-connections, router. Wrapping the block as a single unit instead would
+        make one all-gather carry ~7B parameters.
+
+        Under expert parallelism the routed experts are left out: they are already
+        partitioned, on their own axis, and moved by the dispatch rather than by an
+        FSDP all-gather.
+        """
+        parallel = self.expert_parallel
+        plan: list[nn.Module] = []
+        for block in self.blocks:
+            if not parallel:
+                plan.append(block.ffn.experts)
+            plan.append(block.ffn.shared_experts)
+            plan.append(block.attn)
+            plan.append(block)
+        return plan
+
+    def ep_local_param_keys(self) -> set[str]:
+        """``state_dict`` names of the routed experts this rank owns alone.
+
+        Empty unless the run is expert-parallel, in which case each rank built a
+        disjoint slice: there is no global tensor for rank 0 to broadcast, and the
+        slices are sharded explicitly rather than by FSDP.
+        """
+        if not self.expert_parallel:
+            return set()
+        local = {id(p) for block in self.blocks for p in block.ffn.experts.parameters()}
+        return {name for name, p in self.named_parameters() if id(p) in local}
+
+    @property
     def blocks(self) -> list[MhcDecoderBlock]:
         """``self.layers`` with its element type preserved.
 
@@ -401,14 +440,12 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             The router is never warm-started: neither its weight nor its balance
             bias transfers to a different hidden distribution.
 
-        EP-aware for experts (the stacked ``GroupedExperts`` weights are still plain
-        per-rank tensors at build time — before the ``Shard(0)`` wrap — so each rank
-        copies only its
-        ``[ep_expert_offset : +n_local]`` slice); the rest are replicated (full copy per
-        rank). No-op on meta params (non-rank0 under ``--init-on-meta``; broadcast
-        fills). Requires the draft dims to match the verifier's (the faithful config);
-        raises on any missing
-        key / shape mismatch. The verifier uses DeepSeek names, so copies are 1:1."""
+        Under expert parallelism a rank copies only the verifier experts matching the
+        slice it owns (``expert_offset`` onward); everything else is replicated. The
+        stacked weights are still plain tensors at this point -- the ``Shard(0)`` wrap
+        happens later -- so this is an ordinary copy either way. Requires the draft dims
+        to match the verifier's (the faithful config), and raises on any missing key or
+        shape mismatch. The verifier uses DeepSeek names, so the copies are 1:1."""
         import logging  # noqa: PLC0415
 
         from speculators.utils.loading import load_model_layers  # noqa: PLC0415
@@ -494,7 +531,7 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             eids: list[int] = []
             if "moe" in parts:
                 ffn = blk.ffn
-                off = int(getattr(ffn, "ep_expert_offset", 0))
+                off = int(ffn.expert_offset)
                 eids = [off + i for i in range(ffn.experts.w1.shape[0])]
                 moe_keys = [
                     pre + "ffn.gate.weight",

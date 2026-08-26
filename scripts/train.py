@@ -23,6 +23,7 @@ from speculators.models.utils import (
     get_verifier_config,
     resolve_draft_intermediate_size,
 )
+from speculators.train import expert_parallel
 from speculators.train.config import TrainConfig
 from speculators.train.dataloader import create_train_val_loaders
 from speculators.train.distributed import (
@@ -560,6 +561,14 @@ def main(cfg: TrainConfig):  # noqa: C901
             "otherwise parameters are not sharded."
         )
 
+    if args.expert_parallel and not is_distributed():
+        raise ValueError(
+            "--expert-parallel requires launching with torchrun/distributed training; "
+            "with one rank there is nothing to partition the experts across."
+        )
+    if args.bf16_experts and not args.expert_parallel:
+        raise ValueError("--bf16-experts has no effect without --expert-parallel.")
+
     # Install partial-neox rotary patch if not using full-head hack
     if not args.draft_mrope_full_head_hack:
         install_partial_neox_rotary()
@@ -605,6 +614,12 @@ def main(cfg: TrainConfig):  # noqa: C901
         )
 
     model_class = registry[args.speculator_type]
+
+    # Expert parallelism has to be settled before the model is built: each rank only
+    # ever allocates the experts it owns, so the constructor reads this.
+    if args.expert_parallel:
+        context = expert_parallel.configure_from_world()
+        logger.info("Expert parallelism enabled over %d ranks.", context.size)
 
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
 
@@ -702,6 +717,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        bf16_experts=args.bf16_experts,
         max_steps=args.max_steps,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
