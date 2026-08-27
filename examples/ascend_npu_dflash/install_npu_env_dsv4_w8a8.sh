@@ -192,6 +192,25 @@ PY2
 if [ -n "$TF_REQ" ]; then
   echo "vllm-ascend pins: $TF_REQ"
   python -m pip install --no-deps "$TF_REQ" || echo "WARN: could not apply $TF_REQ — continuing"
+  # `--no-deps` above is what protects torch, but it also leaves `tokenizers` wherever the
+  # NEWER transformers put it, and transformers hard-fails AT IMPORT when tokenizers sits
+  # outside its window. That window moves with PyPI, so this breaks on nothing but the date:
+  # 2026-08-22 the newest tokenizers satisfied the pin; by 08-27 vLLM pulled 0.23.1 while the
+  # pinned transformers wanted <=0.23.0, and every `import transformers` died. Read the window
+  # from transformers' own metadata rather than hardcoding a version that will drift too.
+  TOK_REQ="$(python - <<'PY3'
+import importlib.metadata as m
+try:
+    reqs = m.requires("transformers") or []
+except Exception:
+    reqs = []
+print(next((r.split(";")[0].strip() for r in reqs if r.startswith("tokenizers")), ""))
+PY3
+)"
+  if [ -n "$TOK_REQ" ]; then
+    echo "transformers wants: $TOK_REQ"
+    python -m pip install --no-deps "$TOK_REQ" || echo "WARN: could not apply $TOK_REQ — continuing"
+  fi
 else
   echo "no transformers pin found in vllm_ascend metadata — leaving as installed"
 fi
