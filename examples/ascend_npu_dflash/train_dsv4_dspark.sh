@@ -54,6 +54,14 @@ BLOCK="${BLOCK:-5}"                     # ★ BLOCK = # draft slots per block = 
                                        # WRONG off-by-one task with slot 0 untrained and collapsed at serve
                                        # (fixed in dspark core). DO NOT use 6 now. NB: BLOCK scales draft-forward
                                        # tokens = MAX_ANCHORS*BLOCK -> memory (256*5=1280).
+OPTIM="${OPTIM:-adamw}"                  # adamw | muon.  ⚠ muon 只作用于 2D 权重矩阵,
+                                       # 其余(norm/bias/embed/head)仍走 AdamW。它省的是优化器
+                                       # 状态:AdamW 两个 buffer(exp_avg+exp_avg_sq),Muon 一个
+                                       # (momentum)。⚠ MUON_LR 不设时 schema 默认 10*lr —— 对我们
+                                       # 2e-4 就是 2e-3,而 AdamW 在 6e-4 就 NaN 过。做显存/耗时
+                                       # 对照时用 MUON_ADJUST=match_rms_adamw 并显式给 MUON_LR。
+MUON_LR="${MUON_LR:-}"                  # 空 = 用 schema 默认(10*lr)
+MUON_ADJUST="${MUON_ADJUST:-match_rms_adamw}"   # original | match_rms_adamw
 DECAY_GAMMA="${DECAY_GAMMA:-4.0}"       # loss per-position decay: weight_k = exp(-k/gamma) over the BLOCK
                                        # slots. Canonical DSpark = 4.0 -> slots [1.0,0.78,0.61,0.47,0.37].
                                        # LARGER gamma = flatter = more gradient to LATER slots (pos3/4/5);
@@ -197,6 +205,10 @@ if [ -n "${MARKOV_HEAD_TYPE:-}" ]; then EXTRA="$EXTRA --markov-head-type $MARKOV
 if [ -n "${SELECT_RANK:-}" ]; then EXTRA="$EXTRA --select-rank $SELECT_RANK"; fi
 # BLOCK_CONV_TAPS=2 -> the DFlash2 dynamic causal convolutions around each sublayer.
 # Identity-initialised; same FROM_PRETRAINED silent-ignore caveat as the flags above.
+if [ "$OPTIM" = "muon" ]; then
+  [ -n "$MUON_LR" ] && EXTRA="$EXTRA --muon-lr $MUON_LR"
+  EXTRA="$EXTRA --muon-adjust-lr-fn $MUON_ADJUST"
+fi
 if [ -n "${BLOCK_CONV_TAPS:-}" ]; then EXTRA="$EXTRA --block-conv-kernel-size $BLOCK_CONV_TAPS"; fi
 if [ -n "${BLOCK_CONV_GROUP:-}" ]; then EXTRA="$EXTRA --block-conv-group-size $BLOCK_CONV_GROUP"; fi
 
@@ -274,6 +286,7 @@ SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
 echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL  init(moe/attn/hc/norm/layer)=$INITMOE/$INITATTN/$INITHC/$INITNORM/$INITLAYER"
+echo " optimizer=$OPTIM  muon_lr=${MUON_LR:-<10*lr>}  muon_adjust=$MUON_ADJUST"
 echo " block=$BLOCK (all $BLOCK slots drafted = gamma = num_spec; sample_from_anchor=True)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS  noncausal_block=$NONCAUSAL (=serve cad.causal=False)"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
@@ -315,7 +328,7 @@ nohup env \
     --kd-temperature "$KD_TEMP" \
     --draft-attn-impl sdpa --loss-fn "$LOSS_FN" \
     --scheduler-type "$SCHED_TYPE" --scheduler-warmup-ratio "$WARMUP_RATIO" \
-    --optimizer adamw --lr "$LR" --epochs "$EPOCHS" $EXTRA \
+    --optimizer "$OPTIM" --lr "$LR" --epochs "$EPOCHS" $EXTRA \
     --on-missing generate --on-generate delete \
     --num-workers "$NUM_WORKERS" --prefetch-factor "$PREFETCH_FACTOR" \
     --hidden-states-path "$HS_DIR" --vllm-endpoint "$ENDPOINT" \
