@@ -3,13 +3,16 @@
 Provides a single entry point, :func:`build_optimizers`, that returns the list of
 optimizers the trainer should drive. The default ("adamw") returns a single AdamW
 optimizer over all parameters, preserving the historical behavior. The "muon" option
-returns two optimizers: ``torch.optim.Muon`` over the 2D weight matrices (which is all
-Muon supports) and ``torch.optim.AdamW`` over everything else (norms, biases, and the
-embedding / LM-head matrices, following standard Muon practice).
+returns two optimizers: :class:`~speculators.train.muon_distributed.DistributedMuon` over
+the weight matrices and the expert stacks, and ``torch.optim.AdamW`` over everything else
+(norms, biases, and the embedding / LM-head matrices, following standard Muon practice).
 
-Muon works transparently for both single-GPU and multi-GPU (FSDP2) training: when the
-model is sharded with ``fully_shard`` the parameters become ``DTensor``s and Muon's
-Newton-Schulz orthogonalization dispatches across ranks automatically.
+⚠ This used to say that "Muon works transparently under FSDP2 because the parameters
+become DTensors and the orthogonalization dispatches across ranks automatically". It does
+not. ``torch.optim.Muon``'s Newton-Schulz transposes, which flips a ``Shard(0)`` parameter
+to ``Shard(1)``, and the closing in-place update then raises "in-place operations that
+require placement changes are not supported". See ``muon_distributed`` for the fix and for
+which parameters take which route.
 """
 
 import logging
@@ -18,44 +21,14 @@ import torch
 from torch import Tensor
 from torch.nn import Module
 
+from speculators.train.muon_distributed import DistributedMuon, split_named_params
+
 logger = logging.getLogger("speculators")
 
-# Names of parameters that are 2D but should still be optimized with AdamW rather than
-# Muon, following the convention from Keller Jordan's Muon (embeddings and the output
-# head are excluded from the orthogonalized update).
-_ADAMW_NAME_HINTS = ("embed_tokens", "lm_head")
-
-# Muon only orthogonalizes 2D weight matrices.
-_MATRIX_NDIM = 2
-
-
-def split_named_params_for_muon(
-    model: Module,
-) -> tuple[list[tuple[str, Tensor]], list[tuple[str, Tensor]]]:
-    """Split a model's trainable parameters into Muon and AdamW groups.
-
-    A parameter goes to Muon iff it requires gradients, is a 2D matrix with both
-    dimensions > 1, and is not an embedding or LM-head weight; everything else goes to
-    AdamW. Degenerate 2D weights (``[1, N]`` / ``[N, 1]`` vectors) route to AdamW --
-    Muon orthogonalizes matrices, not vectors, and crashes on them under FSDP2.
-
-    :param model: The model whose parameters should be partitioned.
-    :return: A ``(muon_params, adamw_params)`` tuple of named parameter lists.
-    """
-    muon_params: list[tuple[str, Tensor]] = []
-    adamw_params: list[tuple[str, Tensor]] = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if (
-            param.ndim == _MATRIX_NDIM
-            and min(param.shape) > 1  # exclude degenerate [1, N] / [N, 1] vectors
-            and not any(hint in name for hint in _ADAMW_NAME_HINTS)
-        ):
-            muon_params.append((name, param))
-        else:
-            adamw_params.append((name, param))
-    return muon_params, adamw_params
+# The parameter split now lives in `muon_distributed.split_named_params`, which also
+# routes the 3D expert stacks. The old 2D-only splitter that used to sit here is gone on
+# purpose: leaving two competing splitters around is how the experts quietly end up back
+# on AdamW, which is most of the parameters and the entire memory saving.
 
 
 def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
@@ -78,9 +51,17 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         ]
 
     if config.optimizer == "muon":
-        muon_params, adamw_params = split_named_params_for_muon(model)
+        # NOT torch.optim.Muon: it runs Newton-Schulz on the DTensor itself, the
+        # iteration's transpose flips the shard dim, and the final in-place write fails
+        # with "aten.add_.Tensor: in-place operations that require placement changes are
+        # not supported" (seen on hyper.py's [32, 16384] HyperMix.fn under 8-way FSDP2).
+        # DistributedMuon drops to local tensors for the math instead. It also routes the
+        # 3D expert stacks to Muon, which the old 2D-only split did not -- and since the
+        # experts are most of the parameters, that split left the memory saving on the
+        # table even when it did not crash.
+        muon_params, adamw_params = split_named_params(model)
         logger.info(
-            "Muon optimizer: %d 2D params via Muon, %d params via AdamW.",
+            "Muon optimizer: %d params via DistributedMuon, %d via AdamW.",
             len(muon_params),
             len(adamw_params),
         )
@@ -88,7 +69,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         optimizers: list[torch.optim.Optimizer] = []
         if muon_params:
             optimizers.append(
-                torch.optim.Muon(
+                DistributedMuon(
                     muon_params,
                     lr=config.muon_lr,
                     momentum=config.muon_momentum,
