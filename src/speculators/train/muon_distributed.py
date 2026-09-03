@@ -220,24 +220,27 @@ class DistributedMuon(Optimizer):
         state = self.state.setdefault(param, {})
         grad, m = param.grad, group["momentum"]
 
-        if self._route[id(param)] == "matrix" and isinstance(grad, DTensor):
-            # A row-shard is not a matrix: gather the gradient, run the identical
-            # iteration on every rank, then keep this rank's slice. The momentum buffer
-            # is kept in FULL shape here so it matches what the iteration consumes.
-            work = grad.full_tensor()
-        else:
-            # Experts: whole matrices are already local, so nothing to gather.
-            work = grad.to_local() if isinstance(grad, DTensor) else grad
-
+        # The momentum buffer stays SHARDED, always. Keeping it in gathered shape would
+        # put a whole copy of every matrix on every rank -- for this draft that is ~1 GB
+        # of pure waste per rank, which is a large bite out of the very saving Muon is
+        # here for. Only the iteration input is gathered, and only transiently.
+        g_local = grad.to_local() if isinstance(grad, DTensor) else grad
         buf = state.get("momentum_buffer")
         if buf is None:
-            buf = state["momentum_buffer"] = torch.zeros_like(work)
-        buf.lerp_(work, 1.0 - m)
-        effective = work.add(buf, alpha=m) if group["nesterov"] else buf
+            buf = state["momentum_buffer"] = torch.zeros_like(g_local)
+        buf.lerp_(g_local, 1.0 - m)
+        effective = g_local.add(buf, alpha=m) if group["nesterov"] else buf
 
-        update = self._orthogonalize(effective, group)
-        if self._route[id(param)] == "matrix" and isinstance(param, DTensor):
-            update = _local_shard_of(update, param)
+        if self._route[id(param)] == "matrix" and isinstance(grad, DTensor):
+            # A row-shard is not a matrix: gather the effective gradient, run the
+            # identical iteration on every rank, then keep this rank's slice back.
+            eff_full = DTensor.from_local(
+                effective, grad.device_mesh, grad.placements
+            ).full_tensor()
+            update = _local_shard_of(self._orthogonalize(eff_full, group), param)
+        else:
+            # Experts: whole matrices are already local, so nothing to gather.
+            update = self._orthogonalize(effective, group)
 
         # Write through .to_local(): the in-place add is exactly what torch's Muon dies
         # on, and doing it on plain tensors is what avoids the placement propagation.
