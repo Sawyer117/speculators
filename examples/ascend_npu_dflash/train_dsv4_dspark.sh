@@ -54,6 +54,9 @@ BLOCK="${BLOCK:-5}"                     # ★ BLOCK = # draft slots per block = 
                                        # WRONG off-by-one task with slot 0 untrained and collapsed at serve
                                        # (fixed in dspark core). DO NOT use 6 now. NB: BLOCK scales draft-forward
                                        # tokens = MAX_ANCHORS*BLOCK -> memory (256*5=1280).
+MAX_STEPS="${MAX_STEPS:-}"              # 空 = 跑满 EPOCHS。给个数就在这么多优化器步后停,
+                                       # 用于只量显存/耗时的短测(30 步足够看 mem/max_reserved_gb
+                                       # 和 profile/*_ms 稳下来),不用等一个 epoch。
 OPTIM="${OPTIM:-adamw}"                  # adamw | muon.  ⚠ muon 只作用于 2D 权重矩阵,
                                        # 其余(norm/bias/embed/head)仍走 AdamW。它省的是优化器
                                        # 状态:AdamW 两个 buffer(exp_avg+exp_avg_sq),Muon 一个
@@ -209,6 +212,7 @@ if [ "$OPTIM" = "muon" ]; then
   [ -n "$MUON_LR" ] && EXTRA="$EXTRA --muon-lr $MUON_LR"
   EXTRA="$EXTRA --muon-adjust-lr-fn $MUON_ADJUST"
 fi
+[ -n "$MAX_STEPS" ] && EXTRA="$EXTRA --max-steps $MAX_STEPS"
 if [ -n "${BLOCK_CONV_TAPS:-}" ]; then EXTRA="$EXTRA --block-conv-kernel-size $BLOCK_CONV_TAPS"; fi
 if [ -n "${BLOCK_CONV_GROUP:-}" ]; then EXTRA="$EXTRA --block-conv-group-size $BLOCK_CONV_GROUP"; fi
 
@@ -286,7 +290,7 @@ SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
 echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL  init(moe/attn/hc/norm/layer)=$INITMOE/$INITATTN/$INITHC/$INITNORM/$INITLAYER"
-echo " optimizer=$OPTIM  muon_lr=${MUON_LR:-<10*lr>}  muon_adjust=$MUON_ADJUST"
+echo " optimizer=$OPTIM  max_steps=${MAX_STEPS:-<all>}  muon_lr=${MUON_LR:-<10*lr>}  muon_adjust=$MUON_ADJUST"
 echo " block=$BLOCK (all $BLOCK slots drafted = gamma = num_spec; sample_from_anchor=True)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS  noncausal_block=$NONCAUSAL (=serve cad.causal=False)"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
