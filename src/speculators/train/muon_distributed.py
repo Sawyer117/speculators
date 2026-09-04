@@ -28,8 +28,18 @@ Two routes, matching how the draft is actually sharded:
   previous wiring did -- leaves the experts on AdamW and saves nothing.
 * **matrices** -- 2D, row-sharded by FSDP2. A row-shard is not a matrix, so the full
   gradient is gathered, the iteration runs identically on every rank, and each rank keeps
-  its own slice. Redundant compute, but these are the small parameters and the optimizer
-  step measured ~5% of a training step on this model.
+  its own slice. Redundant compute, but these are the small parameters.
+
+COST, MEASURED (8x A2, faithful EP config, steady state). The ~5% figure this
+file used to quote was AdamW's, not Muon's:
+
+    AdamW   opt_ms  99 ms / step_ms 2155 ms  =  4.6%
+    Muon    opt_ms 1010 ms / step_ms 2960 ms  =  34%   (+37% wall-clock/step)
+
+The 1 s is Newton-Schulz FLOPs on the 3D expert stacks, not communication: 5
+iterations x 3 ``bmm`` each, over every local expert. ``ns_steps`` is therefore
+the first knob to reach for if step time has to come down, and ``hybrid_ns``
+settles the singular values in fewer of them.
 
 ⚠ ``validate_expert_shard_dim0`` is not decoration. If experts were ever sharded INSIDE a
 matrix instead of across the expert axis, the local route would orthogonalize incomplete

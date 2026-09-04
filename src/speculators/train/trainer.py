@@ -92,27 +92,56 @@ class _StepTimer:
         }
 
 
+_MEM_WARNED: dict[str, str] = {}
+
+
 def _gpu_mem_stats() -> dict[str, float] | None:
     """Per-device memory in GB: current + cumulative peak.
 
-    Uses the ``torch.cuda.*`` memory API, which ``transfer_to_npu`` monkeypatches
-    onto the NPU allocator, so this reports real Ascend device memory on the box.
     ``max_*`` are cumulative (never reset here), so the last logged step of a run
     carries the whole-run peak -- the number that answers "does it fit". Returns
-    None on a CPU-only stack.
+    None only when there is genuinely no accelerator.
+
+    ⚠ This used to gate on ``torch.cuda.is_available()``. On Ascend that is FALSE
+    even though every function below works, so ``mem`` logged ``None`` on every
+    step of every NPU run -- all 124,480 steps of the production log carry no
+    memory number, leaving only ``npu-smi``, which shows the driver's
+    never-shrinking reserved pool and cannot see an optimizer-state delta. The
+    cause is in ``scripts/train.py``: when ``torch_npu``'s ``transfer_to_npu``
+    raises mid-init, the recovery path re-runs ``_apply_patches()`` with the patch
+    list DROPPED, then hand-shims exactly seven ``torch.cuda.*`` functions -- the
+    four used below among them, but NOT ``is_available``. So the guard answered no
+    while the body would have answered fine.
+
+    Ask torch's device-agnostic API instead, and read the stats off the live
+    accelerator's own module (``torch.npu`` / ``torch.cuda``), which is right
+    whether or not a shim ran. Same idiom as ``npu_bridge.npu_available``.
     """
-    if not torch.cuda.is_available():
-        return None
     gb = 1024**3
     try:
-        return {
-            "alloc_gb": round(torch.cuda.memory_allocated() / gb, 2),
-            "reserved_gb": round(torch.cuda.memory_reserved() / gb, 2),
-            "max_alloc_gb": round(torch.cuda.max_memory_allocated() / gb, 2),
-            "max_reserved_gb": round(torch.cuda.max_memory_reserved() / gb, 2),
-        }
-    except Exception:  # noqa: BLE001 - memory probe must never break training
-        return None
+        acc = torch.accelerator.current_accelerator()
+        if acc is None:
+            reason = "no accelerator (CPU-only stack)"
+        else:
+            mod = getattr(torch, acc.type, None)
+            if mod is None or not hasattr(mod, "memory_allocated"):
+                reason = f"torch.{acc.type} exposes no memory API"
+            else:
+                return {
+                    "alloc_gb": round(mod.memory_allocated() / gb, 2),
+                    "reserved_gb": round(mod.memory_reserved() / gb, 2),
+                    "max_alloc_gb": round(mod.max_memory_allocated() / gb, 2),
+                    "max_reserved_gb": round(mod.max_memory_reserved() / gb, 2),
+                }
+    except Exception as exc:  # noqa: BLE001 - probe must never break training
+        reason = f"{type(exc).__name__}: {exc}"
+
+    # Say WHY, once. A silent None is what let a whole 5-epoch run finish with no
+    # memory record; one warning at step 0 would have cost nothing.
+    if _MEM_WARNED.get("reason") != reason:
+        _MEM_WARNED["reason"] = reason
+        root_logger.warning("memory metrics unavailable: %s", reason)
+    return None
 
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
