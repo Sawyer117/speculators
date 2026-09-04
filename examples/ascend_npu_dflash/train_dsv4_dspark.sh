@@ -211,9 +211,11 @@ if [ -n "${SELECT_RANK:-}" ]; then EXTRA="$EXTRA --select-rank $SELECT_RANK"; fi
 if [ "$OPTIM" = "muon" ]; then
   [ -n "$MUON_LR" ] && EXTRA="$EXTRA --muon-lr $MUON_LR"
   EXTRA="$EXTRA --muon-adjust-lr-fn $MUON_ADJUST"
-  # MUON_HYBRID=0 复现 2026-09-04 之前的跑法(单组系数重复 5 步)。默认开,因为它
-  # 不多花一分算力却把正交度提高一个量级 —— 详见 muon_distributed 里的实测表。
-  [ "${MUON_HYBRID:-1}" = "0" ] && EXTRA="$EXTRA --no-muon-hybrid-ns"
+  # MUON_HYBRID=1 打开混合 Newton-Schulz(后两步换 (2.0,-1.5,0.5) 系数)。
+  # 默认【关】,和上游 torchtitan-npu 一致:它数值上更接近正交(实测好 16 倍,且不
+  # 多花算力),但正交度不是训练目标 —— Jordan 的主系数本来就不收敛到 1。对
+  # accept_len 的影响【未验证】,要做 >=1000 步 A/B 才谈得上改默认。
+  [ "${MUON_HYBRID:-0}" = "1" ] && EXTRA="$EXTRA --muon-hybrid-ns"
 fi
 [ -n "$MAX_STEPS" ] && EXTRA="$EXTRA --max-steps $MAX_STEPS"
 if [ -n "${BLOCK_CONV_TAPS:-}" ]; then EXTRA="$EXTRA --block-conv-kernel-size $BLOCK_CONV_TAPS"; fi
@@ -293,7 +295,7 @@ SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
 echo "==================================================================="
 echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL  init(moe/attn/hc/norm/layer)=$INITMOE/$INITATTN/$INITHC/$INITNORM/$INITLAYER"
-echo " optimizer=$OPTIM  max_steps=${MAX_STEPS:-<all>}  muon_lr=${MUON_LR:-<10*lr>}  muon_adjust=$MUON_ADJUST  muon_hybrid=${MUON_HYBRID:-1}"
+echo " optimizer=$OPTIM  max_steps=${MAX_STEPS:-<all>}  muon_lr=${MUON_LR:-<10*lr>}  muon_adjust=$MUON_ADJUST  muon_hybrid=${MUON_HYBRID:-0}"
 echo " block=$BLOCK (all $BLOCK slots drafted = gamma = num_spec; sample_from_anchor=True)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS  noncausal_block=$NONCAUSAL (=serve cad.causal=False)"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"

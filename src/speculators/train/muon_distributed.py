@@ -55,12 +55,21 @@ is usable at 3 steps -- the best is 0.21, i.e. barely orthogonalized at all:
     MindSpeed "quintic"       0.0159           0.2087
     "polar_express"           0.0842           0.6075
 
-``hybrid_ns`` is what that table is really about: switching the last two steps to
-``COEFF_SECONDARY`` costs nothing -- same step count, same FLOPs -- and lands 16x
-closer to orthogonal (40x on the 1:32 matrices, 0.1174 -> 0.0029). It also beats
-MindSpeed's per-step-varying schedule. It defaults on now; it was implemented but
-never passed through from the config, so every Muon run before 2026-09-04 --
-including the A/B above -- used the worst row of that table.
+⚠ READ THE TABLE FOR WHAT IT IS. It measures distance from orthogonal, which is
+NOT the training objective. ``COEFF_PRIMARY`` does not converge to 1 by design:
+as a map on singular values, p(x) = a x + b x^3 + c x^5 has p(1) = 0.7010, so 1 is
+not even a fixed point, and iterating it oscillates (1.19, 0.90, 0.82, 0.77, ...,
+1.13). Muon accepts sigma in roughly [0.7, 1.3]. ``COEFF_SECONDARY`` has p(1) = 1
+and p'(1) = 0 -- a genuine quadratically-convergent fixed point -- which is why
+hybrid measures better here. Whether that helps accept_len is UNTESTED, so
+``hybrid_ns`` defaults OFF, matching upstream.
+
+⚠ AND THIS PORT IS NOT EQUIVALENT TO UPSTREAM AT ``ns_steps=5``. torchtitan-npu
+switches at an ABSOLUTE ``i >= 8`` with ``steps=10`` (8 primary + 2 secondary);
+this file switches at ``steps - 2``. The two agree at 10 steps, but at our 5 steps
+upstream's condition never fires -- their ``hybrid_ns=True`` would be a complete
+no-op -- while this gives 3 primary + 2 secondary, a schedule upstream never
+validated. Anything claimed for hybrid here rests on our own measurement only.
 
 MindSpeed has no fused NPU kernel here to borrow: its Newton-Schulz accepts a
 ``use_syrk`` argument and documents that the NPU path falls back to plain matmul.

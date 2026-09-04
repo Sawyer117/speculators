@@ -354,12 +354,13 @@ class OptimizerArgs(_Group):
         description="Muon LR adjustment. 'match_rms_adamw' matches AdamW's update RMS.",
     )
     muon_hybrid_ns: bool = Field(
-        default=True,
+        default=False,
         description="Switch the last two Newton-Schulz steps to the gentler "
-        "(2.0, -1.5, 0.5) polynomial, which settles the singular values at 1 instead "
-        "of overshooting. Free -- same step count, same FLOPs -- and measured 16x "
-        "closer to orthogonal on the real parameter shapes (mean|sigma-1| 0.165 -> "
-        "0.0104 on the expert stacks). Set false to reproduce the pre-2026-09-04 runs.",
+        "(2.0, -1.5, 0.5) polynomial. Measured 16x closer to orthogonal on the real "
+        "parameter shapes at no extra cost -- but orthogonality is not the training "
+        "objective (Muon's primary coefficients deliberately do NOT converge to 1), "
+        "so this is UNVALIDATED on accept_len and defaults off, matching upstream "
+        "torchtitan-npu. Needs a >=1000-step A/B before it becomes the default.",
     )
 
 
