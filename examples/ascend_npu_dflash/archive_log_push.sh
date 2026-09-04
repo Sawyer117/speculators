@@ -46,6 +46,12 @@ die() { echo "!! $*" >&2; exit 1; }
 # what makes `cat part.*` -> decompress work even though each part was compressed alone.
 ext() { [ "$COMPRESS" = "xz" ] && echo "xz" || echo "gz"; }
 
+# The manifest is MANIFEST.txt, not MANIFEST: the repo's .gitignore carries a bare
+# `MANIFEST` (the setuptools-generated file, straight out of the Python template), which
+# matches at any depth -- so a plain MANIFEST was unaddable. Older packs still have one;
+# prefer the new name and fall back, so an existing archive does not need re-packing.
+mf() { [ -f "$1/MANIFEST.txt" ] && echo "$1/MANIFEST.txt" || echo "$1/MANIFEST"; }
+
 cmd_pack() {
   local log="${1:?usage: pack <logfile> [dest_dir]}"
   [ -f "$log" ] || die "no such file: $log"
@@ -120,7 +126,7 @@ sys.exit(0 if worst <= limit else 3)
 PYSPLIT
 
   local n; n="$(find "$dest" -name "part.*.$e" | wc -l)"
-  cat > "$dest/MANIFEST" <<EOF
+  cat > "$dest/MANIFEST.txt" <<EOF
 name        $name
 raw_bytes   $raw_size
 raw_sha256  $raw_sha
@@ -131,30 +137,39 @@ parts       $n
 restore     cat part.*.$e > $name.$e && $COMPRESS -d $name.$e && sha256sum $name
 EOF
   echo "== 完成 -> $dest"
-  cat "$dest/MANIFEST"
+  cat "$dest/MANIFEST.txt"
 }
 
 cmd_push() {
   local dest="${1:?usage: push <dest_dir>}"
-  [ -f "$dest/MANIFEST" ] || die "no MANIFEST in $dest — run pack first"
-
-  # Catch an ignored destination HERE, with a fix, instead of letting `git add` abort the
-  # loop under `set -e` with nothing but git's generic "paths are ignored" hint.
-  if git check-ignore -q "$dest" 2>/dev/null; then
-    echo "!! $dest 被 .gitignore 挡住($(git check-ignore -v "$dest" | cut -f1)):" >&2
-    echo "   换个不以 .log 结尾的目录名即可,分片不用重做:" >&2
-    echo "     mv '$dest' '${dest%.log}'" >&2
-    echo "     $0 push '${dest%.log}'" >&2
-    exit 5
-  fi
+  local mfp; mfp="$(mf "$dest")"
+  [ -f "$mfp" ] || die "no MANIFEST.txt in $dest — run pack first"
 
   local branch e
   branch="$(git rev-parse --abbrev-ref HEAD)"
-  e="$(awk '$1=="compress"{print ($2=="xz")?"xz":"gz"}' "$dest/MANIFEST")"
+  e="$(awk '$1=="compress"{print ($2=="xz")?"xz":"gz"}' "$mfp")"
+
+  # Catch anything ignored HERE, with a fix, instead of letting `git add` abort the loop
+  # under `set -e` with nothing but git's generic "paths are ignored" hint. Check EVERY
+  # file about to be added, not just the directory: checking only the directory passed,
+  # then `git add` died on MANIFEST, which .gitignore matches by its own bare name.
+  local blocked
+  blocked="$(git check-ignore "$mfp" $(find "$dest" -name "part.*.$e" | sort) 2>/dev/null || true)"
+  if [ -n "$blocked" ]; then
+    echo "!! 这些路径被 .gitignore 挡住,git add 会失败:" >&2
+    git check-ignore -v $blocked >&2
+    case "$blocked" in
+      *MANIFEST) echo "   修法:  mv '$dest/MANIFEST' '$dest/MANIFEST.txt'  然后重跑本命令" >&2 ;;
+      *) echo "   修法:换一个不被忽略的目录名,分片不用重做:" >&2
+         echo "     mv '$dest' '${dest%.log}' && $0 push '${dest%.log}'" >&2 ;;
+    esac
+    exit 5
+  fi
+
   # MANIFEST goes first so that an interrupted run still tells the next reader what this
   # pile of parts is and how to restore it.
   local f
-  for f in "$dest/MANIFEST" $(find "$dest" -name "part.*.$e" | sort); do
+  for f in "$mfp" $(find "$dest" -name "part.*.$e" | sort); do
     # Already committed -> skip. This is what makes the whole thing resumable: after a
     # failed push, just re-run and it picks up where it stopped.
     git ls-files --error-unmatch "$f" >/dev/null 2>&1 && continue
@@ -173,11 +188,12 @@ cmd_push() {
 
 cmd_verify() {
   local dest="${1:?usage: verify <dest_dir>}"
-  [ -f "$dest/MANIFEST" ] || die "no MANIFEST in $dest"
+  local mfp; mfp="$(mf "$dest")"
+  [ -f "$mfp" ] || die "no MANIFEST.txt in $dest"
   local name want got tool e
-  name="$(awk '$1=="name"{print $2}' "$dest/MANIFEST")"
-  want="$(awk '$1=="raw_sha256"{print $2}' "$dest/MANIFEST")"
-  tool="$(awk '$1=="compress"{print $2}' "$dest/MANIFEST")"
+  name="$(awk '$1=="name"{print $2}' "$mfp")"
+  want="$(awk '$1=="raw_sha256"{print $2}' "$mfp")"
+  tool="$(awk '$1=="compress"{print $2}' "$mfp")"
   e="$([ "$tool" = "xz" ] && echo xz || echo gz)"
   # tmp is GLOBAL on purpose: the EXIT trap runs after this function returns, so a
   # `local tmp` would be out of scope there and `set -u` would abort inside the trap.
@@ -186,7 +202,7 @@ cmd_verify() {
   "$tool" -d "$tmp/$name.$e"
   got="$(sha256sum "$tmp/$name" | cut -d' ' -f1)"
   [ "$got" = "$want" ] || die "校验失败: want $want got $got"
-  echo "== 校验通过: $name 与原始逐字节相同 ($(awk '$1=="parts"{print $2}' "$dest/MANIFEST") 片)"
+  echo "== 校验通过: $name 与原始逐字节相同 ($(awk '$1=="parts"{print $2}' "$mfp") 片)"
 }
 
 # Deleting the parts is the one irreversible step here, so it is gated three ways:
