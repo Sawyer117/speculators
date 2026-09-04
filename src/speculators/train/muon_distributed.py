@@ -30,16 +30,33 @@ Two routes, matching how the draft is actually sharded:
   gradient is gathered, the iteration runs identically on every rank, and each rank keeps
   its own slice. Redundant compute, but these are the small parameters.
 
-COST, MEASURED (8x A2, faithful EP config, steady state). The ~5% figure this
-file used to quote was AdamW's, not Muon's:
+COST AND BENEFIT, MEASURED (8x A2, faithful EP config; medians / means over
+~1700 matched steps of two runs on the SAME lr schedule -- verified identical at
+step 57 and 2002). The ~5% cost this file used to quote was AdamW's, not Muon's:
 
-    AdamW   opt_ms  99 ms / step_ms 2155 ms  =  4.6%
-    Muon    opt_ms 1010 ms / step_ms 2960 ms  =  34%   (+37% wall-clock/step)
+    opt_ms      AdamW    99   Muon  1010    10.2x
+    step_ms     AdamW  2040   Muon  3030     1.49x
+
+    steps 1900-2004      AdamW     Muon
+    accept_len            2.453    2.793   +13.9%
+    position_0_acc        0.709    0.750    +5.8%
+    position_4_acc        0.246    0.357   +45.1%
 
 The 1 s is Newton-Schulz FLOPs on the 3D expert stacks, not communication: 5
-iterations x 3 ``bmm`` each, over every local expert. ``ns_steps`` is therefore
-the first knob to reach for if step time has to come down, and ``hybrid_ns``
-settles the singular values in fewer of them.
+iterations x 3 ``bmm`` each, over every local expert. ``ns_steps`` is the first
+knob if step time has to come down; ``hybrid_ns`` settles in fewer of them.
+
+Muon wins even after paying the 1.49x: at EQUAL WALL CLOCK (AdamW step 2970 vs
+Muon step 2000) accept_len is 2.650 vs 2.796, and AdamW needs ~step 4500 to reach
+2.796 -- 2.2x the steps, 1.5x the wall clock. The gain also grows monotonically
+with position, which is what matters for a longer block.
+
+⚠ Two limits on the above. It is step ~2000 of a 124,480-step run (1.6% in; AdamW
+ends at accept_len 3.87), and it is one seed each -- nothing here says the lead
+survives to convergence. And Muon is genuinely WORSE early: behind on loss from
+step ~25 to ~200 (steps 50-75: ce 29.9 vs 9.8). It passes AdamW on accept_len
+around step 100 and on loss around step 250, so a 100-step smoke test reads as a
+regression.
 
 ⚠ ``validate_expert_shard_dim0`` is not decoration. If experts were ever sharded INSIDE a
 matrix instead of across the expert axis, the local route would orthogonalize incomplete
