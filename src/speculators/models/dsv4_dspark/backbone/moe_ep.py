@@ -26,6 +26,7 @@ so its gradient flows too; only the integer local-expert-id ride is non-differen
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -36,6 +37,66 @@ from .moe import GroupedExperts, swiglu_grouped
 from .moe_grouped_gemm import _fused_permute_dispatch_npu, _grouped_matmul
 
 _MOE_OP = "moe_dispatch"
+
+# DSPARK_EP_CHECK=1: validate the counts handshake below before the payload rides on it.
+_EP_CHECK = os.environ.get("DSPARK_EP_CHECK") == "1"
+
+
+def _verify_splits(input_splits, output_splits, group, size, rank, where) -> None:
+    """Prove the ranks agree on the SIZE of the token all-to-all, before it is issued.
+
+    WHY THIS EXISTS. Every collective in a step is issued by every rank, in the same
+    order -- the sequence counter in the trace says so (all eight ranks sat at
+    ``seq=179`` through the whole optimizer). The counts match. Yet ranks {0,1,2,3}
+    then block forever in a plain device ``synchronize()`` while {4,5,6,7} drain in
+    1.3 s and run on. A device sync waits on work already queued, so one of those 179
+    collectives completed on half the mesh and never completed on the other half.
+
+    A collective can do that ONLY if the ranks disagree on how many bytes are moving:
+    the ranks that were sent everything they expected complete, the ranks still short
+    of their expected receive block forever. Count agreement cannot catch it.
+
+    This model has exactly one variable-size collective -- the EP token all-to-all --
+    and its sizes come from the handshake above. That handshake is
+    ``all_to_all_single`` on a ``torch.bincount`` result, i.e. **int64 over HCCL**,
+    which is the same datatype class that already handed this project uninitialised
+    memory out of an int64 all-gather.
+
+    So: gather the whole [size, size] table and check it. Two assertions, in order:
+
+      1. **my own row must round-trip.** I know exactly what I put in, so if the copy
+         that comes back through the collective differs, the CHECK channel is itself
+         corrupt and its verdict on anything else is worthless. Reported separately.
+      2. **``output_splits`` must equal column ``rank`` of the table** -- what every
+         other rank says it is sending me. This is the actual claim under test.
+
+    The check channel is int32 on purpose: a check must not ride the datatype it is
+    checking. One 256-byte all-gather per dispatch, opt-in, off by default.
+    """
+    mine = input_splits.to(torch.int32).contiguous()
+    table = torch.empty(size * size, dtype=torch.int32, device=mine.device)
+    dist.all_gather_into_tensor(table, mine, group=group)
+    table = table.view(size, size)  # table[r] == rank r's input_splits
+
+    sent, echoed = input_splits.tolist(), table[rank].tolist()
+    if sent != echoed:
+        raise RuntimeError(
+            f"[EP-CHECK {where}] rank {rank}: the check channel corrupted its own "
+            f"row -- put in {sent}, got back {echoed}. int32 all-gather is not "
+            "trustworthy on "
+            "this stack, so nothing below can be concluded; fix the transport first."
+        )
+
+    expected, actual = table[:, rank].tolist(), output_splits.tolist()
+    if expected != actual:
+        raise RuntimeError(
+            f"[EP-CHECK {where}] rank {rank}: counts handshake disagrees. The other "
+            f"ranks say they are sending me {expected}, the int64 all-to-all "
+            f"handshake returned {actual}. The token all-to-all would then post the "
+            "wrong receive size and "
+            "hang on whichever ranks come up short -- which is the observed failure. "
+            f"My own sends: {sent}."
+        )
 
 
 @dataclass
@@ -145,6 +206,8 @@ def moe_dispatch_ep(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tenso
     input_splits = torch.bincount(owner, minlength=ep.size)            # tokens I send to each rank
     output_splits = torch.empty_like(input_splits)
     dist.all_to_all_single(output_splits, input_splits, group=ep.group)  # tokens I receive from each
+    if _EP_CHECK:
+        _verify_splits(input_splits, output_splits, ep.group, ep.size, ep.rank, _MOE_OP)
     in_s, out_s = input_splits.tolist(), output_splits.tolist()
 
     # ---- dispatch: token features + router weight ride ONE autograd all-to-all ----
