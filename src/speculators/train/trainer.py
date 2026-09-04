@@ -650,6 +650,23 @@ class Trainer:
             # instead of the token-weighted 1/N, so mean(n)/n_r is exactly how far off that
             # rank's weight is -- 1.0 everywhere means the two objectives coincide and
             # DSPARK_GLOBAL_LOSS_REDUCE is a no-op. See models/metrics.py.
+            if _TRACE:
+                # WHY a rank ends up with no gradient is a fact about ITS batch, not
+                # about the optimizer, so record the batch before anything consumes
+                # it. Shapes of every tensor plus the supervised-token count: a rank
+                # whose loss_mask sums to 0 contributes nothing to the loss, and the
+                # parameters that only that path touches then come back from backward
+                # with `grad is None`.
+                # `sup_tokens_zero_ranks` in the profile below already tracks that this
+                # happens here; this says WHICH rank and WHEN, on every step.
+                _shapes = " ".join(
+                    f"{k}={tuple(v.shape)}"
+                    for k, v in gpu_batch.items()
+                    if isinstance(v, torch.Tensor)
+                )
+                _lm0 = gpu_batch.get("loss_mask")
+                _sup = "-" if _lm0 is None else int(_lm0.sum().item())
+                _trace(f"batch: sup_tokens={_sup} {_shapes}", self.global_step)
             _trace("batch+HS ready", self.global_step)
             fetch_all: list[float] | None = None
             tokens_all: list[int] | None = None
@@ -682,9 +699,34 @@ class Trainer:
             # non-finite value pinpoints the step where NaN enters via the gradients.
             # (Under EP the routed experts are Shard(0) DTensors on the same mesh as the
             # FSDP-sharded rest, so a single clip over all params is uniform -- no split.)
+            if _TRACE:
+                # THE CENSUS. Which parameters came out of backward with no gradient
+                # on THIS rank, and in what dtype the ones that did. Both are
+                # rank-local, and both feed the same failure: a parameter missing on
+                # some ranks and present on others made the old optimizer issue a
+                # different NUMBER of collectives (1b62bd8c guarded `_step_param`
+                # behind `if param.grad is not None`), and makes the current one issue
+                # a different SIZE. Model-wide rather than Muon-only, so it still says
+                # something if the divergence is in a parameter Muon never touches.
+                _none, _dts = [], {}
+                for _n, _p in self.model.named_parameters():
+                    if not _p.requires_grad:
+                        continue
+                    if _p.grad is None:
+                        _none.append(_n)
+                    else:
+                        _k = str(_p.grad.dtype).removeprefix("torch.")
+                        _dts[_k] = _dts.get(_k, 0) + 1
+                _trace(
+                    f"grad census: none={len(_none)} have={sum(_dts.values())} "
+                    f"dtypes={_dts} {_none[:16]}",
+                    self.global_step,
+                )
             _trace("backward done -> clip_grad_norm (collective)", self.global_step)
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            _trace("clip_grad_norm done", self.global_step)
+            # Per-rank, not just rank 0 on log steps: a norm that is 0 or non-finite on
+            # one rank group is itself the answer to "what was different about them".
+            _trace(f"clip_grad_norm done norm={float(grad_norm):.6g}", self.global_step)
 
             timer.mark("bwd")
             _trace("optimizer.step -> enter", self.global_step)
