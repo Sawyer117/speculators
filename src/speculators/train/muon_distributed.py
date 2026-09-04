@@ -97,6 +97,7 @@ import logging
 import math
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
@@ -259,11 +260,49 @@ class DistributedMuon(Optimizer):
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
         loss = closure() if closure is not None else None
+
+        # ⚠ THE COLLECTIVE MUST NOT BE CONDITIONAL. The matrix route calls
+        # ``full_tensor()`` -- an all-gather over the whole mesh. Skipping a parameter
+        # on the ranks where its grad happens to be None, while the others gather, makes
+        # the ranks disagree on how many collectives to issue, and it does not fail --
+        # it HANGS until HCCL_EXEC_TIMEOUT (1800 s here), dying far from the cause.
+        # So a missing grad is treated as a zero grad, and every rank walks the same
+        # parameters in the same order. AdamW never had this exposure -- its step is
+        # element-wise on local shards and issues no collectives at all.
+        stepped = 0
         for group in self.param_groups:
             for param in group["params"]:
-                if param.grad is not None:
-                    self._step_param(param, group)
+                self._step_param(param, group)
+                stepped += param.grad is not None
+        self._assert_ranks_agree(stepped)
         return loss
+
+    def _assert_ranks_agree(self, stepped: int) -> None:
+        """Turn a rank disagreement into an immediate error instead of a 30-min hang.
+
+        One scalar all-gather per step (negligible next to ~1 s of Newton-Schulz). If
+        ranks ever walk different parameter sets, this says so on the spot, naming the
+        counts, rather than leaving a collective half-issued for the watchdog to find.
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        param = next(
+            (p for g in self.param_groups for p in g["params"] if p.numel()), None
+        )
+        if param is None:
+            return
+        device = (param.to_local() if isinstance(param, DTensor) else param).device
+        counts = torch.tensor([stepped], device=device, dtype=torch.int64)
+        gathered = [torch.zeros_like(counts) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, counts)
+        seen = [int(t.item()) for t in gathered]
+        if len(set(seen)) > 1:
+            raise RuntimeError(
+                "DistributedMuon: ranks disagree on how many parameters carried a "
+                f"gradient ({seen}). They would issue different numbers of collectives "
+                "and the run would hang until the HCCL timeout. This means the ranks "
+                "took different code paths in the backward."
+            )
 
     def _orthogonalize(self, effective: Tensor, group: dict) -> Tensor:
         upd = zeropower_via_newtonschulz5(
@@ -273,24 +312,34 @@ class DistributedMuon(Optimizer):
 
     def _step_param(self, param: Tensor, group: dict) -> None:
         state = self.state.setdefault(param, {})
-        grad, m = param.grad, group["momentum"]
+        m = group["momentum"]
+
+        # The mesh and placements come from the PARAMETER, not the gradient, because a
+        # rank may arrive here with grad None -- see the note in step(). A missing grad
+        # becomes a zero grad so the collective below is still issued in lockstep; the
+        # momentum simply decays, which is what a zero gradient should do anyway.
+        p_local = param.to_local() if isinstance(param, DTensor) else param
+        g_local = param.grad
+        if g_local is None:
+            g_local = torch.zeros_like(p_local)
+        elif isinstance(g_local, DTensor):
+            g_local = g_local.to_local()
 
         # The momentum buffer stays SHARDED, always. Keeping it in gathered shape would
         # put a whole copy of every matrix on every rank -- for this draft that is ~1 GB
         # of pure waste per rank, which is a large bite out of the very saving Muon is
         # here for. Only the iteration input is gathered, and only transiently.
-        g_local = grad.to_local() if isinstance(grad, DTensor) else grad
         buf = state.get("momentum_buffer")
         if buf is None:
             buf = state["momentum_buffer"] = torch.zeros_like(g_local)
         buf.lerp_(g_local, 1.0 - m)
         effective = g_local.add(buf, alpha=m) if group["nesterov"] else buf
 
-        if self._route[id(param)] == "matrix" and isinstance(grad, DTensor):
+        if self._route[id(param)] == "matrix" and isinstance(param, DTensor):
             # A row-shard is not a matrix: gather the effective gradient, run the
             # identical iteration on every rank, then keep this rank's slice back.
             eff_full = DTensor.from_local(
-                effective, grad.device_mesh, grad.placements
+                effective, param.device_mesh, param.placements
             ).full_tensor()
             update = _local_shard_of(self._orthogonalize(eff_full, group), param)
         else:
@@ -299,7 +348,6 @@ class DistributedMuon(Optimizer):
 
         # Write through .to_local(): the in-place add is exactly what torch's Muon dies
         # on, and doing it on plain tensors is what avoids the placement propagation.
-        p_local = param.to_local() if isinstance(param, DTensor) else param
         if group["weight_decay"]:
             p_local.mul_(1.0 - group["lr"] * group["weight_decay"])
         p_local.add_(update.to(p_local.dtype), alpha=-group["lr"])
