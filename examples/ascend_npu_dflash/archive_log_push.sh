@@ -166,6 +166,14 @@ cmd_push() {
     exit 5
   fi
 
+  # A previous run can leave commits made but not pushed (commit succeeds, push fails on
+  # auth). Drain them BEFORE adding more, or the next push carries several parts in one
+  # request -- which is the very thing the per-part split exists to avoid.
+  if [ -n "$(git rev-list @{u}..HEAD 2>/dev/null)" ]; then
+    echo "== 先把上次已提交但未推送的 $(git rev-list --count @{u}..HEAD) 个提交推掉"
+    git push -q origin "HEAD:$branch" || die "push 失败 —— 认证/网络修好后重跑本命令"
+  fi
+
   # MANIFEST goes first so that an interrupted run still tells the next reader what this
   # pile of parts is and how to restore it.
   local f
