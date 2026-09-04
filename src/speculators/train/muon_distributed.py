@@ -553,8 +553,30 @@ class DistributedMuon(Optimizer):
         if self._route[id(param)] == "matrix" and isinstance(param, DTensor):
             # A row-shard is not a matrix: gather the effective gradient, run the
             # identical iteration on every rank, then keep this rank's slice back.
+            #
+            # ⚠ `shape=`/`stride=` ARE LOAD-BEARING, NOT DECORATION. Without them
+            # `from_local` has nothing to go on and INFERS the global shape as
+            # `local_shape * mesh_size`. That is right only when the parameter divides
+            # evenly. `hc_head.hc_fn` is [hc_mult, hc_mult * hidden] = [4, 16384] and
+            # this mesh is 8 wide, so ranks 0-3 hold one row each and ranks 4-7 hold
+            # NONE -- and the inference then yields [8, 16384] on the first four and
+            # [0, 16384] on the last four. The ranks disagree about the size of the
+            # all-gather they are jointly issuing, so the first four wait forever for
+            # bytes the last four never send. Verified on 4-rank gloo with a [2, 8]
+            # parameter: inference gives [4, 8] / [0, 8], passing shape= gives [2, 8]
+            # on every rank and an exact round trip.
+            #
+            # This is why 7f35a95d ran and everything after it hangs: that version
+            # gathered `grad.full_tensor()`, a REAL DTensor carrying the true global
+            # shape. 1b62bd8c moved the momentum buffer to the local shard -- worth
+            # ~1 GB/rank -- and rebuilt the DTensor from a plain local tensor, which
+            # silently dropped that metadata. Keep the saving, restore the shape.
             eff_full = DTensor.from_local(
-                effective, param.device_mesh, param.placements
+                effective,
+                param.device_mesh,
+                param.placements,
+                shape=param.shape,
+                stride=param.stride(),
             ).full_tensor()
             update = _local_shard_of(self._orthogonalize(eff_full, group), param)
         else:
