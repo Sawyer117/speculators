@@ -43,8 +43,27 @@ step 57 and 2002). The ~5% cost this file used to quote was AdamW's, not Muon's:
     position_4_acc        0.246    0.357   +45.1%
 
 The 1 s is Newton-Schulz FLOPs on the 3D expert stacks, not communication: 5
-iterations x 3 ``bmm`` each, over every local expert. ``ns_steps`` is the first
-knob if step time has to come down; ``hybrid_ns`` settles in fewer of them.
+iterations x 3 ``bmm`` each, over every local expert.
+
+⚠ ``ns_steps`` is NOT a usable knob for cutting that. Measured on the real shapes
+in bf16 (GPU, mean|sigma-1| of the orthogonalized result), no coefficient schedule
+is usable at 3 steps -- the best is 0.21, i.e. barely orthogonalized at all:
+
+    5 steps, expert w1/w3 [2048, 4096]        3 steps
+    single triplet repeated   0.1650           0.2811
+    hybrid (this file)        0.0104           0.2811
+    MindSpeed "quintic"       0.0159           0.2087
+    "polar_express"           0.0842           0.6075
+
+``hybrid_ns`` is what that table is really about: switching the last two steps to
+``COEFF_SECONDARY`` costs nothing -- same step count, same FLOPs -- and lands 16x
+closer to orthogonal (40x on the 1:32 matrices, 0.1174 -> 0.0029). It also beats
+MindSpeed's per-step-varying schedule. It defaults on now; it was implemented but
+never passed through from the config, so every Muon run before 2026-09-04 --
+including the A/B above -- used the worst row of that table.
+
+MindSpeed has no fused NPU kernel here to borrow: its Newton-Schulz accepts a
+``use_syrk`` argument and documents that the NPU path falls back to plain matmul.
 
 Muon wins even after paying the 1.49x: at EQUAL WALL CLOCK (AdamW step 2970 vs
 Muon step 2000) accept_len is 2.650 vs 2.796, and AdamW needs ~step 4500 to reach

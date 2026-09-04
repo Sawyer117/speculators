@@ -76,6 +76,11 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
                     weight_decay=config.muon_weight_decay,
                     ns_steps=config.muon_ns_steps,
                     adjust_lr_fn=config.muon_adjust_lr_fn,
+                    # Was never passed, so hybrid_ns sat at its False default and every
+                    # Muon run so far used the single repeated coefficient triplet --
+                    # measurably the worst of the schedules tested. See the table in
+                    # muon_distributed.
+                    hybrid_ns=config.muon_hybrid_ns,
                 )
             )
         if adamw_params:
