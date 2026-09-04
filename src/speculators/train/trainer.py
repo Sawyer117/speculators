@@ -158,7 +158,8 @@ def _gpu_mem_stats() -> dict[str, float] | None:
 # This writes from EVERY rank, unbuffered, with a timestamp. The last line each rank
 # printed is exactly how far that rank got, so a stalled collective becomes a diff
 # between rank groups instead of a guess. Off by default, zero cost when off.
-_TRACE = os.environ.get("DSPARK_TRACE") == "1"
+_TRACE_SYNC = os.environ.get("DSPARK_TRACE_SYNC") == "1"
+_TRACE = os.environ.get("DSPARK_TRACE") == "1" or _TRACE_SYNC
 
 
 def _trace(phase: str, step: object = None) -> None:
@@ -518,8 +519,22 @@ class Trainer:
             opt.zero_grad()
 
     def _optimizers_step(self):
+        # Traced PER OPTIMIZER, not as one block. In muon mode this list is
+        # [DistributedMuon, AdamW], and a trace that lumps them together cannot say
+        # which one a stuck rank is in -- the run that reached "all params done" on
+        # every rank and still never completed a step is exactly that ambiguity.
         for opt in self.optimizers:
+            name = type(opt).__name__
+            _trace(f"{name}.step -> enter", self.global_step)
             opt.step()
+            if _TRACE_SYNC:
+                # Collectives are queued, not awaited: without this the line below
+                # proves only that the call returned, not that its communication
+                # completed. Debugging only.
+                torch.accelerator.synchronize()
+                _trace(f"{name}.step <- DRAINED", self.global_step)
+            else:
+                _trace(f"{name}.step <- returned", self.global_step)
 
     def _schedulers_step(self):
         for scheduler in self.schedulers:
