@@ -296,6 +296,57 @@ LOG="$RUN/${TAG}_${TS}.log"
 # from ./output. Override SAVE_PATH=<dir> to resume a specific run.
 SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 
+# ── RUN PROVENANCE ─────────────────────────────────────────────────────────────────────
+# A run that trains is an asset, and the only thing that makes it reproducible later is
+# the COMMIT IT RAN ON. Learned the hard way: a Muon hang was chased for days across a
+# reboot, a broken driver and four wrong hypotheses because a rollback was aimed one
+# commit late -- nobody could say which commit the last good run had used.
+#
+# `train_command.txt` in the ckpt dir records the argparse half only; the DSPARK_* env
+# half lives here in the launcher. This file records BOTH plus the SHA, alongside the log
+# and named after the same run, so log <-> recipe <-> commit are one lookup apart.
+# Written before torchrun so it survives a crash in the first second.
+GIT_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+GIT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+GIT_SUBJECT="$(git -C "$REPO_ROOT" log -1 --format=%s 2>/dev/null || echo unknown)"
+GIT_DIRTY="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null || true)"
+# `[ … ] && …` as the last command of a loop body returns nonzero under `set -e` and
+# kills the script — same trap the TAG comment above warns about. if-blocks only.
+DIRTY_MARK=""
+if [ -n "$GIT_DIRTY" ]; then DIRTY_MARK=" +DIRTY"; fi
+PROV="$RUN/${TAG}_${TS}.provenance.txt"
+{
+  echo "run_ts=$TS   tag=$TAG   mode=$MODE   nproc=$NPROC"
+  echo "log=$LOG"
+  echo "save=$SAVE_PATH"
+  echo "repo=$REPO_ROOT"
+  echo
+  echo "commit=$GIT_SHA"
+  echo "branch=$GIT_BRANCH"
+  echo "subject=$GIT_SUBJECT"
+  if [ -n "$GIT_DIRTY" ]; then
+    echo "dirty=YES  -- the commit above does NOT fully describe this run:"
+    echo "$GIT_DIRTY" | sed 's/^/  /'
+  else
+    echo "dirty=no"
+  fi
+  echo
+  echo "# env recipe (the half train_command.txt does NOT record)"
+  for _v in VERIFIER DATA HS_DIR ENDPOINT LR EPOCHS MAX_ANCHORS SEQLEN MASK_TOKEN BLOCK \
+            MAX_STEPS OPTIM MUON_LR MUON_ADJUST MUON_HYBRID DECAY_GAMMA SWA_WINDOW \
+            NONCAUSAL SCHED_TYPE WARMUP_RATIO LOSS_FN TEACHER_DNORM KD_TEMP NOISE_STD \
+            GROUPED EP RECOMPUTE COMPILE NOVAL INITMOE INITATTN INITHC INITNORM \
+            INITLAYER INITNOROUTER FROM_PRETRAINED LAYERS EXPERTS CKPT_FREQ \
+            DSPARK_MOE_BALANCE DSPARK_MOE_BALANCE_RATE DSPARK_LOG_EXPERT_LOAD \
+            DSPARK_TRACE DSPARK_TRACE_SYNC DSPARK_EP_CHECK BF16_EXPERTS; do
+    eval "_val=\${$_v-}"
+    if [ -n "${_val:-}" ]; then echo "$_v=$_val"; fi
+  done
+  echo
+  echo "# to reproduce this run exactly"
+  echo "git -C $REPO_ROOT checkout $GIT_SHA"
+} > "$PROV" 2>/dev/null || echo "!! could not write provenance to $PROV"
+
 echo "==================================================================="
 echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL  init(moe/attn/hc/norm/layer)=$INITMOE/$INITATTN/$INITHC/$INITNORM/$INITLAYER"
 echo " optimizer=$OPTIM  max_steps=${MAX_STEPS:-<all>}  muon_lr=${MUON_LR:-<10*lr>}  muon_adjust=$MUON_ADJUST  muon_hybrid=${MUON_HYBRID:-0}"
@@ -304,6 +355,7 @@ echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (ancho
 echo " verifier=$VERIFIER"
 echo " data=$DATA"
 echo " 📋 log -> $LOG   (rank0 mirror also in $RUN/train_*.log)"
+echo " 🔖 commit -> ${GIT_SHA:0:12}${DIRTY_MARK}  ($GIT_BRANCH)   recipe -> $PROV"
 echo " 💾 save -> $SAVE_PATH"
 echo "==================================================================="
 
