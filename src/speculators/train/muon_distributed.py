@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 
 import torch
 import torch.distributed as dist
@@ -243,6 +244,10 @@ class DistributedMuon(Optimizer):
                 "hybrid_ns": hybrid_ns,
             },
         )
+        # A rank that disables the probe while the others keep it would itself create
+        # the divergence the probe exists to catch, so the flag is per-instance and the
+        # probe is opt-in; see step().
+        self._probe_ok = True
         self._route: dict[int, str] = {}
         counts = {"expert": 0, "matrix": 0}
         for name, param in zip(names, params, strict=True):
@@ -275,7 +280,13 @@ class DistributedMuon(Optimizer):
             for param in group["params"]:
                 self._step_param(param, group)
                 stepped += param.grad is not None
-        if getattr(self, "_probe_ok", True):
+        # OPT-IN ONLY (SPECULATORS_MUON_RANK_CHECK=1). This probe has cost more than
+        # it found: its first version used int64 and returned uninitialised memory,
+        # accusing the training of a divergence that was not there, and its own
+        # all-gather then became the frame every later hang reported -- which makes the
+        # evidence harder to read, not easier. It stays available for deliberate
+        # debugging and stays out of the default path.
+        if os.environ.get("SPECULATORS_MUON_RANK_CHECK") == "1" and self._probe_ok:
             self._assert_ranks_agree(stepped)
         return loss
 
