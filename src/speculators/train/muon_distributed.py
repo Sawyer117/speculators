@@ -208,10 +208,20 @@ def classify(name: str, param: Tensor) -> str:
 
 
 def split_named_params(model) -> tuple[list[tuple[str, Tensor]], list[tuple[str, Tensor]]]:
-    """Split trainable parameters into the Muon group and the AdamW group."""
+    """Split trainable parameters into the Muon group and the AdamW group.
+
+    ⚠ SORTED BY NAME, and that is load-bearing, not tidiness. The matrix route issues an
+    all-gather per parameter, so every rank must walk the SAME parameters in the SAME
+    order or two ranks gather different tensors under one collective and the job hangs
+    until the HCCL watchdog fires -- with a traceback pointing at whatever was issued
+    last, nowhere near the cause. Observed on 8x A2: rank 0 reached
+    ``layers.1.attn.wq_a`` [1024, 4096] at position 16 while rank 4 was at
+    ``layers.1.attn.wq_b`` [32768, 1024]. Sorting by name makes the sequence a pure
+    function of the model, identical on every rank by construction.
+    """
     muon: list[tuple[str, Tensor]] = []
     adamw: list[tuple[str, Tensor]] = []
-    for name, param in model.named_parameters():
+    for name, param in sorted(model.named_parameters(), key=lambda kv: kv[0]):
         if not param.requires_grad:
             continue
         (adamw if classify(name, param) == "adamw" else muon).append((name, param))
@@ -268,21 +278,61 @@ class DistributedMuon(Optimizer):
         # the divergence the probe exists to catch, so the flag is per-instance and the
         # probe is opt-in; see step().
         self._probe_ok = True
+        # Parallel to the flat parameter order, NOT keyed by id(): an address is not an
+        # identity, it is only unique among LIVE objects, and using it as a key made the
+        # diagnostic print one parameter's name for another.
+        self._names: list[str] = list(names)
         self._route: dict[int, str] = {}
-        self._name: dict[int, str] = {}
         counts = {"expert": 0, "matrix": 0}
         for name, param in zip(names, params, strict=True):
             route = classify(name, param)
             if route == "expert":
                 validate_expert_shard_dim0(param, name)
             self._route[id(param)] = route
-            self._name[id(param)] = name
             counts[route] = counts.get(route, 0) + 1
+        self._assert_same_param_order(names)
         logger.info(
             "DistributedMuon: %d expert stacks (local route, no comm) + %d matrices "
             "(gather route)",
             counts.get("expert", 0),
             counts.get("matrix", 0),
+        )
+
+    def _assert_same_param_order(self, names: list[str]) -> None:
+        """Every rank must walk the same parameters in the same order. Check it ONCE.
+
+        The matrix route issues one all-gather per parameter, so a disagreement
+        here does not raise -- it hangs, for the full HCCL timeout, and the
+        traceback then names
+        whichever collective happened to be issued last. This turns a 30-minute silent
+        stall into an immediate, readable error at startup, and costs one broadcast of a
+        list of strings.
+
+        ``broadcast_object_list`` rather than a tensor reduction on purpose: comparing
+        NAMES says which parameter diverged, and it sidesteps Ascend's thin
+        int64 support (an int64 all-gather here returned uninitialised memory).
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        payload = [list(names)]
+        dist.broadcast_object_list(payload, src=0)
+        rank0_names = payload[0]
+        if rank0_names == names:
+            return
+        diff = next(
+            (
+                f"position {i}: rank0 has {a!r}, this rank has {b!r}"
+                for i, (a, b) in enumerate(zip(rank0_names, names, strict=False))
+                if a != b
+            ),
+            f"length differs: rank0 {len(rank0_names)}, this rank {len(names)}",
+        )
+        raise RuntimeError(
+            "DistributedMuon: ranks disagree on the parameter order -- "
+            f"{diff}. Every rank must walk the same parameters in the same order, or "
+            "two ranks gather differently-shaped tensors under one collective and the "
+            "run hangs until the HCCL timeout. split_named_params sorts by name to "
+            "prevent this; something upstream of it is rank-dependent."
         )
 
     @torch.no_grad()
@@ -298,10 +348,12 @@ class DistributedMuon(Optimizer):
         # parameters in the same order. AdamW never had this exposure -- its step is
         # element-wise on local shards and issues no collectives at all.
         stepped = 0
+        idx = 0
         for group in self.param_groups:
             for param in group["params"]:
-                _trace(f"-> {self._name.get(id(param), '?')} [{self._route[id(param)]}]")
+                _trace(f"-> {self._names[idx]} [{self._route[id(param)]}]")
                 self._step_param(param, group)
+                idx += 1
                 stepped += param.grad is not None
         _trace("all params done")
         # OPT-IN ONLY (SPECULATORS_MUON_RANK_CHECK=1). This probe has cost more than
