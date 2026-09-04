@@ -1,0 +1,8 @@
+name        faithful_ep_20260904_051225.redacted.log
+raw_bytes   5357045
+raw_sha256  d6df2ecf24378c01a1d049262c9e5c9a3be403ae02b5a40d5bf7d04db23d2946
+compress    xz
+raw_target  1800000
+part_bytes  90000
+parts       3
+restore     cat part.*.xz > faithful_ep_20260904_051225.redacted.log.xz && xz -d faithful_ep_20260904_051225.redacted.log.xz && sha256sum faithful_ep_20260904_051225.redacted.log
