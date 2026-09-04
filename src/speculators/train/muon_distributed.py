@@ -133,6 +133,20 @@ def _mesh_of(param) -> str:
     return f"{tuple(m.shape)}/{m.mesh.flatten().tolist()}"
 
 
+def _collective_seq() -> str:
+    """Collectives issued so far on the default group.
+
+    See ``trainer._collective_seq`` for why this counter is the thing to diff.
+
+    Duplicated for the same reason ``_trace`` is: trainer imports this module.
+    """
+    try:
+        pg = dist.distributed_c10d._get_default_group()  # noqa: SLF001
+        return str(pg._get_sequence_number_for_group())  # noqa: SLF001
+    except Exception:  # noqa: BLE001 - a debug print must never take the run down
+        return "?"
+
+
 def _trace(phase: str) -> None:
     if not _TRACE:
         return
@@ -141,7 +155,9 @@ def _trace(phase: str) -> None:
     ts = time.strftime("%H:%M:%S", time.localtime(now))
     ms = int(now * 1000) % 1000
     print(  # noqa: T201 - the whole point is an unbuffered per-rank marker
-        f"[TRACE {ts}.{ms:03d} rank={rank}] muon: {phase}", file=sys.stderr, flush=True
+        f"[TRACE {ts}.{ms:03d} rank={rank} seq={_collective_seq()}] muon: {phase}",
+        file=sys.stderr,
+        flush=True,
     )
 
 

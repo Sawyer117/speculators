@@ -162,6 +162,31 @@ _TRACE_SYNC = os.environ.get("DSPARK_TRACE_SYNC") == "1"
 _TRACE = os.environ.get("DSPARK_TRACE") == "1" or _TRACE_SYNC
 
 
+def _collective_seq() -> str:
+    """How many collectives this rank has issued on the default process group.
+
+    THE POINT. A phase marker says how far a rank got in PYTHON; it does not say how
+    many collectives that rank put on the wire. HCCL matches ops by position in the
+    stream, so if two ranks ever disagree on the COUNT, every later collective is
+    matched to the wrong partner -- an all-gather on one rank meeting a reduce on
+    another -- and the run hangs with both ranks apparently "in the same place".
+
+    That is exactly the observed signature: ranks {4,5,6,7} finished Muon's last
+    parameter and queued the metrics reduces (``seq_num 180-211``, ``HcclReduce``)
+    while ranks {0,1,2,3} sat in an all-gather for that same parameter.
+
+    Printing the counter next to every phase turns that into a diff: walk the two rank
+    groups down the trace and the FIRST phase where their seq deltas differ is the code
+    that issues a rank-dependent number of collectives. Pure getter, no collective, no
+    sync -- safe to call on every line.
+    """
+    try:
+        pg = dist.distributed_c10d._get_default_group()  # noqa: SLF001
+        return str(pg._get_sequence_number_for_group())  # noqa: SLF001
+    except Exception:  # noqa: BLE001 - a debug print must never take the run down
+        return "?"
+
+
 def _trace(phase: str, step: object = None) -> None:
     if not _TRACE:
         return
@@ -170,7 +195,8 @@ def _trace(phase: str, step: object = None) -> None:
     ts = time.strftime("%H:%M:%S", time.localtime(now))
     ms = int(now * 1000) % 1000
     print(  # noqa: T201 - the whole point is an unbuffered per-rank marker
-        f"[TRACE {ts}.{ms:03d} rank={rank} step={step}] {phase}",
+        f"[TRACE {ts}.{ms:03d} rank={rank} step={step} "
+        f"seq={_collective_seq()}] {phase}",
         file=sys.stderr,
         flush=True,
     )
@@ -707,8 +733,18 @@ class Trainer:
                             (max(tokens_all) - min(tokens_all)) / _mean, 4
                         )
                 if self.is_distributed:
+                    # One reduce PER KEY, so the key set must match across ranks. It is
+                    # built by the model's forward, which makes the collective count
+                    # data-dependent in principle -- name the keys once so a mismatch is
+                    # readable rather than a hang.
+                    _trace(
+                        f"metrics reduce -> enter n={len(metrics)} "
+                        f"keys={sorted(metrics)}",
+                        self.global_step,
+                    )
                     for v in metrics.values():
                         dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
+                    _trace("metrics reduce <- done", self.global_step)
 
                 metrics = {k: v.item() for k, v in metrics.items()}
                 world_size = dist.get_world_size() if self.is_distributed else 1
