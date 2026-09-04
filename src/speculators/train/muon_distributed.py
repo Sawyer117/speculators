@@ -161,6 +161,11 @@ def _trace(phase: str) -> None:
     )
 
 
+def _dt(t: Tensor) -> str:
+    """Short dtype name for the trace ('float32' not 'torch.float32')."""
+    return str(t.dtype).removeprefix("torch.")
+
+
 # Quintic Newton-Schulz coefficients, chosen to maximize the slope at zero.
 COEFF_PRIMARY = (3.4445, -4.7750, 2.0315)
 # DeepSeek-V4's hybrid schedule: the last two steps swap to a gentler polynomial that
@@ -387,7 +392,7 @@ class DistributedMuon(Optimizer):
             for param in group["params"]:
                 nm, rt = self._names[idx], self._route[id(param)]
                 _trace(f"-> {nm} [{rt}] mesh={_mesh_of(param)}")
-                self._step_param(param, group)
+                self._step_param(param, group, nm)
                 if _TRACE_SYNC:
                     # Collectives are queued, not awaited, so a trace line normally only
                     # proves the CALL returned. Synchronising here makes each line prove
@@ -463,7 +468,7 @@ class DistributedMuon(Optimizer):
         )
         return normalise_grad(upd, group["adjust_lr_fn"])
 
-    def _step_param(self, param: Tensor, group: dict) -> None:
+    def _step_param(self, param: Tensor, group: dict, nm: str = "?") -> None:
         state = self.state.setdefault(param, {})
         m = group["momentum"]
 
@@ -489,6 +494,36 @@ class DistributedMuon(Optimizer):
         effective = g_local.add(buf, alpha=m) if group["nesterov"] else buf
 
         if self._route[id(param)] == "matrix" and isinstance(param, DTensor):
+            if _TRACE:
+                # ⚠ WHAT THIS IS LOOKING FOR. The two branches above pick `g_local`'s
+                # dtype from DIFFERENT places -- `zeros_like(p_local)` when this
+                # rank has no gradient, `grad.to_local()` when it does -- and which
+                # branch a rank takes is a RANK-LOCAL fact about its own batch. FSDP2
+                # here runs `MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32)`,
+                # so those two dtypes are not guaranteed equal.
+                #
+                # The gather below is issued by every rank (the comment in step()
+                # makes sure of that), but if the ranks disagree on the DTYPE they
+                # are each contributing, they disagree on the byte count -- and an
+                # all-gather whose ranks disagree on bytes completes for whoever got
+                # what they expected and blocks forever for whoever came up short.
+                # That is exactly the observed failure: identical `seq`, {4,5,6,7}
+                # drain, {0,1,2,3} never do, on this parameter. It is also
+                # self-perpetuating: the momentum buffer is created from `g_local` at
+                # step 0, so a dtype that forks there stays forked.
+                #
+                # So print what each rank is about to put on the wire. If `bytes=`
+                # differs between the two rank groups, that is the bug. If it is
+                # identical on all eight, this reasoning is dead and the search
+                # moves on.
+                _trace(
+                    f"   gather {nm} "
+                    f"grad={'none' if param.grad is None else _dt(param.grad)} "
+                    f"p={_dt(p_local)} buf={_dt(buf)} eff={_dt(effective)}"
+                    f"{tuple(effective.shape)} "
+                    f"bytes={effective.numel() * effective.element_size()} "
+                    f"full={tuple(param.shape)}"
+                )
             # A row-shard is not a matrix: gather the effective gradient, run the
             # identical iteration on every rank, then keep this rank's slice back.
             eff_full = DTensor.from_local(
