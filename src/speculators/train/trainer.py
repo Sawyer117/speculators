@@ -166,6 +166,13 @@ class TrainerConfig(NamedTuple):
     muon_weight_decay: float = 0.1
     muon_ns_steps: int = 5
     muon_adjust_lr_fn: str = "match_rms_adamw"
+    # Off by default, matching upstream torchtitan-npu: it measures closer to
+    # orthogonal at no extra cost, but orthogonality is not the training objective.
+    # ⚠ Adding a Muon knob means touching THREE places, not one -- this NamedTuple is
+    # what build_optimizers reads, scripts/train.py has its own hand-written argparse,
+    # and train/config/schema.py is a separate entry point that this launcher never
+    # uses. Changing only the schema gets you "unrecognized arguments" at rank 0.
+    muon_hybrid_ns: bool = False
     scheduler_type: Literal["linear", "cosine", "none"] = "linear"
     scheduler_warmup_steps: int | None = None
     scheduler_warmup_ratio: float | None = None

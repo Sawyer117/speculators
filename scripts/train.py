@@ -823,6 +823,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         muon_weight_decay=args.muon_weight_decay,
         muon_ns_steps=args.muon_ns_steps,
         muon_adjust_lr_fn=args.muon_adjust_lr_fn,
+        muon_hybrid_ns=args.muon_hybrid_ns,
         scheduler_type=args.scheduler_type,
         scheduler_warmup_steps=args.scheduler_warmup_steps,
         scheduler_warmup_ratio=args.scheduler_warmup_ratio,
@@ -1620,6 +1621,14 @@ def parse_args():
         default="match_rms_adamw",
         choices=["original", "match_rms_adamw"],
         help="Muon LR adjustment. 'match_rms_adamw' matches AdamW's update RMS.",
+    )
+    parser.add_argument(
+        "--muon-hybrid-ns",
+        action="store_true",
+        help="Switch the last two Newton-Schulz steps to the gentler (2.0, -1.5, 0.5) "
+        "polynomial. Measured 16x closer to orthogonal at no extra cost, but "
+        "orthogonality is not the training objective and this is UNVALIDATED on "
+        "accept_len -- off by default, matching upstream torchtitan-npu.",
     )
 
     args = parser.parse_args()
