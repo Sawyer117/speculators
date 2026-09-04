@@ -40,7 +40,7 @@ echo ">>> out=$OUTFILE"
 # shellcheck disable=SC2086
 python "$REPO_ROOT/scripts/response_regeneration/script.py" \
   --endpoint "http://127.0.0.1:$PORT/v1/chat/completions" \
-  --dataset open_perfectblend \
+  --dataset open-perfectblend \
   --dataset-path "$DATASET_PATH" \
   --no-thinking \
   --temperature "$TEMPERATURE" \

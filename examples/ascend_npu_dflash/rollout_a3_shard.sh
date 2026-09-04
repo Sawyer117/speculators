@@ -119,7 +119,7 @@ fi
 echo ">>> [A3 shard $SID] rollout $SHARD (conc=$CONC max_tokens=$MAXTOK) -> $OUT"
 python "$REPO_ROOT/scripts/response_regeneration/script.py" \
   --endpoint "http://127.0.0.1:$PORT/v1/chat/completions" \
-  --dataset open_perfectblend --dataset-path "$SHARD" \
+  --dataset open-perfectblend --dataset-path "$SHARD" \
   --temperature 0 --max-tokens "$MAXTOK" --concurrency "$CONC" --resume \
   --outfile "$OUT"
 
