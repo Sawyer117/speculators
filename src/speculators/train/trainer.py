@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -142,6 +144,35 @@ def _gpu_mem_stats() -> dict[str, float] | None:
         _MEM_WARNED["reason"] = reason
         root_logger.warning("memory metrics unavailable: %s", reason)
     return None
+
+
+
+# DSPARK_TRACE=1: a per-rank, immediately-flushed phase marker.
+#
+# WHY. The metric log is rank-0 only and emits once per STEP, so a hang that happens
+# before the first step completes logs NOTHING -- and says nothing about which rank
+# reached which phase. Three hangs in a row were reported at three different Python
+# frames (timer.mark, an optimizer collective, metrics .item()) because a traceback
+# names whichever collective was issued LAST, not the one that stalled.
+#
+# This writes from EVERY rank, unbuffered, with a timestamp. The last line each rank
+# printed is exactly how far that rank got, so a stalled collective becomes a diff
+# between rank groups instead of a guess. Off by default, zero cost when off.
+_TRACE = os.environ.get("DSPARK_TRACE") == "1"
+
+
+def _trace(phase: str, step: object = None) -> None:
+    if not _TRACE:
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    now = time.time()
+    ts = time.strftime("%H:%M:%S", time.localtime(now))
+    ms = int(now * 1000) % 1000
+    print(  # noqa: T201 - the whole point is an unbuffered per-rank marker
+        f"[TRACE {ts}.{ms:03d} rank={rank} step={step}] {phase}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
@@ -554,6 +585,7 @@ class Trainer:
             # local_step is 1-based index into the *full* epoch (not the slice).
             local_step = local_step_rel + skip_steps
             timer.reset(self.global_step % self.config.log_freq == 0)
+            _trace("step-begin", self.global_step)
 
             timer.mark_value("start", t_before_fetch)
             gpu_batch = {
@@ -577,6 +609,7 @@ class Trainer:
             # instead of the token-weighted 1/N, so mean(n)/n_r is exactly how far off that
             # rank's weight is -- 1.0 everywhere means the two objectives coincide and
             # DSPARK_GLOBAL_LOSS_REDUCE is a no-op. See models/metrics.py.
+            _trace("batch+HS ready", self.global_step)
             fetch_all: list[float] | None = None
             tokens_all: list[int] | None = None
             align_ms = 0.0
@@ -588,7 +621,9 @@ class Trainer:
                 if _lm is not None:
                     _buf[1] = _lm.sum().to(torch.float32)
                 _out = [torch.zeros_like(_buf) for _ in range(dist.get_world_size())]
+                _trace("align all_gather -> enter", self.global_step)
                 dist.all_gather(_out, _buf)
+                _trace("align all_gather <- done", self.global_step)
                 align_ms = (time.perf_counter() - _t_align) * 1000
                 fetch_all = [round(float(t[0].item()), 1) for t in _out]
                 tokens_all = [int(t[1].item()) for t in _out]
@@ -597,6 +632,7 @@ class Trainer:
                 **gpu_batch, **(self.config.train_call_kwargs or {})
             )
 
+            _trace("forward done", self.global_step)
             timer.mark("fwd")
             self._optimizers_zero_grad()
             loss.backward()
@@ -605,16 +641,22 @@ class Trainer:
             # non-finite value pinpoints the step where NaN enters via the gradients.
             # (Under EP the routed experts are Shard(0) DTensors on the same mesh as the
             # FSDP-sharded rest, so a single clip over all params is uniform -- no split.)
+            _trace("backward done -> clip_grad_norm (collective)", self.global_step)
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            _trace("clip_grad_norm done", self.global_step)
 
             timer.mark("bwd")
+            _trace("optimizer.step -> enter", self.global_step)
             self._optimizers_step()
+            _trace("optimizer.step <- done", self.global_step)
 
             current_lrs = {
                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
             }
             self._schedulers_step()
+            _trace("schedulers done -> timer.mark(opt) sync", self.global_step)
             timer.mark("opt")
+            _trace("timer.mark(opt) done", self.global_step)
             t_before_fetch = timer.now() or time.perf_counter()
 
             profile = None

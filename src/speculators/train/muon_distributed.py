@@ -96,6 +96,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
+import time
 
 import torch
 import torch.distributed as dist
@@ -105,6 +107,24 @@ from torch.distributed.tensor.placement_types import Shard
 from torch.optim import Optimizer
 
 logger = logging.getLogger("speculators")
+
+# DSPARK_TRACE=1: the same per-rank marker as trainer._trace, duplicated rather
+# than imported because trainer imports this module. Prints which PARAMETER the
+# gather route is on, so a stall inside the optimizer names the tensor, not just
+# the frame.
+_TRACE = os.environ.get("DSPARK_TRACE") == "1"
+
+
+def _trace(phase: str) -> None:
+    if not _TRACE:
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    now = time.time()
+    ts = time.strftime("%H:%M:%S", time.localtime(now))
+    ms = int(now * 1000) % 1000
+    print(  # noqa: T201 - the whole point is an unbuffered per-rank marker
+        f"[TRACE {ts}.{ms:03d} rank={rank}] muon: {phase}", file=sys.stderr, flush=True
+    )
 
 
 # Quintic Newton-Schulz coefficients, chosen to maximize the slope at zero.
@@ -249,12 +269,14 @@ class DistributedMuon(Optimizer):
         # probe is opt-in; see step().
         self._probe_ok = True
         self._route: dict[int, str] = {}
+        self._name: dict[int, str] = {}
         counts = {"expert": 0, "matrix": 0}
         for name, param in zip(names, params, strict=True):
             route = classify(name, param)
             if route == "expert":
                 validate_expert_shard_dim0(param, name)
             self._route[id(param)] = route
+            self._name[id(param)] = name
             counts[route] = counts.get(route, 0) + 1
         logger.info(
             "DistributedMuon: %d expert stacks (local route, no comm) + %d matrices "
@@ -278,8 +300,10 @@ class DistributedMuon(Optimizer):
         stepped = 0
         for group in self.param_groups:
             for param in group["params"]:
+                _trace(f"-> {self._name.get(id(param), '?')} [{self._route[id(param)]}]")
                 self._step_param(param, group)
                 stepped += param.grad is not None
+        _trace("all params done")
         # OPT-IN ONLY (SPECULATORS_MUON_RANK_CHECK=1). This probe has cost more than
         # it found: its first version used int64 and returned uninitialised memory,
         # accusing the training of a divergence that was not there, and its own
