@@ -388,6 +388,19 @@ class DistributedMuon(Optimizer):
         # element-wise on local shards and issues no collectives at all.
         stepped = 0
         idx = 0
+        # Which parameters arrived without a gradient ON THIS RANK. This is the single
+        # fact the whole hang investigation turns on, so it gets its own summary line
+        # rather than having to be diffed out of 46 per-parameter lines x 8 ranks.
+        #
+        # It is rank-local, and BOTH generations of this optimizer mishandle a rank-local
+        # divergence here, in opposite ways: the version that ran 2000 steps (1b62bd8c)
+        # guarded the whole `_step_param` call -- and therefore its all-gather -- behind
+        # `if param.grad is not None`, so a rank that skipped one issued a different
+        # NUMBER of collectives. bd01b440 fixed that by treating a missing grad as
+        # zero, which
+        # keeps the count right but takes the zero from `zeros_like(p_local)`, so the
+        # ranks can now differ in DTYPE instead. Same trigger, two ways to hang.
+        missing: list[str] = []
         for group in self.param_groups:
             for param in group["params"]:
                 nm, rt = self._names[idx], self._route[id(param)]
@@ -401,9 +414,14 @@ class DistributedMuon(Optimizer):
                     # full device sync per parameter; debugging only.
                     torch.accelerator.synchronize()
                     _trace(f"<- {self._names[idx]} drained")
+                if param.grad is None:
+                    missing.append(nm)
                 idx += 1
                 stepped += param.grad is not None
-        _trace("all params done")
+        _trace(
+            f"all params done  no_grad={len(missing)}/{idx}"
+            + (f" {missing}" if missing else "")
+        )
         # OPT-IN ONLY (SPECULATORS_MUON_RANK_CHECK=1). This probe has cost more than
         # it found: its first version used int64 and returned uninitialised memory,
         # accusing the training of a divergence that was not there, and its own
