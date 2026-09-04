@@ -113,6 +113,24 @@ logger = logging.getLogger("speculators")
 # gather route is on, so a stall inside the optimizer names the tensor, not just
 # the frame.
 _TRACE = os.environ.get("DSPARK_TRACE") == "1"
+# DSPARK_TRACE_SYNC=1: also synchronise after each parameter, so a trace line proves the
+# collective drained rather than merely that the call returned. Implies DSPARK_TRACE.
+_TRACE_SYNC = os.environ.get("DSPARK_TRACE_SYNC") == "1"
+if _TRACE_SYNC:
+    _TRACE = True
+
+
+def _mesh_of(param) -> str:
+    """Which device mesh this parameter's collectives run on.
+
+    The hang splits ranks {0,1,2,3} against {4,5,6,7} -- the shape of a 2x4 mesh, not of
+    one slow rank. If some parameters live on an EP sub-mesh and others on the full FSDP
+    mesh, that is where to look, so print it next to every parameter.
+    """
+    if not isinstance(param, DTensor):
+        return "plain"
+    m = param.device_mesh
+    return f"{tuple(m.shape)}/{m.mesh.flatten().tolist()}"
 
 
 def _trace(phase: str) -> None:
@@ -351,8 +369,17 @@ class DistributedMuon(Optimizer):
         idx = 0
         for group in self.param_groups:
             for param in group["params"]:
-                _trace(f"-> {self._names[idx]} [{self._route[id(param)]}]")
+                nm, rt = self._names[idx], self._route[id(param)]
+                _trace(f"-> {nm} [{rt}] mesh={_mesh_of(param)}")
                 self._step_param(param, group)
+                if _TRACE_SYNC:
+                    # Collectives are queued, not awaited, so a trace line normally only
+                    # proves the CALL returned. Synchronising here makes each line prove
+                    # that parameter's communication actually COMPLETED -- the last
+                    # name a stuck rank printed is then the stuck collective. Costs a
+                    # full device sync per parameter; debugging only.
+                    torch.accelerator.synchronize()
+                    _trace(f"<- {self._names[idx]} drained")
                 idx += 1
                 stepped += param.grad is not None
         _trace("all params done")
