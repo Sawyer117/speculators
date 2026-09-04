@@ -441,6 +441,26 @@ Resolved by the launcher: `3L x 256E`, `block=5`, `seqlen=3072`, `max_anchors=51
 run — the modified-file listing is in that run's `provenance.txt`. Transcribe it here
 before this row is used as a baseline; that is exactly the gap asset #1 fell into.
 
+**Healthy at step 17** (02:37): `loss` 5.44-5.68, `grad_norm` 29-33 (no NaN, no blow-up),
+`accept_len` 1.000 and position accs ~0 as expected while lr is still in warmup
+(`5.2e-6 -> 6.8e-6`). `sup_tokens_ranks` 1864-3049, no zero-token rank.
+
+Cost matches asset #1's measurement, so the fix bought correctness for nothing:
+`opt_ms` **992** (asset #1 measured Muon 1010) and `step_ms` **2.94e3** (asset #1: 3030),
+`tokens_per_s` ~1000.
+
+★ **First real Muon memory number**, which is what the whole Muon line was opened to get:
+`mem/max_reserved_gb=49.32`, `mem/max_alloc_gb=40.25`, `alloc_gb=14.70` steady;
+`npu-smi` ~50.9 GB of 65536 MB per card, all 8. ⚠ The AdamW half of that A/B is still
+missing and cannot be recovered from asset #1: `_gpu_mem_stats` logged `None` on every NPU
+step until `4acb09b` (09-04 09:51), and asset #1 started at 05:10, so its logs carry no
+memory at all. `OPTIM=adamw MAX_STEPS=20` on this same commit closes it in ~10 minutes
+whenever a slot frees.
+
+One HS straggler at step 14: `fetch_ms_ranks[1]=4703.9` against ~19 ms elsewhere, spilling
+into `fwd_ms=5.24e3` for that step only. Known behaviour, and the align all-gather did its
+job of naming the rank.
+
 Status: training. Promote to "completed" with step count and accept_len once it has run,
 and enter the eval in `ascend-npu-dsv4-dspark-eval-results.md`.
 
