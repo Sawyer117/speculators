@@ -71,7 +71,12 @@ cmd_pack() {
 
   local name dest e
   name="$(basename "$log")"
-  dest="${2:-docs/deployment/logs/$name}"
+  # Strip the trailing .log when naming the DIRECTORY: .gitignore carries a bare `*.log`,
+  # which matches directories too, so `docs/deployment/logs/run.redacted.log/` was silently
+  # unaddable and `push` died at `git add` with "paths are ignored by one of your
+  # .gitignore files". MANIFEST still records the full original name, so verify is
+  # unaffected. (The first archive escaped this only by being a single .xz file.)
+  dest="${2:-docs/deployment/logs/${name%.log}}"
   e="$(ext)"
   mkdir -p "$dest"
 
@@ -132,6 +137,17 @@ EOF
 cmd_push() {
   local dest="${1:?usage: push <dest_dir>}"
   [ -f "$dest/MANIFEST" ] || die "no MANIFEST in $dest — run pack first"
+
+  # Catch an ignored destination HERE, with a fix, instead of letting `git add` abort the
+  # loop under `set -e` with nothing but git's generic "paths are ignored" hint.
+  if git check-ignore -q "$dest" 2>/dev/null; then
+    echo "!! $dest 被 .gitignore 挡住($(git check-ignore -v "$dest" | cut -f1)):" >&2
+    echo "   换个不以 .log 结尾的目录名即可,分片不用重做:" >&2
+    echo "     mv '$dest' '${dest%.log}'" >&2
+    echo "     $0 push '${dest%.log}'" >&2
+    exit 5
+  fi
+
   local branch e
   branch="$(git rev-parse --abbrev-ref HEAD)"
   e="$(awk '$1=="compress"{print ($2=="xz")?"xz":"gz"}' "$dest/MANIFEST")"
