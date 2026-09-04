@@ -105,6 +105,7 @@ from torch.optim import Optimizer
 
 logger = logging.getLogger("speculators")
 
+
 # Quintic Newton-Schulz coefficients, chosen to maximize the slope at zero.
 COEFF_PRIMARY = (3.4445, -4.7750, 2.0315)
 # DeepSeek-V4's hybrid schedule: the last two steps swap to a gentler polynomial that
@@ -274,7 +275,8 @@ class DistributedMuon(Optimizer):
             for param in group["params"]:
                 self._step_param(param, group)
                 stepped += param.grad is not None
-        self._assert_ranks_agree(stepped)
+        if getattr(self, "_probe_ok", True):
+            self._assert_ranks_agree(stepped)
         return loss
 
     def _assert_ranks_agree(self, stepped: int) -> None:
@@ -283,6 +285,14 @@ class DistributedMuon(Optimizer):
         One scalar all-gather per step (negligible next to ~1 s of Newton-Schulz). If
         ranks ever walk different parameter sets, this says so on the spot, naming the
         counts, rather than leaving a collective half-issued for the watchdog to find.
+
+        ⚠ float32, NOT int64. The first version used int64 and came back as
+        ``[-5079460489903334489, ..., 46, 46, 46, 46]`` -- four plausible counts
+        and four words of uninitialised memory. Ascend's int64 support is thin
+        (the same run warns that ArgSort falls back to AiCpu for int32/int64), so
+        an int64 HCCL all-gather is not trustworthy here. A probe that cries wolf
+        is worse than no probe, hence the range check below: out-of-range values
+        mean the PROBE failed, not the training.
         """
         if not (dist.is_available() and dist.is_initialized()):
             return
@@ -292,16 +302,29 @@ class DistributedMuon(Optimizer):
         if param is None:
             return
         device = (param.to_local() if isinstance(param, DTensor) else param).device
-        counts = torch.tensor([stepped], device=device, dtype=torch.int64)
+        total = sum(len(g["params"]) for g in self.param_groups)
+        counts = torch.full((1,), float(stepped), device=device, dtype=torch.float32)
         gathered = [torch.zeros_like(counts) for _ in range(dist.get_world_size())]
         dist.all_gather(gathered, counts)
-        seen = [int(t.item()) for t in gathered]
+        seen = [t.item() for t in gathered]
+
+        if any(not (0.0 <= v <= total) or v != int(v) for v in seen):
+            logger.warning(
+                "DistributedMuon: the rank-agreement probe returned implausible "
+                "values %s for %d parameters -- the collective itself is "
+                "unreliable on this stack, so the probe is now disabled rather "
+                "than trusted. This says nothing about the training.",
+                seen,
+                total,
+            )
+            self._probe_ok = False
+            return
         if len(set(seen)) > 1:
             raise RuntimeError(
                 "DistributedMuon: ranks disagree on how many parameters carried a "
-                f"gradient ({seen}). They would issue different numbers of collectives "
-                "and the run would hang until the HCCL timeout. This means the ranks "
-                "took different code paths in the backward."
+                f"gradient ({[int(v) for v in seen]}). They would issue different "
+                "numbers of collectives and the run would hang until the HCCL timeout. "
+                "This means the ranks took different code paths in the backward."
             )
 
     def _orthogonalize(self, effective: Tensor, group: dict) -> Tensor:
