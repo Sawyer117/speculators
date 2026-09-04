@@ -416,7 +416,33 @@ resolved env, `git checkout` line). **Copy the SHA here when a run proves itself
 | # | date | commit | run | why it is an asset |
 |---|---|---|---|---|
 | 1 | 2026-09-04 ~05:10 | **`7f35a95d`** | Muon vs AdamW A/B, ~1700 matched steps each | the ONLY Muon run that has ever completed; the sole source of the measured cost/benefit table in `train/muon_distributed.py` |
-| 2 | 2026-09-05 | **`0c229cd8`** | first run after the uneven-shard gather fix | *PENDING — confirm it passes step 0, then fill in* |
+| 2 | 2026-09-05 02:29 | **`84402a1b`** ⚠+DIRTY | `ckpt_faithful_ep_20260905_022910` — first run after the uneven-shard gather fix | **the hang is gone**: first Muon run to clear step 0 since asset #1, i.e. since `7f35a95d` |
+
+**Asset #2 — `ckpt_faithful_ep_20260905_022910`, launched on 109 (env `dspark-dsv4-compile`).**
+Carries the uneven-shard fix (`0c229cd8`, live check on the box: `muon_distributed.py:582`
+`shape=param.shape,`). Verbatim launch — this is the recipe that broke the hang:
+
+```bash
+HCCL_TIMEOUT=1800 OPTIM=muon \
+DSPARK_EP=1 BF16_EXPERTS=1 RECOMPUTE=1 COMPILE=0 \
+DSPARK_MOE_BALANCE=1 DSPARK_MOE_BALANCE_RATE=1e-3 \
+INIT_LAYER=1 INIT_MOE_NO_ROUTER=1 \
+LR=2e-4 EPOCHS=5 MAX_ANCHORS=512 CKPT_FREQ=0.5 \
+DATA=/share/canada_group_folder/dataset/open_perfectblend.dsv4_rollout/arrow_0730_77w_dedup \
+  bash examples/ascend_npu_dflash/train_dsv4_dspark.sh faithful
+```
+
+Resolved by the launcher: `3L x 256E`, `block=5`, `seqlen=3072`, `max_anchors=512`,
+`noncausal_block=1`, `noval=1`, `muon_lr=<10*lr>`, `muon_adjust=match_rms_adamw`,
+`muon_hybrid=0`, `init(moe/attn/hc/norm/layer)=0/0/0/0/1`. Artefacts:
+`run/faithful_ep_20260905_022910.{log,provenance.txt}`.
+
+⚠ **The tree was `+DIRTY` at launch**, so `84402a1b` alone does not fully describe this
+run — the modified-file listing is in that run's `provenance.txt`. Transcribe it here
+before this row is used as a baseline; that is exactly the gap asset #1 fell into.
+
+Status: training. Promote to "completed" with step count and accept_len once it has run,
+and enter the eval in `ascend-npu-dsv4-dspark-eval-results.md`.
 
 **Asset #1's SHA is proven, not guessed.** Every version from `1b62bd8c` onward deadlocks
 before step 0 on `hc_head.hc_fn`: it is `[hc_mult, hc_mult*hidden]` = `[4, 16384]` on an
