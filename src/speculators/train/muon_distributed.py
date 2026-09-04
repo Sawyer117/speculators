@@ -32,7 +32,11 @@ Two routes, matching how the draft is actually sharded:
 
 COST AND BENEFIT, MEASURED (8x A2, faithful EP config; medians / means over
 ~1700 matched steps of two runs on the SAME lr schedule -- verified identical at
-step 57 and 2002). The ~5% cost this file used to quote was AdamW's, not Muon's:
+step 57 and 2002). Those runs are asset #1 in the ledger in
+``docs/deployment/ascend-npu-dsv4-worklog.md``; they ran on ``7f35a95d``, and for
+a long stretch afterwards NO Muon run completed at all, so this table is the only
+measurement of it that exists. The ~5% cost this file used to quote was AdamW's,
+not Muon's:
 
     opt_ms      AdamW    99   Muon  1010    10.2x
     step_ms     AdamW  2040   Muon  3030     1.49x

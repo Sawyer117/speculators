@@ -403,6 +403,45 @@ to our warm-start).
 
 **Why this section exists:** the per-ckpt `train_command.txt` (trainer writes it into every ckpt dir) captures the `train.py` **argparse ONLY** — it does NOT record the `DSPARK_*` **env vars** (`DSPARK_EP / RECOMPUTE / COMPILE / MOE_BALANCE(+RATE) / TEACHER_DOUBLE_NORM`, plus the `BF16_EXPERTS` force) that the launcher sets via `env … torchrun`. Recover those from the run log's `patch_getenv` INFO lines (`get env DSPARK_X = Y`) + the `[MOE-BALANCE]` echo. **Complete recipe = train_command.txt + those env lines.** Both resolved below.
 
+### ★ ASSET LEDGER — every run that actually trained, and the commit it ran on
+
+A run that trains is an asset. The one thing that makes it reproducible later is **the
+commit it ran on**, and that is exactly what nobody recorded for asset #1 — which is why
+the rollback meant to bisect the Muon hang was aimed one commit late, "rolled back and it
+still hangs" got read as "the code is innocent", and the search cost a reboot, a broken
+driver and several training slots. Never again: `478f751a` makes the launcher write
+`<RUN>/<tag>_<ts>.provenance.txt` next to every log (full SHA, branch, dirty listing,
+resolved env, `git checkout` line). **Copy the SHA here when a run proves itself.**
+
+| # | date | commit | run | why it is an asset |
+|---|---|---|---|---|
+| 1 | 2026-09-04 ~05:10 | **`7f35a95d`** | Muon vs AdamW A/B, ~1700 matched steps each | the ONLY Muon run that has ever completed; the sole source of the measured cost/benefit table in `train/muon_distributed.py` |
+| 2 | 2026-09-05 | **`0c229cd8`** | first run after the uneven-shard gather fix | *PENDING — confirm it passes step 0, then fill in* |
+
+**Asset #1's SHA is proven, not guessed.** Every version from `1b62bd8c` onward deadlocks
+before step 0 on `hc_head.hc_fn`: it is `[hc_mult, hc_mult*hidden]` = `[4, 16384]` on an
+8-wide mesh, so ranks 0-3 hold one row and ranks 4-7 hold none, and
+`DTensor.from_local` without `shape=` then infers `[8, 16384]` on one half and `[0, 16384]`
+on the other. That is structural and data-independent — it cannot run 2000 steps. So a
+2000-step run cannot have been on `1b62bd8c` or later, and `7f35a95d` (05:10, twelve
+minutes earlier) is the only earlier `DistributedMuon`. Fixed in `0c229cd8`.
+
+⚠ **`7f35a95d` is a reference point, NOT a rollback target.** It gathers
+`grad.full_tensor()` and keeps the momentum buffer in FULL shape — about 1 GB/rank of
+waste, which is a large bite out of the saving Muon exists to deliver. `0c229cd8` is
+`7f35a95d`'s correctness plus `1b62bd8c`'s sharded momentum.
+
+⚠ **Asset #1's exact recipe is not transcribed yet** — it predates the provenance file, so
+it has to come off the box. On 109:
+
+```bash
+ls -d /home/a00652497/dspark_austin/run/ckpt_faithful_ep_20260904_05*
+cat  /home/a00652497/dspark_austin/run/ckpt_faithful_ep_20260904_05*/*/train_command.txt   # argparse half
+grep 'get env DSPARK_' /home/a00652497/dspark_austin/run/faithful_ep_20260904_05*.log      # env half
+```
+
+Do NOT hand-reconstruct it from memory; paste those two outputs in below instead.
+
 ### LAST run — `ckpt_faithful_ep_20260729_092941` (ep4p5; a RESUME of the bal-1e3 / fresh-router / dedup line)
 Git SHA `da064ea` · speculators 0.5.0.dev448 · transformers 5.13.1 · torch 2.12.0+cpu · world_size 8 (EP8).
 - **env (from log `patch_getenv`):** `DSPARK_EP=1  DSPARK_RECOMPUTE=1  DSPARK_COMPILE=0  DSPARK_MOE_BALANCE=1  DSPARK_MOE_BALANCE_RATE=1e-3  DSPARK_TEACHER_DOUBLE_NORM=0  DSPARK_HS_DUMP=1  BF16_EXPERTS=1` (forced → `--bf16-experts` even under EP=1, because A2 64G can't fit EP option-A fp32 experts).
