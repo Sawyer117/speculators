@@ -34,7 +34,7 @@ from speculators.models.dspark.core import DSparkDraftModel
 # mishandles two-level ones (``from .backbone.block`` -> looks for the file
 # ``backbone.block.py``). Absolute imports are not parsed, so save_pretrained works.
 from speculators.models.dsv4_dspark import checkpoint_mapping
-from speculators.models.dsv4_dspark.backbone.block import MhcDecoderBlock
+from speculators.models.dsv4_dspark.backbone.block import MhcDecoderBlock, _prof
 from speculators.models.dsv4_dspark.backbone.hyper import HyperHead
 from speculators.models.dsv4_dspark.backbone.rotary import precompute_freqs_cis
 from speculators.models.dsv4_dspark.config import DSparkDraftConfig
@@ -596,19 +596,28 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 total_seq_len, dtype=torch.long, device=device
             ).unsqueeze(0)
 
-        full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
+        _masks = _prof(
+            "OUT.build_mask",
+            lambda: self._build_attention_mask(
+                loss_mask, num_anchors, document_ids, device
+            ),
         )
+        (full_attn_mask, sliding_window_attn_mask,
+         anchor_positions, anchor_valid) = _masks
 
         mask_tokens_size = num_anchors * self.block_size
         mask_token_ids = torch.full(
             (1, mask_tokens_size), self.mask_token_id, dtype=torch.long, device=device
         )
         mask_token_ids[:, :: self.block_size] = input_ids[:, anchor_positions]
-        noise_embedding = self.embed_tokens(mask_token_ids)  # [1, TB, H]
+        noise_embedding = _prof(
+            "OUT.embed", lambda: self.embed_tokens(mask_token_ids)
+        )  # [1, TB, H]
 
-        fc_output = self.fc(hidden_states)
-        fc_output = self.hidden_norm(fc_output)  # [1, T, H]  (main_x context)
+        # NB: over the FULL total_seq_len (3072), not the TB draft tokens.
+        fc_output = _prof(
+            "OUT.fc_main_proj", lambda: self.hidden_norm(self.fc(hidden_states))
+        )
 
         from speculators.models.dflash.utils import get_base_indices_for_anchored_blocks
 
@@ -636,7 +645,9 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             _teacher_h = verifier_last_hidden_states
             if os.environ.get("DSPARK_TEACHER_DOUBLE_NORM") == "1":
                 _teacher_h = self.verifier_norm(_teacher_h)
-            verifier_logits = self.verifier_lm_head(_teacher_h)
+            verifier_logits = _prof(
+                "OUT.teacher_lm_head", lambda: self.verifier_lm_head(_teacher_h)
+            )
             if not self.config.sample_from_anchor:
                 # False: shift right by 1 so slot j predicts the token AT position j
                 # (slot 0 = the given anchor). True (DSpark, matches the vllm-ascend
@@ -734,8 +745,8 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             print(f">>> [DSPARK_SATDUMP] train: embed + {len(_rec['layers'])} layers "
                   f"({len(_rec['substages'])} sub-staged) + hc_head → {_sdir}/train_sat.pt", flush=True)
 
-        hidden = self.norm(self.hc_head(streams))  # [1, TB, H]
-        logits = self.lm_head(hidden)
+        hidden = _prof("OUT.hc_head", lambda: self.norm(self.hc_head(streams)))
+        logits = _prof("OUT.lm_head", lambda: self.lm_head(hidden))
 
         # ── DSPARK_TRAIN_PARITY_DUMP=1: one-shot, rank0 — write the FIRST anchor's block in the
         #    EXACT serve-dump format (dsv4_dspark_forward_parity_v2.py's PIECE 1 schema) so the SAME
