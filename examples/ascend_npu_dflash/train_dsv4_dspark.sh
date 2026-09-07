@@ -68,6 +68,21 @@ OPTIM="${OPTIM:-adamw}"                  # adamw | muon.  ⚠ muon 只作用于 
                                        # 对照时用 MUON_ADJUST=match_rms_adamw 并显式给 MUON_LR。
 MUON_LR="${MUON_LR:-}"                  # 空 = 用 schema 默认(10*lr)
 MUON_ADJUST="${MUON_ADJUST:-match_rms_adamw}"   # original | match_rms_adamw
+# ⚠ 4.0 IS DFLASH'S DEFAULT, INHERITED — IT IS NOT DSPARK'S, AND IT IS NOT DERIVED FROM
+# BLOCK. Under DSpark (`sample_from_anchor=True`) the weight is `exp(-pos/gamma)` over
+# pos 0..BLOCK-1. Our own transcription of the official method
+# (`dspark_method.py`) sets `decay_gamma = block_size = 5`, i.e. **gamma = BLOCK**;
+# `dflash/core.py` defaults 4.0 and `dspark/core.py` copied it, which is where ours comes
+# from. At BLOCK=5 that makes 4 look like "BLOCK-1" — a coincidence of two unrelated
+# numbers, and reasoning from it produced a rule that does not exist.
+#
+# So when BLOCK changes, scale gamma WITH IT: gamma = BLOCK (sourced), not BLOCK-1.
+#     BLOCK=5  gamma=4  ->  1, .779, .607, .472, .368     (what we have always run)
+#     BLOCK=5  gamma=5  ->  1, .819, .670, .549, .449     (DSpark reference)
+#     BLOCK=15 gamma=4  ->  last slot exp(-14/4) = .030   (tail is untrained — WRONG)
+#     BLOCK=15 gamma=15 ->  last slot exp(-14/15) = .393
+# Leaving 4.0 while raising BLOCK is the failure mode worth guarding against; 14 vs 15 is
+# 6.8% on one slot before normalisation, i.e. inside the noise.
 DECAY_GAMMA="${DECAY_GAMMA:-4.0}"       # loss per-position decay: weight_k = exp(-k/gamma) over the BLOCK
                                        # slots. Canonical DSpark = 4.0 -> slots [1.0,0.78,0.61,0.47,0.37].
                                        # LARGER gamma = flatter = more gradient to LATER slots (pos3/4/5);
