@@ -66,6 +66,9 @@ cover/
 # archive one -- twice matching the destination DIRECTORY, once the file -- so give the
 # curated ones a home that is exempt instead of reaching for `git add -f` each time.
 !docs/deployment/logs/*.log
+# `*` does not cross `/`, so the line above only exempts DIRECT children. Sharded
+# raw logs live one level down (one directory per run), hence the recursive form.
+!docs/deployment/logs/**/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
