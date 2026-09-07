@@ -10,9 +10,14 @@ result, plus the launcher banner that says which commit and recipe produced them
 
 ## Size: small enough to open is not small enough to push
 
-The gateway caps ONE HTTP request at ~100 KB, and `git push` sends the whole pack as a
-single POST — so the limit lands on the **push**, not on the file. A 2.6 MB excerpt
-committed fine, packed to 193 KB, and came back `HTTP 403`.
+The training box's network caps ONE HTTP request at ~100 KB, and `git push` sends the
+whole pack as a single POST — so the limit lands on the **push**, not on the file. A
+2.6 MB excerpt committed fine, packed to 193 KB, and came back `HTTP 403`.
+
+**This is that box, not GitHub and not everywhere.** From an unrestricted machine, 84 MB
+of raw shards went in one push in 6.4 s. GitHub's own limit is 100 MB per *file*. So the
+per-part loop matters when pushing from the box; elsewhere, `git add <dir> && git commit
+&& git push` is enough.
 
 Keep the raw excerpt **under ~1 MB** (git's delta+zlib on this kind of log runs ~13x).
 `extract_log_steps.py` checks the size it produced and tells you which way to go. For a

@@ -6,10 +6,18 @@
 # line. These shards are the plain text: open one in the GitHub UI and read it. Both are
 # worth having, and the .xz set stays the authority because it carries the sha256.
 #
-# THE CONSTRAINT IS THE PUSH, NOT THE FILE. The gateway caps ONE HTTP request at ~100 KB
-# and `git push` sends the whole pack as a single POST, so a shard must stay under the cap
-# AFTER git's zlib -- measured at ~18x on this kind of log. Hence ~1.2 MB of raw text per
-# shard, one shard per commit, one push per commit. A 189 MB log is ~150 shards.
+# ⚠ THE ~100 KB PUSH CAP IS THE TRAINING BOX'S NETWORK, NOT GITHUB AND NOT EVERYWHERE.
+# On that box `git push` sends the whole pack as one POST and a 192 KB pack came back
+# `HTTP 403`, which is why `push` here commits one shard at a time. Measured from an
+# unrestricted machine, 73 shards -- 84 MB of raw log -- went in a SINGLE push in 6.4 s.
+# So: if you can reach GitHub without that gateway, skip `push` entirely and just
+#     git add <dest_dir> && git commit && git push
+# GitHub's own limit is 100 MB per FILE, which nothing here comes close to.
+#
+# The ~1.2 MB shard size is kept for a different reason: readability. GitHub's blob viewer
+# gives up on very large text files, so a 95 MB log would be un-openable in the browser --
+# which defeats the point of shipping plain text. 1.2 MB opens instantly, and the split
+# only ever falls on a record boundary.
 #
 # Cuts only at a record start (`^[`), so no shard begins mid-record: the rich logger wraps
 # one step across ~26 lines and a byte-split would tear it.
