@@ -464,7 +464,54 @@ job of naming the rank.
 Status: training. Promote to "completed" with step count and accept_len once it has run,
 and enter the eval in `ascend-npu-dsv4-dspark-eval-results.md`.
 
-### ★★ block_size=15 is not viable, and the cost is NOT where anyone looked (2026-09-08)
+### ★★ block_size=15 IS viable — the "23 days" was allocator churn, not compute (2026-09-08)
+
+**`MAX_ANCHORS=240` → `192` takes the step from 16,000-22,000 ms to 3,340 ms.** Same
+block size, same everything else. The entry below called block_size=15 unviable at 23 days;
+that number was an artefact and this supersedes it.
+
+```
+step_ms   3,340
+├─ fetch      34
+├─ fwd_ms    685      model_ms 680, profiler TOTAL 642  (the 38 ms gap = FSDP2 hooks)
+│   ├─ backbone 597   MLA.attn 251 · MoE.ffn 198 · build_mask 25 · mHC 47 · heads ~25
+│   └─ loss       39
+├─ bwd_ms  1,620      (8,000-12,000 at 240 anchors)
+└─ opt_ms    995      Muon
+max_reserved 54.5 GB, steady          tokens_per_s 905  (137-190 at 240)
+```
+
+All three levels reconcile: `fwd_ms ≈ align_ms + model_ms`, `model_ms ≈ TOTAL + hooks`,
+`TOTAL` UNACCOUNTED 2 ms.
+
+**Root cause.** At 240 anchors `max_reserved` sat at 59.9 of 64 GB and `mem/reserved_gb`
+swung 55 → 18.9 → 55 between logged steps — `expandable_segments` unmapping and remapping
+segments through the driver. That cost ~5 s in forward and ~10 s in backward. It is not
+compute, and no amount of timing instrumentation could see it, which is why four rounds of
+timing points did not: **the missing dimension was memory, not time.** The profiler now
+records a reserved-memory delta per region alongside the duration.
+
+**Economics — block_size=15 costs almost nothing per token:**
+
+| | BLOCK=5 / 512 anchors | **BLOCK=15 / 192 anchors** |
+|---|---|---|
+| tokens/step | 2,560 | **2,880** (+12.5%) |
+| `step_ms` | 2,940 | **3,340** (+14%) |
+| 5 epochs | 4.2 days | **4.8 days** |
+
+⚠ The memory model held again: predicted `max_alloc` 46.3 GB at 192 anchors, measured
+**44.29** — 4% out, on its fourth point.
+
+⚠ **Headroom is not optional.** 240 anchors did not OOM; it thrashed. The usable ceiling is
+therefore well below the OOM ceiling, and `max_reserved` near 60 of 64 is already past it.
+Budget to ~55 GB, not to 64.
+
+⚠ At this config `opt_ms` is **30% of the step** — so the Newton-Schulz kernel handoff is
+worth ~20% of the step again. But see the Muon-vs-AdamW entry below: AdamW's `opt_ms` is 99,
+so switching optimizer cuts the same 900 ms AND converges higher. Fix the optimizer choice
+before paying for a kernel.
+
+### block_size=15 first look — superseded by the entry above (2026-09-08)
 
 `BLOCK=15 MAX_ANCHORS=240` runs, but at **~16 s/step → 124,480 steps ≈ 23 days**. Against
 `BLOCK=5 MAX_ANCHORS=512` (2.94 s/step) the token count rose only 1.5× (2560 → 3600) while
