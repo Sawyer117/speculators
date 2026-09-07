@@ -6,6 +6,7 @@ from transformers import PretrainedConfig
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
+from speculators.models.dspark import profiling as _profiling
 from speculators.models.dspark.metrics import compute_metrics
 from speculators.models.dspark.model_definitions import (
     ConfidenceHead,
@@ -147,88 +148,102 @@ class DSparkDraftModel(DFlashDraftModel):
         kd_temperature: float = 1.0,
         **kwargs,
     ):
-        hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
-            self._backbone_forward(
-                hidden_states,
-                input_ids,
-                loss_mask,
-                verifier_last_hidden_states,
-                document_ids,
-                position_ids,
-                max_anchors=max_anchors,
-                **kwargs,
+        # ⚠ The TOP.* regions below PARTITION this forward. That is the point: `end()`
+        # prints total, parts and UNACCOUNTED, so a partition that misses the cost says so
+        # on the first run instead of after another round of guessing where to look.
+        _pt0 = _profiling.begin()
+        with _profiling.region("TOP.backbone"):
+            hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
+                self._backbone_forward(
+                    hidden_states,
+                    input_ids,
+                    loss_mask,
+                    verifier_last_hidden_states,
+                    document_ids,
+                    position_ids,
+                    max_anchors=max_anchors,
+                    **kwargs,
+                )
             )
-        )
 
-        # DSpark: add the Markov logit bias and predict per-position confidence.
-        num_blocks = max_anchors
-        block = self.block_size
-        mask_tokens_size = num_blocks * block
-        # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
-        block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
-        if self.config.sample_from_anchor:
-            # With sample_from_anchor=True (DSpark default), slot k predicts
-            # token p+k+1 and the inference Markov chain conditions slot k's
-            # bias on the token at the previous position p+k.
-            prev_token_ids = block_tokens
-        else:
-            # With sample_from_anchor=False (Dflash default), slot k predicts
-            # token p+k, so the previous token within the block is
-            # block_tokens[:, k-1] (shifted).
-            prev_token_ids = torch.cat(
-                [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
-            )  # [num_blocks, block]
-        hidden_blocks = hidden.view(num_blocks, block, -1)
+        with _profiling.region("TOP.prep"):
+            # DSpark: add the Markov logit bias and predict per-position confidence.
+            num_blocks = max_anchors
+            block = self.block_size
+            mask_tokens_size = num_blocks * block
+            # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
+            block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
+            if self.config.sample_from_anchor:
+                # With sample_from_anchor=True (DSpark default), slot k predicts
+                # token p+k+1 and the inference Markov chain conditions slot k's
+                # bias on the token at the previous position p+k.
+                prev_token_ids = block_tokens
+            else:
+                # With sample_from_anchor=False (Dflash default), slot k predicts
+                # token p+k, so the previous token within the block is
+                # block_tokens[:, k-1] (shifted).
+                prev_token_ids = torch.cat(
+                    [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
+                )  # [num_blocks, block]
+            hidden_blocks = hidden.view(num_blocks, block, -1)
 
         confidence_logits = None
         prev_emb = None
-        if self.markov_head is not None:
-            prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
-            markov_bias = self.markov_head.block_bias(
-                prev_token_ids=prev_token_ids,
-                hidden_states=hidden_blocks,
-                prev_emb=prev_emb,
-            )
-            logits = (logits.view(num_blocks, block, -1) + markov_bias).view(
-                1, mask_tokens_size, -1
-            )
-
-        if self.select_head is not None:
-            # Additive and zero at init, so this is an exact no-op until it is trained.
-            select_bias = self.select_head.block_bias(
-                prev_token_ids=prev_token_ids,
-                hidden_states=hidden_blocks,
-            )
-            logits = (logits.view(num_blocks, block, -1) + select_bias).view(
-                1, mask_tokens_size, -1
-            )
-
-        if self.confidence_head is not None:
-            # confidence_head_with_markov requires markov_rank > 0 (enforced in
-            # __init__), so prev_emb is always set when the flag is on.
-            if self.config.confidence_head_with_markov and prev_emb is not None:
-                conf_features = torch.cat(
-                    [hidden_blocks.detach(), prev_emb.detach().to(hidden_blocks.dtype)],
-                    dim=-1,
+        with _profiling.region("TOP.markov"):
+            if self.markov_head is not None:
+                prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
+                markov_bias = self.markov_head.block_bias(
+                    prev_token_ids=prev_token_ids,
+                    hidden_states=hidden_blocks,
+                    prev_emb=prev_emb,
                 )
-            else:
-                conf_features = hidden_blocks.detach()
-            confidence_logits = self.confidence_head(conf_features).reshape(
-                1, mask_tokens_size
-            )
+                logits = (logits.view(num_blocks, block, -1) + markov_bias).view(
+                    1, mask_tokens_size, -1
+                )
 
-        loss, metrics = compute_metrics(
-            logits,
-            targets,
-            confidence_logits,
-            aligned_loss_mask,
-            self.block_size,
-            loss_config=loss_config or _DEFAULT_LOSS_CONFIG,
-            gamma=gamma,
-            confidence_head_alpha=confidence_head_alpha,
-            per_position_loss_weight=per_position_loss_weight,
-            dpace_alpha=dpace_alpha,
-            sample_from_anchor=self.config.sample_from_anchor,
-            kd_temperature=kd_temperature,
-        )
+        with _profiling.region("TOP.select"):
+            if self.select_head is not None:
+                # Additive and zero at init, so this is an exact no-op until it is trained.
+                select_bias = self.select_head.block_bias(
+                    prev_token_ids=prev_token_ids,
+                    hidden_states=hidden_blocks,
+                )
+                logits = (logits.view(num_blocks, block, -1) + select_bias).view(
+                    1, mask_tokens_size, -1
+                )
+
+        with _profiling.region("TOP.confidence"):
+            if self.confidence_head is not None:
+                # confidence_head_with_markov requires markov_rank > 0 (enforced in
+                # __init__), so prev_emb is always set when the flag is on.
+                if self.config.confidence_head_with_markov and prev_emb is not None:
+                    conf_features = torch.cat(
+                        [
+                            hidden_blocks.detach(),
+                            prev_emb.detach().to(hidden_blocks.dtype),
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    conf_features = hidden_blocks.detach()
+                confidence_logits = self.confidence_head(conf_features).reshape(
+                    1, mask_tokens_size
+                )
+
+        with _profiling.region("TOP.loss"):
+            loss, metrics = compute_metrics(
+                logits,
+                targets,
+                confidence_logits,
+                aligned_loss_mask,
+                self.block_size,
+                loss_config=loss_config or _DEFAULT_LOSS_CONFIG,
+                gamma=gamma,
+                confidence_head_alpha=confidence_head_alpha,
+                per_position_loss_weight=per_position_loss_weight,
+                dpace_alpha=dpace_alpha,
+                sample_from_anchor=self.config.sample_from_anchor,
+                kd_temperature=kd_temperature,
+            )
+        _profiling.end(_pt0)
         return None, loss, metrics

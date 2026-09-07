@@ -32,7 +32,9 @@ import time as _time
 # (which splits the MoE internals). Pins whether a fwd spike is MLA / mHC-Sinkhorn / MoE vs. HS-fetch
 # (read fetch_ms/align_ms for that). Diagnostic only; syncs serialize the pipe so it SLOWS the run —
 # off (default) = zero cost. Lower DSPARK_PROFILE_FWD_MS (e.g. 0) to print every sub-op every step.
-_FWD_PROF = _os.environ.get("DSPARK_PROFILE_FWD") == "1"
+from speculators.models.dspark import profiling as _profiling
+
+_FWD_PROF = _profiling.ON
 _FWD_PROF_MS = float(_os.environ.get("DSPARK_PROFILE_FWD_MS", "2000"))
 
 # DSPARK_SATDUMP intra-layer capture: _backbone_forward sets this to a list during its
@@ -40,17 +42,10 @@ _FWD_PROF_MS = float(_os.environ.get("DSPARK_PROFILE_FWD_MS", "2000"))
 _SAT_SUB = None
 
 
-def _prof(tag, fn):
-    if not _FWD_PROF:
-        return fn()
-    torch.npu.synchronize()
-    _t0 = _time.perf_counter()
-    out = fn()
-    torch.npu.synchronize()
-    _dt = (_time.perf_counter() - _t0) * 1000.0
-    if _dt > _FWD_PROF_MS:
-        print(f"[FWD_PROF] {tag}: {_dt:.0f} ms", flush=True)
-    return out
+# Delegates to the shared profiler so the in-layer points and the TOP.* partition feed ONE
+# accumulator and the per-step summary can report UNACCOUNTED honestly. Kept under this name
+# because the call sites below and in dsv4_dspark/core.py already use it.
+_prof = _profiling.prof
 
 
 class MhcDecoderBlock(nn.Module):
