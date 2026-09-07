@@ -8,6 +8,20 @@ A full run log is 100–250 MB and belongs in the run directory on the box, not 
 What belongs here is the part someone else has to read: the step windows that carry a
 result, plus the launcher banner that says which commit and recipe produced them.
 
+## Size: small enough to open is not small enough to push
+
+The gateway caps ONE HTTP request at ~100 KB, and `git push` sends the whole pack as a
+single POST — so the limit lands on the **push**, not on the file. A 2.6 MB excerpt
+committed fine, packed to 193 KB, and came back `HTTP 403`.
+
+Keep the raw excerpt **under ~1 MB** (git's delta+zlib on this kind of log runs ~13x).
+`extract_log_steps.py` checks the size it produced and tells you which way to go. For a
+66k-step run, `--every 2000 --last 40` is ~70 records and lands well inside one push.
+
+Anything larger goes through `archive_log_push.sh` (`pack` / `push` / `verify`), which
+cuts at record boundaries and does **one part per commit, one push per commit**,
+resumable.
+
 ## Making one
 
 ```bash

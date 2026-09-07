@@ -20,6 +20,12 @@ with ``[`` and runs to just before the next one, and a record is kept or dropped
 
 Streams with a bounded buffer, so the 181 MB file costs no memory.
 
+⚠ SMALL ENOUGH TO OPEN IS NOT SMALL ENOUGH TO PUSH. The gateway caps one HTTP
+request at ~100 KB and ``git push`` sends the whole pack as a single POST, so a
+2.6 MB excerpt fails with ``HTTP 403`` at push time even though the commit
+succeeded. Keep the raw excerpt under ~1 MB, or ship it through
+``archive_log_push.sh`` one part per push. This tool checks the size and says which.
+
 USAGE
     extract_log_steps.py <log> <out> --steps 1900-2004
     extract_log_steps.py <log> <out> --every 100            # every 100th step
@@ -136,16 +142,42 @@ def main() -> int:
         print(f"highest step seen   : {max_step}")
     ratio = src_mb / max(dst_mb, 1e-9)
     print(f"{src_mb:.1f} MB -> {dst_mb:.3f} MB  ({ratio:.0f}x smaller)")
-    # Spell out the rest of the chain. `*.log` is ignored repo-wide and has already
-    # blocked three separate attempts to commit an excerpt; `docs/deployment/logs/` is
-    # the one exempt directory, and redaction is not optional on a public fork.
-    stem = args.log.stem
+    _next_steps(args.log.stem, args.out, args.out.stat().st_size)
+    return 0
+
+
+# The gateway caps ONE HTTP request at ~100 KB, and `git push` sends the whole pack as
+# a single POST -- so the limit lands on the PUSH, not on the file. A 2.6 MB excerpt
+# packed to 193 KB and came back `HTTP 403`. Git's delta+zlib on this kind of log runs
+# about 13x, so keep the raw excerpt under ~1 MB to stay inside one push.
+ONE_PUSH_RAW_BYTES = 1_000_000
+
+
+def _next_steps(stem: str, out: Path, size: int) -> None:
+    """Print the rest of the chain -- redact, then commit somewhere git will take it.
+
+    Both halves have drawn blood. `*.log` is ignored repo-wide and blocked three
+    separate attempts to commit an excerpt, and `git add -f` is not the fix because it
+    also waves through an unredacted file on a PUBLIC fork. And an excerpt small enough
+    to open is not automatically small enough to PUSH -- this size check exists to
+    catch that before the 403 rather than after it.
+    """
     print("\nNEXT -- redact (mandatory: the fork is PUBLIC, paths carry the box id),")
     print("then commit into the one directory `*.log` does not swallow:\n")
-    print(f"  python examples/ascend_npu_dflash/redact_log.py {args.out} \\")
+    print(f"  python examples/ascend_npu_dflash/redact_log.py {out} \\")
     print(f"      docs/deployment/logs/{stem}.log")
     print(f"  git add docs/deployment/logs/{stem}.log && git commit && git push")
-    return 0
+    if size <= ONE_PUSH_RAW_BYTES:
+        return
+    print(f"\n⚠ {size / 2**20:.1f} MB is TOO BIG FOR ONE PUSH. The gateway caps one")
+    print("  request at ~100 KB and git sends the whole pack in one POST, so this")
+    print("  fails with `HTTP 403` at push time, not at commit time. Select less:\n")
+    print("     --every 2000 --last 40        # trend + tail, ~70 records")
+    print("\n  or ship it in parts, one push per part (resumable):\n")
+    print("     examples/ascend_npu_dflash/archive_log_push.sh pack \\")
+    print(f"         docs/deployment/logs/{stem}.log docs/deployment/logs/{stem}_parts")
+    print("     examples/ascend_npu_dflash/archive_log_push.sh push \\")
+    print(f"         docs/deployment/logs/{stem}_parts")
 
 
 if __name__ == "__main__":
