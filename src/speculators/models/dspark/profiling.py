@@ -41,6 +41,20 @@ ON = os.environ.get("DSPARK_PROFILE_FWD") == "1"
 _PER_CALL_MS = float(os.environ.get("DSPARK_PROFILE_FWD_MS", "0") or 0)
 _ACC: dict[str, float] = defaultdict(float)
 _N: dict[str, int] = defaultdict(int)
+# Reserved-memory delta per bucket. Time alone cannot see an allocator that is
+# unmapping and remapping segments -- and `mem/reserved_gb` was observed swinging
+# 55 -> 18.9 -> 55 GB between logged steps at block_size=15/240 anchors, with
+# max_reserved at 59.9 of 64. That churn goes through the driver and is slow, so a
+# region whose RESERVED jumps is the region paying for it.
+_RES: dict[str, float] = defaultdict(float)
+# Below this the reserved delta is allocator noise, not a signal worth a column.
+_MEM_NOISE_GB = 0.05
+
+
+def _reserved_gb() -> float:
+    if hasattr(torch, "npu"):
+        return torch.npu.memory_reserved() / 2**30
+    return 0.0
 
 
 def _sync() -> None:
@@ -60,11 +74,12 @@ def prof(tag: str, fn):
     if not ON:
         return fn()
     _sync()
-    t0 = time.perf_counter()
+    t0, r0 = time.perf_counter(), _reserved_gb()
     out = fn()
     _sync()
     dt = (time.perf_counter() - t0) * 1000.0
     _ACC[tag] += dt
+    _RES[tag] += _reserved_gb() - r0
     _N[tag] += 1
     if _PER_CALL_MS and dt > _PER_CALL_MS:
         print(f"[FWD_PROF] {tag}: {dt:.0f} ms", flush=True)
@@ -79,13 +94,14 @@ def region(tag: str):
         yield
         return
     _sync()
-    t0 = time.perf_counter()
+    t0, r0 = time.perf_counter(), _reserved_gb()
     try:
         yield
     finally:
         _sync()
         dt = (time.perf_counter() - t0) * 1000.0
         _ACC[tag] += dt
+        _RES[tag] += _reserved_gb() - r0
         _N[tag] += 1
         if _PER_CALL_MS and dt > _PER_CALL_MS:
             print(f"[FWD_PROF] {tag}: {dt:.0f} ms", flush=True)
@@ -97,16 +113,21 @@ def begin():
         return None
     _ACC.clear()
     _N.clear()
+    _RES.clear()
     _sync()
     return time.perf_counter()
 
 
 def _fmt(d: dict[str, float], prefix: str = "") -> str:
     """``prefix`` restores the accumulator key when the display name was stripped."""
-    return "  ".join(
-        f"{k}={v:.0f}({_N[prefix + k]}x)"
-        for k, v in sorted(d.items(), key=lambda kv: -kv[1])
-    )
+    out = []
+    for k, v in sorted(d.items(), key=lambda kv: -kv[1]):
+        r = _RES[prefix + k]
+        # Only show the memory column when the region actually moved reserved memory;
+        # a steady-state region moves none and the noise would bury the signal.
+        mem = f"/{r:+.1f}GB" if abs(r) >= _MEM_NOISE_GB else ""
+        out.append(f"{k}={v:.0f}{mem}({_N[prefix + k]}x)")
+    return "  ".join(out)
 
 
 def end(t0) -> None:
@@ -121,7 +142,8 @@ def end(t0) -> None:
     inner = {k: v for k, v in _ACC.items() if not k.startswith("TOP.")}
     s_top = sum(top.values())
     print(
-        f"[FWD_PROF] TOTAL={total:.0f}ms | {_fmt(top, 'TOP.')} | "
+        f"[FWD_PROF] TOTAL={total:.0f}ms reserved={_reserved_gb():.1f}GB | "
+        f"{_fmt(top, 'TOP.')} | "
         f"UNACCOUNTED={total - s_top:.0f}ms "
         f"({100 * (total - s_top) / max(total, 1e-9):.0f}%)",
         flush=True,
