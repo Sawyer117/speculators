@@ -464,6 +464,46 @@ job of naming the rank.
 Status: training. Promote to "completed" with step count and accept_len once it has run,
 and enter the eval in `ascend-npu-dsv4-dspark-eval-results.md`.
 
+### ★★ Muon vs AdamW at scale: the early lead crosses over and Muon LOSES (2026-09-07)
+
+The 2000-step A/B had Muon +13%, and we concluded Muon wins. **That was 1.6% into a run
+and it is now refuted.** The full 124,480-step AdamW baseline was in the repo all along —
+`docs/deployment/logs/faithful_ep_20260804_165215.redacted.log.xz` on branch
+`dflash2-reproduce`, a single 11 MB xz. That run is `ckpt_faithful_ep_20260804_165215`,
+i.e. **the production RoPE-fix run that ended at serve-side mean 4.40 = 99.5% of the
+released draft** — the best baseline we have, same recipe, same `DSPARK_*` line for line.
+
+| step | AdamW | Muon | Δ |
+|---|---|---|---|
+| 1,000 | 2.088 | 2.377 | **+13.9%** |
+| 2,000 | 2.455 | 2.779 | +13.2% |
+| 5,000 | 2.863 | 2.977 | +4.0% |
+| 10,000 | 3.166 | 3.178 | +0.4% ← **crossover** |
+| 20,000 | 3.389 | 3.290 | −2.9% |
+| 40,000 | 3.586 | 3.406 | −5.0% |
+| 66,500 | 3.739 | 3.556 | **−4.9%** |
+| 124,300 | 3.885 | — | still climbing at the end |
+
+**Muon optimizes faster early and converges lower.** Everything agrees at 66.5k:
+`ce_loss` +14.0%, `full_acc` −4.4%, `position_4` −6.3%.
+
+**Wall clock does not rescue it.** Both runs averaged **3.16 s/step** end to end (AdamW
+109.3 h / 124,479; Muon 58.5 h / 66,658) — HS-fetch stalls dominate and swamp the
+optimizer difference. At an equal 58.5 h AdamW is at step 66,519 with 3.742 vs Muon 3.560,
+**+5.1%**. The 1.47× optimizer penalty is real in median step time (2000 vs 2940 ms) and
+would bite on a machine without those stalls; here it never got the chance.
+
+⚠ Confounds: the Muon arm carried `hybrid_ns=1` (worth 0.6–3.4%, so "pure" Muon is maybe a
+point better — still behind); independent runs, one seed each, different data order.
+
+⚠ **The "AdamW would not fit in 64 GB" argument is dead too** — this AdamW run did
+124,480 steps on the same 8×A2. Muon's memory case has to be re-argued from scratch if it
+is to be argued at all.
+
+⟹ **Muon is not the lever.** The remaining Muon work (the Newton-Schulz kernel, worth ~20%
+of step time) only pays if Muon is used at all, so it drops behind the HS-straggler work,
+which is worth 5.9% of wall clock and helps *every* run regardless of optimizer.
+
 ### hybrid_ns: settled, and it loses (2026-09-07)
 
 The pending "≥1000-step A/B before touching the default" is done, and it came for free —

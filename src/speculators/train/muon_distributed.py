@@ -101,17 +101,44 @@ validated. Anything claimed for hybrid here rests on our own measurement only.
 MindSpeed has no fused NPU kernel here to borrow: its Newton-Schulz accepts a
 ``use_syrk`` argument and documents that the NPU path falls back to plain matmul.
 
-Muon wins even after paying the 1.49x: at EQUAL WALL CLOCK (AdamW step 2970 vs
-Muon step 2000) accept_len is 2.650 vs 2.796, and AdamW needs ~step 4500 to reach
-2.796 -- 2.2x the steps, 1.5x the wall clock. The gain also grows monotonically
-with position, which is what matters for a longer block.
+★★ THE EARLY LEAD DOES NOT SURVIVE. MEASURED TO 66k STEPS, AND MUON LOSES.
 
-⚠ Two limits on the above. It is step ~2000 of a 124,480-step run (1.6% in; AdamW
-ends at accept_len 3.87), and it is one seed each -- nothing here says the lead
-survives to convergence. And Muon is genuinely WORSE early: behind on loss from
-step ~25 to ~200 (steps 50-75: ce 29.9 vs 9.8). It passes AdamW on accept_len
-around step 100 and on loss around step 250, so a 100-step smoke test reads as a
-regression.
+The 2000-step A/B showed Muon ahead by ~13%, and this file used to conclude from
+it that "Muon wins even after paying the 1.49x". That conclusion was drawn at 1.6%
+of a run, and it is now refuted against the full 124,480-step AdamW baseline
+(``faithful_ep_20260804_165215`` -- the production RoPE-fix run that reached a
+serve-side mean of 4.40, i.e. 99.5% of the released draft):
+
+    step      AdamW    Muon      delta
+     1,000    2.088    2.377    +13.9%     <- the early lead, real
+     2,000    2.455    2.779    +13.2%
+     5,000    2.863    2.977     +4.0%
+    10,000    3.166    3.178     +0.4%     <- CROSSOVER
+    20,000    3.389    3.290     -2.9%
+    40,000    3.586    3.406     -5.0%
+    66,500    3.739    3.556     -4.9%
+   124,300    3.885      --                 AdamW still climbing at the end
+
+Muon optimizes FASTER EARLY and CONVERGES LOWER. Everything downstream agrees:
+at 66.5k ce_loss is +14.0%, full_acc -4.4%, position_4 -6.3%.
+
+AND THE WALL CLOCK DOES NOT RESCUE IT. Both runs averaged 3.16 s/step end to end
+(AdamW 109.3 h / 124,479; Muon 58.5 h / 66,658) because HS-fetch stalls dominate
+and swamp the optimizer difference -- so at an equal 58.5 h AdamW is at step
+66,519 with accept_len 3.742 against Muon's 3.560, i.e. +5.1%. The 1.47x optimizer
+penalty is real in median step time (2000 ms vs 2940 ms) and would bite on a
+machine without those stalls; here it simply did not get the chance to matter.
+
+⚠ Confounds, stated rather than buried: the Muon arm ran with ``hybrid_ns=1``,
+which the A/B below measures at 0.6-3.4% of accept_len, so "pure" Muon is perhaps
+a point better than shown -- still behind. And these are independent runs, one
+seed each, with different data order, unlike the hybrid A/B further down which
+shares its data order exactly.
+
+⚠ Muon is also genuinely WORSE in the first ~200 steps: behind on loss from step
+~25 to ~200 (steps 50-75: ce 29.9 vs 9.8), passing AdamW on accept_len near step
+100. So a short smoke test reads as a regression, a 2,000-step test reads as a
+13% win, and 66,000 steps read as a 5% loss. Only the last one is the answer.
 
 ⚠ ``validate_expert_shard_dim0`` is not decoration. If experts were ever sharded INSIDE a
 matrix instead of across the expert axis, the local route would orthogonalize incomplete
