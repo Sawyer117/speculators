@@ -96,6 +96,11 @@ bmm(poly, x)     1.10e12 -> 1.10e12    SYMM: same FLOPs, half the reads of poly
                  2.75e12 -> 1.93e12    = 1.43x
 ```
 
+**MindSpeed already anticipates this and does not deliver it on NPU.** Its own
+Newton-Schulz takes a `use_syrk` argument, and its documentation says the NPU path falls
+back to plain matmul — so the symmetric formulation is the acknowledged right answer for
+this kernel, and the Ascend implementation of it does not exist yet. That is the gap.
+
 This premise is **checked, not asserted**. `verify_structure()` in the reference measures
 `max|A − Aᵀ| / max|A|` for both and prints it; at the production shape both come back
 exactly `0.00e+00`.

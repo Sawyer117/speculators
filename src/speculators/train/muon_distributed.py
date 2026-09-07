@@ -65,8 +65,31 @@ as a map on singular values, p(x) = a x + b x^3 + c x^5 has p(1) = 0.7010, so 1 
 not even a fixed point, and iterating it oscillates (1.19, 0.90, 0.82, 0.77, ...,
 1.13). Muon accepts sigma in roughly [0.7, 1.3]. ``COEFF_SECONDARY`` has p(1) = 1
 and p'(1) = 0 -- a genuine quadratically-convergent fixed point -- which is why
-hybrid measures better here. Whether that helps accept_len is UNTESTED, so
-``hybrid_ns`` defaults OFF, matching upstream.
+hybrid measures better here.
+
+IT DOES NOT HELP accept_len -- MEASURED, and it costs a little. Two runs on the
+SAME data order (verified: 2000 of 2004 steps have bit-identical per-rank
+supervised-token counts) and the same lr schedule, differing only in
+``hybrid_ns``:
+
+    band          hybrid=0   hybrid=1        delta
+    accept_len   500-999       2.1768     2.1019    -3.4%
+                1800-2003      2.7638     2.7466    -0.6%
+    ce_loss       500-999       2.5118     2.6379    +5.0%
+    position_0    500-999       0.6315     0.6032    -4.5%
+    full_acc      500-999       0.3846     0.3719    -3.3%
+    grad_norm    1800-2003      0.8797     1.0113   +15.0%
+
+Every metric, every band, one sign. The gap narrows toward convergence, so a
+long-run reversal is not excluded by 2004 steps -- but there is no evidence of
+benefit and consistent evidence of a small cost, which is why ``hybrid_ns``
+defaults OFF. The higher grad_norm is the tell and is mechanistically consistent:
+grad_norm is measured pre-clip on the MODEL, so a persistently larger one means a
+less-converged model, matching the higher loss.
+
+Runs: hybrid=0 ``faithful_ep_20260904_051225`` (asset #1, ``7f35a95d``),
+hybrid=1 ``faithful_ep_20260905_024421`` (asset #2, ``84402a1b``); both archived
+under ``docs/deployment/logs/``.
 
 ⚠ AND THIS PORT IS NOT EQUIVALENT TO UPSTREAM AT ``ns_steps=5``. torchtitan-npu
 switches at an ABSOLUTE ``i >= 8`` with ``steps=10`` (8 primary + 2 secondary);

@@ -464,6 +464,36 @@ job of naming the rank.
 Status: training. Promote to "completed" with step count and accept_len once it has run,
 and enter the eval in `ascend-npu-dsv4-dspark-eval-results.md`.
 
+### hybrid_ns: settled, and it loses (2026-09-07)
+
+The pending "≥1000-step A/B before touching the default" is done, and it came for free —
+asset #1's archived log turned out to be the matched control. Same config line for line,
+same lr schedule, and **the same data order**: 2000 of 2004 steps carry bit-identical
+per-rank supervised-token counts, so the only variable is `hybrid_ns`.
+
+| band | metric | hybrid=0 | hybrid=1 | Δ |
+|---|---|---|---|---|
+| 500–999 | `accept_len` | 2.1768 | 2.1019 | **−3.4%** |
+| 1800–2003 | `accept_len` | 2.7638 | 2.7466 | −0.6% |
+| 500–999 | `ce_loss` | 2.5118 | 2.6379 | **+5.0%** |
+| 500–999 | `position_0_acc` | 0.6315 | 0.6032 | −4.5% |
+| 500–999 | `full_acc` | 0.3846 | 0.3719 | −3.3% |
+| 1800–2003 | `grad_norm` | 0.8797 | 1.0113 | **+15.0%** |
+
+Eight metrics × six bands, essentially all one sign. **`hybrid_ns` stays OFF**, now on
+measurement rather than on "upstream defaults it off".
+
+The gap narrows toward convergence (−3.4% → −0.6%), so 2004 steps cannot exclude a
+long-run reversal — but there is no evidence of benefit to weigh against a consistent
+small cost, and a 60-hour matched arm is not worth spending to chase it.
+
+⚠ The `opt_ms` difference in the same comparison (1010 → 993, −1.6%) is **not** hybrid.
+It is `1b62bd8c` moving the momentum buffer to the local shard, i.e. less memory traffic.
+
+Runs: hybrid=0 `faithful_ep_20260904_051225` (asset #1, `7f35a95d`) · hybrid=1
+`faithful_ep_20260905_024421` (asset #2, `84402a1b`). Both archived under
+`docs/deployment/logs/`, the second also as 158 readable shards.
+
 **Asset #1's SHA is proven, not guessed.** Every version from `1b62bd8c` onward deadlocks
 before step 0 on `hc_head.hc_fn`: it is `[hc_mult, hc_mult*hidden]` = `[4, 16384]` on an
 8-wide mesh, so ranks 0-3 hold one row and ranks 4-7 hold none, and
