@@ -1,0 +1,8 @@
+name        full.redacted.log
+raw_bytes   189174610
+raw_sha256  0feccea0ab1b0f17955ad0bf76f0ecde302d9639f956f44bfb691cee555db141
+compress    xz
+raw_target  1273212
+part_bytes  90000
+parts       149
+restore     cat part.*.xz > full.redacted.log.xz && xz -d full.redacted.log.xz && sha256sum full.redacted.log
