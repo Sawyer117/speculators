@@ -698,9 +698,23 @@ class Trainer:
                 tokens_all = [int(t[1].item()) for t in _out]
                 align_ms = (time.perf_counter() - _t_align) * 1000
             # --------------------------------------------------------------------------------------
+            # ⚠ BRACKET THE MODEL CALL. `fwd_ms` spans mark("fetch") to mark("fwd"),
+            # but the model's own exhaustive profiler (DSPARK_PROFILE_FWD) starts
+            # INSIDE `forward()`, so whatever the call does before reaching that
+            # body -- FSDP2's root pre-forward unshard above all -- lands in fwd_ms
+            # and in no bucket at all. Measured at block_size=15/240: fwd_ms 6,430,
+            # the model's own TOTAL 1,448, align_ms 3.2. Nearly 5 s in neither, and
+            # this is the only span left that can hold it. `model_ms` closes it:
+            #     fwd_ms   ~=  align_ms + model_ms
+            #     model_ms  -  TOTAL  ==  cost outside forward()'s body
+            _t_model = time.perf_counter() if timer.enabled else None
             _draft_tokens, loss, metrics = self.model(
                 **gpu_batch, **(self.config.train_call_kwargs or {})
             )
+            model_ms = 0.0
+            if _t_model is not None:
+                torch.accelerator.synchronize()
+                model_ms = (time.perf_counter() - _t_model) * 1000
 
             _trace("forward done", self.global_step)
             timer.mark("fwd")
@@ -765,6 +779,8 @@ class Trainer:
                         profile["fetch_ms_ranks"] = fetch_all
                         profile["fetch_ms_max"] = max(fetch_all)
                         profile["align_ms"] = round(align_ms, 1)
+                        # see the bracket note at the model call
+                        profile["model_ms"] = round(model_ms, 1)
                     if tokens_all and sum(tokens_all) > 0:
                         _mean = sum(tokens_all) / len(tokens_all)
                         profile["sup_tokens_ranks"] = tokens_all
