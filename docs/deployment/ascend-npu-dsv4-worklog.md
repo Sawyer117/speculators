@@ -464,6 +464,57 @@ job of naming the rank.
 Status: training. Promote to "completed" with step count and accept_len once it has run,
 and enter the eval in `ascend-npu-dsv4-dspark-eval-results.md`.
 
+### ★★ block_size=15 is not viable, and the cost is NOT where anyone looked (2026-09-08)
+
+`BLOCK=15 MAX_ANCHORS=240` runs, but at **~16 s/step → 124,480 steps ≈ 23 days**. Against
+`BLOCK=5 MAX_ANCHORS=512` (2.94 s/step) the token count rose only 1.5× (2560 → 3600) while
+the step rose 5.4×. `DSPARK_PROFILE_FWD=1` was extended from the four in-layer points to ten,
+and the answer is that **nine tenths of the forward is in none of them**:
+
+| point | per call | per step |
+|---|---|---|
+| `OUT.build_mask` | 31 ms | 31 |
+| `MLA.attn` | 127 ms | ×3 = **381** |
+| `MoE.ffn` | ~95 ms | ×3 = **285** |
+| `mHC.ffn` | 35 ms | 35 |
+| `OUT.fc_main_proj` / `embed` / `teacher_lm_head` / `hc_head` / `lm_head` | **< 30 ms, never printed** | — |
+| **instrumented total** | | **≈ 730 ms** |
+| **measured `fwd_ms`** | | **7,100 ms** |
+| **unaccounted** | | **≈ 6,370 ms (90%)** |
+
+**Two wrong theories, both retracted.** (1) "the einsum materialises 6.33 GiB" — it does not;
+that arithmetic used the mask's `[q_len, 3072+q_len]` shape, whereas the real call is
+per-anchor-block `[N, gamma, H, W+gamma]` ≈ 141 MB. (2) "achieved TFLOPS collapse 10.4 → 1.5"
+— built on the same wrong denominator. **`MLA.attn` is 381 ms of 7,100 ms; attention is not
+the bottleneck, and neither are the vocab-sized GEMMs** — `teacher_lm_head` is 3072×4096×129280
+= 3.25 TFLOP in under 30 ms.
+
+What is left, all uninstrumented, in order of suspicion:
+
+```
+compound_loss              draft AND teacher distributions at [3600, 129280] fp32 = 1.86 GB
+                           each, softmax + TV(|p-q|.sum(-1)) + CE, and SPECULATORS_DISABLE_
+                           FUSED_LOSS=1 is FORCED (transfer_to_npu patches .is_cuda True, so
+                           the fused path would dispatch to a Triton backend that has no
+                           Ascend implementation) -> the whole thing runs EAGER
+torch.roll(verifier_logits, 1, dims=1)     a full [1, 3072, 129280] copy
+targets = verifier_logits[:, anchored_block_indices]    large gather
+markov_head / confidence_head
+```
+
+⟹ **The next instrumentation goes in the loss, not the model.** And `block_size` scaling is
+gated on that, not on attention, not on anchors: no `MAX_ANCHORS` setting makes 23 days into
+a viable number.
+
+**Memory, for the record** (the two-point model now has a third point and holds): predicted
+`max_alloc` 55.5 GB at 240 anchors, measured **54.46** — 2% out. But `max_reserved` came back
+at **58.70**, i.e. ~5 GB of headroom rather than the 6-8 GB estimated from the 256-anchor run,
+because the reserved-over-alloc gap is not stable under pressure. 256 anchors OOMed at
+`clip_grad_norm` with the profiler on.
+
+Also seen: step 0 `fetch_ms = 209 s` on all eight ranks (HS serve cold start, not a fault),
+and `MoE.ffn` spikes of 553-617 ms on individual ranks (known new-shape recompile).
+
 ### ★★ Muon vs AdamW at scale: the early lead crosses over and Muon LOSES (2026-09-07)
 
 The 2000-step A/B had Muon +13%, and we concluded Muon wins. **That was 1.6% into a run
