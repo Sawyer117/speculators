@@ -682,9 +682,21 @@ class Trainer:
                 _trace("align all_gather -> enter", self.global_step)
                 dist.all_gather(_out, _buf)
                 _trace("align all_gather <- done", self.global_step)
-                align_ms = (time.perf_counter() - _t_align) * 1000
+                # ⚠ MEASURE AFTER THE .item(), NOT BEFORE IT. `dist.all_gather` is async:
+                # it queues and returns, so a perf_counter read taken here times the CALL,
+                # not the RENDEZVOUS. The first `.item()` below is what actually waits.
+                #
+                # Measured wrong, this reported align_ms = 1.4 ms while the model's own
+                # forward was 1.24 s against a profile/fwd_ms of 6.19 s -- and the 4.95 s
+                # in between was exactly this wait, hiding in the two lines under the
+                # timer. It also cost a wrong answer: asked whether the missing time was a
+                # cross-rank wait, I said no ON THE STRENGTH OF THIS NUMBER.
+                #
+                # This barrier is the whole reason align_ms exists -- to pull straggler
+                # wait OUT of fwd_ms -- so under-reporting it defeats the point.
                 fetch_all = [round(float(t[0].item()), 1) for t in _out]
                 tokens_all = [int(t[1].item()) for t in _out]
+                align_ms = (time.perf_counter() - _t_align) * 1000
             # --------------------------------------------------------------------------------------
             _draft_tokens, loss, metrics = self.model(
                 **gpu_batch, **(self.config.train_call_kwargs or {})
