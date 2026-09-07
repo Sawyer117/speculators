@@ -32,6 +32,8 @@ which is usually the context that makes the numbers readable. Selections are a U
 ⚠ The output still contains absolute paths with the box account id. Before pushing to
 the PUBLIC fork, run it through ``redact_log.py`` -- ``archive_log_push.sh pack``
 refuses an unredacted file, but a one-off ``git add`` of this output would not.
+Committed excerpts live in ``docs/deployment/logs/``, the only place repo-wide
+``*.log`` does not swallow them; the command printed at the end says so.
 """
 
 from __future__ import annotations
@@ -134,7 +136,15 @@ def main() -> int:
         print(f"highest step seen   : {max_step}")
     ratio = src_mb / max(dst_mb, 1e-9)
     print(f"{src_mb:.1f} MB -> {dst_mb:.3f} MB  ({ratio:.0f}x smaller)")
-    print("\n⚠ still unredacted -- redact_log.py before pushing to the public fork.")
+    # Spell out the rest of the chain. `*.log` is ignored repo-wide and has already
+    # blocked three separate attempts to commit an excerpt; `docs/deployment/logs/` is
+    # the one exempt directory, and redaction is not optional on a public fork.
+    stem = args.log.stem
+    print("\nNEXT -- redact (mandatory: the fork is PUBLIC, paths carry the box id),")
+    print("then commit into the one directory `*.log` does not swallow:\n")
+    print(f"  python examples/ascend_npu_dflash/redact_log.py {args.out} \\")
+    print(f"      docs/deployment/logs/{stem}.log")
+    print(f"  git add docs/deployment/logs/{stem}.log && git commit && git push")
     return 0
 
 
