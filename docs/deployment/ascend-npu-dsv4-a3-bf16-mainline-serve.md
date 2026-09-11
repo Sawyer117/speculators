@@ -444,3 +444,43 @@ TOKENIZER=/home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16 \
 | 3 | 主线栈 vs 老栈的吞吐差多少(mega_moe 快路值多少) | ⏳ 需要同机同权重的 A/B |
 | 4 | `VA_COMMIT` 要不要从 `4ce367a` 往前推 | ⏳ 等 ① 的数出来再评估;推的话会一并拿到 #15303 |
 | 5 | vllm-ascend main 声明但被 `--no-deps` 跳过的五个依赖 | ✅ 起服务没报缺模块,确认不在路径上 |
+
+---
+
+## 9. ★ eval 数据集:代理后面的三连坑(2026-09-12,一次性解决)
+
+`run_dspark_eval.sh` **默认 `OFFLINE=1`,这是对的** —— eval 是几小时的活,跑起来之后不该再依赖网络。
+但前提是数据集已经在缓存里。新机器上没有,而在企业 MITM 代理后面把它们弄进来
+**连踩三个坑,而且每个报错都指向别处**。
+
+⟹ 已固化成工具:**`examples/ascend_npu_dflash/fetch_eval_datasets.py`**
+
+```bash
+source /home/a00652497/portproxy_remote.sh
+python examples/ascend_npu_dflash/fetch_eval_datasets.py --insecure
+# 有企业 CA 的话用这个更好(校验保持开启):
+#   python …/fetch_eval_datasets.py --ca-bundle /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+```
+
+期望 **1319 / 500 / 164 / 257 / 80** 五行 `OK`,然后 eval 照默认 `OFFLINE=1` 跑。
+
+### 三个坑,按触发顺序
+
+| # | 报错 | 真因 | 处置 |
+|---|---|---|---|
+| 1a | `HTTP Error 504` on every HEAD | `HF_ENDPOINT` 指向华为镜像 `mirrors.tools.huawei.com/huggingface` —— **它不服务 datasets 命名空间**。直连 + 代理才是通的 | `unset HF_ENDPOINT` |
+| 1b | `UnsupportedProtocol: Request URL is missing an 'http://' or 'https://' protocol` | ⚠️⚠️ **把 `HF_ENDPOINT` "清空"成 `''` 比不设还糟** —— 空串让 httpx 直接报协议缺失,读起来像 datasets 的 bug | **必须 `unset`,不能设成空** |
+| 2 | `File reconstruction error: CAS Client Error` | `huggingface_hub` 默认走 **Xet/CAS 分块后端**,取块的是 `us.aws.cdn.hf.co`(**与 `huggingface.co` 不同的域**)。元数据能过所以拿得到签名 URL,取块失败。**识别特征:进度条先 `downloading bytes: 0.00B` 再 `reconstructing file: 0%`** | `HF_HUB_DISABLE_XET=1` |
+| 3 | `[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate in certificate chain` | 代理的自签名证书。⚠️ **`huggingface_hub` ≥1.x 已改用 httpx**,`requests` 时代那些旋钮全部无效 | httpx 认 `SSL_CERT_FILE`(首选);或 monkey-patch `httpx.Client/AsyncClient.__init__` 强制 `verify=False` |
+
+### ⚠️ 一个会骗人的现象
+
+**已经缓存过的数据集在网络完全不通时照样返回 `OK`** —— `datasets` 会静默回落到缓存并打印
+`Using the latest cached version`。我们排查时 `MATH-500` 一直 `OK`,差点据此判断"网络是通的"。
+**别拿单独一行 OK 当网络正常的证据,要看整张表。**
+
+### 其他
+
+- eval 客户端的 `TOKENIZER` 默认探测 `/share` `/home` `/mnt/nfs` 三个前缀后回落到 `/share/…`,
+  **本机在 `/home/…`,必须显式传** `TOKENIZER=/home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16`。
+- `Warning: You are sending unauthenticated requests to the HF Hub` 不用管,五个小数据集碰不到限流。
