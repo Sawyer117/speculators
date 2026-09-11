@@ -22,7 +22,7 @@
 
 | | |
 |---|---|
-| 当前进度 | **✅ 环境装通**(2026-09-12 02:40)。下一步:起 bf16 服务 |
+| 当前进度 | **✅ 服务起通**(2026-09-12 03:54),released draft 全量 eval 进行中 |
 | 分支 | `feat/dsv4-dspark-block16` |
 | 起始日期 | 2026-09-11 |
 
@@ -259,12 +259,188 @@ pandas-stubs · quart
 
 ---
 
-## 6. 待验证 / 未闭合
+## 6. ★ 起服务:四颗雷,全部是老栈没有的
+
+> **这一节是本文档最值钱的部分。** A3 + bf16 在**老栈**(vLLM 0.23.0 + 我们 fork 的
+> `386530d12`)上跑通过十几遍(见 [`…-eval-results.md`](./ascend-npu-dsv4-dspark-eval-results.md)
+> 里那一长串 `Serve = 176 A3-single`)。换到主线栈后连炸四次,**四颗雷互相独立,一颗都绕不过去。**
+
+⚠️ **先说清楚"以前能现在不能"的三个不同答案**,免得再绕弯路(我们绕了):
+
+| 机器 | 精度 | 栈 | 为什么它没事 |
+|---|---|---|---|
+| **176**(bf16 eval 跑了十几遍) | bf16 | vLLM 0.23.0 + fork `386530d12` | **老栈,下面四段代码那时都还不存在** |
+| **136**(现在仍能 eval) | **w8a8** | vLLM 0.27.1 + main | **双重免疫**:走量化 `quant_method`,根本不进 `routed_experts.py`;而且 A2 脚本**压根没设 `FUSED_MC2`** |
+| **本机** | bf16 | 0.27.1 + main | ← 这一格从来没人跑过 |
+
+---
+
+### 雷 1 —— `Failed to load the backend extension: torch_npu`
+
+**症状**:`vllm/env_override.py` 里 `import torch` 就炸,根因是
+`/usr/lib64/libstdc++.so.6` 缺 `CXXABI_1.3.15`。
+
+**真因**:conda-forge 的 `libsqlite` 带 ICU 扩展,`import sqlite3` 拉 `libicui18n.so.78`,
+它需要比系统更新的 `libstdc++`。环境里**装了**够新的,但链接器先命中系统那个。
+
+**为什么只在起服务时炸**:安装脚本第 125 行有这一行,**A3 起服务脚本没有**:
+
+```
+install_npu_env_dsv4_w8a8.sh:125      export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:…"   ✔
+serve_dsv4_a2_singlenode_w8a8.sh:149  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:…"   ✔
+serve_dsv4_a3_singlenode.sh           （没有）                                        ✘
+```
+
+**处置**:父 shell 里 `export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"`。
+脚本内部随后 `source CANN` 会往前插它自己的路径,但那些路径里没有 `libstdc++`,
+所以 conda 的仍排在 `/usr/lib64` 前面 —— **实测成立**。
+⚠️ **每个新 shell 都要重来**,忘了这条错误会原样回来。
+
+---
+
+### 雷 2 —— `enable_multithread_load does not support safetensors_load_strategy='prefetch'`
+
+A3 脚本第 117-118 行同时给了两个加载选项,**0.23.0 上能共存,0.27.1 把它们变成互斥**:
+
+```sh
+[ "$PREFETCH" = "1" ] && LOAD_ARGS=(--safetensors-load-strategy prefetch)
+LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,…}")
+```
+
+**处置**:`PREFETCH=0`(保留 16 线程多线程加载,去掉 prefetch)。脚本自带这个旋钮。
+
+---
+
+### 雷 3 —— ★ OOM 60.5 / 61.27 GiB:**上游已修的 bug,我们的 pin 把它钉住了**
+
+**症状**:target 权重装完(`Loading weights took 10.08s`,46/46 分片),倒在
+`vllm_ascend/ops/fused_moe/routed_experts.py:95` 的 `w2_weight_list` 克隆上。
+注意是倒在 **w2**,说明 **w13 那份已经克隆成功** —— 即专家权重已经被复制了一份半。
+
+**完整因果链**:
+
+```
+A3 脚本第 98 行  VLLM_ASCEND_ENABLE_FUSED_MC2=1          （A3 专属三件套之一）
+CANN 9.2.0-beta1 带 cann_ops_transformer 这个 python 包
+   ↳ ascend_config.py:27
+     _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not None  → True
+DSV4 过了 _is_megamoe_supported_by_config                → enable_fused_mc2 保持 1
+⟹ 走进 _MEGA_MOE_SUPPORTED 分支：w13/w2 各克隆一份
+   而该分支【不 del 原张量】【不 empty_cache】—— 相邻的 dynamic_eplb 分支两样都做了
+⟹ 本地专家权重驻留 ×2 → OOM
+```
+
+⭐ **`apply()` 证明原张量是死重量**(同文件 123-149 行):
+
+```python
+w1 = w13_weight_list if isinstance(w13_weight_list, list) else [layer.w13_weight]
+```
+
+列表存在时,`layer.w13_weight` 在前向里一次都不会被读。
+
+**处置 = 上游 PR [#15216](https://github.com/vllm-project/vllm-ascend/pull/15216)**
+(`e41435157`,*[BugFix] Release unused unquantized weights for fused MC2*,Jade Zheng,2026-08-29 合入)。
+作者的描述与我们的诊断一字不差,他给的算例(43 层 MoE / 每 rank 4 专家 / hidden 4096 / 中间维 2048 / bf16)
+省 **8.06 GiB**。
+
+```bash
+cd <VA_DIR>
+git fetch origin main
+git show e41435157d3a80937bb01f60efb46b28d663f2d5 -- vllm_ascend/ops/fused_moe/routed_experts.py | git apply -v
+# editable 安装,不用重装
+```
+
+**实测干净可打**(一个 hunk,offset 1 行),打完专家权重不再翻倍,**mega_moe 快路也保住了**
+—— 比 `VLLM_ASCEND_ENABLE_FUSED_MC2=0` 那条绕路强。
+
+⚠️⚠️ **这颗雷的教训比修法本身重要:`VA_COMMIT=4ce367a`(#14696,08-21)这个 pin 有两面性。**
+当初钉在那里的理由是"#14696 是 DSpark 能跑的地板";但它**同时把 8 天后(08-29)才修的这个 OOM
+一起钉住了**。⟹ **pin 一个 commit 等于同时拒绝了它之后的所有修复**,升级窗口要定期重评。
+
+📌 同一段代码后来还有 [#15303](https://github.com/vllm-project/vllm-ascend/pull/15303)
+(`_MEGA_MOE_SUPPORTED` 从模块级 stale import 改成运行时 `use_cann_megamoe()`,修"想关 megamoe 却关不掉")。
+**我们不需要**(我们要它开着),但升 `VA_COMMIT` 时会一并拿到。
+
+---
+
+### 雷 4 —— `assert "mtp.0." in name`:`method=mtp` 在主线上不再等价于 `dspark`
+
+**症状**:target 装完、进到 `Loading drafter model...` 后炸在
+`vllm_ascend/models/deepseek_v4/mtp.py:301`。
+
+**真因**:那是**单层** MTP 的模型类,`load_weights` 硬断言 `assert "mtp.0." in name`,
+后面全是 `name.replace("mtp.0.", "model.layers.0…")`。**DSpark 草稿是 3 层(`mtp.0/1/2`)**,
+第一个 `mtp.1.*` 就炸。
+
+**为什么老栈没事**:`serve_dsv4_a3_singlenode_specmethod.sh` 的头注释记着 ——
+老栈上 `get_spec_decode_method()` 对两者返回同一个 `AscendDsparkProposer`,
+它在 `__init__` 里把 `self.method` 覆写成 `"dflash"`,所以 method 字符串**不影响任何分支**。
+**主线上不再如此**:`method` 直接决定加载哪个模型类。
+
+主线里 `dspark` 是一等公民:
+
+```
+spec_decode/__init__.py:44        elif method == "dspark":
+spec_decode/dspark_proposer.py    专门的 AscendDsparkProposer
+llm_base_proposer.py              十余处 self.method == "dspark" 分支
+```
+
+**处置**:用 `serve_dsv4_a3_singlenode_specmethod.sh`(它与父脚本**只差 method 一处**,
+默认 `SPEC_METHOD=dspark`)。确认:`grep -m1 "Loading draft model" <log>` 应显示 `method=dspark`。
+
+---
+
+### ✅ 起通的完整命令(2026-09-12 03:54)
+
+```bash
+source /home/a00652497/portproxy_remote.sh
+export no_proxy="localhost,127.0.0.1,::1,${no_proxy:-}"; export NO_PROXY="$no_proxy"
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate dspark-dsv4-serving
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"      # ← 雷 1
+cd /home/a00652497/dsv4_serve/speculators
+
+CANN_ENV=/data0/canada_group_folder/CANN/9.2.0-beta1/cann-9.2.0-beta.1/set_env.sh \
+MODEL=/home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16 \
+DRAFT=/home/canada_group_folder/ckpt/released_draft_bf16_standalone \
+NUM_SPEC=5 PREFETCH=0 \                                             # ← 雷 2
+  nohup bash examples/ascend_npu_dflash/serve_dsv4_a3_singlenode_specmethod.sh \
+  > ~/dsv4_a3_dspark.log 2>&1 &                                      # ← 雷 4
+```
+
+(雷 3 是代码补丁,已打在 `<VA_DIR>` 上,不在命令里。)
+
+⚠️ eval 客户端的 `TOKENIZER` 默认指向 `/share/canada_group_folder/...`,
+**本机是 `/home/...`,必须覆盖**:
+
+```bash
+PORT=7000 DATASET=all CONCURRENCY=48 NUM_PROMPTS=0 KEEP_WARMUP=0 \
+TOKENIZER=/home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16 \
+  bash examples/ascend_npu_dflash/run_dspark_eval.sh
+```
+
+---
+
+## 7. 给新脚本的差异清单
+
+雷 1/2/4 都是**脚本层面**的,应当固化进一个
+`serve_dsv4_a3_singlenode_mainline.sh`(**新开文件,不动仍在给 176 用的那个**):
+
+| 差异 | 老栈 | 主线栈 |
+|---|---|---|
+| `LD_LIBRARY_PATH` | 不需要 | **必须** `$CONDA_PREFIX/lib` 前置 |
+| `PREFETCH` | 1(可与多线程加载共存) | **0**(0.27.1 上互斥) |
+| spec `method` | `mtp` ≡ `dspark` | **必须 `dspark`** |
+| `--no-disable-hybrid-kv-cache-manager` | 无 | 建议加(`MAXLEN=8192` 下无害;长上下文时 KV 差 3.6×) |
+
+---
+
+## 8. 仍未闭合
 
 | # | 问题 | 状态 |
 |---|---|---|
-| 1 | **CANN 9.2.0-beta1 + torch-npu 2.10.0.post4 能否编过 V4/SAS 算子** | ✅ **能。2026-09-12 实测装通。** 沿途三个证据点:① `set_env.sh` 正常 source;② 工具链在原位(`lld=…/9.2.0-beta.1/bin/lld`,beta 没挪);③ `torch 2.10.0+cpu \| npu True` —— torch-npu import 成功。脚本第 0 步那句 `⚠ NOT 9.1.0` 只是告警,不是拦截。**⟹ 9.1.0 不是硬下限,9.2.0-beta1 可用。** |
-| 2 | `serve_dsv4_a3_singlenode.sh` 是按**老栈**(vLLM 0.23.0 + fork)写的,在 0.27.1 + 上游 main 上旗标可能已挪位或改名 | ⏳ 起服务时逐条过 |
-| 3 | bf16 拓扑 = **DP2 × TP8**,不是 w8a8 的 DP4×TP4 | 📌 已知,来自 A3 老栈的实测记录:TP8 → dense/8 ≈ 37 GB 权重 + ~15 GB KV/device;DP4×TP4 对 bf16 太紧 |
-| 4 | A3 专属 env 是否仍需要 / 是否仍是这几个 | ⏳ 老栈上是 `ASCEND_A3_ENABLE=1` / `VLLM_ASCEND_ENABLE_FUSED_MC2=1` / `HCCL_BUFFSIZE=1024`,且 MTP method 为 `deepseek_mtp`(非 A2 的 `mtp`) |
-| 5 | 是否带 DSpark 草稿做投机,还是先起纯 AR 基线 | ⏳ 未定 |
+| 1 | released draft 在本栈上的 accept_len 能否复现 **gsm8k 4.658 / 五项 4.42** | ⏳ 全量 eval 进行中。**这是整条主线栈可不可信的判据** |
+| 2 | `--additional-config` + `num_spec=5` / TP=8 的 issue #14260 | ✅ 没触发(脚本在有 `DRAFT` 时自动 `FLASHCOMM1=0`) |
+| 3 | 主线栈 vs 老栈的吞吐差多少(mega_moe 快路值多少) | ⏳ 需要同机同权重的 A/B |
+| 4 | `VA_COMMIT` 要不要从 `4ce367a` 往前推 | ⏳ 等 ① 的数出来再评估;推的话会一并拿到 #15303 |
+| 5 | vllm-ascend main 声明但被 `--no-deps` 跳过的五个依赖 | ✅ 起服务没报缺模块,确认不在路径上 |
