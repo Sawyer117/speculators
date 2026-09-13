@@ -64,6 +64,38 @@ for src in "${EDIT[@]}"; do
   _link "$src" "$STAGE/src/$d" && echo "${d}|${src}" >> "$STAGE/src/PATHS" && echo "  暂存 $src -> $d"
 done
 
+# ── record the git state of every editable tree ────────────────────────────────────────
+# ⚠️ These are EDITABLE installs: site-packages holds only a .pth pointing here, so whatever
+# is checked out in these directories IS the code the image runs. An uncommitted change goes
+# in silently and nothing downstream can tell. Write it down, and refuse nothing -- a dirty
+# tree is sometimes exactly what makes the stack work (vllm-ascend-serving is a detached HEAD).
+MAN="$STAGE/src/GIT_MANIFEST"
+{
+  echo "# built $(date -Is) on $(hostname) by $(whoami)"
+  echo "# ROLE=$ROLE  CONDA_ENV=$CONDA_ENV  CANN=$CANN_SRC  BASE=$BASE_IMAGE"
+  echo
+  for src in "${EDIT[@]}"; do
+    [ -d "$src" ] || continue
+    echo "[$src]"
+    if [ -d "$src/.git" ]; then
+      echo "  commit : $(git -C "$src" rev-parse HEAD 2>/dev/null)"
+      echo "  branch : $(git -C "$src" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+      echo "  subject: $(git -C "$src" log -1 --format=%s 2>/dev/null)"
+      n=$(git -C "$src" status --porcelain 2>/dev/null | wc -l)
+      if [ "$n" != 0 ]; then
+        echo "  ⚠ DIRTY: $n uncommitted change(s) baked into this image:"
+        git -C "$src" status --porcelain 2>/dev/null | sed 's/^/      /'
+      else
+        echo "  clean  : yes"
+      fi
+    else
+      echo "  (not a git checkout)"
+    fi
+    echo
+  done
+} > "$MAN"
+echo ">>> git 状态:"; sed 's/^/    /' "$MAN"
+
 echo ">>> 暂存体积:"; du -sh "$STAGE"/* 2>/dev/null
 echo ">>> 构建上下文所在盘:"; df -h "$HERE" | tail -1
 

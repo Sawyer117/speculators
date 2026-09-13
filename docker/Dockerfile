@@ -68,7 +68,9 @@ RUN if [ -f /stage_src/PATHS ]; then \
         [ -z "$d" ] && continue; \
         mkdir -p "$(dirname "$dest")" && mv "/stage_src/$d" "$dest" && echo "  -> $dest"; \
       done < /stage_src/PATHS ; \
-    fi; rm -rf /stage_src
+    fi; \
+    cp -f /stage_src/GIT_MANIFEST /opt/image_manifest.txt 2>/dev/null || true; \
+    rm -rf /stage_src
 
 # ── 6. environment wiring ──────────────────────────────────────────────────────────────
 # ★ $CONDA_PREFIX/lib MUST precede the system libs. conda-forge's libsqlite pulls libicui18n,
