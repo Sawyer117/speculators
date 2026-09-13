@@ -30,6 +30,12 @@ ARG CONDA_ROOT=/home/n84449292/miniconda3
 ARG CONDA_ENV=dspark-dsv4-serving
 ARG CANN_HOME=/home/a00652497/CANN/9.1.0.0627
 ARG SKIP_PKGS=0
+# ⚠️ NOT named http_proxy. A base image's ENV SHADOWS a same-named ARG, and torchspec_ty:116
+# ships ENV http_proxy=http://90.255.89.236:3128 (dead from these hosts) -- so --build-arg
+# http_proxy is silently ignored and apt hangs on the dead one. A distinct name cannot be
+# shadowed; the RUN below exports it over the inherited ENV for that layer only.
+ARG BUILD_PROXY=
+ARG BUILD_NO_PROXY=localhost,127.0.0.1,.huawei.com
 
 ENV TZ=Asia/Shanghai LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive
 
@@ -38,6 +44,8 @@ ENV TZ=Asia/Shanghai LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive
 # which then needs no network at all.
 RUN if [ "$SKIP_PKGS" = "1" ]; then echo ">>> SKIP_PKGS=1, 跳过装包"; else \
       rm -f /etc/apt/apt.conf.d/*proxy* 2>/dev/null; \
+      export http_proxy="$BUILD_PROXY" https_proxy="$BUILD_PROXY" no_proxy="$BUILD_NO_PROXY"; \
+      echo ">>> apt 走的代理: ${BUILD_PROXY%%://*}://***(已覆盖 base 镜像里那个死的)"; \
       ( command -v apt-get >/dev/null \
         && apt-get update -qq \
         && apt-get install -y -qq --no-install-recommends \

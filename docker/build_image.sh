@@ -55,6 +55,7 @@ for m in ("vllm", "vllm_ascend", "speculators"):
     print(root)
 PYEOF
 )
+mapfile -t EDIT < <(printf '%s\n' "${EDIT[@]}" | grep '^/' || true)
 [ "${#EDIT[@]}" -gt 0 ] && printf '    %s\n' "${EDIT[@]}" || echo "    (无 editable,只有 site-packages)"
 
 rm -rf "$STAGE"; mkdir -p "$STAGE/src"
@@ -114,9 +115,8 @@ docker build -t "$TAG" \
   --build-arg CONDA_ENV="$CONDA_ENV" \
   --build-arg CANN_HOME="$CANN_SRC" \
   --build-arg SKIP_PKGS="${SKIP_PKGS:-0}" \
-  --build-arg http_proxy="${http_proxy:-}" \
-  --build-arg https_proxy="${https_proxy:-}" \
-  --build-arg no_proxy="${no_proxy:-localhost,127.0.0.1,.huawei.com}" \
+  --build-arg BUILD_PROXY="${http_proxy:-}" \
+  --build-arg BUILD_NO_PROXY="${no_proxy:-localhost,127.0.0.1,.huawei.com}" \
   "$STAGE" || { echo "!! 构建失败"; exit 1; }
 
 echo; echo "✅ $TAG"; docker images "$TAG"
