@@ -18,7 +18,13 @@ CANN_SRC="${CANN_SRC:-/home/a00652497/CANN/9.1.0.0627}"
 BASE_IMAGE="${BASE_IMAGE:-torchspec_ty:116}"
 TAG="${TAG:-dsv4-dspark-${ROLE}:$(date +%Y%m%d)}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STAGE="$HERE/stage"
+REPO="$(cd "$HERE/.." && pwd)"
+# ⚠️ The stage dir MUST live OUTSIDE the repo. speculators is itself one of the trees being
+# staged, so a stage dir inside it makes `cp -al` refuse: "cannot copy a directory into itself".
+# Keep it on the SAME filesystem as the sources, though, or the hard links degrade to real
+# copies (16 GB of CANN). The stage dir doubles as the build context, so the context contains
+# exactly what the image needs and nothing else.
+STAGE="${STAGE_DIR:-$(dirname "$REPO")/.lingxu_stage_${ROLE}}"
 
 case "$ROLE" in
   serve) CONDA_ENV="${CONDA_ENV:-dspark-dsv4-serving}" ;;
@@ -52,6 +58,8 @@ PYEOF
 [ "${#EDIT[@]}" -gt 0 ] && printf '    %s\n' "${EDIT[@]}" || echo "    (无 editable,只有 site-packages)"
 
 rm -rf "$STAGE"; mkdir -p "$STAGE/src"
+cp -f "$HERE/Dockerfile" "$HERE/entrypoint.sh" "$HERE/setup_proxy.sh" "$STAGE/"
+echo ">>> 暂存目录(在仓库外):$STAGE"
 _link() { cp -al "$1" "$2" 2>/dev/null || cp -a "$1" "$2"; }
 
 echo ">>> 暂存 conda env ..."; _link "$CONDA_ROOT/envs/$CONDA_ENV" "$STAGE/conda_env"
@@ -97,7 +105,7 @@ MAN="$STAGE/src/GIT_MANIFEST"
 echo ">>> git 状态:"; sed 's/^/    /' "$MAN"
 
 echo ">>> 暂存体积:"; du -sh "$STAGE"/* 2>/dev/null
-echo ">>> 构建上下文所在盘:"; df -h "$HERE" | tail -1
+echo ">>> 构建上下文所在盘:"; df -h "$STAGE" | tail -1
 
 docker build -t "$TAG" \
   --build-arg BASE_IMAGE="$BASE_IMAGE" \
@@ -109,7 +117,7 @@ docker build -t "$TAG" \
   --build-arg http_proxy="${http_proxy:-}" \
   --build-arg https_proxy="${https_proxy:-}" \
   --build-arg no_proxy="${no_proxy:-localhost,127.0.0.1,.huawei.com}" \
-  "$HERE" || { echo "!! 构建失败"; exit 1; }
+  "$STAGE" || { echo "!! 构建失败"; exit 1; }
 
 echo; echo "✅ $TAG"; docker images "$TAG"
 echo; echo ">>> 自查:   bash $HERE/check_image.sh $TAG"

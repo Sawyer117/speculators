@@ -54,15 +54,15 @@ RUN mkdir -p /var/run/sshd && \
     ssh-keygen -A && /usr/sbin/sshd -t
 
 # ── 3. CANN toolkit (NOT the driver) ───────────────────────────────────────────────────
-COPY stage/cann ${CANN_HOME}
+COPY cann ${CANN_HOME}
 
 # ── 4. conda env, at its ORIGINAL absolute path ────────────────────────────────────────
-COPY stage/conda_env ${CONDA_ROOT}/envs/${CONDA_ENV}
+COPY conda_env ${CONDA_ROOT}/envs/${CONDA_ENV}
 
 # ── 5. editable source trees, also at their ORIGINAL paths ─────────────────────────────
 # build_image.sh stages each tree under stage/src/<basename-of-its-parent>__<basename>, and
 # writes stage/src/PATHS mapping staged dir -> final absolute path, so this layer is generic.
-COPY stage/src /stage_src
+COPY src /stage_src
 RUN if [ -f /stage_src/PATHS ]; then \
       while IFS='|' read -r d dest; do \
         [ -z "$d" ] && continue; \
