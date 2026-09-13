@@ -96,8 +96,10 @@ fatal: unable to access 'https://github.com/vllm-project/vllm/':
 **不影响结果**,不用管。
 
 ⚠️⚠️ **别把代理 URL 写进任何要提交的文件** —— 它是 `user:pass@host:port` 形式,
-本 fork 是**公开**的。只记脚本路径,不记 URL。推日志前先
-`grep -i 'ptaishan\|@90\.' <log>` 核一遍。
+本 fork 是**公开**的。只记脚本路径,不记 URL。推日志前先用通用模式自查一遍:
+```bash
+grep -nE '://[^/[:space:]]+:[^/@[:space:]]+@' <log>   # 任何 user:pass@host 形式的 URL
+```
 
 有企业 CA bundle 的话更干净,一次配好三者:
 `export SSL_CERT_FILE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` + `REQUESTS_CA_BUNDLE` +
