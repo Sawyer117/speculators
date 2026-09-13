@@ -1,0 +1,4 @@
+# The build context must stay small. Everything the image needs is COPYed from explicit
+# paths staged by build_image.sh, never from a working tree.
+*
+!stage/
