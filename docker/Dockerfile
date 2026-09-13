@@ -90,4 +90,9 @@ ENV PATH=${CONDA_PREFIX_PATH}/envs/${ROLE}_env/bin:$PATH \
 
 EXPOSE 22
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["/bin/bash"]
+# ⚠️ `sleep infinity`, NOT `/bin/bash`. The platform starts the container detached and execs in
+# afterwards, so there is no TTY -- bash would read EOF on stdin and exit IMMEDIATELY, and the
+# container would die. The official check only greps the CMD string for "/bin/bash|sleep", so a
+# bash CMD PASSES the check and still fails in practice. The migration guide says the same:
+# "sleep infinity is recommended because it reliably keeps non-interactive containers running".
+CMD ["sleep", "infinity"]
