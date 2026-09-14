@@ -14,6 +14,10 @@ fi
 
 docker run --rm --entrypoint "" "$IMAGE" /bin/bash -c '
 check() { if eval "$2"; then echo "[PASS] $1"; else echo "[FAIL] $1"; fi; }
+# --entrypoint "" 跳过了 entrypoint,而这是个非交互 shell ⟹ /root/.bashrc 提前 return。
+# 必须显式 source,否则 libhccl.so 找不到,整个栈假 FAIL。
+# shellcheck disable=SC1091
+[ -f /etc/profile.d/00-dsv4.sh ] && . /etc/profile.d/00-dsv4.sh >/dev/null 2>&1
 echo ""; echo "=== Mandatory ==="
 check "sshd"        "command -v sshd || test -f /usr/sbin/sshd"
 check "sshd_config" "test -f /etc/ssh/sshd_config"

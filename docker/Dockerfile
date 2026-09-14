@@ -87,15 +87,23 @@ RUN if [ -f /stage_src/PATHS ]; then \
 # ★ The base image's dead proxy is cleared so it cannot poison anything at run time.
 COPY setup_proxy.sh /usr/local/bin/setup_proxy.sh
 COPY entrypoint.sh  /usr/local/bin/entrypoint.sh
+# 环境是 ONE 份,放在 /etc/profile.d 里 —— 不要写进 ~/.bashrc 就完事:
+#   Ubuntu 的 /root/.bashrc 第一行是 `case $- in *i*) ;; *) return;; esac`,
+#   非交互 shell(`docker run img python -c ...`、`docker exec img cmd`)直接 return,
+#   追加在末尾的 export 一行都不会跑 ⟹ libhccl.so 找不到 ⟹ import torch 炸。
+# /etc/profile.d 则被 `bash -lc` 经 /etc/profile 加载,entrypoint 也显式 source 它。
 RUN dos2unix /usr/local/bin/setup_proxy.sh /usr/local/bin/entrypoint.sh && \
     chmod +x /usr/local/bin/setup_proxy.sh /usr/local/bin/entrypoint.sh && \
     { \
       echo "export PATH=${CONDA_ROOT}/envs/${CONDA_ENV}/bin:\$PATH"; \
       echo "export CONDA_PREFIX=${CONDA_ROOT}/envs/${CONDA_ENV}"; \
       echo "export LD_LIBRARY_PATH=\$CONDA_PREFIX/lib:\${LD_LIBRARY_PATH:-}"; \
-      echo "source ${CANN_HOME}/ascend-toolkit/set_env.sh 2>/dev/null || true"; \
-      echo "source /usr/local/bin/setup_proxy.sh"; \
-    } >> /root/.bashrc
+      echo "source ${CANN_HOME}/ascend-toolkit/set_env.sh >/dev/null 2>&1 || true"; \
+      echo "[ -f ${CANN_HOME}/nnal/atb/set_env.sh ] && source ${CANN_HOME}/nnal/atb/set_env.sh >/dev/null 2>&1 || true"; \
+      echo "source /usr/local/bin/setup_proxy.sh >/dev/null 2>&1 || true"; \
+    } > /etc/profile.d/00-dsv4.sh && \
+    chmod +x /etc/profile.d/00-dsv4.sh && \
+    echo "source /etc/profile.d/00-dsv4.sh" >> /root/.bashrc
 
 ENV http_proxy="" https_proxy="" \
     PATH=${CONDA_ROOT}/envs/${CONDA_ENV}/bin:$PATH \
