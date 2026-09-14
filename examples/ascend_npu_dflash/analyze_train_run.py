@@ -41,6 +41,7 @@ import re
 import sys
 import time
 from collections import Counter
+from math import exp
 from statistics import median, mean, pstdev
 
 # where train_dsv4_dspark.sh writes logs (RUN=... in that script); override via env.
@@ -238,6 +239,92 @@ def detect_positions(recs) -> list[str]:
             if m:
                 ks.add(int(m.group(1)))
     return [f"train/position_{i}_acc" for i in sorted(ks)]
+
+
+
+def print_position_trend(recs, pos_keys, gamma=None, bins=6):
+    """Per-position accuracy TREND across the run, plus where the loss mass went.
+
+    The existing per-position line is a SNAPSHOT (last-20-step median). A snapshot cannot
+    answer the question that actually decides the next experiment: *is this position still
+    learning, or has it converged?* Those two have opposite next moves — more epochs vs
+    re-weighting — so the trend is the thing worth printing.
+
+    Read it with the loss-share row underneath. DSpark weights position k by
+    ``w_k = exp(-k/gamma)`` and normalises over the block, so at gamma=block_size the early
+    positions' SHARE shrinks as block_size grows: pos0 takes 28.7% of the mass at block5 but
+    only 10.2% at block15. A position that flatlined while holding a small share is starved,
+    not saturated — and starving is fixable for free by lowering gamma.
+
+    Per-step values swing hugely (pos0 ranged 0.784-0.888 within 20 adjacent steps on the
+    block15 run), so every cell here is a MEDIAN over its bin; single steps mean nothing.
+    """
+    good = [r for r in recs if f(r, "train/loss") is not None and not isnan(f(r, "train/loss"))]
+    if not good or not pos_keys:
+        return
+    n = len(good)
+    edges = [round(n * b / bins) for b in range(bins + 1)]
+    chunks = [good[edges[b]:edges[b + 1]] for b in range(bins)]
+    chunks = [c for c in chunks if c]
+    if len(chunks) < 2:
+        return
+
+    def med_of(chunk, key):
+        v = [f(r, key) for r in chunk]
+        v = [x for x in v if x is not None and not isnan(x)]
+        return median(v) if v else None
+
+    # Label each bin by its step RANGE. `step_of` returns -1 for a truncated leading record,
+    # and //1000 collapses distinct bins to the same label on short runs — both produced
+    # garbage headers ("-1k 0k 1k 1k 2k 2k") before this.
+    hi = max(step_of(c[-1]) for c in chunks)
+    unit = 1000 if hi >= 10000 else 1
+    def lab(c):
+        a = max(0, step_of(c[0]))
+        return f"{a//unit}k" if unit == 1000 else f"{a}"
+    spans = [lab(c) for c in chunks]
+
+    print()
+    print("逐位准确率轨迹 (每格 = 该区间中位数;单步噪声极大,别看单步)")
+    print("  pos " + "".join(f"{sp:>8}" for sp in spans)
+          + f"{'前半增益':>10}{'后半增益':>10}  状态" + ("   损失份额" if gamma else ""))
+
+    shares = None
+    if gamma:
+        w = [exp(-k / gamma) for k in range(len(pos_keys))]
+        tot = sum(w)
+        shares = [100 * x / tot for x in w]
+
+    mid = len(chunks) // 2
+    for i, key in enumerate(pos_keys):
+        vals = [med_of(c, key) for c in chunks]
+        if any(v is None for v in vals):
+            continue
+        # Halves, not last-bin delta. A single bin's delta is dominated by noise (pos0 swung
+        # 0.784-0.888 across 20 adjacent steps on the real run), and it mislabelled the
+        # fastest-improving positions as plateaued. Comparing the two halves' GAINS asks the
+        # question that matters — is this position still moving at the rate it used to?
+        g1 = vals[mid] - vals[0]
+        g2 = vals[-1] - vals[mid]
+        if g1 <= 0.002:
+            mark = "● 平台" if abs(g2) <= 0.004 else ("↑ 后段才起" if g2 > 0 else "↓ 回落")
+        elif g2 <= 0.15 * g1:
+            mark = "● 平台"
+        elif g2 <= 0.5 * g1:
+            mark = "◐ 放缓"
+        else:
+            mark = "↑ 仍在涨"
+        row = (f"  {i:3d} " + "".join(f"{v:8.3f}" for v in vals)
+               + f"{g1:+10.3f}{g2:+10.3f}  {mark}")
+        if shares:
+            row += f"{shares[i]:8.2f}%"
+        print(row)
+
+    if shares:
+        print(f"       损失权重 w_k = exp(-k/γ), γ={gamma:g}  —— pos0 占 {shares[0]:.2f}%,"
+              f" pos0-2 合计 {sum(shares[:3]):.2f}%")
+        print( "       ⚠️ 某位置『平台』且份额小 = 信号不足(降 γ 即可,零算力成本);"
+               "份额大才是真饱和。")
 
 
 def spike_report(recs, key, k_thresh=3.0):
@@ -1062,6 +1149,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", default=None, metavar="DIR", help="folder for PNG plots (created if missing)")
     ap.add_argument("--spike-k", type=float, default=3.0, help="spike = stage > k*steady-median (default 3.0)")
     ap.add_argument("--recent", type=int, default=500, help="window (steps) for the recent-dynamics trend")
+    ap.add_argument("--gamma", type=float, default=None,
+                    help="损失位置衰减 γ(w_k=exp(-k/γ))。默认 = 检测到的位置数,即 DSpark 的\n                         γ=block_size 约定;训练时改过就在这里给实际值,否则份额列会算错。")
     ap.add_argument("--skip", type=int, default=0,
                     help="drop global_steps < N (exclude shape-warmup / resume HS-regen); applied to BOTH runs")
     ap.add_argument("--arm", action="append", default=[], metavar="NAME=LOG",
@@ -1505,6 +1594,8 @@ def main() -> None:
         vals = [last_n_med(k) for k in pos_keys]
         print(f"per-position   : " + "  ".join(f"p{i+1}={fmt(v)}" for i, v in enumerate(vals))
               + f"   (γ={len(pos_keys)} draft positions)")
+        # γ defaults to block_size for DSpark (see decay-gamma-equals-block); override with --gamma.
+        print_position_trend(recs, pos_keys, gamma=getattr(args, "gamma", None) or len(pos_keys))
     # confidence calibration
     cl = last_n_med("train/confidence_loss")
     if cl is not None:
