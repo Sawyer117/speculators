@@ -6,7 +6,13 @@
 #   bash run_dspark_eval.sh                 # defaults: port 7000, model dsv4, gsm8k, concurrency 16
 #   PORT=7000 DATASET=gsm8k CONCURRENCY=16 bash run_dspark_eval.sh
 #
-# Bar to beat = released DSV4 draft accept_len 3.94 @ num_spec=5 (vllm-ascend PR #11196).
+# ⚠️ THE BAR IS STACK-SPECIFIC — there is no single number to print here.
+# The same released draft measures differently on every stack, so a hardcoded bar is worse
+# than no bar: it invites a wrong verdict. Known bars, gsm8k / 5-set mean, num_spec=5:
+#   old 176   (386530d12 / CANN 9.0.0)        4.665 / 4.4232
+#   mainline  (4ce367a  / CANN 9.2.0-beta1)   4.523 / 4.287
+#   (3.94 was the ORIGINAL PR #11196 figure on a long-gone stack — do not use it.)
+# And a run at num_spec != 5 is not comparable to either: accept_len's ceiling is num_spec.
 set -o pipefail
 PORT="${PORT:-7000}"
 MODEL="${MODEL:-dsv4}"
@@ -58,7 +64,10 @@ echo ">>> [3/4] spec-decode counters (must be NON-zero to prove drafting is live
 curl -s --noproxy '*' "$BASE/metrics" | grep -E "spec_decode_num_(drafts|accepted_tokens)_total" \
   || echo "    (!! no spec_decode counters — serve fell back to AR? check speculative_config in ~/dsv4_bf16_head.log)"
 
-echo ">>> [4/4] $DATASET accept_len (Evaluator, greedy temp0/top-p1/top-k1) — bar = released 3.94 ..."
+echo ">>> [4/4] $DATASET accept_len (Evaluator, greedy temp0/top-p1/top-k1)"
+echo "    ⚠️ 横杆随栈而变,脚本不替你选。ns=5 时:老栈 176 = gsm8k 4.665 / 五项 4.4232;"
+echo "       主线+CANN9.2 = gsm8k 4.523 / 五项 4.287。本次 NUM_SPEC=${NUM_SPEC:-<未设>}"
+echo "       —— num_spec 不同则 accept_len 上限不同,不能直接比大小。"
 NP_ARG=(); [ "$NUM_PROMPTS" -gt 0 ] 2>/dev/null && NP_ARG=(--num-prompts "$NUM_PROMPTS")
 KEEP_ARG=(); [ "$KEEP_WARMUP" = "1" ] && KEEP_ARG=(--keep-warmup-samples)
 exec python "$SCRIPT_DIR/Evaluator.py" \
