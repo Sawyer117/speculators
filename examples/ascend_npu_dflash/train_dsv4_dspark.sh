@@ -144,6 +144,31 @@ GROUPED="${DSPARK_GROUPED_MOE:-0}"
 #    照着它写 `EP=1` 会被下一行立刻覆盖成 0,然后走 --init-on-meta 那条路,
 #    在 FROM_PRETRAINED 下崩成 `Cannot copy out of meta tensor; no data!`。
 #    静默退化代价太大(8 卡跑到建模型才炸),所以这里直接拦。
+# ── 未知旗标检测 ────────────────────────────────────────────────────────────────────────
+# 写错名字的环境变量【静默无效】—— 今天 DSPARK_RECOMPUTE(真名 RECOMPUTE)就是这么
+# 丢掉的,横幅打 recompute=0 而没人察觉。把「看起来像给本脚本的、但脚本从不读」的
+# 变量列出来,总比跑到一半发现配方不对强。
+# 只看 DSPARK_* 与本脚本认识的那批全大写名,避免误报 shell 自带的环境变量。
+_KNOWN=" RUN VERIFIER DATA HS_DIR ENDPOINT LR EPOCHS MAX_ANCHORS SEQLEN MASK_TOKEN BLOCK
+ MAX_STEPS OPTIM MUON_LR MUON_ADJUST MUON_HYBRID DECAY_GAMMA SWA_WINDOW NONCAUSAL
+ SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO FROM_PRETRAINED LOSS_FN TEACHER_DNORM
+ KD_TEMP NOISE_STD RECOMPUTE COMPILE NO_VAL INIT_MOE INIT_ATTN INIT_HC INIT_NORM
+ INIT_LAYER INIT_MOE_NO_ROUTER CKPT_FREQ NPROC SAVE_PATH CANN_ENV TRAIN_PY MODE
+ BF16_EXPERTS PYTORCH_NPU_ALLOC_CONF HCCL_TIMEOUT "
+_unknown=""
+for _e in $(env | sed -n 's/^\(DSPARK_[A-Z_]*\)=.*/\1/p'); do
+  case "$_e" in
+    DSPARK_EP|DSPARK_GROUPED_MOE|DSPARK_COMPILE|DSPARK_MOE_BALANCE|DSPARK_MOE_BALANCE_RATE\
+    |DSPARK_LOG_EXPERT_LOAD|DSPARK_TRACE|DSPARK_TRACE_SYNC|DSPARK_EP_CHECK|DSPARK_HS_DIR) ;;
+    *) _unknown="$_unknown $_e" ;;
+  esac
+done
+if [ -n "$_unknown" ]; then
+  echo "!! 这些 DSPARK_* 环境变量本脚本【不认识】,会被静默忽略:$_unknown" >&2
+  echo "   常见错名:DSPARK_RECOMPUTE → RECOMPUTE ;  DSPARK_NO_VAL → NO_VAL" >&2
+  exit 2
+fi
+
 if [ -n "${EP:-}" ] && [ -z "${DSPARK_EP:-}" ]; then
   echo "!! 你传的是 EP=$EP,但旗标名是 DSPARK_EP。" >&2
   echo "   (provenance 里的 EP= 是解析后的内部名,不是输入旗标。)" >&2
