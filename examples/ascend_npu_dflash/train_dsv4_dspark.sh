@@ -370,6 +370,9 @@ SAVE_PATH="${SAVE_PATH:-$RUN/ckpt_${TAG}_${TS}}"
 # reboot, a broken driver and four wrong hypotheses because a rollback was aimed one
 # commit late -- nobody could say which commit the last good run had used.
 #
+# ★ 这里打印的是【输入旗标名】,可以直接照抄进命令行重放。脚本内部会把 DSPARK_EP
+#   读进 EP、INIT_LAYER 读进 INITLAYER,若按内部名记录,照抄出来的命令会【静默失效】。
+#
 # `train_command.txt` in the ckpt dir records the argparse half only; the DSPARK_* env
 # half lives here in the launcher. This file records BOTH plus the SHA, alongside the log
 # and named after the same run, so log <-> recipe <-> commit are one lookup apart.
@@ -408,7 +411,26 @@ PROV="$RUN/${TAG}_${TS}.provenance.txt"
             DSPARK_MOE_BALANCE DSPARK_MOE_BALANCE_RATE DSPARK_LOG_EXPERT_LOAD \
             DSPARK_TRACE DSPARK_TRACE_SYNC DSPARK_EP_CHECK BF16_EXPERTS; do
     eval "_val=\${$_v-}"
-    if [ -n "${_val:-}" ]; then echo "$_v=$_val"; fi
+    # ⚠️ 打印【输入旗标名】,不是内部变量名。这个文件是给人照着重放的,而脚本内部
+    #    把 DSPARK_EP 读进 EP、INIT_LAYER 读进 INITLAYER……直接打内部名会诱导出
+    #    `EP=1` `INITLAYER=1` 这种【静默失效】的命令行 —— 2026-09-15 就这么连栽三次
+    #    (EP 退化成 0 → --init-on-meta → Cannot copy out of meta tensor)。
+    case "$_v" in
+      EP)           _flag=DSPARK_EP ;;
+      GROUPED)      _flag=DSPARK_GROUPED_MOE ;;
+      RECOMPUTE)    _flag=DSPARK_RECOMPUTE ;;
+      COMPILE)      _flag=DSPARK_COMPILE ;;
+      NOVAL)        _flag=NO_VAL ;;
+      INITMOE)      _flag=INIT_MOE ;;
+      INITATTN)     _flag=INIT_ATTN ;;
+      INITHC)       _flag=INIT_HC ;;
+      INITNORM)     _flag=INIT_NORM ;;
+      INITLAYER)    _flag=INIT_LAYER ;;
+      INITNOROUTER) _flag=INIT_MOE_NO_ROUTER ;;
+      LAYERS|EXPERTS) _flag="# $_v(由 mode 决定,不是旗标)" ;;
+      *)            _flag="$_v" ;;
+    esac
+    if [ -n "${_val:-}" ]; then echo "$_flag=$_val"; fi
   done
   echo
   echo "# to reproduce this run exactly"
