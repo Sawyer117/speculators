@@ -249,6 +249,27 @@ except Exception as exc:
 print("OK: vLLM + vllm-ascend import cleanly and the ascend platform plugin registers")
 PY
 
+# ── Provenance: make the env say what it IS, so nobody has to remember ────────────────
+# We lost hours once to "which build is this env?" -- the serve script printed a cheerful
+# banner that came from bash `echo`, not from the build, and the wrong install answered 200s
+# while silently doing nothing. An env that states its own CANN/commit/dirs kills that class
+# of bug. Read it any time with:  cat $CONDA_PREFIX/STACK.txt
+{
+  echo "# written by install_npu_env_dsv4_w8a8.sh at $(date -Is) on $(hostname) by $(whoami)"
+  echo "CONDA_ENV      = ${CONDA_DEFAULT_ENV:-?}"
+  echo "CONDA_PREFIX   = ${CONDA_PREFIX:-?}"
+  echo "CANN_ENV       = ${CANN_ENV:-<unset>}"
+  echo "ASCEND_HOME    = ${ASCEND_HOME_PATH:-<unset>}"
+  echo "VLLM_DIR       = $VLLM_DIR"
+  echo "VA_DIR         = $VA_DIR"
+  echo "VA_COMMIT      = $VA_COMMIT"
+  echo "torch          = $(python -c 'import torch;print(torch.__version__)' 2>/dev/null || echo ?)"
+  echo "torch_npu      = $(python -c 'import torch_npu;print(torch_npu.__version__)' 2>/dev/null || echo ?)"
+  echo "numpy          = $NUMPY_VER"
+} > "$CONDA_PREFIX/STACK.txt"
+echo ">>> 环境自述已写入 $CONDA_PREFIX/STACK.txt"
+cat "$CONDA_PREFIX/STACK.txt"
+
 echo "==================================================================="
 echo " DONE. Expect: numpy $NUMPY_VER | torch 2.10.0 | vllm 0.27.1 | vllm-ascend ${VA_COMMIT:0:12}"
 echo " NEXT: bash examples/ascend_npu_dflash/serve_dsv4_a2_singlenode_w8a8.sh"
