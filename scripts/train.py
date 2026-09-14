@@ -483,6 +483,67 @@ def _build_from_config_only(
     return model
 
 
+
+def _ep_sharded_state_dict(ckpt_dir: str) -> dict | None:
+    """Per-rank state dict for an EP run loading a FULL-expert checkpoint.
+
+    The checkpoint stores every routed expert (``experts.w{1,2,3}`` are ``[n_routed, ...]``)
+    because saving gathers the ``Shard(0)`` DTensors. Under ``DSPARK_EP`` each rank BUILDS
+    only ``n_routed // ep_size`` experts, so ``from_pretrained`` sees [256,...] vs [32,...]
+    and refuses -- there is nothing wrong with either side, transformers simply has no notion
+    of expert-parallel sharding.
+
+    This is the same contract torchtitan/DCP use: the checkpoint is the full LOGICAL tensor
+    and each rank reads only its shard. Here the read is done with ``safe_open``'s slicing so
+    only this rank's 1/ep_size of the expert stacks is ever materialised -- loading all of it
+    on all ranks would be ep_size x the file (334 GB at 8 x 41.8 GB).
+
+    Returns ``None`` when EP is off, so the caller falls through to the normal path.
+    """
+    import os  # noqa: PLC0415
+    import re  # noqa: PLC0415
+
+    import torch.distributed as dist  # noqa: PLC0415
+
+    if os.environ.get("DSPARK_EP") != "1":
+        return None
+    if not dist.is_initialized():
+        return None
+
+    from safetensors import safe_open  # noqa: PLC0415
+
+    rank, world = dist.get_rank(), dist.get_world_size()
+    files = sorted(Path(ckpt_dir).glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"--from-pretrained {ckpt_dir}: no *.safetensors")
+
+    expert_re = re.compile(r"\.experts\.w[123]$")
+    state: dict[str, torch.Tensor] = {}
+    n_sharded = 0
+    for f in files:
+        with safe_open(str(f), framework="pt") as fh:
+            for key in fh.keys():  # noqa: SIM118
+                if not expert_re.search(key):
+                    state[key] = fh.get_tensor(key)
+                    continue
+                sl = fh.get_slice(key)
+                n_total = sl.get_shape()[0]
+                if n_total % world != 0:
+                    raise ValueError(
+                        f"{key}: {n_total} experts not divisible by EP size {world}"
+                    )
+                per = n_total // world
+                state[key] = sl[rank * per : (rank + 1) * per]
+                n_sharded += 1
+    if rank == 0:
+        print(
+            f">>> [DSPARK_EP] from-pretrained: sharded {n_sharded} expert stacks "
+            f"to 1/{world} per rank (full checkpoint stays on disk)",
+            flush=True,
+        )
+    return state
+
+
 def build_draft_model(
     args: argparse.Namespace,
     model_class: type[SpeculatorModel],
@@ -528,12 +589,14 @@ def build_draft_model(
             # __init__ resolves its own default ("sdpa") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl
+            ep_sd = _ep_sharded_state_dict(args.from_pretrained)
             return model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,
                 t2d=t2d,
                 d2t=d2t,
                 verifier=args.verifier_name_or_path,
+                **({"state_dict": ep_sd} if ep_sd is not None else {}),
             )
         return model_class.from_pretrained(
             args.from_pretrained,
