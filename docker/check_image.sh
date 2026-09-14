@@ -37,7 +37,20 @@ echo ""; echo "=== 我们自己的栈 ==="
 check "python 3.11" "python -c \"import sys;assert sys.version_info[:2]==(3,11)\""
 check "torch"       "python -c \"import torch\""
 check "torch_npu"   "python -c \"import torch_npu\""
-check "LD_LIBRARY_PATH 前置 conda lib" "echo \$LD_LIBRARY_PATH | grep -q \"^\$CONDA_PREFIX/lib\""
+# 真实要求(文档 §6 雷 1 实测):conda 的 lib 只要排在【系统 lib 之前】即可 ——
+# CANN 的 set_env.sh 会往最前面插它自己的路径,但那些目录里没有 libstdc++,不影响。
+# 早先写成 grep "^$CONDA_PREFIX/lib"(必须在第 0 位)比真实要求严,CANN 一插就假 FAIL。
+ld_ok() {
+  local IFS=: i=0 ci=0 si=0 p
+  for p in $LD_LIBRARY_PATH; do
+    i=$((i+1))
+    [ "$ci" = 0 ] && [ "$p" = "$CONDA_PREFIX/lib" ] && ci=$i
+    [ "$si" = 0 ] && { [ "$p" = /usr/lib64 ] || [ "$p" = /usr/lib ] || [ "$p" = /lib64 ]; } && si=$i
+  done
+  [ "$ci" != 0 ] && { [ "$si" = 0 ] || [ "$ci" -lt "$si" ]; }
+}
+echo "    LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+check "LD_LIBRARY_PATH: conda lib 早于系统 lib" "ld_ok"
 check "CANN set_env 存在" "ls \$ASCEND_TOOLKIT_HOME/../set_env.sh >/dev/null 2>&1 || ls /home/a00652497/CANN/*/ascend-toolkit/set_env.sh >/dev/null 2>&1"
 if [ "$ROLE" = "serve" ]; then
   check "vllm"        "python -c \"import vllm\""

@@ -131,9 +131,33 @@ ROLE=serve CANN_SRC=/home/canada_group_account/CANN/9.1.0.0627 bash docker/build
 不用 `cp -aL`(全量跟随):`cann` 和 `cann-9.1.0-beta.3` 本是同一份的两个名字,
 跟随会实打实复制两遍,镜像从 38G 涨到 50G+。
 
+### 3.8 自查脚本自己写错的断言
+
+`LD_LIBRARY_PATH` 那条原本写成 `grep -q "^$CONDA_PREFIX/lib"`,要求 conda lib 在**第 0 位**。
+但 §6 雷 1 实测下来的真实要求是「conda lib 排在**系统 lib 之前**」—— CANN 的 `set_env.sh`
+会往最前面插自己的路径,那些目录里没有 `libstdc++`,不影响。CANN 一插,这条就假 FAIL。
+已改成按位置比较。
+
+教训:**自查脚本的断言比被查对象更容易错**。一条 FAIL 先问「断言对不对」,再问「镜像对不对」。
+
 ---
 
-## 4. 待办
+## 4. 状态
+
+**2026-09-14 116 `ROLE=serve` 全绿**(`fed102ba36dc`,38.7 GB):
+
+```
+Mandatory    sshd / sshd_config / chpasswd                         PASS
+Recommended  hostname / host keys / PermitRootLogin / rsync / dos2unix  PASS
+Optional     ping                                                  PASS
+我们的栈     python3.11 / torch / torch_npu / vllm / vllm_ascend    PASS
+```
+
+`can not use command: npu-smi info` 是没挂 NPU 设备时 torch_npu 的正常提示,不是错误。
+`libtinfo.so.6: no version information available` 同理 —— conda 的 libtinfo 比系统 bash
+编译时用的旧,只是 warning。
+
+## 5. 待办
 
 - [ ] `ROLE=train` 在 **109** 上 build(109 无 DNS ⟹ `SKIP_PKGS=1`,或用本地 `ascend-verl:v4` 作 base)
 - [ ] 问平台方:驱动/device 挂载方式、权重卷挂载、环境变量注入、是否要 executor-server、base 镜像有无限制
