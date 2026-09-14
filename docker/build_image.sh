@@ -58,7 +58,16 @@ PYEOF
 mapfile -t EDIT < <(printf '%s\n' "${EDIT[@]}" | grep '^/' || true)
 [ "${#EDIT[@]}" -gt 0 ] && printf '    %s\n' "${EDIT[@]}" || echo "    (无 editable,只有 site-packages)"
 
-rm -rf "$STAGE"; mkdir -p "$STAGE/src"
+# ⚠️ CANN ships read-only directories (0555). `cp -al` hard-links the FILES but creates NEW
+# directories inheriting that mode, so a plain `rm -rf` on an old stage dies with hundreds of
+# "Permission denied" lines. chmod first -- and note this is safe: only the new directories are
+# touched, never the CANN originals (files are hard links; unlinking one leaves the other).
+if [ -d "$STAGE" ]; then
+  echo ">>> 清理上一次的暂存(先给目录加写权限,CANN 原件不受影响) ..."
+  find "$STAGE" -type d -exec chmod u+w {} + 2>/dev/null
+  rm -rf "$STAGE"
+fi
+mkdir -p "$STAGE/src"
 cp -f "$HERE/Dockerfile" "$HERE/entrypoint.sh" "$HERE/setup_proxy.sh" "$STAGE/"
 echo ">>> 暂存目录(在仓库外):$STAGE"
 _link() { cp -al "$1" "$2" 2>/dev/null || cp -a "$1" "$2"; }
