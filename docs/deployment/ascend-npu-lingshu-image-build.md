@@ -195,3 +195,54 @@ docker push harbor.computing.lab.rnd.huawei.com/<项目>/dsv4-dspark-serve:20260
 
 - [ ] `ROLE=train` 在 **109** 上 build(109 无 DNS ⟹ `SKIP_PKGS=1`,或用本地 `ascend-verl:v4` 作 base)
 - [ ] 问平台方:驱动/device 挂载方式、权重卷挂载、环境变量注入、是否要 executor-server、base 镜像有无限制
+
+---
+
+## 8. HS-dump 补丁能不能跟上主线(2026-09-14 调研)
+
+**背景**:在线 HS rollout 用的是 fork 构建 `vllm-ascend-v4 @ 4677f0baa` + `dspark_hs_dumper.py`,
+不在主线上。如果新栈(CANN 9.2 + vllm-ascend main)要接管这个角色,补丁得跟过去。
+
+### 8.1 补丁体量
+
+```
+vllm_ascend/dspark_hs_dumper.py       207 行   全新文件 → 不可能冲突
+vllm_ascend/worker/model_runner_v1.py  16 行   ← 唯一集成点
+```
+
+纯 Python,不碰 `csrc` ⟹ **不需要重编**。
+
+### 8.2 ★ 直接 rebase 会「打得上、不生效」
+
+主线的 DSpark 走 **MRV2**(`vllm_ascend/worker/v2/`),不是 `model_runner_v1.py`
+(#12968 让 MRV2 支持 DSV4 DSpark,877→1192 tok/s;#14696 修的也是 MRV2)。
+16 行打在 v1 上会**干净地应用,然后一个文件都不写** —— 最难查的那类失败。
+必须改挂到 `vllm_ascend/worker/v2/model_runner.py`。
+
+### 8.3 MRV2 反而更好挂
+
+| | v1 | MRV2 |
+|---|---|---|
+| 取 aux | `getattr(model, "get_mtp_target_hidden_states", lambda: None)()` 鸭子钩子 | `state.aux_hidden_states` 一等字段 |
+| 取 hidden | 局部变量 | `state.hidden_states` |
+| 取 batch | `self.input_batch` | `state.input_batch` |
+| 插入点 | execute_model 中段,靠上下文行定位 | vllm-ascend 自己的 `execute_model` override 末尾 |
+
+MRV2 的 DSpark speculator 签名是 `propose(last_hidden_states, aux_hidden_states)` ——
+与我们 dump 的两样东西 1:1 对应。
+
+### 8.4 工作量:半天到一天,成本在验证不在写码
+
+三个**必须用数值证、不能靠读代码**的点:
+
+1. MRV2 的 `aux_hidden_states` 与 v1 的 `get_mtp_target_hidden_states()` 是否同一批层
+   (`[40,41,42]`)、同一 pre/post-norm 约定。旧 `hs_*.safetensors` 还在 ⟹ 同 prompt
+   逐张量对比,有 ground truth,这个验证是硬的。
+2. **flashcomm 的 all-gather**:aux 在 flashcomm 开启时要 all-gather,dump 必须插在
+   `self.execute_model_state = state._replace(...)` **之后**,否则各 rank dump 到未聚合的碎片。
+3. **rank 归属**:v1 是 TP rank0 写、各 DP 互不重叠;MRV2 的 rank 语义要重新确认。
+
+### 8.5 对镜像方案的结论
+
+**dumper 是纯 Python ⟹ 不构成做第二个镜像的理由。**
+HS-dump 角色 = 同一镜像里 `git checkout` 我们的分支。三机一镜像的设想不受影响。
