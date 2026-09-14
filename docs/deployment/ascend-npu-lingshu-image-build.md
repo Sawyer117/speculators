@@ -162,7 +162,36 @@ Optional     ping                                                  PASS
 `libtinfo.so.6: no version information available` 同理 —— conda 的 libtinfo 比系统 bash
 编译时用的旧,只是 warning。
 
-## 5. 待办
+## 5. 交付方式:push 到 Harbor(不是交 tar)
+
+平台文档《06 灵枢平台镜像制作要求》末尾写明的交付路径:
+
+```bash
+docker tag  dsv4-dspark-serve:20260914 \
+  harbor.computing.lab.rnd.huawei.com/<项目>/dsv4-dspark-serve:20260914
+docker push harbor.computing.lab.rnd.huawei.com/<项目>/dsv4-dspark-serve:20260914
+```
+
+**需要先申请 Harbor 权限**,`<项目>` 也要问对接人(文档示例里的 `mindspeed-mm` 是人家的项目)。
+`export_image.sh` 产出的 tar 仍然有用 —— 离线备份 + 换机搬运,37 GB 推 Harbor 不快。
+
+## 6. 逐条对照平台的 11 项要求
+
+| # | 要求 | 必选 | 我们 |
+|---|---|---|---|
+| 1 | OS 源配置(`mirrors.tools.huawei.com`) | 必须 | ✅ 已补。**检查脚本不查这条** —— 自查全绿 ≠ 合规 |
+| 2 | rsync / dos2unix | 必选 | ✅ |
+| 3 | sshd | 必选 | ✅ 装了。平台说**不必自己启动**(它用 Portainer exec API 启),我们 entrypoint 里也启了,无害 |
+| 4 | `PermitRootLogin yes` | 必选 | ✅ |
+| 5 | 主机密钥 | 必须 | ✅ build 期生成 + entrypoint 兜底 |
+| 6 | hostname | 必选 | ✅ |
+| 7 | ping | 可选 | ✅ |
+| 8 | `/etc/profile`、`~/.bashrc` 的 source **不能太久** | 建议 | ⚠️ 我们在 `/etc/profile.d/00-dsv4.sh` 里 source 了 CANN `set_env.sh`,**须实测耗时** |
+| 9 | `CMD` = `/bin/bash` 或 `sleep infinity` | 必选 | ✅ 用 `sleep infinity`(`/bin/bash` 无 TTY 会立刻退,官方两个都收但这个更稳) |
+| 10 | `EXPOSE 22` | 可选 | ✅ |
+| 11 | http_proxy | 可选 | ✅ `setup_proxy.sh`,三个 IP 与官方一致;账号密码走 `-e PROXY_USER/PROXY_PASS` 注入,不写死在镜像里 |
+
+## 7. 待办
 
 - [ ] `ROLE=train` 在 **109** 上 build(109 无 DNS ⟹ `SKIP_PKGS=1`,或用本地 `ascend-verl:v4` 作 base)
 - [ ] 问平台方:驱动/device 挂载方式、权重卷挂载、环境变量注入、是否要 executor-server、base 镜像有无限制

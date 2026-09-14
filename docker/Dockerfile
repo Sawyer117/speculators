@@ -42,8 +42,16 @@ ENV TZ=Asia/Shanghai LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive
 # ── 1. LingShu mandatory packages ──────────────────────────────────────────────────────
 # Ubuntu base -> apt. Set SKIP_PKGS=1 for a base that already has all six (ascend-verl:v4),
 # which then needs no network at all.
+# 灵枢要求 #1(必须):apt 换内网源。检查脚本【不查】这条,所以自查全绿也可能不合规。
+# 换源之后容器里 apt 不再依赖代理账号也能装包。
+# ⚠️ 注释一律写在 RUN 外面:RUN 续行里的 # 是雷 —— 续行会被拼成一行,
+#    一旦 # 原样传给 shell,它后面的内容会被整段吞掉。
 RUN if [ "$SKIP_PKGS" = "1" ]; then echo ">>> SKIP_PKGS=1, 跳过装包"; else \
       rm -f /etc/apt/apt.conf.d/*proxy* 2>/dev/null; \
+      sed -i -e "s@http://[^ ]*archive.ubuntu.com@http://mirrors.tools.huawei.com@g" \
+             -e "s@http://[^ ]*security.ubuntu.com@http://mirrors.tools.huawei.com@g" \
+             -e "s@http://ports.ubuntu.com@http://mirrors.tools.huawei.com@g" \
+             /etc/apt/sources.list 2>/dev/null || true; \
       export http_proxy="$BUILD_PROXY" https_proxy="$BUILD_PROXY" no_proxy="$BUILD_NO_PROXY"; \
       echo ">>> apt 走的代理: ${BUILD_PROXY%%://*}://***(已覆盖 base 镜像里那个死的)"; \
       ( command -v apt-get >/dev/null \
