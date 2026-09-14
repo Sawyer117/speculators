@@ -354,6 +354,18 @@ PY
     exit 2
   fi
   SHAPING_ARGS=""
+  # INIT_* 是「从 target 初始化」,而 FROM_PRETRAINED 直接加载完整草稿 —— 两者互斥,
+  # train.py 里 --from-pretrained 胜出、其余【静默忽略】。不提醒的话,下次读 provenance
+  # 会以为它们生效过。
+  _ignored=""
+  for _f in INITMOE:INIT_MOE INITATTN:INIT_ATTN INITHC:INIT_HC INITNORM:INIT_NORM \
+            INITLAYER:INIT_LAYER INITNOROUTER:INIT_MOE_NO_ROUTER; do
+    eval "_iv=\${${_f%%:*}-0}"
+    if [ "$_iv" = "1" ]; then _ignored="$_ignored ${_f##*:}"; fi
+  done
+  if [ -n "$_ignored" ]; then
+    echo ">>> ⚠️ FROM_PRETRAINED 下这些 INIT_* 会被【静默忽略】(权重整个来自 ckpt):$_ignored"
+  fi
   echo ">>> FROM_PRETRAINED:形状(layers/experts/sliding-window)全部取自 ckpt 的 config.json,"
   echo "    LAYERS=$LAYERS EXPERTS=$EXPERTS SWA_WINDOW=$SWA_WINDOW 【不传】给 train.py"
 else
