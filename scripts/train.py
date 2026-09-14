@@ -487,16 +487,16 @@ def _build_from_config_only(
 def _ep_sharded_state_dict(ckpt_dir: str) -> dict | None:
     """Per-rank state dict for an EP run loading a FULL-expert checkpoint.
 
-    The checkpoint stores every routed expert (``experts.w{1,2,3}`` are ``[n_routed, ...]``)
-    because saving gathers the ``Shard(0)`` DTensors. Under ``DSPARK_EP`` each rank BUILDS
-    only ``n_routed // ep_size`` experts, so ``from_pretrained`` sees [256,...] vs [32,...]
-    and refuses -- there is nothing wrong with either side, transformers simply has no notion
-    of expert-parallel sharding.
+    The checkpoint stores every routed expert (``experts.w{1,2,3}`` are
+    ``[n_routed, ...]``) because saving gathers the ``Shard(0)`` DTensors. Under
+    ``DSPARK_EP`` each rank BUILDS only ``n_routed // ep_size`` experts, so
+    ``from_pretrained`` sees [256,...] vs [32,...] and refuses -- neither side is
+    wrong, transformers simply has no notion of expert-parallel sharding.
 
-    This is the same contract torchtitan/DCP use: the checkpoint is the full LOGICAL tensor
-    and each rank reads only its shard. Here the read is done with ``safe_open``'s slicing so
-    only this rank's 1/ep_size of the expert stacks is ever materialised -- loading all of it
-    on all ranks would be ep_size x the file (334 GB at 8 x 41.8 GB).
+    Same contract as torchtitan/DCP: the checkpoint is the full LOGICAL tensor and
+    each rank reads only its shard. The read uses ``safe_open``'s slicing so only
+    this rank's 1/ep_size of the expert stacks is ever materialised -- reading all
+    of it on all ranks would be ep_size x the file (334 GB at 8 x 41.8 GB).
 
     Returns ``None`` when EP is off, so the caller falls through to the normal path.
     """
