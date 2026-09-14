@@ -35,6 +35,26 @@ esac
 echo "ROLE=$ROLE  env=$CONDA_ENV  cann=$CANN_SRC  base=$BASE_IMAGE  tag=$TAG"
 [ -d "$CONDA_ROOT/envs/$CONDA_ENV" ] || { echo "!! 没有这个环境: $CONDA_ROOT/envs/$CONDA_ENV"; exit 1; }
 [ -d "$CANN_SRC/ascend-toolkit" ]    || { echo "!! $CANN_SRC 下没有 ascend-toolkit"; exit 1; }
+
+# ★ CANN 树里到处是【绝对路径】符号链接。`cp -al` 的 -a 含 -d(不跟随链接),链接会原样
+#   搬进镜像;只要目标还在 $CANN_SRC 里面就没事(镜像里 CANN 就落在这个路径),
+#   但指向树【外面】的就是断链 —— 而且 docker build 完全不报错,要等到容器里
+#   `import torch` 才炸成 `libhccl.so: cannot open shared object file`。
+#   2026-09-14 在 116 上就是这么中招的:a00652497 那棵树是 canada_group_account 那棵的
+#   `cp -al` 硬链副本,ascend-toolkit/{latest,set_env.sh} 全指向 canada_group_account。
+#   在这里当场拦下来,别留到 check_image.sh。
+_setenv_real="$(readlink -f "$CANN_SRC/ascend-toolkit/set_env.sh" 2>/dev/null || true)"
+case "${_setenv_real:-}" in
+  "$CANN_SRC"/*) ;;
+  *)
+    echo "!! $CANN_SRC 的符号链接指向这棵树【外面】,搬进镜像会全变断链。"
+    echo "   set_env.sh 实际解析到: ${_setenv_real:-<解析不到>}"
+    find "$CANN_SRC" -maxdepth 3 -type l -lname '/*' -printf '     %p -> %l\n' 2>/dev/null \
+      | grep -v -- "-> $CANN_SRC/" | head -10
+    echo "   修:把 CANN_SRC 指到真正拥有这些文件的那棵树再跑,例如"
+    echo "     CANN_SRC=<真实根> ROLE=$ROLE bash $0"
+    exit 1 ;;
+esac
 docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || {
   echo "!! 基础镜像不在本地: $BASE_IMAGE   (这两台都拉不到远端镜像)"
   echo "   可选:"; docker images --format '     {{.Repository}}:{{.Tag}}  {{.Size}}' | head -20; exit 1; }
@@ -123,6 +143,7 @@ docker build -t "$TAG" \
   --build-arg CONDA_ROOT="$CONDA_ROOT" \
   --build-arg CONDA_ENV="$CONDA_ENV" \
   --build-arg CANN_HOME="$CANN_SRC" \
+  --build-arg CANN_ALIAS="${CANN_ALIAS:-/home/a00652497/CANN/9.1.0.0627}" \
   --build-arg SKIP_PKGS="${SKIP_PKGS:-0}" \
   --build-arg BUILD_PROXY="${http_proxy:-}" \
   --build-arg BUILD_NO_PROXY="${no_proxy:-localhost,127.0.0.1,.huawei.com}" \

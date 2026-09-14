@@ -100,6 +100,37 @@ ssh 进去是交互的,反而看不出问题 —— 所以这坑只在 `docker e
 /home/a00652497/dspark_austin/speculators
 ```
 
+### 3.7 ★ CANN 里的**绝对路径符号链接**指向树外 ⟹ 断链,且 build 不报错
+
+116 上 `/home/a00652497/CANN/9.1.0.0627` 是 `/home/canada_group_account/CANN/9.1.0.0627` 的
+`cp -al` 硬链副本(每个条目 link count = 2),而 `ascend-toolkit/{latest,set_env.sh}` 和 `cann`
+三条链接**指向 canada_group_account 那棵树**。
+
+`cp -al` 的 `-a` 含 `-d`(不跟随链接)⟹ 链接原样进镜像 ⟹ 目标路径不在镜像里 ⟹ 断链。
+**docker build 全程不报错**,16G 也确实搬进去了,四个 `set_env.sh` 也都在,
+但要到容器里 `import torch` 才炸:
+
+```
+ImportError: libhccl.so: cannot open shared object file
+```
+
+**修**:`CANN_SRC` 指向**真正拥有文件的那棵树**(canada_group_account),它内部自洽
+(绝对链接全指向自己,其余是相对链接)。`build_image.sh` 现在会在 build 前用
+`readlink -f $CANN_SRC/ascend-toolkit/set_env.sh` 校验解析结果是否落在 `$CANN_SRC` 内,
+不在就直接 exit 1 并打印越界的链接 —— 不再留到 `check_image.sh` 才发现。
+
+另给老路径 `/home/a00652497/CANN/9.1.0.0627` 补了一条软链(`CANN_ALIAS`),因为
+文档和 serve 脚本里写死的是它。
+
+**正确的 build 命令(116):**
+
+```bash
+ROLE=serve CANN_SRC=/home/canada_group_account/CANN/9.1.0.0627 bash docker/build_image.sh
+```
+
+不用 `cp -aL`(全量跟随):`cann` 和 `cann-9.1.0-beta.3` 本是同一份的两个名字,
+跟随会实打实复制两遍,镜像从 38G 涨到 50G+。
+
 ---
 
 ## 4. 待办

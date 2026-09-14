@@ -63,6 +63,13 @@ RUN mkdir -p /var/run/sshd && \
 
 # ── 3. CANN toolkit (NOT the driver) ───────────────────────────────────────────────────
 COPY cann ${CANN_HOME}
+# 我们的文档/serve 脚本里到处写死了 /home/a00652497/CANN/9.1.0.0627。真实 CANN 树可能在别处
+# (116 上就在 /home/canada_group_account/...),所以给老路径补一条软链,两个路径都能用。
+ARG CANN_ALIAS=
+RUN if [ -n "$CANN_ALIAS" ] && [ "$CANN_ALIAS" != "$CANN_HOME" ]; then \
+      mkdir -p "$(dirname "$CANN_ALIAS")" && ln -sfn "$CANN_HOME" "$CANN_ALIAS" && \
+      echo ">>> CANN 别名: $CANN_ALIAS -> $CANN_HOME"; \
+    fi
 
 # ── 4. conda env, at its ORIGINAL absolute path ────────────────────────────────────────
 COPY conda_env ${CONDA_ROOT}/envs/${CONDA_ENV}
