@@ -140,6 +140,16 @@ NOISE_STD="${NOISE_STD:-0.05}"          # --noise-std: uniform ±std noise added
                                        # DeepSpec (it trains with ZERO hidden-state noise) — top candidate to
                                        # sharpen the pos2+ tail. Change ONE variable per run.
 GROUPED="${DSPARK_GROUPED_MOE:-0}"
+# ⚠️ 旗标名是 DSPARK_EP,不是 EP。provenance 记的 `EP=1` 是脚本【解析后】的内部变量名 ——
+#    照着它写 `EP=1` 会被下一行立刻覆盖成 0,然后走 --init-on-meta 那条路,
+#    在 FROM_PRETRAINED 下崩成 `Cannot copy out of meta tensor; no data!`。
+#    静默退化代价太大(8 卡跑到建模型才炸),所以这里直接拦。
+if [ -n "${EP:-}" ] && [ -z "${DSPARK_EP:-}" ]; then
+  echo "!! 你传的是 EP=$EP,但旗标名是 DSPARK_EP。" >&2
+  echo "   (provenance 里的 EP= 是解析后的内部名,不是输入旗标。)" >&2
+  echo "   改成:  DSPARK_EP=$EP ..." >&2
+  exit 2
+fi
 EP="${DSPARK_EP:-0}"
 BF16EXPERTS="${BF16_EXPERTS:-auto}"     # AMP masters for EP experts. DEFAULT "auto": option A (upstream —
                                        # experts get fp32 masters) EXCEPT the faithful+EP=0 path, which
@@ -328,6 +338,21 @@ if [ "$NONCAUSAL" = "1" ]; then NONCAUSAL_FLAG="--sliding-window-non-causal"; fi
 #    config.json 决定,CLI 给的会是错的(或者被静默忽略,更糟)。
 # NB --n-routed-experts 不在 DECODER_SHAPING_FLAGS 里,但它同样由 ckpt 决定,一并省掉。
 if [ -n "$FROM_PRETRAINED" ]; then
+  # ⚠️ --block-size 不在 train.py 的 DECODER_SHAPING_FLAGS 里,所以它【照样会传过去】
+  #    并可能覆盖 ckpt 的值。热启动时 block 必须与 ckpt 一致,否则形状与权重对不上
+  #    (或者更糟:静默训错)。从 ckpt 的 config.json 里读出来比一比。
+  _ck_block=$(python - "$FROM_PRETRAINED" <<'PY' 2>/dev/null
+import json, sys, pathlib
+c = json.loads(pathlib.Path(sys.argv[1], "config.json").read_text())
+for k in ("dspark_block_size", "block_size"):
+    if k in c: print(c[k]); break
+PY
+)
+  if [ -n "$_ck_block" ] && [ "$_ck_block" != "$BLOCK" ]; then
+    echo "!! BLOCK=$BLOCK 与 ckpt 的 block_size=$_ck_block 不一致。" >&2
+    echo "   热启动时 block 必须跟 ckpt 走:  BLOCK=$_ck_block ..." >&2
+    exit 2
+  fi
   SHAPING_ARGS=""
   echo ">>> FROM_PRETRAINED:形状(layers/experts/sliding-window)全部取自 ckpt 的 config.json,"
   echo "    LAYERS=$LAYERS EXPERTS=$EXPERTS SWA_WINDOW=$SWA_WINDOW 【不传】给 train.py"
