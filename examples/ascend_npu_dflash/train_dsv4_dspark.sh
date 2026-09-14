@@ -115,7 +115,11 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"   # --scheduler-warmup-ratio; 0.04 (4%) = D
 DECAY_RATIO="${DECAY_RATIO:-0.1}"       # --scheduler-decay-ratio;0 = 永不离开平台
 MIN_LR_RATIO="${MIN_LR_RATIO:-0.0}"     # --scheduler-min-lr-ratio;衰减的地板
                                        # warmup). NB the 6e-4-NaN memory blames too-little warmup — this closes it.
-LOSS_FN="${LOSS_FN:-{\"ce\":0.1,\"tv\":1.8}}"  # ce + TVD weights. ★ tv 1.8 (not 0.9): speculators `tv_loss` = TVD
+# ⚠️ 默认值必须拆成两步写。`${VAR:-{...}}` 里【第一个 `}` 就终止参数展开】,
+#    剩下那个 `}` 会变成字面量粘在值尾部 ⟹ 无论传不传 LOSS_FN,结果都是
+#    `{"ce":0.1,"tv":1.8}}`,train.py 当场 ValueError。
+_LOSS_FN_DEFAULT='{"ce":0.1,"tv":1.8}'
+LOSS_FN="${LOSS_FN:-$_LOSS_FN_DEFAULT}"  # ce + TVD weights. ★ tv 1.8 (not 0.9): speculators `tv_loss` = TVD
                                        # = 1/2 of DeepSpec's L1 (=sum|p-q|=2*TVD, PR #648 chose the standard TVD
                                        # normalization), so tv 1.8 restores DeepSpec's effective ce:dist = 0.1:1.8
                                        # balance. Pure normalization-convention alignment. Set LOSS_FN=... to override.
