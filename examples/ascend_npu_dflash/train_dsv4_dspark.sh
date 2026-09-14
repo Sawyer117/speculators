@@ -353,7 +353,24 @@ PY
     echo "   热启动时 block 必须跟 ckpt 走:  BLOCK=$_ck_block ..." >&2
     exit 2
   fi
-  SHAPING_ARGS=""
+  # ⚠️ --n-routed-experts 必须【继续传】。它不在 train.py 的 DECODER_SHAPING_FLAGS 里
+  #    (所以 --from-pretrained 不拒绝它),但 DSPARK_EP 路径要用它做整除检查:
+  #      n_exp = args.n_routed_experts ;  if n_exp % world != 0   ← None % 8 → TypeError
+  #    值从 ckpt 的 config.json 读,保证与权重一致;读不到才回落到 mode 的默认。
+  _ck_exp=$(python - "$FROM_PRETRAINED" <<'PY' 2>/dev/null
+import json, sys, pathlib
+c = json.loads(pathlib.Path(sys.argv[1], "config.json").read_text())
+for k in ("n_routed_experts", "num_experts", "moe_num_experts"):
+    if k in c: print(c[k]); break
+PY
+)
+  if [ -n "$_ck_exp" ]; then
+    echo ">>> FROM_PRETRAINED:n_routed_experts=$_ck_exp(取自 ckpt)"
+  else
+    _ck_exp="$EXPERTS"
+    echo ">>> ⚠️ ckpt 的 config.json 里没有 n_routed_experts,回落到 mode 默认 $EXPERTS"
+  fi
+  SHAPING_ARGS="--n-routed-experts $_ck_exp"
   # INIT_* 是「从 target 初始化」,而 FROM_PRETRAINED 直接加载完整草稿 —— 两者互斥,
   # train.py 里 --from-pretrained 胜出、其余【静默忽略】。不提醒的话,下次读 provenance
   # 会以为它们生效过。
