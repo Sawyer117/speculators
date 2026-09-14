@@ -370,8 +370,12 @@ class OptimizerArgs(_Group):
 
 
 class SchedulerArgs(_Group):
-    scheduler_type: Literal["linear", "cosine", "none"] = Field(
-        default="linear", description="LR scheduler type."
+    scheduler_type: Literal["linear", "cosine", "wsd", "none"] = Field(
+        default="linear",
+        description="LR scheduler type. 'wsd' = Warmup-Stable-Decay: warm up, hold the "
+        "peak LR, then decay only over the last --scheduler-decay-ratio of the budget. "
+        "Unlike linear/cosine its stable phase is flat, so the step budget need not be "
+        "committed up front and an extended run keeps training at full LR.",
     )
     scheduler_warmup_steps: int | None = Field(
         default=None, description="Warmup steps (default: scheduler-dependent)."
@@ -386,6 +390,20 @@ class SchedulerArgs(_Group):
     )
     scheduler_num_cosine_cycles: float = Field(
         default=0.5, description="Number of cosine cycles for the cosine scheduler."
+    )
+    scheduler_decay_ratio: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="WSD only: fraction of the step budget spent in the final decay. "
+        "0 disables the decay (warmup + constant), for runs whose checkpoints will be "
+        "decayed in a separate branch.",
+    )
+    scheduler_min_lr_ratio: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="WSD only: floor of the decay as a fraction of base LR.",
     )
 
 

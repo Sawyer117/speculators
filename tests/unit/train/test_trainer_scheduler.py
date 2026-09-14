@@ -6,6 +6,7 @@ from transformers import get_linear_schedule_with_warmup
 
 from speculators.train.checkpointer import SingleGPUCheckpointer
 from speculators.train.config import TrainConfig
+from speculators.train.schedulers import get_wsd_schedule_with_warmup
 from speculators.train.trainer import (
     TrainerConfig,
     _resolve_scheduler_steps,
@@ -131,3 +132,78 @@ def test_scheduler_resume_restores_optimizer_learning_rate(tmp_path: Path):
 
     assert resumed_scheduler.get_last_lr()[0] == pytest.approx(expected_lr)
     assert resumed_optimizer.param_groups[0]["lr"] == pytest.approx(expected_lr)
+
+
+def _wsd_lrs(total, warmup, decay_ratio=0.1, min_lr_ratio=0.0, base_lr=1.0, steps=None):
+    """Drive the schedule step-by-step and return the LR seen at each step."""
+    param = torch.nn.Parameter(torch.zeros(1))
+    opt = torch.optim.SGD([param], lr=base_lr)
+    sched = get_wsd_schedule_with_warmup(
+        opt,
+        num_warmup_steps=warmup,
+        num_training_steps=total,
+        decay_ratio=decay_ratio,
+        min_lr_ratio=min_lr_ratio,
+    )
+    out = []
+    for _ in range(steps if steps is not None else total):
+        out.append(opt.param_groups[0]["lr"])
+        opt.step()
+        sched.step()
+    return out
+
+
+def test_wsd_warms_up_then_holds_peak():
+    lrs = _wsd_lrs(total=100, warmup=10)
+
+    assert lrs[0] == pytest.approx(0.0)
+    assert lrs[5] == pytest.approx(0.5)
+    # Everything between the end of warmup and the start of decay is exactly the peak —
+    # this flat middle is the whole point of WSD over cosine.
+    assert all(lr == pytest.approx(1.0) for lr in lrs[10:90])
+
+
+def test_wsd_decays_only_over_the_last_decay_ratio():
+    lrs = _wsd_lrs(total=100, warmup=10, decay_ratio=0.1)
+
+    assert lrs[89] == pytest.approx(1.0)
+    assert lrs[90] == pytest.approx(1.0)  # p=0 at the first decay step
+    assert lrs[95] < 0.35  # 1 - sqrt(0.5)
+    assert lrs[99] < 0.06
+
+
+def test_wsd_zero_decay_ratio_never_leaves_the_plateau():
+    # The setting for a run whose budget is unknown: hold peak forever and branch a
+    # decay from a checkpoint later. A cosine cannot express this.
+    lrs = _wsd_lrs(total=100, warmup=10, decay_ratio=0.0)
+
+    assert all(lr == pytest.approx(1.0) for lr in lrs[10:])
+
+
+def test_wsd_min_lr_ratio_is_the_floor_and_holds_past_the_budget():
+    lrs = _wsd_lrs(total=100, warmup=10, min_lr_ratio=0.2, steps=130)
+
+    # The floor applies to the DECAY, not to warmup — warmup still ramps from 0, as
+    # in the transformers schedules. So look past the ramp.
+    assert min(lrs[10:]) >= pytest.approx(0.2)
+    # Overrunning the budget must clamp, not go negative.
+    assert all(lr == pytest.approx(0.2) for lr in lrs[100:])
+
+
+def test_wsd_warmup_survives_a_decay_window_that_would_swallow_it():
+    # decay_ratio=0.9 puts the decay start before the end of warmup; the ramp must still
+    # happen, otherwise the first steps run at ~0 LR for no reason.
+    lrs = _wsd_lrs(total=100, warmup=50, decay_ratio=0.9)
+
+    assert lrs[0] == pytest.approx(0.0)
+    assert lrs[25] == pytest.approx(0.5)
+    assert lrs[49] == pytest.approx(0.98)
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.1])
+def test_wsd_rejects_out_of_range_ratios(bad):
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1.0)
+    with pytest.raises(ValueError, match="must be in"):
+        get_wsd_schedule_with_warmup(opt, 10, 100, decay_ratio=bad)
+    with pytest.raises(ValueError, match="must be in"):
+        get_wsd_schedule_with_warmup(opt, 10, 100, min_lr_ratio=bad)

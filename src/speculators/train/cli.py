@@ -727,6 +727,8 @@ def main(cfg: TrainConfig):  # noqa: C901
         scheduler_warmup_ratio=args.scheduler_warmup_ratio,
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
+        scheduler_decay_ratio=args.scheduler_decay_ratio,
+        scheduler_min_lr_ratio=args.scheduler_min_lr_ratio,
         checkpoint_freq=args.checkpoint_freq,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
