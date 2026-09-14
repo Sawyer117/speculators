@@ -1493,7 +1493,7 @@ def main() -> None:
     recs, ckpt_steps, steps_per_epoch, raw_text = _load_and_skip(
         args.logfile, args.skip, max_step=args.max_step)
     if recs is None:
-        print("!! no metric records parsed — is this a trainer.py rich-logger log?")
+        print("!! no metric records parsed — is this a trainer.py rich-logger log?\n   训练日志与 ckpt 同名同目录:ckpt 是 <RUN>/ckpt_<TAG>_<TS>,日志是 <RUN>/<TAG>_<TS>.log\n   硬判据(只有真训练日志有这个键):\n     grep -l position_14_acc <RUN>/*.log")
         return
     cur_label = args.label or _default_label(args.logfile)
 
