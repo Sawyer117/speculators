@@ -35,6 +35,7 @@ from speculators.train.distributed import (
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
 from speculators.train.recovery import BatchRecoveryCoordinator
+from speculators.train.schedulers import get_wsd_schedule_with_warmup
 from speculators.train.utils import normalize_counted_metrics
 
 root_logger = logging.getLogger("speculators")
@@ -128,11 +129,13 @@ class TrainerConfig(NamedTuple):
     muon_weight_decay: float = 0.1
     muon_ns_steps: int = 5
     muon_adjust_lr_fn: str = "match_rms_adamw"
-    scheduler_type: Literal["linear", "cosine", "none"] = "linear"
+    scheduler_type: Literal["linear", "cosine", "wsd", "none"] = "linear"
     scheduler_warmup_steps: int | None = None
     scheduler_warmup_ratio: float | None = None
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
+    scheduler_decay_ratio: float = 0.1
+    scheduler_min_lr_ratio: float = 0.0
     checkpoint_freq: float = 1
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
@@ -395,6 +398,15 @@ class Trainer:
                     opt,
                     num_warmup_steps=scheduler_warmup_steps,
                     num_training_steps=scheduler_total_steps,
+                    last_epoch=last_epoch,
+                )
+            if self.config.scheduler_type == "wsd":
+                return get_wsd_schedule_with_warmup(
+                    opt,
+                    num_warmup_steps=scheduler_warmup_steps,
+                    num_training_steps=scheduler_total_steps,
+                    decay_ratio=self.config.scheduler_decay_ratio,
+                    min_lr_ratio=self.config.scheduler_min_lr_ratio,
                     last_epoch=last_epoch,
                 )
             return get_cosine_schedule_with_warmup(
