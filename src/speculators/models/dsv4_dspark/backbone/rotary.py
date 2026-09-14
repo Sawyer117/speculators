@@ -52,19 +52,27 @@ def precompute_freqs_cis(
         high = math.ceil(correction_dim(high_rot))
         return max(low, 0), min(high, dim - 1)
 
+    # ⚠️ Build on CPU EXPLICITLY, never on the default device. ``from_pretrained`` loads
+    # under a meta-device context (transformers' low-memory path), and a bare
+    # ``torch.arange`` inherits it -- the whole computation then lands on meta and the
+    # closing ``.to(device)`` dies with "Cannot copy out of meta tensor; no data!".
+    # This buffer is small, deterministic and not a parameter, so materialising it for
+    # real is always correct; there is nothing for meta-init to save here.
     def linear_ramp(lo: float, hi: float, n: int) -> torch.Tensor:
         if lo == hi:
             hi += 0.001
-        ramp = (torch.arange(n, dtype=torch.float32) - lo) / (hi - lo)
+        ramp = (torch.arange(n, dtype=torch.float32, device="cpu") - lo) / (hi - lo)
         return torch.clamp(ramp, 0, 1)
 
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    freqs = 1.0 / (
+        base ** (torch.arange(0, dim, 2, dtype=torch.float32, device="cpu") / dim)
+    )
     if original_seq_len > 0:
         low, high = correction_range(beta_fast, beta_slow)
         smooth = 1 - linear_ramp(low, high, dim // 2)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
-    t = torch.arange(seqlen, dtype=torch.float32)
+    t = torch.arange(seqlen, dtype=torch.float32, device="cpu")
     angles = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(angles), angles)
     return freqs_cis.to(device)
