@@ -47,9 +47,12 @@ MOE = re.compile(
 # family -> columns, in the order they should appear. A key absent from a record is "".
 FAMILIES: dict[str, list[str]] = {
     "loss":       ["train/loss", "train/ce_loss", "train/tv_loss", "train/confidence_loss"],
+    # ⚠️ position_* is filled in at runtime, NOT listed here. It used to be hardcoded to
+    # position_0..4 from the block-5 era, which silently DROPPED positions 5-14 on a
+    # block-15 run -- the CSV looked complete and was missing two thirds of the per-position
+    # data. Columns absent from FAMILIES are not written, and nothing warns.
     "accept":     ["train/accept_rate", "train/accept_len", "train/hard_accept_len",
-                   "train/full_acc", "train/position_0_acc", "train/position_1_acc",
-                   "train/position_2_acc", "train/position_3_acc", "train/position_4_acc"],
+                   "train/full_acc"],
     "confidence": ["train/confidence_abs_error", "train/confidence_pred_mean",
                    "train/confidence_cumprod_bias"],
     "timing":     ["profile/fetch_ms", "profile/fwd_ms", "profile/bwd_ms", "profile/opt_ms",
@@ -85,6 +88,21 @@ def main() -> int:
     ap.add_argument("--every", type=int, default=1, help="keep 1 step in N (default 1 = all)")
     ap.add_argument("--gzip", action="store_true", help="write .csv.gz")
     args = ap.parse_args()
+
+    # Scan for how many draft positions this run logs (block_size varies per run) and extend
+    # the accept family to match. Cheap: reads until the first record that has any of them.
+    n_pos = 0
+    with open(args.logfile, errors="ignore") as fh:
+        for i, line in enumerate(fh):
+            for m in re.finditer(r"train/position_(\d+)_acc", line):
+                n_pos = max(n_pos, int(m.group(1)) + 1)
+            if n_pos and i > 5000:
+                break
+    if n_pos:
+        FAMILIES["accept"] += [f"train/position_{k}_acc" for k in range(n_pos)]
+        print(f"检测到 {n_pos} 个草稿位置 -> accept.csv 写 position_0..{n_pos - 1}_acc")
+    else:
+        print("⚠️ 日志里没有 train/position_*_acc —— accept.csv 将不含逐位数据")
 
     out = args.out or os.path.basename(args.logfile) + ".split"
     os.makedirs(out, exist_ok=True)
