@@ -152,4 +152,6 @@ docker build -t "$TAG" \
 echo; echo "✅ $TAG"; docker images "$TAG"
 echo; echo ">>> 自查:   bash $HERE/check_image.sh $TAG"
 echo ">>> 导出:   bash $HERE/export_image.sh $TAG"
-echo ">>> 清暂存: rm -rf $STAGE"
+echo ">>> 清暂存: find $STAGE -type d -exec chmod u+w {} + 2>/dev/null; rm -rf $STAGE"
+echo "           (CANN 的目录是 0555,裸 rm -rf 会刷屏 Permission denied;"
+echo "            chmod 只动 cp -al 新建的副本目录,CANN 原件不受影响)"
