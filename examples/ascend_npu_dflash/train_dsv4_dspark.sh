@@ -315,6 +315,21 @@ if [ "$GROUPED" = "1" ]; then TAG="${TAG}_grouped"; fi
 # if-block (NOT `&&`) so a NONCAUSAL=0 test can't nonzero-abort under set -e.
 NONCAUSAL_FLAG=""
 if [ "$NONCAUSAL" = "1" ]; then NONCAUSAL_FLAG="--sliding-window-non-causal"; fi
+
+# ── decoder 塑形旗标:FROM_PRETRAINED 下必须【不传】 ────────────────────────────────────
+# train.py 的契约是「模型定义只能有一个来源」:--from-pretrained 加载完整草稿,与
+# --num-layers / --draft-arch / --draft-hidden-act / --sliding-window /
+# --full-attention-indices 互斥,传了就 parser.error 退出(exitcode 2)。
+# ⚠️ 这不是可以绕开的检查 —— 那些值本来就该来自 checkpoint。热启动时形状由 ckpt 的
+#    config.json 决定,CLI 给的会是错的(或者被静默忽略,更糟)。
+# NB --n-routed-experts 不在 DECODER_SHAPING_FLAGS 里,但它同样由 ckpt 决定,一并省掉。
+if [ -n "$FROM_PRETRAINED" ]; then
+  SHAPING_ARGS=""
+  echo ">>> FROM_PRETRAINED:形状(layers/experts/sliding-window)全部取自 ckpt 的 config.json,"
+  echo "    LAYERS=$LAYERS EXPERTS=$EXPERTS SWA_WINDOW=$SWA_WINDOW 【不传】给 train.py"
+else
+  SHAPING_ARGS="--num-layers $LAYERS --n-routed-experts $EXPERTS --sliding-window $SWA_WINDOW"
+fi
 LOG="$RUN/${TAG}_${TS}.log"
 # Fresh per-run save-path so we DON'T auto-resume a stale (possibly non-EP) checkpoint
 # from ./output. Override SAVE_PATH=<dir> to resume a specific run.
@@ -410,9 +425,9 @@ nohup env \
   HCCL_CONNECT_TIMEOUT="${HCCL_TIMEOUT:-1800}" HCCL_EXEC_TIMEOUT="${HCCL_TIMEOUT:-1800}" $PORTS \
   torchrun --nproc_per_node "$NPROC" "${TRAIN_PY:-$REPO_ROOT/scripts/train.py}" \
     --speculator-type dsv4_dspark --served-model-name dsv4 \
-    --num-layers "$LAYERS" --n-routed-experts "$EXPERTS" \
+    $SHAPING_ARGS \
     --block-size "$BLOCK" --target-layer-ids 40 41 42 --max-anchors "$MAX_ANCHORS" \
-    --dflash-decay-gamma "$DECAY_GAMMA" --sliding-window "$SWA_WINDOW" $NONCAUSAL_FLAG \
+    --dflash-decay-gamma "$DECAY_GAMMA" $NONCAUSAL_FLAG \
     --total-seq-len "$SEQLEN" --mask-token-id "$MASK_TOKEN" --noise-std "$NOISE_STD" \
     --kd-temperature "$KD_TEMP" \
     --draft-attn-impl sdpa --loss-fn "$LOSS_FN" \
