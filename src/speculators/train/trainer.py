@@ -24,6 +24,7 @@ from transformers import (
 )
 
 from speculators.model import SpeculatorModel
+from speculators.train.schedulers import get_wsd_schedule_with_warmup
 from speculators.train.checkpointer import (
     BaseCheckpointer,
     DistributedCheckpointer,
@@ -231,11 +232,13 @@ class TrainerConfig(NamedTuple):
     # and train/config/schema.py is a separate entry point that this launcher never
     # uses. Changing only the schema gets you "unrecognized arguments" at rank 0.
     muon_hybrid_ns: bool = False
-    scheduler_type: Literal["linear", "cosine", "none"] = "linear"
+    scheduler_type: Literal["linear", "cosine", "wsd", "none"] = "linear"
     scheduler_warmup_steps: int | None = None
     scheduler_warmup_ratio: float | None = None
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
+    scheduler_decay_ratio: float = 0.1
+    scheduler_min_lr_ratio: float = 0.0
     checkpoint_freq: float = 1
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
@@ -525,6 +528,15 @@ class Trainer:
                     opt,
                     num_warmup_steps=scheduler_warmup_steps,
                     num_training_steps=scheduler_total_steps,
+                    last_epoch=last_epoch,
+                )
+            if self.config.scheduler_type == "wsd":
+                return get_wsd_schedule_with_warmup(
+                    opt,
+                    num_warmup_steps=scheduler_warmup_steps,
+                    num_training_steps=scheduler_total_steps,
+                    decay_ratio=self.config.scheduler_decay_ratio,
+                    min_lr_ratio=self.config.scheduler_min_lr_ratio,
                     last_epoch=last_epoch,
                 )
             return get_cosine_schedule_with_warmup(

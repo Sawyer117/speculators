@@ -829,6 +829,8 @@ def main(args: argparse.Namespace):  # noqa: C901
         scheduler_warmup_ratio=args.scheduler_warmup_ratio,
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
+        scheduler_decay_ratio=args.scheduler_decay_ratio,
+        scheduler_min_lr_ratio=args.scheduler_min_lr_ratio,
         checkpoint_freq=args.checkpoint_freq,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
@@ -1573,9 +1575,15 @@ def parse_args():
         "--scheduler-type",
         type=str,
         default="linear",
-        choices=["linear", "cosine", "none"],
+        choices=["linear", "cosine", "wsd", "none"],
     )
     parser.add_argument("--scheduler-warmup-steps", type=int, default=None)
+    parser.add_argument("--scheduler-decay-ratio", type=float, default=0.1,
+                        help="WSD only: fraction of the budget spent decaying. 0 = never "
+                             "leave the plateau (every checkpoint is equivalent, so a run "
+                             "killed at an arbitrary step still yields a usable one).")
+    parser.add_argument("--scheduler-min-lr-ratio", type=float, default=0.0,
+                        help="WSD only: floor of the decay, as a fraction of base LR.")
     parser.add_argument(
         "--scheduler-warmup-ratio",
         type=float,

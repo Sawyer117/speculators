@@ -365,7 +365,7 @@ class OptimizerArgs(_Group):
 
 
 class SchedulerArgs(_Group):
-    scheduler_type: Literal["linear", "cosine", "none"] = Field(
+    scheduler_type: Literal["linear", "cosine", "wsd", "none"] = Field(
         default="linear", description="LR scheduler type."
     )
     scheduler_warmup_steps: int | None = Field(

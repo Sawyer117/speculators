@@ -105,6 +105,15 @@ NONCAUSAL="${NONCAUSAL:-1}"            # --sliding-window-non-causal: block-inte
 SCHED_TYPE="${SCHED_TYPE:-cosine}"     # LR scheduler (--scheduler-type). cosine = align to the DeepSpec DSpark
                                        # trainer (was speculators' default linear).
 WARMUP_RATIO="${WARMUP_RATIO:-0.04}"   # --scheduler-warmup-ratio; 0.04 (4%) = DeepSpec. Previously unset (~no
+# ── WSD(SCHED_TYPE=wsd)──────────────────────────────────────────────────────────────
+# cosine 把大半预算花在小到走不动的 LR 上,而且形状是 num_training_steps 的函数 ⟹ 总步数
+# 必须在第 0 步前就承诺,超出预算的续训在 ~0 LR 上空转。实测:本线 5 epoch 的最后一个
+# epoch 平均 LR 只有峰值的 3.2%,而前四个 epoch 在 LR 从 78.9% 掉到 21.1% 的全过程中
+# accept_len 增益纹丝不动(+0.33/epoch)—— 那个 epoch 大半算力浪费了。
+# DECAY_RATIO=0 = 纯 warmup+stable:任何时刻 kill 拿到的 checkpoint 都等价,
+# 适合「边看边决定训多久」。要交付时再从某个 checkpoint 分支一小段 decay。
+DECAY_RATIO="${DECAY_RATIO:-0.1}"       # --scheduler-decay-ratio;0 = 永不离开平台
+MIN_LR_RATIO="${MIN_LR_RATIO:-0.0}"     # --scheduler-min-lr-ratio;衰减的地板
                                        # warmup). NB the 6e-4-NaN memory blames too-little warmup — this closes it.
 LOSS_FN="${LOSS_FN:-{\"ce\":0.1,\"tv\":1.8}}"  # ce + TVD weights. ★ tv 1.8 (not 0.9): speculators `tv_loss` = TVD
                                        # = 1/2 of DeepSpec's L1 (=sum|p-q|=2*TVD, PR #648 chose the standard TVD
@@ -349,7 +358,7 @@ PROV="$RUN/${TAG}_${TS}.provenance.txt"
   echo "# env recipe (the half train_command.txt does NOT record)"
   for _v in VERIFIER DATA HS_DIR ENDPOINT LR EPOCHS MAX_ANCHORS SEQLEN MASK_TOKEN BLOCK \
             MAX_STEPS OPTIM MUON_LR MUON_ADJUST MUON_HYBRID DECAY_GAMMA SWA_WINDOW \
-            NONCAUSAL SCHED_TYPE WARMUP_RATIO LOSS_FN TEACHER_DNORM KD_TEMP NOISE_STD \
+            NONCAUSAL SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO FROM_PRETRAINED LOSS_FN TEACHER_DNORM KD_TEMP NOISE_STD \
             GROUPED EP RECOMPUTE COMPILE NOVAL INITMOE INITATTN INITHC INITNORM \
             INITLAYER INITNOROUTER FROM_PRETRAINED LAYERS EXPERTS CKPT_FREQ \
             DSPARK_MOE_BALANCE DSPARK_MOE_BALANCE_RATE DSPARK_LOG_EXPERT_LOAD \
@@ -408,6 +417,7 @@ nohup env \
     --kd-temperature "$KD_TEMP" \
     --draft-attn-impl sdpa --loss-fn "$LOSS_FN" \
     --scheduler-type "$SCHED_TYPE" --scheduler-warmup-ratio "$WARMUP_RATIO" \
+    --scheduler-decay-ratio "$DECAY_RATIO" --scheduler-min-lr-ratio "$MIN_LR_RATIO" \
     --optimizer "$OPTIM" --lr "$LR" --epochs "$EPOCHS" $EXTRA \
     --on-missing generate --on-generate delete \
     --num-workers "$NUM_WORKERS" --prefetch-factor "$PREFETCH_FACTOR" \
