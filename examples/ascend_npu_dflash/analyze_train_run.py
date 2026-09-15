@@ -1453,7 +1453,7 @@ def fwd_profiler_report(text: str) -> None:
     print("  cross-check the free headline: fetch_ms/align_ms high = HS-fetch stall (not compute).")
 
 
-def moe_load_report(text: str) -> None:
+def moe_load_report(text: str, tokens_per_step: float | None = None) -> None:
     """MoE expert-load balance over the run from ``[MOE-LOAD Ln]`` prints (DSPARK_LOG_EXPERT_LOAD=1).
     Silent if absent. Shows per-layer used/dead experts + normalized entropy EARLY->LATE, so a router
     COLLAPSE (entropy falling / dead experts growing over training) is visible. entropy 1.0 = uniform
@@ -1521,6 +1521,18 @@ def moe_load_report(text: str) -> None:
         print("    E-expert capacity is permanently idle => caps accept_len + drives over-train decline.")
         print("    FIX = noaux_tc load-balance bias (DSPARK_MOE_BALANCE) and/or lower LR (less collapse")
         print("    pressure). ⚠ Confirm TRAINING-drift not DATA-limited: is it already low at step 0 (INIT)?")
+    elif entropy_low and rotating and tokens_per_step and tokens_per_step >= 8 * E:
+        # The "small-batch artifact" escape hatch is only available when a step really CANNOT
+        # reach every expert. Measured supervised tokens/step says otherwise here, so say so:
+        # a rotating hot set with plenty of tokens is a real per-step imbalance, it just isn't a
+        # FIXED dead set. Both halves of that matter and the old text asserted only the second.
+        print(f"    ⚠ PER-STEP CONCENTRATED, HOT SET ROTATES — and it is NOT a small-batch artifact:")
+        print(f"    the run logs ~{tokens_per_step:,.0f} supervised tokens/step against {E} experts "
+              f"({tokens_per_step / E:.0f}x),")
+        print("    so a step COULD cover them all and does not. Over the dataset most experts still")
+        print("    get data (large union), so this is not a fixed dead set — but each STEP is heavily")
+        print("    imbalanced, which is an EP all-to-all cost, not necessarily a quality one. Check")
+        print("    the BOTTLENECK BREAKDOWN's a2a line before spending anything on it.")
     elif entropy_low and rotating:
         print("    ⚠ PER-STEP SPARSE BUT ROTATING: entropy is low per step, but the hot experts CHANGE")
         print("    across steps (large union) -> over the dataset most experts DO get used. The low")
@@ -1857,7 +1869,16 @@ def main() -> None:
               f" | cumprod_bias {fmt(last_n_med('train/confidence_cumprod_bias'))}")
 
     fwd_profiler_report(raw_text)
-    moe_load_report(raw_text)
+    # Supervised tokens/step — lets the MoE verdict tell "a step cannot reach 256 experts"
+    # (small-batch artifact) apart from "a step can and doesn't" (real per-step imbalance).
+    _tok = re.findall(r"sup_tokens_ranks=\[([\d,\s]*)\]", raw_text)
+    _tps = None
+    if _tok:
+        _sums = [sum(int(v) for v in row.replace(" ", "").split(",") if v) for row in _tok]
+        _sums = [v for v in _sums if v > 0]
+        if _sums:
+            _tps = sum(_sums) / len(_sums)
+    moe_load_report(raw_text, tokens_per_step=_tps)
     hs_split_report(raw_text)
     loss_imbalance_report(recs, raw_text)
 
