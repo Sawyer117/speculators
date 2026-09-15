@@ -590,13 +590,49 @@ def build_draft_model(
             config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl
             ep_sd = _ep_sharded_state_dict(args.from_pretrained)
+            if ep_sd is not None:
+                # transformers refuses `state_dict=` together with a path ("Use one of the
+                # two loading strategies"), so under EP we bypass its loader entirely and
+                # reproduce what SpeculatorModel.from_pretrained does: construct from the
+                # config, wire the vocab mappings, pull the verifier weights, then assign
+                # the per-rank shards ourselves.
+                model = model_class(config=config)
+                model.load_vocab_mappings(t2d, d2t)
+                # The verifier path lives in the config's speculators_config (the ckpt
+                # carries it); load_verifier_weights reads it from there, not from an
+                # attribute -- so nothing to pass here.
+                model.load_verifier_weights()
+                # strict=False on purpose: the verifier tensors this model now holds are not
+                # in the draft checkpoint, and would otherwise read as "missing". Anything
+                # the checkpoint DOES carry must land, so unexpected keys are fatal.
+                missing, unexpected = model.load_state_dict(ep_sd, strict=False)
+                if unexpected:
+                    raise RuntimeError(
+                        f"--from-pretrained: {len(unexpected)} key(s) in the checkpoint have "
+                        f"no home in the model, e.g. {sorted(unexpected)[:5]}"
+                    )
+                verifier_missing = [k for k in missing if "verifier" in k]
+                real_missing = [k for k in missing if "verifier" not in k]
+                if real_missing:
+                    raise RuntimeError(
+                        f"--from-pretrained: {len(real_missing)} draft parameter(s) got NO "
+                        f"checkpoint weight (they would train from random init), e.g. "
+                        f"{sorted(real_missing)[:5]}"
+                    )
+                import torch.distributed as _dist  # noqa: PLC0415
+                if _dist.get_rank() == 0:
+                    print(
+                        f">>> [DSPARK_EP] loaded {len(ep_sd)} tensors from the checkpoint; "
+                        f"{len(verifier_missing)} verifier tensor(s) came from the verifier",
+                        flush=True,
+                    )
+                return model
             return model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,
                 t2d=t2d,
                 d2t=d2t,
                 verifier=args.verifier_name_or_path,
-                **({"state_dict": ep_sd} if ep_sd is not None else {}),
             )
         return model_class.from_pretrained(
             args.from_pretrained,
