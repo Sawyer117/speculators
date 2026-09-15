@@ -113,6 +113,15 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"   # --scheduler-warmup-ratio; 0.04 (4%) = D
 # DECAY_RATIO=0 = 纯 warmup+stable:任何时刻 kill 拿到的 checkpoint 都等价,
 # 适合「边看边决定训多久」。要交付时再从某个 checkpoint 分支一小段 decay。
 DECAY_RATIO="${DECAY_RATIO:-0.1}"       # --scheduler-decay-ratio;0 = 永不离开平台
+SCHED_TOTAL="${SCHED_TOTAL:-}"          # --scheduler-total-steps。空 = EPOCHS*len(loader)。
+# ★ 退火(anneal)专用:DECAY_RATIO=0 跑出来的 checkpoint 都是【平台值】,转换评测必然偏低,
+#   因为上一条 cosine 线的末值是退火到 ~0 之后的数 —— 两者不是同一类读数。要拿可比的数,
+#   从平台期的任一 checkpoint branch 一小段纯衰减即可(WSD 的设计就是这样用的):
+#     FROM_PRETRAINED=<平台 ckpt> SCHED_TYPE=wsd DECAY_RATIO=1.0 WARMUP_RATIO=0 \
+#     SCHED_TOTAL=4000 MAX_STEPS=4000 LR=<平台那条的 LR>
+#   ⚠ SCHED_TOTAL 必须给,而且要等于 MAX_STEPS。MAX_STEPS 只是提前停循环,它【不会】
+#     缩短调度器的视野 —— 只给 MAX_STEPS 的话衰减窗口还是按 EPOCHS*len(loader) 算,
+#     跑 4000 步只走完衰减的一个零头,LR 停在半空中,等于没退火。
 MIN_LR_RATIO="${MIN_LR_RATIO:-0.0}"     # --scheduler-min-lr-ratio;衰减的地板
                                        # warmup). NB the 6e-4-NaN memory blames too-little warmup — this closes it.
 # ⚠️ 默认值必须拆成两步写。`${VAR:-{...}}` 里【第一个 `}` 就终止参数展开】,
@@ -151,7 +160,7 @@ GROUPED="${DSPARK_GROUPED_MOE:-0}"
 # 只看 DSPARK_* 与本脚本认识的那批全大写名,避免误报 shell 自带的环境变量。
 _KNOWN=" RUN VERIFIER DATA HS_DIR ENDPOINT LR EPOCHS MAX_ANCHORS SEQLEN MASK_TOKEN BLOCK
  MAX_STEPS OPTIM MUON_LR MUON_ADJUST MUON_HYBRID DECAY_GAMMA SWA_WINDOW NONCAUSAL
- SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO FROM_PRETRAINED LOSS_FN TEACHER_DNORM
+ SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO SCHED_TOTAL FROM_PRETRAINED LOSS_FN TEACHER_DNORM
  KD_TEMP NOISE_STD RECOMPUTE COMPILE NO_VAL INIT_MOE INIT_ATTN INIT_HC INIT_NORM
  INIT_LAYER INIT_MOE_NO_ROUTER CKPT_FREQ NPROC SAVE_PATH CANN_ENV TRAIN_PY MODE
  BF16_EXPERTS PYTORCH_NPU_ALLOC_CONF HCCL_TIMEOUT "
@@ -284,6 +293,15 @@ if [ "$OPTIM" = "muon" ]; then
   [ "${MUON_HYBRID:-0}" = "1" ] && EXTRA="$EXTRA --muon-hybrid-ns"
 fi
 [ -n "$MAX_STEPS" ] && EXTRA="$EXTRA --max-steps $MAX_STEPS"
+[ -n "$SCHED_TOTAL" ] && EXTRA="$EXTRA --scheduler-total-steps $SCHED_TOTAL"
+# 纯衰减跑(DECAY_RATIO=1.0)而没给 SCHED_TOTAL,是个静默的坑:衰减窗口按 EPOCHS*len(loader)
+# 算,MAX_STEPS 提前停只会停在衰减曲线的开头,LR 还很高 —— 拿到的仍是平台 checkpoint。
+if [ "$SCHED_TYPE" = "wsd" ] && [ -n "$DECAY_RATIO" ] && [ -z "$SCHED_TOTAL" ]; then
+  case "$DECAY_RATIO" in
+    1|1.0|1.00) echo "!! DECAY_RATIO=1.0(纯退火)必须同时给 SCHED_TOTAL=<步数>,否则衰减窗口" \
+                     "按 EPOCHS*len(loader) 算,跑 MAX_STEPS 步只走完一个零头,LR 停在半空。"; exit 2 ;;
+  esac
+fi
 if [ -n "${BLOCK_CONV_TAPS:-}" ]; then EXTRA="$EXTRA --block-conv-kernel-size $BLOCK_CONV_TAPS"; fi
 if [ -n "${BLOCK_CONV_GROUP:-}" ]; then EXTRA="$EXTRA --block-conv-group-size $BLOCK_CONV_GROUP"; fi
 
@@ -459,7 +477,7 @@ PROV="$RUN/${TAG}_${TS}.provenance.txt"
   echo "# env recipe (the half train_command.txt does NOT record)"
   for _v in VERIFIER DATA HS_DIR ENDPOINT LR EPOCHS MAX_ANCHORS SEQLEN MASK_TOKEN BLOCK \
             MAX_STEPS OPTIM MUON_LR MUON_ADJUST MUON_HYBRID DECAY_GAMMA SWA_WINDOW \
-            NONCAUSAL SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO FROM_PRETRAINED LOSS_FN TEACHER_DNORM KD_TEMP NOISE_STD \
+            NONCAUSAL SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO SCHED_TOTAL FROM_PRETRAINED LOSS_FN TEACHER_DNORM KD_TEMP NOISE_STD \
             GROUPED EP RECOMPUTE COMPILE NOVAL INITMOE INITATTN INITHC INITNORM \
             INITLAYER INITNOROUTER FROM_PRETRAINED LAYERS EXPERTS CKPT_FREQ \
             DSPARK_MOE_BALANCE DSPARK_MOE_BALANCE_RATE DSPARK_LOG_EXPERT_LOAD \
@@ -493,7 +511,7 @@ PROV="$RUN/${TAG}_${TS}.provenance.txt"
 
 echo "==================================================================="
 echo " DSV4-DSpark TRAIN  mode=$MODE  nproc=$NPROC  ${LAYERS}L x ${EXPERTS}E  lr=$LR  epochs=$EPOCHS  ep=$EP  grouped_moe=$GROUPED  recompute=$RECOMPUTE  compile=$COMPILE  noval=$NOVAL  init(moe/attn/hc/norm/layer)=$INITMOE/$INITATTN/$INITHC/$INITNORM/$INITLAYER"
-echo " optimizer=$OPTIM  max_steps=${MAX_STEPS:-<all>}  muon_lr=${MUON_LR:-<10*lr>}  muon_adjust=$MUON_ADJUST  muon_hybrid=${MUON_HYBRID:-0}"
+echo " optimizer=$OPTIM  max_steps=${MAX_STEPS:-<all>}  sched_total=${SCHED_TOTAL:-<epochs*loader>}  muon_lr=${MUON_LR:-<10*lr>}  muon_adjust=$MUON_ADJUST  muon_hybrid=${MUON_HYBRID:-0}"
 echo " block=$BLOCK (all $BLOCK slots drafted = gamma = num_spec; sample_from_anchor=True)  seqlen=$SEQLEN  max_anchors=$MAX_ANCHORS  noncausal_block=$NONCAUSAL (=serve cad.causal=False)"
 echo " draft-forward tokens = max_anchors*block = $((MAX_ANCHORS*BLOCK))  (anchor util = $MAX_ANCHORS/$SEQLEN)"
 echo " verifier=$VERIFIER"
