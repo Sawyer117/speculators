@@ -113,6 +113,15 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"   # --scheduler-warmup-ratio; 0.04 (4%) = D
 # DECAY_RATIO=0 = 纯 warmup+stable:任何时刻 kill 拿到的 checkpoint 都等价,
 # 适合「边看边决定训多久」。要交付时再从某个 checkpoint 分支一小段 decay。
 DECAY_RATIO="${DECAY_RATIO:-0.1}"       # --scheduler-decay-ratio;0 = 永不离开平台
+COSINE_CYCLES="${COSINE_CYCLES:-0.5}"   # --scheduler-num-cosine-cycles。0.5 = 教科书单次衰减。
+# ★ >0.5 = SGDR 式热重启:LR 反复衰到 0 再跳回峰值。这是【超长跑 + 随时 kill】唯一能用的形状 ——
+#   WSD 的 DECAY_RATIO=0 平台期里任何时刻 kill 拿到的都是平台 ckpt,评测必然偏低;单次衰减的
+#   cosine 则要跑满全程才拿得到退火值。循环 cosine 让谷底周期性出现,你只要 kill 在任意时刻,
+#   最近一个谷底的 ckpt 就是退火好的、可以直接评测的。
+#   谷底位置(占全程比例)p = (2m-1)/(2C),峰值 p = m/C。
+#   ⚠ 谷底必须落在 EPOCH 末,否则会被后面的存点覆盖(mid-epoch 与 epoch-end 写同一个 <epoch>/
+#     目录)。让谷底落在 epoch 末的取法是 COSINE_CYCLES = EPOCHS/2,配 CKPT_FREQ=1.0。
+#     例:EPOCHS=6 COSINE_CYCLES=3 CKPT_FREQ=1.0 -> 谷底在 epoch 1/3/5,即 ckpt 目录 0/2/4。
 SCHED_TOTAL="${SCHED_TOTAL:-}"          # --scheduler-total-steps。空 = EPOCHS*len(loader)。
 # ★ 退火(anneal)专用:DECAY_RATIO=0 跑出来的 checkpoint 都是【平台值】,转换评测必然偏低,
 #   因为上一条 cosine 线的末值是退火到 ~0 之后的数 —— 两者不是同一类读数。要拿可比的数,
@@ -160,7 +169,7 @@ GROUPED="${DSPARK_GROUPED_MOE:-0}"
 # 只看 DSPARK_* 与本脚本认识的那批全大写名,避免误报 shell 自带的环境变量。
 _KNOWN=" RUN VERIFIER DATA HS_DIR ENDPOINT LR EPOCHS MAX_ANCHORS SEQLEN MASK_TOKEN BLOCK
  MAX_STEPS OPTIM MUON_LR MUON_ADJUST MUON_HYBRID DECAY_GAMMA SWA_WINDOW NONCAUSAL
- SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO SCHED_TOTAL FROM_PRETRAINED LOSS_FN TEACHER_DNORM
+ SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO SCHED_TOTAL COSINE_CYCLES FROM_PRETRAINED LOSS_FN TEACHER_DNORM
  KD_TEMP NOISE_STD RECOMPUTE COMPILE NO_VAL INIT_MOE INIT_ATTN INIT_HC INIT_NORM
  INIT_LAYER INIT_MOE_NO_ROUTER CKPT_FREQ NPROC SAVE_PATH CANN_ENV TRAIN_PY MODE
  BF16_EXPERTS PYTORCH_NPU_ALLOC_CONF HCCL_TIMEOUT "
@@ -294,6 +303,29 @@ if [ "$OPTIM" = "muon" ]; then
 fi
 [ -n "$MAX_STEPS" ] && EXTRA="$EXTRA --max-steps $MAX_STEPS"
 [ -n "$SCHED_TOTAL" ] && EXTRA="$EXTRA --scheduler-total-steps $SCHED_TOTAL"
+EXTRA="$EXTRA --scheduler-num-cosine-cycles $COSINE_CYCLES"
+# 循环 cosine:把谷底(= 退火好、可直接评测的 ckpt)算出来打在横幅上。不打的话没人知道
+# 哪几个 ckpt 目录能测 —— 峰值那几个是热的,评出来必然偏低,而日志上完全看不出区别。
+if [ "$SCHED_TYPE" = "cosine" ] && [ "$COSINE_CYCLES" != "0.5" ]; then
+  _troughs="$(awk -v E="$EPOCHS" -v C="$COSINE_CYCLES" 'BEGIN{
+      for (m=1; m<=C+0.001; m++) { e = E*(2*m-1)/(2*C);
+        if (e <= E+0.001) printf "%s%.3g", (m>1?" ":""), e } }')"
+  _dirs="$(awk -v E="$EPOCHS" -v C="$COSINE_CYCLES" 'BEGIN{
+      for (m=1; m<=C+0.001; m++) { e = E*(2*m-1)/(2*C);
+        if (e <= E+0.001 && e == int(e)) printf "%s%d/", (m>1?" ":""), e-1 } }')"
+  echo ">>> 循环 cosine(COSINE_CYCLES=$COSINE_CYCLES):LR 谷底在 epoch [$_troughs]"
+  if [ -n "$_dirs" ]; then
+    echo "    ⟹ 退火好、可直接评测的 checkpoint 目录 = [$_dirs]  (其余是峰值 LR,别评)"
+  else
+    echo "    ⚠️ 谷底不在整 epoch 上 —— 那几个 ckpt 会被 epoch 末的存点覆盖。"
+    echo "       取 COSINE_CYCLES=$(awk -v E="$EPOCHS" 'BEGIN{printf "%.4g", E/2}') 让谷底落在 epoch 末。"
+  fi
+  case "${CKPT_FREQ:-1.0}" in
+    1|1.0|1.00) ;;
+    *) echo "    ⚠️ CKPT_FREQ=$CKPT_FREQ < 1:mid-epoch 存点与 epoch 末写同一个 <epoch>/ 目录," \
+            "谷底那份会被之后的覆盖。循环 cosine 下建议 CKPT_FREQ=1.0。" ;;
+  esac
+fi
 # 纯衰减跑(DECAY_RATIO=1.0)而没给 SCHED_TOTAL,是个静默的坑:衰减窗口按 EPOCHS*len(loader)
 # 算,MAX_STEPS 提前停只会停在衰减曲线的开头,LR 还很高 —— 拿到的仍是平台 checkpoint。
 if [ "$SCHED_TYPE" = "wsd" ] && [ -n "$DECAY_RATIO" ] && [ -z "$SCHED_TOTAL" ]; then
@@ -477,7 +509,7 @@ PROV="$RUN/${TAG}_${TS}.provenance.txt"
   echo "# env recipe (the half train_command.txt does NOT record)"
   for _v in VERIFIER DATA HS_DIR ENDPOINT LR EPOCHS MAX_ANCHORS SEQLEN MASK_TOKEN BLOCK \
             MAX_STEPS OPTIM MUON_LR MUON_ADJUST MUON_HYBRID DECAY_GAMMA SWA_WINDOW \
-            NONCAUSAL SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO SCHED_TOTAL FROM_PRETRAINED LOSS_FN TEACHER_DNORM KD_TEMP NOISE_STD \
+            NONCAUSAL SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO SCHED_TOTAL COSINE_CYCLES FROM_PRETRAINED LOSS_FN TEACHER_DNORM KD_TEMP NOISE_STD \
             GROUPED EP RECOMPUTE COMPILE NOVAL INITMOE INITATTN INITHC INITNORM \
             INITLAYER INITNOROUTER FROM_PRETRAINED LAYERS EXPERTS CKPT_FREQ \
             DSPARK_MOE_BALANCE DSPARK_MOE_BALANCE_RATE DSPARK_LOG_EXPERT_LOAD \
