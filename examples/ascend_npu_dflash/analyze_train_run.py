@@ -229,7 +229,11 @@ def f(rec: dict, key: str):
 
 
 def step_of(r) -> int:
-    return int(f(r, "global_step") or -1)
+    # NOT `int(f(...) or -1)`. global_step=0 parses to 0.0, which is FALSY, so `or -1` turned
+    # the run's very first step into -1 -- it then showed up as "worst step -1", as an HS stall
+    # "at step -1", and as a "0k" column header on a run that starts at 124k.
+    v = f(r, "global_step")
+    return -1 if v is None else int(v)
 
 
 def epoch_boundaries(recs) -> list[tuple[int, int]]:
@@ -379,7 +383,12 @@ def print_position_trend(recs, pos_keys, gamma=None, bins=6):
         # question that matters — is this position still moving at the rate it used to?
         g1 = vals[mid] - vals[0]
         g2 = vals[-1] - vals[mid]
-        if g1 <= 0.002:
+        if g1 < -0.005:
+            # A DROP is not a plateau. Warm-starting into a higher LR makes every position fall
+            # for a while; labelling that "● 平台" hides the single most important thing on the
+            # table, and the recovery rate in g2 is then what decides whether to wait or relaunch.
+            mark = "↓ 下滑后回升" if g2 > 0.004 else ("↓ 还在掉" if g2 < -0.002 else "↓ 掉了后持平")
+        elif g1 <= 0.002:
             mark = "● 平台" if abs(g2) <= 0.004 else ("↑ 后段才起" if g2 > 0 else "↓ 回落")
         elif g2 <= 0.15 * g1:
             mark = "● 平台"
@@ -427,7 +436,7 @@ def _load_continuation(src: str, label: str | None):
     }
 
 
-def print_continuation(cont, recs, pos_keys, win=200, gamma=None, prev_gamma=None):
+def print_continuation(cont, recs, pos_keys, win=None, gamma=None, prev_gamma=None):
     """Warm-start read-out: the PRIOR run's tail vs this run's head and tail, per position.
 
     The question a warm start exists to answer is never "did the numbers go up" — resetting the
@@ -451,6 +460,8 @@ def print_continuation(cont, recs, pos_keys, win=200, gamma=None, prev_gamma=Non
 
     # Windows must be at most HALF the run, or head and tail are the same slice and every gain
     # prints as exactly +0.000 -- which looks like a converged model rather than a bug.
+    # Default scales with the run: a fixed 200 is ~1.4% of a 14k-step warm start, mostly noise.
+    win = win or max(200, min(2000, len(good) // 10))
     w = max(1, min(win, len(good) // 2))
     head, tail = good[:w], good[-w:]
     ptail = prev[-max(1, min(win, len(prev) // 2)):]
@@ -458,6 +469,8 @@ def print_continuation(cont, recs, pos_keys, win=200, gamma=None, prev_gamma=Non
     print()
     print(f"续训读数 —— 上一轮『{cont['label']}』末 {len(ptail)} 步  vs  本轮(在 step "
           f"{cont['join']:,} 之后)")
+    print(f"  (窗口:上轮末 {len(ptail)} 步 · 本轮首尾各 {w} 步;上轮名次按其后半程,"
+          f"本轮名次按首尾差,都是增益升序、1 = 最小)")
     print(f"  {'指标':<10}{'上轮末':>10}{'本轮初':>10}{'本轮末':>10}{'本轮增益':>12}   上轮名次 → 本轮名次")
 
     rows = []
@@ -466,14 +479,16 @@ def print_continuation(cont, recs, pos_keys, win=200, gamma=None, prev_gamma=Non
         if None in (a, b, c):
             continue
         rows.append([f"pos{i}", a, b, c, c - b])
-    # Rank by GAIN, slowest = rank 1. The previous run's ranking is measured over ITS LAST 2w
-    # records -- the SAME horizon as this run's -- because a slope is only comparable to another
-    # slope measured over the same number of steps. Ranking a converged 124k-step history against
-    # a fresh 2k-step warm start otherwise compares a plateau to a ramp and always "wins".
-    seg = prev[-min(len(prev), 2 * w):]
+    # Rank by GAIN; rank 1 = smallest gain. The prior run is ranked over ITS OWN SECOND HALF
+    # (Q4 minus Q3) -- what `逐位准确率轨迹` measures, and what the "pos0 is the slowest" finding
+    # was based on. An earlier version matched the window to this run's length instead, for
+    # horizon comparability; but a few hundred steps at the tail of a run that had already
+    # annealed to LR~0 move every position by ~0.001, so it ranked pure noise.
+    q = max(1, len(prev) // 4)
+    h = len(prev) // 2
     pg = {}
     for i, k in enumerate(pos_keys):
-        a, b = med(seg[:w], k), med(seg[-w:], k)
+        a, b = med(prev[h:h + q], k), med(prev[-q:], k)
         if a is not None and b is not None:
             pg[f"pos{i}"] = b - a
     prev_rank = {n: r + 1 for r, (n, _) in enumerate(sorted(pg.items(), key=lambda kv: kv[1]))}
@@ -502,10 +517,18 @@ def print_continuation(cont, recs, pos_keys, win=200, gamma=None, prev_gamma=Non
     lr0 = [x for x in (f(r, "lr") for r in head) if x is not None]
     if lr and lr0:
         print(f"  lr        {'—':>10}{lr0[-1]:10.2e}{lr[-1]:10.2e}")
-        if lr[-1] < 0.98 * max(lr0 + lr):
+        allk = [x for x in (f(r, "lr") for r in good) if x is not None]
+        peak = max(allk) if allk else 0.0
+        if peak and lr[-1] >= 0.98 * peak:
+            print()
+            print("       ★ 本轮 LR 还在峰值(WSD decay_ratio=0 = 永不退火),上面全是【平台值】。")
+            print("         而『上轮末』是 cosine 退火到 ~0 之后的数 —— 两者不是同一类读数,平台值")
+            print("         本来就低,直接比会得出『热启动把模型搞坏了』的错误结论。可比只有两条路:")
+            print("         (a) 去上一轮里找 LR 相同的那个 step 比;(b) 停之前先跑一段退火再评测。")
+        elif peak and lr[-1] < 0.98 * peak:
             print("       ⚠️ 本轮 LR 已离开峰值 —— 后段的增益是衰减期的,别和平台期的比。")
-    print("       名次 1 = 本轮增益最小。判据是名次变化,不是数值涨跌:"
-          "热启动把 LR 拉回峰值,所有位置都会涨一段。")
+    print("       名次 1 = 本轮增益最小。判据是名次变化,不是数值涨跌。全线为负时,"
+          "名次越大 = 掉得越少 = 被 γ 保住了。")
 
 
 def spike_report(recs, key, k_thresh=3.0):
