@@ -696,14 +696,20 @@ def run_one_dataset(args, dataset_name, tokenizer):
         "num_drafts": d_drafts,
         "num_draft_tokens": d_draft_tok,
         "num_accepted_tokens": d_acc,
+        # ITL = TPOT (time per output token, 首 token 之后的解码间隔). 它一直被 print 出来,
+        # 却没进返回值,所以每一份汇总和 CSV 里都没有 —— 事后想知道 TPOT 只能去翻原始日志,
+        # 或者拿 concurrency/throughput 反推(那是个上界:elapsed 含 prefill 和收尾的降并发)。
+        "itl_mean_ms": statistics.mean(all_itls) if all_itls else float("nan"),
+        "itl_median_ms": statistics.median(all_itls) if all_itls else float("nan"),
+        "ttft_mean_ms": statistics.mean(all_ttfts) if all_ttfts else float("nan"),
     }
 
 
 def print_final_summary(results):
     print()
-    print("=" * 120)
+    print("=" * 140)
     print("FINAL SUMMARY")
-    print("=" * 120)
+    print("=" * 140)
     print(
         f"{'Dataset':<12} "
         f"{'Samples':>10} "
@@ -712,9 +718,11 @@ def print_final_summary(results):
         f"{'Time(s)':>12} "
         f"{'Throughput(tok/s)':>20} "
         f"{'Accept Len':>14} "
-        f"{'Accept Rate':>14}"
+        f"{'Accept Rate':>14} "
+        f"{'TPOT p50(ms)':>14} "
+        f"{'TTFT(ms)':>11}"
     )
-    print("-" * 120)
+    print("-" * 140)
 
     for r in results:
         accept_rate_pct = 100 * r["accept_rate"]
@@ -727,10 +735,14 @@ def print_final_summary(results):
             f"{r['elapsed']:>12.2f} "
             f"{r['throughput']:>20.2f} "
             f"{r['accept_length']:>14.3f} "
-            f"{accept_rate_pct:>13.2f}%"
+            f"{accept_rate_pct:>13.2f}% "
+            f"{r.get('itl_median_ms', float('nan')):>14.2f} "
+            f"{r.get('ttft_mean_ms', float('nan')):>11.1f}"
         )
 
-    print("=" * 120)
+    print("=" * 140)
+    print("TPOT p50 = 每输出 token 的解码间隔中位数(= Median ITL),在本次 concurrency 下测的;"
+          "并发不同不可比。TTFT = 首 token 均值。")
 
 
 # ---------------------------------------------------------------------
