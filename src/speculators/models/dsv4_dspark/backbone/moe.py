@@ -59,6 +59,17 @@ class Router(nn.Module):
         # bias (zero balancing) that let the router COLLAPSE to a few experts. rate via DSPARK_MOE_BALANCE_RATE.
         self._balance = os.environ.get("DSPARK_MOE_BALANCE") == "1"
         self._balance_rate = float(os.environ.get("DSPARK_MOE_BALANCE_RATE", "1e-3"))
+        # DSPARK_MOE_BALANCE_TARGET: stop nudging once this layer's normalized load entropy reaches
+        # the target. noaux_tc's ONLY fixed point is uniform load, and uniform is NOT what we want:
+        # measured on this model, forced un-collapse to N_eff ~120 scored accept_len 2.66 vs ~18
+        # collapsed scoring 3.63 (worklog "Balance A/B", degenerate-RoPE era, compare within-table).
+        # The official draft's own regime is N_eff ~47-70 / entropy 0.70-0.77, and our best block5
+        # run reproduced it at 0.60->0.74-0.79. So the goal is a BAND, and the rule has no setpoint
+        # to hold one -- DeepSeek-V3 handles this by setting the rate to 0 in the final stage; this
+        # flag is the same idea made continuous and per-layer. 0 = off (pure noaux_tc, drives to
+        # uniform). Entropy here is the same quantity [MOE-LOAD] prints, so the target is directly
+        # comparable to what you read in the log.
+        self._balance_target = float(os.environ.get("DSPARK_MOE_BALANCE_TARGET", "0"))
         self._sel_counts: torch.Tensor | None = None
         self._step_load: torch.Tensor | None = None
 
@@ -132,6 +143,15 @@ class Router(nn.Module):
             dist.all_reduce(load, op=dist.ReduceOp.SUM)  # -> global per-expert load (same on all ranks)
         delta = self._balance_rate * torch.sign(load.mean() - load)
         delta = delta - delta.mean()  # zero-mean the step (torchtitan-canonical): keeps the bias CENTERED
+        if self._balance_target > 0:
+            # Gate, not an early return: `.item()` here would force a device->host sync every step
+            # on every layer. Multiplying by a 0/1 tensor is the same math with no sync. `load` is
+            # already all-reduced, so the gate is identical on every rank and the bias stays
+            # replicated -- computing it BEFORE the all-reduce would silently desync the ranks.
+            prob = load / load.sum().clamp_min(1.0)
+            nz = prob.clamp_min(1e-12)
+            ent = -(prob * nz.log()).sum() / math.log(self.n_routed_experts)
+            delta = delta * (ent < self._balance_target).to(delta.dtype)
         # fp32 accumulate, always. See _apply: in bf16 this add is a silent no-op over most of the
         # range and -0.5 is an absorbing state, which is how a run with balancing ON stayed collapsed.
         self.bias.add_(delta.float())  # so it can't drift as a whole over a long run

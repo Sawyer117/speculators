@@ -686,6 +686,11 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 if not _d.is_initialized() or _d.get_rank() == 0:
                     _r0 = self.layers[0].ffn.router
                     _b = _r0.bias
+                    _tg = getattr(_r0, "_balance_target", 0.0)
+                    print(f"[MOE-BALANCE] 目标 entropy={_tg or '无(会一直推到均匀)'}"
+                          f"   —— 官方 draft 的实测区间是 entropy 0.70-0.77 / N_eff 47-70;"
+                          f"推到均匀实测有害(N_eff~120 时 accept_len 2.66 vs 塌缩 ~18 时 3.63)",
+                          flush=True)
                     print(f"[MOE-BALANCE] noaux_tc ON: rate={_r0._balance_rate} across "
                           f"{len(self.layers)} routers (bias updated PRE-layer from prev-step load; AC-safe)",
                           flush=True)
