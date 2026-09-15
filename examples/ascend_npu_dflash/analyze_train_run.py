@@ -22,6 +22,8 @@ Usage (see --help for the full list + examples):
     python analyze_train_run.py <dir>                 # newest *.log with metrics in <dir>
     python analyze_train_run.py <logfile> [--out plots_dir]
     python analyze_train_run.py CURRENT --baseline OLD --out ./cmp   # COMPARE two runs
+    python analyze_train_run.py NEW --continue-from OLD --out ./cont # CONTINUE one trajectory
+    python analyze_train_run.py <split-dir> --out ./plots            # replot an archived run
     <cmd> 2>&1 | tee run.log ; python analyze_train_run.py run.log --out ./analysis
     python analyze_train_run.py -                     # read stdin, console only
 
@@ -29,13 +31,27 @@ COMPARE MODE: pass --baseline <log> to overlay an older reference run on every p
 (CURRENT = solid, BASELINE = dashed / grouped bars). The text report stays CURRENT-only,
 plus a compact 'VS BASELINE' headline delta table (accept_len / loss / tok_s / recompile% / HS%).
 
+CONTINUE MODE: pass --continue-from <log|split-dir> when THIS run warm-starts from that one.
+The current run's global_steps are shifted to sit after the prior run's last step, so both draw
+as ONE curve with a magenta seam at the join, and a '续训读数' table prints the prior run's tail
+against this run's head and tail per position -- ranked by gain, because the question a warm
+start answers is which position is now improving slowest, not whether the numbers went up.
+--continue-from is首尾相接 (one trajectory); --baseline is 并排对比 (two independent arms).
+
+SPLIT DIRS: any path argument (the positional one, --baseline, --continue-from) may be a
+split_train_log.py output dir instead of a log. A finished run's log is 491 MB and lives on
+the training box; its split CSVs are ~11 MB and live in git, and reproduce this report
+identically (verified on the blk15 run: same per-position trend, 5 s instead of minutes).
+
 The run dir defaults to $RUN or /home/a00652497/dspark_austin/run (matches train_dsv4_dspark.sh,
 which writes $RUN/faithful_ep_<ts>.log + a rank0 mirror train_*.log). Override with RUN=... .
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
+import gzip
 import os
 import re
 import sys
@@ -90,6 +106,13 @@ def load(path: str) -> tuple[list[dict], str]:
         if k == "global_step":  # always the last field of a record → flush
             recs.append(cur)
             cur = {}
+    return _derive(recs), text
+
+
+def _derive(recs: list[dict]) -> list[dict]:
+    """Add the per-record derived timing fields. Factored out of ``load`` so that records
+    rebuilt from a split dir (``load_split``) get exactly the same columns as parsed ones —
+    otherwise a --continue-from prior run would silently miss fwd_compute_ms."""
     # Derived per-record field: fwd_ms MINUS the align/all-gather straggler barrier. The align barrier
     # (trainer.py, added between the fetch and fwd marks) makes a serve/HS straggler wait get COUNTED
     # INSIDE fwd_ms (align_ms ⊂ fwd_ms), where the old breakdown mis-attributed it as a "recompile" fwd
@@ -115,7 +138,57 @@ def load(path: str) -> tuple[list[dict], str]:
                 r["profile/fwd_compute_ms"] = max(0.0, _fwd - _al - _a2a)
             except (TypeError, ValueError):
                 pass
-    return recs, text
+    return recs
+
+
+# split_train_log.py writes one CSV per metric family and STRIPS the `train/` / `profile/`
+# prefix from the column names (short()). Reading one back has to put the prefix on again --
+# every other function here keys off the full names, and a silently un-prefixed "loss" column
+# simply never matches, producing an empty, plausible-looking curve.
+_SPLIT_FAMILIES = {"loss": "train/", "accept": "train/", "confidence": "train/",
+                   "timing": "profile/", "ranks": "profile/", "sched": ""}
+
+
+def _is_split_dir(path: str) -> bool:
+    """A split_train_log.py output dir, as opposed to a run dir full of *.log."""
+    return os.path.isdir(path) and any(
+        os.path.exists(os.path.join(path, n))
+        for n in ("accept.csv", "accept.csv.gz", "loss.csv", "loss.csv.gz"))
+
+
+def load_split(path: str) -> list[dict]:
+    """Rebuild `recs` from a split_train_log.py dir — the archived, git-sized form of a run.
+
+    WHY this exists: a finished run's 491 MB log lives on the training box and nowhere else,
+    but its split CSVs are ~11 MB and are in the article repo. Being able to feed those back in
+    means a warm-start run can be plotted as a CONTINUATION of a run whose log you no longer
+    have. Rows are joined on `step`, so the families do not need to agree on which steps they
+    cover (--every, or a family that was absent for part of the run).
+    """
+    by_step: dict[int, dict] = {}
+    found: list[str] = []
+    for fam, pref in _SPLIT_FAMILIES.items():
+        for name in (f"{fam}.csv.gz", f"{fam}.csv"):
+            fp = os.path.join(path, name)
+            if not os.path.exists(fp):
+                continue
+            found.append(name)
+            opener = gzip.open(fp, "rt", newline="") if fp.endswith(".gz") else open(fp, newline="")
+            with opener as fh:
+                for row in csv.DictReader(fh):
+                    st = (row.get("step") or "").strip()
+                    if not st.lstrip("-").isdigit():
+                        continue
+                    r = by_step.setdefault(int(st), {"global_step": st})
+                    for k, v in row.items():
+                        if k == "step" or not v:
+                            continue
+                        r[pref + k] = v
+            break
+    if not by_step:
+        return []
+    print(f">>> 拆分目录 {path}:{len(by_step):,} 步  ({', '.join(sorted(found))})")
+    return _derive([by_step[st] for st in sorted(by_step)])
 
 
 def checkpoint_steps(text: str) -> set[int]:
@@ -327,6 +400,114 @@ def print_position_trend(recs, pos_keys, gamma=None, bins=6):
                "份额大才是真饱和。")
 
 
+def _load_continuation(src: str, label: str | None):
+    """Load the run that the CURRENT one warm-starts FROM. `src` = a log file, a run dir, or a
+    split_train_log.py output dir (the archived form — see load_split).
+
+    Deliberately ignores --skip / --max-step: those bound the run under test, not its history.
+    """
+    if _is_split_dir(src):
+        recs, ck = load_split(src), set()
+    else:
+        # ONE load. Calling _load_and_skip twice re-reads (and re-regexes) the whole file, which
+        # on the 491 MB blk15 log is minutes of pure waste.
+        recs, ck, _, _ = _load_and_skip(src, 0, quiet=True)
+        recs, ck = recs or [], ck or set()
+    steps = [step_of(r) for r in recs if step_of(r) >= 0]
+    if not steps:
+        print(f"!! --continue-from {src}: 没有解析到任何指标 —— 忽略,按单独一轮画")
+        return None
+    return {
+        "recs": recs,
+        "good": [r for r in recs if f(r, "train/loss") is not None and not isnan(f(r, "train/loss"))],
+        "ckpt": ck,
+        "join": max(steps),
+        "label": label or _default_label(src),
+        "pos_keys": detect_positions(recs),
+    }
+
+
+def print_continuation(cont, recs, pos_keys, win=200, gamma=None, prev_gamma=None):
+    """Warm-start read-out: the PRIOR run's tail vs this run's head and tail, per position.
+
+    The question a warm start exists to answer is never "did the numbers go up" — resetting the
+    LR lifts every position for a while, so they all do. It is "did the RANKING change": which
+    position is now improving slowest. So the last column is a RANK, not a delta, and the row
+    order is the previous run's ranking, which is what you are trying to break.
+
+    ⚠ Two things here are NOT comparable across the join and the table says so:
+      * loss, if gamma changed. w_k = exp(-k/gamma) is applied UNNORMALISED (the denominator is
+        the token count), so halving gamma scales the whole loss down without anything improving.
+      * anything measured while the new run is still inside its LR warmup.
+    """
+    good = [r for r in recs if f(r, "train/loss") is not None and not isnan(f(r, "train/loss"))]
+    prev = cont["good"]
+    if not good or not prev:
+        return
+
+    def med(chunk, key):
+        v = [x for x in (f(r, key) for r in chunk) if x is not None and not isnan(x)]
+        return median(v) if v else None
+
+    # Windows must be at most HALF the run, or head and tail are the same slice and every gain
+    # prints as exactly +0.000 -- which looks like a converged model rather than a bug.
+    w = max(1, min(win, len(good) // 2))
+    head, tail = good[:w], good[-w:]
+    ptail = prev[-max(1, min(win, len(prev) // 2)):]
+
+    print()
+    print(f"续训读数 —— 上一轮『{cont['label']}』末 {len(ptail)} 步  vs  本轮(在 step "
+          f"{cont['join']:,} 之后)")
+    print(f"  {'指标':<10}{'上轮末':>10}{'本轮初':>10}{'本轮末':>10}{'本轮增益':>12}   上轮名次 → 本轮名次")
+
+    rows = []
+    for i, k in enumerate(pos_keys):
+        a, b, c = med(ptail, k), med(head, k), med(tail, k)
+        if None in (a, b, c):
+            continue
+        rows.append([f"pos{i}", a, b, c, c - b])
+    # Rank by GAIN, slowest = rank 1. The previous run's ranking is measured over ITS LAST 2w
+    # records -- the SAME horizon as this run's -- because a slope is only comparable to another
+    # slope measured over the same number of steps. Ranking a converged 124k-step history against
+    # a fresh 2k-step warm start otherwise compares a plateau to a ramp and always "wins".
+    seg = prev[-min(len(prev), 2 * w):]
+    pg = {}
+    for i, k in enumerate(pos_keys):
+        a, b = med(seg[:w], k), med(seg[-w:], k)
+        if a is not None and b is not None:
+            pg[f"pos{i}"] = b - a
+    prev_rank = {n: r + 1 for r, (n, _) in enumerate(sorted(pg.items(), key=lambda kv: kv[1]))}
+    cur_rank = {r[0]: i + 1 for i, r in enumerate(sorted(rows, key=lambda r: r[4]))}
+
+    for name, a, b, c, d in rows:
+        pr, cr = prev_rank.get(name), cur_rank[name]
+        arrow = f"{pr:>7} → {cr}" if pr else f"{'—':>7} → {cr}"
+        flag = "  ← 仍垫底" if cr == 1 and pr == 1 else ("  ← 不再垫底" if pr == 1 else "")
+        print(f"  {name:<10}{a:10.3f}{b:10.3f}{c:10.3f}{d:+12.3f}   {arrow}{flag}")
+
+    for k, lab in (("train/accept_len", "accept_len"), ("train/accept_rate", "accept_rate")):
+        a, b, c = med(ptail, k), med(head, k), med(tail, k)
+        if None not in (a, b, c):
+            print(f"  {lab:<10}{a:10.3f}{b:10.3f}{c:10.3f}{c - b:+12.3f}")
+    a, b, c = med(ptail, "train/loss"), med(head, "train/loss"), med(tail, "train/loss")
+    if None not in (a, b, c):
+        note = ""
+        if gamma and prev_gamma and abs(gamma - prev_gamma) > 1e-9:
+            wa = sum(exp(-i / prev_gamma) for i in range(len(pos_keys))) / max(1, len(pos_keys))
+            wb = sum(exp(-i / gamma) for i in range(len(pos_keys))) / max(1, len(pos_keys))
+            note = f"   ⚠ γ {prev_gamma:g}→{gamma:g},平均权重 {wa:.3f}→{wb:.3f},跨接缝不可比"
+        print(f"  {'loss':<10}{a:10.3f}{b:10.3f}{c:10.3f}{c - b:+12.3f}{note}")
+
+    lr = [x for x in (f(r, "lr") for r in tail) if x is not None]
+    lr0 = [x for x in (f(r, "lr") for r in head) if x is not None]
+    if lr and lr0:
+        print(f"  lr        {'—':>10}{lr0[-1]:10.2e}{lr[-1]:10.2e}")
+        if lr[-1] < 0.98 * max(lr0 + lr):
+            print("       ⚠️ 本轮 LR 已离开峰值 —— 后段的增益是衰减期的,别和平台期的比。")
+    print("       名次 1 = 本轮增益最小。判据是名次变化,不是数值涨跌:"
+          "热启动把 LR 拉回峰值,所有位置都会涨一段。")
+
+
 def spike_report(recs, key, k_thresh=3.0):
     """Steady median (spikes excluded) + list of spike (step, value) for a timing stage."""
     vals = col(recs, key)
@@ -352,7 +533,14 @@ def _default_label(path: str) -> str:
 def _load_and_skip(path: str, skip: int, quiet: bool = False, max_step: int = 0):
     """resolve → load → keep skip <= step <= max_step. Returns (recs, ckpt_steps, steps_per_epoch,
     raw_text) — the middle two are None when there are no metrics / no epoch length is discoverable."""
-    recs, raw_text = load(resolve_log(path))
+    # A split_train_log.py dir is a first-class input: an archived run's log is often long gone
+    # while its ~11 MB CSVs are in git. Everything below keys off `recs`, so the only thing lost
+    # is raw_text — i.e. the MoE plot, the fwd-profiler and the HS-split report, all of which
+    # already no-op on a log that lacks their lines.
+    if _is_split_dir(path):
+        recs, raw_text = load_split(path), ""
+    else:
+        recs, raw_text = load(resolve_log(path))
     if not recs:
         return None, None, None, None
     if skip > 0:
@@ -1131,11 +1319,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "  # compare anchor=384 (current) against anchor=196 (baseline)\n"
             "  python analyze_train_run.py new.log --baseline old.log --out ./cmp\n"
             "  python analyze_train_run.py new.log --baseline old.log \\\n"
-            "         --label anchor384 --baseline-label anchor196 --out ./cmp --skip 500\n"
+            "         --label anchor384 --baseline-label anchor196 --out ./cmp --skip 500\n\n"
+            "  # CONTINUE: draw a warm-start run as the continuation of the run it started from\n"
+            "  python analyze_train_run.py new.log --continue-from old.log --out ./cont\n"
+            "  python analyze_train_run.py new.log --continue-from ../logs/blk15 \\\n"
+            "         --continue-gamma 15 --gamma 5 --out ./cont      # split dir + gamma change\n"
         ),
     )
     ap.add_argument("logfile", nargs="?", default=DEFAULT_RUN_DIR,
-                    help=f"CURRENT run: a log file, or a dir to auto-pick its newest *.log (default: {DEFAULT_RUN_DIR})")
+                    help=f"CURRENT run: a log file, a dir to auto-pick its newest *.log, or a\n"
+                         f"                         split_train_log.py 拆分目录(原始日志已丢时用)"
+                         f"  (default: {DEFAULT_RUN_DIR})")
     ap.add_argument("--baseline", default=None, metavar="LOG", nargs="+",
                     help="one or more BASELINE runs to compare against. ONE -> head-to-head (delta table + "
                          "dashed overlays). MULTIPLE -> multi-run overlay (each run its own colour + a compare table).")
@@ -1147,6 +1341,17 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="show the BASELINE's ENTIRE curve; default ALIGNS it to the CURRENT run's "
                          "step range (a short current run isn't buried under a long baseline)")
     ap.add_argument("--out", default=None, metavar="DIR", help="folder for PNG plots (created if missing)")
+    ap.add_argument("--continue-from", default=None, metavar="SRC",
+                    help="接着画:SRC 是本次热启动所【源自】的那一轮 —— 日志文件、run 目录,或\n"
+                         "                         split_train_log.py 的拆分目录(原始日志已经没了时用这个)。\n"
+                         "                         本轮的 global_step 会整体后移到 SRC 的末步之后,两轮画成\n"
+                         "                         一条连续曲线,接缝处画竖线。与 --baseline 的区别:--baseline 是\n"
+                         "                         【并排对比】两个独立的臂,--continue-from 是【首尾相接】同一条线。")
+    ap.add_argument("--continue-label", default=None, metavar="NAME",
+                    help="--continue-from 那一轮的显示名(默认取路径名)")
+    ap.add_argument("--continue-gamma", type=float, default=None, metavar="G",
+                    help="--continue-from 那一轮的 γ。给了且与 --gamma 不同时,续训读数会标出\n"
+                         "                         loss 跨接缝不可比(w_k=exp(-k/γ) 未归一化,改 γ 会整体缩放 loss)。")
     ap.add_argument("--spike-k", type=float, default=3.0, help="spike = stage > k*steady-median (default 3.0)")
     ap.add_argument("--recent", type=int, default=500, help="window (steps) for the recent-dynamics trend")
     ap.add_argument("--gamma", type=float, default=None,
@@ -1497,6 +1702,26 @@ def main() -> None:
         return
     cur_label = args.label or _default_label(args.logfile)
 
+    # CONTINUE mode: shift THIS run's steps to sit after the run it warm-started from, so the two
+    # draw as one line. The shift happens here, before anything else reads a step, so every
+    # downstream consumer (epoch markers, checkpoint dots, plots) is consistent by construction.
+    cont = None
+    if args.continue_from:
+        cont = _load_continuation(args.continue_from, args.continue_label)
+    if cont:
+        off = cont["join"]
+        for r in recs:
+            st = step_of(r)
+            if st >= 0:
+                r["global_step"] = str(st + off)
+        if ckpt_steps:
+            ckpt_steps = {st + off for st in ckpt_steps}
+        print(f">>> 接着画:本轮 step 整体 +{off:,}(上一轮『{cont['label']}』的末步),接缝画竖线")
+        cpk, npk = cont["pos_keys"], detect_positions(recs)
+        if cpk and npk and len(cpk) != len(npk):
+            print(f"⚠️ 两轮的草稿位置数不同({len(cpk)} vs {len(npk)}) —— block_size 变了,"
+                  "逐位曲线在接缝处会断,accept_len 也不是同一个量,别直接连起来读。")
+
     # optional BASELINE run(s) to compare against. ONE -> head-to-head (delta table + dashed
     # overlays). MULTIPLE -> multi-run overlay (each run its own colour + a compare table). Each
     # baseline is aligned to the CURRENT run's step range by default (--full-baseline = full curves).
@@ -1596,6 +1821,10 @@ def main() -> None:
               + f"   (γ={len(pos_keys)} draft positions)")
         # γ defaults to block_size for DSpark (see decay-gamma-equals-block); override with --gamma.
         print_position_trend(recs, pos_keys, gamma=getattr(args, "gamma", None) or len(pos_keys))
+        if cont:
+            print_continuation(cont, recs, pos_keys,
+                               gamma=args.gamma or len(pos_keys),
+                               prev_gamma=args.continue_gamma)
     # confidence calibration
     cl = last_n_med("train/confidence_loss")
     if cl is not None:
@@ -1875,9 +2104,19 @@ def main() -> None:
                              ["profile/fetch_ms", "profile/fwd_ms", "profile/bwd_ms", "profile/opt_ms", "profile/step_ms"]},
                     "ckpt_steps": b["ckpt"], "label": b["label"],
                 }
-            _plots(recs, good, pos_keys, reps, ckpt_steps, args.out, cur_label, base,
-                   steps_per_epoch=steps_per_epoch)
-        _plot_moe(raw_text, args.out, steps_per_epoch)   # expert-load plot (both modes; silent if no [MOE-LOAD])
+            # The console report above stays CURRENT-only (its spike/timing medians would be
+            # meaningless mixed across two runs); the PLOTS get both, concatenated.
+            p_recs, p_good, p_ck = recs, good, ckpt_steps
+            if cont:
+                p_recs = cont["recs"] + recs
+                p_good = cont["good"] + good
+                p_ck = set(ckpt_steps or ()) | set(cont["ckpt"])
+            _plots(p_recs, p_good, pos_keys, reps, p_ck, args.out, cur_label, base,
+                   steps_per_epoch=steps_per_epoch,
+                   join=cont["join"] if cont else None,
+                   join_label=cont["label"] if cont else None)
+        _plot_moe(raw_text, args.out, steps_per_epoch,   # expert-load plot (both modes; silent if no [MOE-LOAD])
+                  offset=cont["join"] if cont else 0)
     print("=" * 78)
 
 
@@ -1957,14 +2196,18 @@ def _timing_tag(recs, reps, spe) -> str:
     return "   ·   ".join(parts)
 
 
-def _plot_moe(text, out, steps_per_epoch=None):
+def _plot_moe(text, out, steps_per_epoch=None, offset=0):
     """MoE expert-load plots from ``[MOE-LOAD]`` prints — built to be read AT A GLANCE by non-experts.
 
     Panel A: 'effective experts working' = ``E**entropy`` (the honest capacity number) over training,
     per layer. Bold line = actually working; faint dotted = merely 'touched' by >=1 token (looks fine
     but misleads). A collapse shows as the bold line sliding toward the red zone.
     Panel B: a final-state capacity gauge per layer ('18 of 256 working (7%)').
-    Silent if the log has no ``[MOE-LOAD]`` lines (``DSPARK_LOG_EXPERT_LOAD`` was off)."""
+    Silent if the log has no ``[MOE-LOAD]`` lines (``DSPARK_LOG_EXPERT_LOAD`` was off).
+
+    ``offset`` shifts the step axis under --continue-from. This plot re-parses global_step from
+    the raw text, so without it moe_experts.png would keep the run's OWN 0-based axis while every
+    other PNG in the same folder is on the joined axis -- two x-axes in one report."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -1984,7 +2227,7 @@ def _plot_moe(text, out, steps_per_epoch=None):
             continue
         ms = step_re.search(line)
         if ms and pending:
-            st = int(ms.group(1))
+            st = int(ms.group(1)) + offset
             for lyr, used, E, ent in pending:
                 series.setdefault(lyr, []).append((st, ent, used, E))
             pending = []
@@ -2055,7 +2298,8 @@ def _plot_moe(text, out, steps_per_epoch=None):
     print(f"  · MoE expert-load plot -> {out}/moe_experts.png")
 
 
-def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=None, steps_per_epoch=None):
+def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=None,
+           steps_per_epoch=None, join=None, join_label=None):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -2123,9 +2367,21 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
     def _epoch_lines():
         for s, e in ep_bounds:
             plt.axvline(s, color="0.55", ls=":", lw=0.9, alpha=0.75, zorder=0)
-            plt.annotate(f"e{e}", xy=(s, 1.0), xycoords=("data", "axes fraction"),
+            # A warm start restarts the epoch counter, so the joined axis has two "e1"s. Prime
+            # the post-seam ones rather than renumbering: e1' IS epoch 1 of the new run.
+            plt.annotate(f"e{e}" + ("'" if join is not None and s > join else ""),
+                         xy=(s, 1.0), xycoords=("data", "axes fraction"),
                          xytext=(2, -2), textcoords="offset points",
                          color="0.4", fontsize=7, ha="left", va="top")
+        # CONTINUE mode: the seam between the run this one warm-started from and this one.
+        # Drawn on every step-axis plot, because on every one of them the two sides are
+        # DIFFERENT runs and a curve that crosses it without a marker reads as one run.
+        if join is not None:
+            plt.axvline(join, color="#B5179E", ls="-", lw=1.5, alpha=0.9, zorder=1)
+            plt.annotate(f"warm start  |  ← {join_label}", xy=(join, 0.01),
+                         xycoords=("data", "axes fraction"), xytext=(4, 0),
+                         textcoords="offset points", color="#B5179E", fontsize=7.5,
+                         rotation=90, ha="left", va="bottom")
 
     # 1) loss  (+ a small 3-number tag in the corner: step-time · steps · time-per-epoch)
     plt.figure(figsize=(9, 4))
@@ -2247,6 +2503,41 @@ def _plots(recs, good, pos_keys, reps, ckpt_steps, out, label="current", base=No
             plt.title(f"Per-position draft accuracy — last {n} steps (decays p1→p{len(pos_keys)})")
             plt.grid(axis="y", alpha=.3, zorder=0)
             plt.tight_layout(); plt.savefig(f"{out}/position_acc.png", dpi=120); plt.close()
+
+    # 2d) per-position accuracy TRAJECTORY. position_acc.png above is a snapshot of the last
+    # 50 steps; this is the one that answers "which position is still learning", which is the
+    # question that decides the next run (more epochs vs re-weighting gamma). Under
+    # --continue-from it spans both runs — the whole reason a warm start is launched is to see
+    # a position's slope CHANGE at the seam, and that is invisible on a snapshot.
+    # Binned medians, not raw: pos0 swung 0.784-0.888 across 20 adjacent steps on the real run.
+    if pos_keys and len(good) >= 4 * len(pos_keys):
+        nb = min(80, max(6, len(good) // 40))
+        edges = [round(len(good) * b / nb) for b in range(nb + 1)]
+        chunks = [good[edges[b]:edges[b + 1]] for b in range(nb)]
+        chunks = [c for c in chunks if c]
+        cmap = plt.get_cmap("viridis")
+        plt.figure(figsize=(9.5, 5.0))
+        drew = 0
+        for i, k in enumerate(pos_keys):
+            xs, ys = [], []
+            for c in chunks:
+                v = col(c, k)
+                st = [step_of(r) for r in c if step_of(r) >= 0]
+                if v and st:
+                    xs.append(median(st)); ys.append(median(v))
+            if xs:
+                plt.plot(xs, ys, lw=1.3, color=cmap(i / max(1, len(pos_keys) - 1)), label=f"pos{i}")
+                drew += 1
+        if drew:
+            _epoch_lines()
+            plt.xlabel("step"); plt.ylabel("greedy accuracy  (median per bin)")
+            plt.title(f"Per-position accuracy trajectory — {drew} positions, {len(chunks)} bins"
+                      + ttl_suffix)
+            plt.grid(alpha=.3)
+            plt.legend(fontsize=7, ncol=max(1, (drew + 7) // 8), loc="center left",
+                       bbox_to_anchor=(1.005, 0.5), frameon=False)
+            plt.tight_layout(); plt.savefig(f"{out}/position_trend.png", dpi=120)
+        plt.close()
 
     # 3) confidence calibration
     plt.figure(figsize=(9, 4))
