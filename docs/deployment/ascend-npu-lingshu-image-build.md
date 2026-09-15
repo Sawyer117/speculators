@@ -246,3 +246,57 @@ MRV2 的 DSpark speculator 签名是 `propose(last_hidden_states, aux_hidden_sta
 
 **dumper 是纯 Python ⟹ 不构成做第二个镜像的理由。**
 HS-dump 角色 = 同一镜像里 `git checkout` 我们的分支。三机一镜像的设想不受影响。
+
+---
+
+## 交付:按平台命名规范重命名(2026-09-16)
+
+平台要求镜像名带上核心框架与 PyTorch 版本:
+`<group>_py<Python>pt<PyTorch>:<OS/架构><年份><release branch>`,非正式发布再追加构建标识。
+
+**已交付(80.5.5.116):**
+
+```
+/data1/lingxu_export/llm_py311pt210-arm26_0914.tar
+镜像名(tar 内)  llm_py311pt210:arm26_0914
+sha256          63958c583ba25d4d99a63099299f7d3ad04f24814205af419ab6597b8265ad9c
+大小            39,000,119,296 B (≈39 GB)
+```
+
+字段全部由 `docker/probe_image.sh` 从镜像里读出,不是从文档抄的:
+
+| | |
+|---|---|
+| Python | 3.11.15 |
+| PyTorch | 2.10.0+cpu(`+cpu` 正常:torch_npu 方案就是 CPU 版 torch + 插件提供 NPU 后端) |
+| torch_npu | 2.10.0 |
+| vLLM | 0.23.0 + vllm-ascend |
+| transformers / numpy | 5.13.0 / 2.3.5 |
+| CANN | 9.1.0.0627 |
+| OS / 架构 | Ubuntu 22.04 / aarch64 |
+| 构建时间 | 2026-09-14 |
+
+### ★ 三个坑
+
+**1. 改 tar 文件名没有任何作用。** `docker save` 把**镜像名**存在归档里(`manifest.json` 的
+`RepoTags`),别人 `docker load` 看到的是那个,不是文件名。必须 `docker tag` 之后重新
+`docker save`。验证一行就够,不用 load:
+
+```bash
+tar -xOf <tar> manifest.json | head -c 200      # 看 RepoTags
+```
+
+**2. 要预留一倍磁盘。** 新旧两份各 39 GB 并存。旧的**等平台确认新名字合规、并且他们那边
+load 成功之后**再删 —— 删早了要重跑一次 39 GB 的 save。
+
+**3. `pt210` 有歧义,已上报。** 规范示例 `pt26` = PyTorch 2.6(去点),那 2.10 → `pt210`,
+和 **2.1.0** 撞车。这是规范本身的问题,不是这个镜像的问题,已请平台定夺(`pt210` 还是 `pt2_10`)。
+同样待定的是 `<release branch>`:本镜像不在任何官方发布分支上,当前留空只保留构建标识;
+若该槽位应承载 CANN 发布序列,则名字为 `llm_py311pt210:arm26cann910_0914`。
+
+### 与原始清单的出入
+
+* **80.5.5.109 上没有这个文件** —— `/data1/lingxu_export/` 这个路径只在 115/116 上存在。
+* 另两个镜像(`mini-swe-cpl_v0.1.tar`、`dflash_20261009.tar`)不是我们维护的,分别来自
+  rezaul 与 lingxu 的目录,版本要由他们提供。`dflash_20261009` 的日期是 2026-10-09,
+  在交付日之后,疑似笔误。
