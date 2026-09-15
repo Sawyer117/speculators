@@ -685,8 +685,21 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 import torch.distributed as _d  # noqa: PLC0415
                 if not _d.is_initialized() or _d.get_rank() == 0:
                     _r0 = self.layers[0].ffn.router
+                    _b = _r0.bias
                     print(f"[MOE-BALANCE] noaux_tc ON: rate={_r0._balance_rate} across "
                           f"{len(self.layers)} routers (bias updated PRE-layer from prev-step load; AC-safe)",
+                          flush=True)
+                    # ★ dtype is load-bearing. The per-step nudge is ~1e-4 after zero-mean
+                    # centering; bf16's ulp at 0.5 is 3.9e-3, so a bf16 bias stops moving and
+                    # PILES UP at exactly -0.5 (an absorbing state) while still reporting ON.
+                    # Print it so a regressed cast is visible at step 1 instead of after a
+                    # 5-epoch run. See Router._apply.
+                    print(f"[MOE-BALANCE] bias dtype={_b.dtype} "
+                          f"min={_b.min().item():+.4f} max={_b.max().item():+.4f} "
+                          f"std={_b.std().item():.4f} "
+                          f"@-0.5={int((_b <= -0.4999).sum())}/{_b.numel()}"
+                          + ("   ⚠️ 非 fp32:每步更新会被舍入吞掉,均衡形同虚设"
+                             if _b.dtype != torch.float32 else ""),
                           flush=True)
             for _layer in self.layers:
                 _layer.ffn.router.update_load_balance_bias()

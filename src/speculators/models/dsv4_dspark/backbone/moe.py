@@ -48,7 +48,9 @@ class Router(nn.Module):
         # the combine weights), nudged by a load-balance RULE at train time — NOT by backprop. A
         # persistent BUFFER (not a Parameter) so FSDP leaves it REPLICATED (not Shard(0)) -> it stays
         # identical across ranks and is updatable in-place with the all-reduced global load.
-        self.register_buffer("bias", torch.zeros(cfg.n_routed_experts), persistent=True)
+        self.register_buffer(
+            "bias", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=True
+        )
         self.n_routed_experts = cfg.n_routed_experts
         # DSPARK_LOG_EXPERT_LOAD=1 -> stash per-expert selection counts each fwd (diagnostic; core.py).
         self._log_load = os.environ.get("DSPARK_LOG_EXPERT_LOAD") == "1"
@@ -59,6 +61,37 @@ class Router(nn.Module):
         self._balance_rate = float(os.environ.get("DSPARK_MOE_BALANCE_RATE", "1e-3"))
         self._sel_counts: torch.Tensor | None = None
         self._step_load: torch.Tensor | None = None
+
+    def _apply(self, fn, recurse: bool = True):
+        """Keep ``bias`` in fp32 through any ``model.to(bfloat16)`` / AMP cast.
+
+        ★ THIS IS NOT COSMETIC. The noaux_tc update is ``b_i += rate * sign(...)``, then
+        zero-meaned. Under a collapsed router almost every expert is below the mean load, so the
+        centering makes the vote lopsided: with a fraction p below mean, an UNDER-loaded expert
+        moves by ``2*rate*(1-p)`` and an over-loaded one by ``-2*rate*p``. At p≈0.96 and
+        rate=1e-3 that is +7.8e-5 up vs -1.9e-3 down.
+
+        In bf16 both of those are below the rounding threshold over most of the range:
+        ulp(0.25..0.5) = 1.95e-3, ulp(0.5..1) = 3.9e-3. Measured by simulation:
+
+          * an expert that stays over-loaded walks down from 0 and STOPS DEAD at exactly
+            -0.500000 after 257 steps — at that point 3.9e-3/2 > 1.9e-3, so demotion rounds
+            back, and 7.8e-5 was already far too small to promote. It is an ABSORBING STATE.
+          * promotion stalls everywhere past |bias| ~ 0.04 (7.8e-5 < half an ulp).
+
+        That is exactly what the 124k-step run's checkpoint shows: all three layers have
+        ``min = -0.5000`` on the nose, and max only ~0.06-0.12. The balancer had silently
+        stopped balancing — which is the real reason L2 sat at ~7 effective experts while
+        DSPARK_MOE_BALANCE=1 was on the whole time. fp32 has ~1e-8 resolution there, so the
+        same updates accumulate normally.
+
+        The forward already reads ``self.bias.float()``, so fp32 here costs one 256-float
+        buffer per layer and changes no math.
+        """
+        out = super()._apply(fn, recurse)
+        if self.bias.dtype != torch.float32:
+            self.bias = self.bias.float()
+        return out
 
     def _score(self, scores: torch.Tensor) -> torch.Tensor:
         if self.score_func == "softmax":
@@ -99,7 +132,9 @@ class Router(nn.Module):
             dist.all_reduce(load, op=dist.ReduceOp.SUM)  # -> global per-expert load (same on all ranks)
         delta = self._balance_rate * torch.sign(load.mean() - load)
         delta = delta - delta.mean()  # zero-mean the step (torchtitan-canonical): keeps the bias CENTERED
-        self.bias.add_(delta.to(self.bias.dtype))  # so it can't drift as a whole over a long run
+        # fp32 accumulate, always. See _apply: in bf16 this add is a silent no-op over most of the
+        # range and -0.5 is an absorbing state, which is how a run with balancing ON stayed collapsed.
+        self.bias.add_(delta.float())  # so it can't drift as a whole over a long run
         self._step_load = None
 
 
