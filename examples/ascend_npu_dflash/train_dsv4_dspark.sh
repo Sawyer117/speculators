@@ -490,6 +490,35 @@ GIT_DIRTY="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null || true)"
 # kills the script — same trap the TAG comment above warns about. if-blocks only.
 DIRTY_MARK=""
 if [ -n "$GIT_DIRTY" ]; then DIRTY_MARK=" +DIRTY"; fi
+# ── 与基线配方对拍 ─────────────────────────────────────────────────────────────────────
+# BASE_PROV=<某次 run 的 .provenance.txt> -> 逐项比对【本次解析后的实际取值】与那一次的记录,
+# 只打不同的项。为什么值得做:provenance 里记的 key 就是本脚本的变量名,所以对拍是机械的;
+# 而真实事故是「照着上一条命令改了三个字段,漏了两个没写在命令里、靠默认值的旗标」——
+# INIT_LAYER=1 / INIT_MOE_NO_ROUTER=1 漏掉,整层热启动变成纯随机初始化,grad_norm 从 1.16
+# 变成 8.3(clip 写死 1.0 ⟹ 每步都被削),800 步的进度只等于基线 300-500 步。横幅上完全看不出来,
+# 只有把两份配方并排才看得见。差异不报错 —— 大多数时候是故意改的,但必须【可见】。
+if [ -n "${BASE_PROV:-}" ]; then
+  if [ ! -f "$BASE_PROV" ]; then
+    echo "!! BASE_PROV=$BASE_PROV 不存在"; exit 2
+  fi
+  echo ">>> 与基线配方对拍:$BASE_PROV"
+  _ndiff=0
+  while IFS='=' read -r _k _bv; do
+    case "$_k" in ''|'#'*|*' '*) continue ;; esac
+    eval "_cv=\${$_k-__UNSET__}"
+    if [ "$_cv" = "__UNSET__" ]; then continue; fi          # 基线记了、本脚本没这个变量
+    if [ "$_cv" != "$_bv" ]; then
+      printf '    %-24s 基线=%-24s 本次=%s\n' "$_k" "$_bv" "$_cv"
+      _ndiff=$((_ndiff+1))
+    fi
+  done < <(sed -n '/^# env recipe/,$p' "$BASE_PROV")
+  if [ "$_ndiff" = "0" ]; then
+    echo "    ✅ 逐项一致(基线里记录的每一项)"
+  else
+    echo "    ⚠️ 共 $_ndiff 项不同 —— 确认每一项都是【你有意改的】再继续。"
+  fi
+fi
+
 PROV="$RUN/${TAG}_${TS}.provenance.txt"
 {
   echo "run_ts=$TS   tag=$TAG   mode=$MODE   nproc=$NPROC"
