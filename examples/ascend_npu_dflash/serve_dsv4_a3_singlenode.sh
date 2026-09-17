@@ -86,6 +86,14 @@ HS_SIDECAR_WORKERS="${HS_SIDECAR_WORKERS:-8}"  # prefork N processes → concurr
 source "$CANN_ENV"
 source "$(conda info --base)/etc/profile.d/conda.sh" 2>/dev/null || true
 conda activate "$CONDA_ENV"
+# ⚠ conda-forge/miniforge 环境要让自己的 libstdc++ 赢过系统那个。conda-forge 的 libsqlite 带
+# ICU 扩展,`import sqlite3` 会拉 libicui18n.so.78,它要 CXXABI_1.3.15 —— 比 /usr/lib64 的
+# libstdc++.so.6 新。环境里本来就装了 libstdcxx-16.1.0,只是输在查找顺序上。症状是 torch_npu
+# 加载失败,报错在一屏 traceback 的最底下,容易被当成 torch_npu 装坏了:
+#   ImportError: /usr/lib64/libstdc++.so.6: version `CXXABI_1.3.15\' not found
+#   RuntimeError: Failed to load the backend extension: torch_npu
+# ⚠ 必须在 conda activate 之后 —— CONDA_PREFIX 那时才指向本 env。
+[ -n "${CONDA_PREFIX:-}" ] && export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 # --- single-node env (NO cross-node socket / HCCL_IF_IP / port-range stuff — this is ONE box;
 #     no HCCL_INTRA_PCIE_ENABLE either — A3's 16 cards talk over HCCS, let HCCL pick it) ---
