@@ -16,7 +16,10 @@
 #    MoE 权重占双份,很可能直接 OOM。
 #
 # 顺带:非 mega 分支的条件从 `enable_fused_mc2 == 1 and dynamic_eplb` 放宽成 `dynamic_eplb`。
-# 作者未知(不是我们加的,是那个 install 建起来时就有的)。
+# ★ 2026-09-17 更正:这【是我们自己的修复】,我最初写成「作者未知」是错的。
+# 已提交进 fork,本文件只作为「它曾经长期以未提交状态存在」的事故留档:
+#   Sawyer117/vllm-ascend  fix/mega-moe-free-stacked-weights  (427d9550c,单独一条,基于 4ce367a7d)
+#   Sawyer117/vllm-ascend  feat/dsv4-verdict-dumper           (6efda675d,dumper 之上)
 diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
 index 55d0ce7bd..3118ac9d8 100644
 --- a/vllm_ascend/ops/fused_moe/routed_experts.py
