@@ -44,6 +44,8 @@
 #          bash examples/ascend_npu_dflash/install_npu_env_dsv4_w8a8.sh
 # OVERRIDES (env):
 #   ROOT / VLLM_DIR / VA_DIR   as in the sibling script
+#   VLLM_TAG    vLLM tag to build against (default v0.27.1). ⚠️ MUST match what the chosen
+#               VA_COMMIT pins -- see the pairing table next to VLLM_TAG below.
 #   VA_COMMIT   vllm-ascend commit to pin (default: the #14696 merge commit = the floor)
 #   VA_REPO     default upstream; point at the fork only if you need fork patches
 #   NUMPY_VER   default 2.3.5
@@ -55,7 +57,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"                 # the speculators checkout
 ROOT="${ROOT:-$(cd "$REPO_ROOT/.." && pwd)}"                 # code root (installation/ + speculators/)
-VLLM_DIR="${VLLM_DIR:-$ROOT/installation/vllm-v0.27.1}"
+# ⚠️ vLLM tag and vllm-ascend commit are a PAIR -- vllm-ascend pins which vLLM it builds
+# against in .github/vllm-release-tag.commit, and mixing them fails at import or compile:
+#     VA_COMMIT 4ce367a7d (2026-08-21, the #14696 floor)  <-> VLLM_TAG v0.27.1
+#     VA_COMMIT upstream main (>= 2026-09-08, #14898)     <-> VLLM_TAG v0.28.0
+# When bumping VA_COMMIT, read that file at the target commit rather than assuming.
+VLLM_TAG="${VLLM_TAG:-v0.27.1}"
+VLLM_DIR="${VLLM_DIR:-$ROOT/installation/vllm-$VLLM_TAG}"
 VA_DIR="${VA_DIR:-$ROOT/installation/vllm-ascend-main}"
 VA_REPO="${VA_REPO:-https://github.com/vllm-project/vllm-ascend.git}"
 # FLOOR = the #14696 merge commit. Anything older crashes DSpark on MRV2.
@@ -67,7 +75,7 @@ HW_ASCEND="https://mirrors.huaweicloud.com/ascend/repos/pypi"
 IDX=(--extra-index-url "$HW_PYPI" --extra-index-url "$HW_ASCEND")
 
 echo "==================================================================="
-echo " DSV4-Flash W8A8 serve stack  (vLLM v0.27.1 + vllm-ascend ${VA_COMMIT:0:12}, numpy=$NUMPY_VER)"
+echo " DSV4-Flash W8A8 serve stack  (vLLM $VLLM_TAG + vllm-ascend ${VA_COMMIT:0:12}, numpy=$NUMPY_VER)"
 echo "==================================================================="
 
 echo "== 0. sanity: py311 + source CANN =="
@@ -148,8 +156,8 @@ fi
 for t in gcc g++ make patch; do command -v "$t" >/dev/null || { echo "!! missing host tool: $t"; exit 1; }; done
 echo "toolchain OK: gcc=$(command -v gcc) | patch=$(command -v patch) | lld=$(command -v lld 2>/dev/null || echo 'from CANN')"
 
-echo "== 3. vLLM v0.27.1 (empty build, editable) =="
-[ -d "$VLLM_DIR/.git" ] || git clone --depth 1 --branch v0.27.1 https://github.com/vllm-project/vllm "$VLLM_DIR"
+echo "== 3. vLLM $VLLM_TAG (empty build, editable) =="
+[ -d "$VLLM_DIR/.git" ] || git clone --depth 1 --branch "$VLLM_TAG" https://github.com/vllm-project/vllm "$VLLM_DIR"
 ( cd "$VLLM_DIR" && TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_TARGET_DEVICE=empty \
     python -m pip install -e . --no-build-isolation -v )
 
