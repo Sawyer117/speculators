@@ -16,10 +16,26 @@
 #    MoE 权重占双份,很可能直接 OOM。
 #
 # 顺带:非 mega 分支的条件从 `enable_fused_mc2 == 1 and dynamic_eplb` 放宽成 `dynamic_eplb`。
-# ★ 2026-09-17 更正:这【是我们自己的修复】,我最初写成「作者未知」是错的。
-# 已提交进 fork,本文件只作为「它曾经长期以未提交状态存在」的事故留档:
-#   Sawyer117/vllm-ascend  fix/mega-moe-free-stacked-weights  (427d9550c,单独一条,基于 4ce367a7d)
-#   Sawyer117/vllm-ascend  feat/dsv4-verdict-dumper           (6efda675d,dumper 之上)
+# ★ 出处(2026-09-17 用 GitHub API 查定,不是靠回忆):
+#
+#     上游 PR  vllm-project/vllm-ascend#15216
+#     标题     [BugFix] Release unused unquantized weights for fused MC2
+#     作者     jianzs
+#     状态     已合入 main,merged_at = 2026-08-29T01:52:10Z
+#     另有     #15219 = 同一修复的 releases/v0.26.0rc backport(同作者,08-31 合入)
+#     逐行比对 与本补丁完全一致(+7/-10)
+#
+#   而我们的 pin 4ce367a7d 是 2026-08-21 —— 比它早 8 天。
+#   ⟹ 这是【把一个已合入上游的修复 backport 到更老的 pin 上】。
+#      既不是我们写的,也不是「未合入的 PR」。
+#
+# ⚠️ 因此【不要拿去上游】—— 它已经在上游 main 里了。
+#
+# ⚠️ 顺带量出来的:pin(2026-08-21)落后上游 main(2026-09-17)**600 个提交**。
+#    本补丁是我们目前已知唯一在往回 backport 的一条;有没有别的,没查过。
+#
+# 我在这份存档里对作者写错过两次(先写「作者未知」,再写「是我们自己的」),
+# 两次都是凭印象。两次 gh api 调用就定案了 —— 下次先查。
 diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
 index 55d0ce7bd..3118ac9d8 100644
 --- a/vllm_ascend/ops/fused_moe/routed_experts.py
