@@ -1,0 +1,49 @@
+# 评测栈上一个【未提交】的本地改动,2026-09-17 从机器工作区捞出来存档。
+#
+# 位置: A3 /data0/a00652497/dsv4_serve/installation/vllm-ascend-main (editable)
+#       vllm-ascend @ 4ce367a7d (0.19.1rc2.dev1627+g4ce367a7d) + vLLM 0.27.1
+#       conda env dspark-dsv4-serving
+#
+# ⚠️ 我们【所有】主线栈评测数都是带着它跑出来的(ep1-ep5 的 4.231/4.559/4.901/5.211/5.359、
+#    released 的 4.523 等),但它不在任何 commit 里。谁重新 clone 到 4ce367a7d 都拿不到。
+#
+# 它做什么:_MEGA_MOE_SUPPORTED 分支原本建好 w13/w2_weight_list(每专家一份 clone)之后
+# 【没有】删掉原来的堆叠张量,等于同一份 MoE 权重在显存里存两遍。补丁把两个分支合并,
+# 建完 list 就 del 原张量并 empty_cache()。
+#
+# ⚠️ 这是显存改动,不是数值改动 —— list 里是同一份数据的 clone,数学完全一致,
+#    不影响 accept_len 或任何评测数。但它是【跑得起来】的前提:缺了它 mega-MoE 下
+#    MoE 权重占双份,很可能直接 OOM。
+#
+# 顺带:非 mega 分支的条件从 `enable_fused_mc2 == 1 and dynamic_eplb` 放宽成 `dynamic_eplb`。
+# 作者未知(不是我们加的,是那个 install 建起来时就有的)。
+diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
+index 55d0ce7bd..3118ac9d8 100644
+--- a/vllm_ascend/ops/fused_moe/routed_experts.py
++++ b/vllm_ascend/ops/fused_moe/routed_experts.py
+@@ -90,18 +90,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         # in their native format without explicit casting here.
+         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
+         if enable_fused_mc2:
+-            if _MEGA_MOE_SUPPORTED:
+-                layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
+-                layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
+-            else:
++            if not _MEGA_MOE_SUPPORTED:
+                 layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+                 layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+-                if enable_fused_mc2 == 1 and self.dynamic_eplb:
+-                    layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
+-                    layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
+-                    del layer.w13_weight
+-                    del layer.w2_weight
+-                    torch.npu.empty_cache()
++            if _MEGA_MOE_SUPPORTED or self.dynamic_eplb:
++                layer.w13_weight_list = [weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)]
++                layer.w2_weight_list = [weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)]
++                del layer.w13_weight
++                del layer.w2_weight
++                torch.npu.empty_cache()
+         else:
+             layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
+             layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
