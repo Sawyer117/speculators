@@ -74,6 +74,19 @@ HW_PYPI="https://mirrors.huaweicloud.com/repository/pypi/simple"
 HW_ASCEND="https://mirrors.huaweicloud.com/ascend/repos/pypi"
 IDX=(--extra-index-url "$HW_PYPI" --extra-index-url "$HW_ASCEND")
 
+# ⚠ 这些盒子走认证代理,pypi.org 会中途开始 407:
+#     OSError('Tunnel connection failed: 407 Proxy Authentication Required')
+#     ERROR: No matching distribution found for decorator
+# 前几个 pip 能过、第四个突然不行,不是「偶发」—— 是代理凭证过期/被限流。
+# ⚠ --extra-index-url 救不了这个:主索引连不上时 pip 重试 5 次后直接报错,
+# 不会退到备用索引。只有换掉主索引才行。PIP_MIRROR=1 让整个脚本(包括第 3 步
+# vLLM editable 拉的 ~60 个依赖)都走华为云镜像。
+if [ "${PIP_MIRROR:-0}" = "1" ]; then
+  export PIP_INDEX_URL="$HW_PYPI"
+  export PIP_EXTRA_INDEX_URL="$HW_ASCEND https://pypi.org/simple"
+  echo "pip 主索引 -> $HW_PYPI  (PIP_MIRROR=1)"
+fi
+
 echo "==================================================================="
 echo " DSV4-Flash W8A8 serve stack  (vLLM $VLLM_TAG + vllm-ascend ${VA_COMMIT:0:12}, numpy=$NUMPY_VER)"
 echo "==================================================================="
@@ -135,11 +148,11 @@ case "$CANN_VER" in *9.1.0*) : ;; *) echo "⚠ NOT 9.1.0 — if the op build in 
 echo "== 1. build deps + torch/torch-npu 2.10.0 + numpy $NUMPY_VER + CANN backfill =="
 # Self-heal a pip-less env (conda-forge python ships without it) instead of dying here.
 python -m pip --version >/dev/null 2>&1 || { echo "no pip in this env — bootstrapping via ensurepip"; python -m ensurepip --upgrade; }
-python -m pip install -U pip setuptools "setuptools-scm>=8" wheel packaging "cmake>=3.26" ninja jinja2 setuptools-rust pybind11
+python -m pip install "${IDX[@]}" -U pip setuptools "setuptools-scm>=8" wheel packaging "cmake>=3.26" ninja jinja2 setuptools-rust pybind11
 python -m pip install "${IDX[@]}" torch==2.10.0 torch-npu==2.10.0.post4 pyyaml
-python -m pip install "numpy==$NUMPY_VER"
+python -m pip install "${IDX[@]}" "numpy==$NUMPY_VER"
 # CANN op compiler (TBE/TVM) imports these DURING the build (step 4) — install BEFORE it.
-python -m pip install decorator "scipy>=1.7.3" ml-dtypes attrs psutil pyyaml matplotlib openpyxl tornado
+python -m pip install "${IDX[@]}" decorator "scipy>=1.7.3" ml-dtypes attrs psutil pyyaml matplotlib openpyxl tornado
 python -c "import torch, torch_npu, torchgen.model, numpy as n; print('torch', torch.__version__, '| numpy', n.__version__, '| npu', torch_npu.npu.is_available())"
 
 echo "== 2. host toolchain: system gcc + CANN (NO conda compilers) =="
