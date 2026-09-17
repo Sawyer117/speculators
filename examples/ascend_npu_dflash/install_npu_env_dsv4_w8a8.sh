@@ -152,7 +152,13 @@ python -m pip install "${IDX[@]}" -U pip setuptools "setuptools-scm>=8" wheel pa
 python -m pip install "${IDX[@]}" torch==2.10.0 torch-npu==2.10.0.post4 pyyaml
 python -m pip install "${IDX[@]}" "numpy==$NUMPY_VER"
 # CANN op compiler (TBE/TVM) imports these DURING the build (step 4) — install BEFORE it.
-python -m pip install "${IDX[@]}" decorator "scipy>=1.7.3" ml-dtypes attrs psutil pyyaml matplotlib openpyxl tornado
+# 这张单子是按「宿主在不在编译链上」挑的,不是把 pip 的 dependency-conflict 告警照单全收:
+#   te / auto-tune / opc-tool / asc-op-compile-base -> decorator attrs psutil scipy
+#   schedule-search                                 -> absl-py decorator
+# 其余告警的宿主都不在编译链上,别补:ms-service-profiler(性能分析:loguru/opentelemetry/
+# pandas/pydantic/tzdata)、cannsim(模拟器:plotly)。⚠ affinity-sched 要的 `argparse` 更是
+# 绝对不能装 —— py3 里它是标准库,PyPI 上那个是 py2 遗留包,装了会遮蔽标准库。
+python -m pip install "${IDX[@]}" decorator absl-py "scipy>=1.7.3" ml-dtypes attrs psutil pyyaml matplotlib openpyxl tornado
 python -c "import torch, torch_npu, torchgen.model, numpy as n; print('torch', torch.__version__, '| numpy', n.__version__, '| npu', torch_npu.npu.is_available())"
 
 echo "== 2. host toolchain: system gcc + CANN (NO conda compilers) =="
