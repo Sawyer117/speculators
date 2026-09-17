@@ -292,7 +292,7 @@ echo ">>> 环境自述已写入 $CONDA_PREFIX/STACK.txt"
 cat "$CONDA_PREFIX/STACK.txt"
 
 echo "==================================================================="
-echo " DONE. Expect: numpy $NUMPY_VER | torch 2.10.0 | vllm 0.27.1 | vllm-ascend ${VA_COMMIT:0:12}"
+echo " DONE. Expect: numpy $NUMPY_VER | torch 2.10.0 | vllm ${VLLM_TAG#v} | vllm-ascend ${VA_COMMIT:0:12}"
 echo " NEXT: bash examples/ascend_npu_dflash/serve_dsv4_a2_singlenode_w8a8.sh"
 echo " NOTE: serve also needs the CANN nnal/atb set_env sourced in a CLEAN shell."
 echo "==================================================================="
