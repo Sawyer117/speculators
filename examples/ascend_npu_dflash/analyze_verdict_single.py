@@ -47,6 +47,43 @@ BANDS = ((0.9, 1.01, "目标很确定 p>0.9"),
          (-0.01, 0.5, "目标也不确定 p<0.5"))
 
 
+# 断点 token 的字符类别。★ 频次表只看得到最常断的那几个词,而长尾里同一类的几百个 token
+# 各自频次都很低,逐个看永远发现不了模式;归到类别上一眼就出来。
+FORMAT_KINDS = ("标点/符号", "换行", "空格")   # 排版类:定界符、空行节奏、分词边界
+
+
+def make_kind(dec_raw):
+    cache: dict[int, str] = {}
+
+    def kind(tid: int) -> str:
+        tid = int(tid)
+        if tid in cache:
+            return cache[tid]
+        t = dec_raw(tid)
+        core = t.strip()
+        if t == "":
+            k = "空/特殊"
+        elif core == "":
+            k = "换行" if "\n" in t else "空格"
+        elif core.startswith("<") and core.endswith(">") or "｜" in core:
+            k = "特殊标记"
+        elif core.isdigit() or (core.lstrip("-").replace(".", "", 1).replace(",", "").isdigit()
+                                and any(c.isdigit() for c in core)):
+            k = "数字"
+        elif all(not c.isalnum() for c in core):
+            k = "标点/符号"
+        elif any("\u4e00" <= c <= "\u9fff" for c in core):
+            k = "中文"
+        elif core.isalpha():
+            k = "英文词/词片"
+        else:
+            k = "混合"
+        cache[tid] = k
+        return k
+
+    return kind
+
+
 def load(dirpath: str, tag: str) -> np.ndarray:
     files = sorted(glob.glob(os.path.join(dirpath, f"verdict_{tag}_*.bin")))
     if not files:
@@ -198,29 +235,7 @@ def main() -> int:
         print("⑤ 断点 token 属于哪一类(草稿给的 / 目标要的)")
         print("=" * 78)
 
-        def kind(tid: int) -> str:
-            t = dec_raw(tid)
-            if t == "":
-                return "空/特殊"
-            core = t.strip()
-            if core == "":
-                return "换行" if "\n" in t else "空格"
-            if core.isdigit() or (core.lstrip("-").replace(".", "", 1).isdigit() and any(c.isdigit() for c in core)):
-                return "数字"
-            if all(not c.isalnum() for c in core):
-                return "标点/符号"
-            if any("\u4e00" <= c <= "\u9fff" for c in core):
-                return "中文"
-            if core.isalpha():
-                return "英文词/词片"
-            return "混合"
-
-        cache: dict[int, str] = {}
-
-        def kcached(tid):
-            if tid not in cache:
-                cache[tid] = kind(tid)
-            return cache[tid]
+        kcached = make_kind(dec_raw)
 
         kd = [kcached(int(x)) for x in dt]
         kt = [kcached(int(x)) for x in tt]
@@ -228,10 +243,10 @@ def main() -> int:
         print(f"{'类别':>12} {'草稿给的':>12} {'目标要的':>12}   说明")
         note = {"数字": "算术/数值 —— 草稿没法凭语言模式猜出来的那类",
                 "英文词/词片": "实词,语义预测失手",
-                "标点/符号": "格式/断句",
-                "换行": "结构边界(步骤之间)",
-                "空格": "分词边界",
-                "中文": "中文实词", "混合": "", "空/特殊": "EOS 等"}
+                "标点/符号": "★排版:LaTeX 定界符 / 粗体标记 / 子句标点",
+                "换行": "★排版:空行节奏、步骤边界",
+                "空格": "★排版:分词边界",
+                "中文": "中文实词", "混合": "", "空/特殊": "", "特殊标记": "EOS/BOS 等控制 token"}
         for c in cats:
             a_ = sum(1 for x in kd if x == c)
             b_ = sum(1 for x in kt if x == c)
@@ -277,6 +292,96 @@ def main() -> int:
                 print(f"    上文 …{ctx!r}")
                 print(f"    草稿 -> {dec_raw(int(a['draft_tok'][row]))!r}"
                       f"      目标 -> {dec_raw(int(a['target_tok'][row]))!r}")
+
+    # ---------------------------------------------------------------- ⑦ 类别 × 置信档
+    # ⑤ 说「断在哪类词上」,② 说「目标当时多确定」。分开看各自都不足以决策:排版类断点如果
+    # 都落在目标也不确定的档里,那是风格自由度、追不得;如果集中在 p>0.9,那是目标有确定
+    # 写法而草稿没学会 —— 训练买得到。这张表把两者叉起来。
+    if args.tokenizer and dec_raw is not None:
+        kcat = make_kind(dec_raw)
+        print("\n" + "=" * 78)
+        print("⑦ 断点:目标要的那个 token 的类别 × 目标置信档")
+        print("=" * 78)
+        ktt = np.array([kcat(x) for x in tt])
+        names = [n for _, _, n in BANDS]
+        print(f"{'目标要的类别':>14} " + "".join(f"{n:>21}" for n in names) + f"{'合计':>10}")
+        for c in sorted(set(ktt.tolist())):
+            row_cnt, line = 0, f"{c:>14} "
+            for (lo_b, hi_b, _n) in BANDS:
+                v = int(((ktt == c) & (p1 > lo_b) & (p1 <= hi_b)).sum())
+                row_cnt += v
+                line += f"{v:>12,}({v / max(len(br), 1) * 100:>4.1f}%)"
+            print(line + f"{row_cnt:>10,}")
+        fmt_mask = np.isin(ktt, FORMAT_KINDS)
+        print("-" * 78)
+        line = f"{'★排版类占本档':>14} "
+        for (lo_b, hi_b, _n) in BANDS:
+            band = (p1 > lo_b) & (p1 <= hi_b)
+            v = int((fmt_mask & band).sum())
+            line += f"{v:>12,}({v / max(int(band.sum()), 1) * 100:>4.1f}%)"
+        print(line + f"{int(fmt_mask.sum()):>10,}")
+        print("   ★ 括号里是【该档之内】排版类的占比 —— 这一个数直接回答「训练重心要不要放到排版上」。")
+
+    # ---------------------------------------------------------------- ⑧ 断点率 vs 位置
+    # 猜想:排版约定(整篇用 display 还是 inline 数学、步骤间空几行)是长程的,由几百 token
+    # 之前确立,而草稿的 sliding_window=128 —— 约定在窗口外,目标看得到草稿看不到。
+    # 若成立,排版类断点的占比应当【随输出位置增加而上升】。
+    # ⚠ 反证需要排除:DSpark 草稿吃目标第 40-42 层的 hidden state,长程信息本该从那里进来。
+    # 所以这张表只能支持或证伪,不能单独定案。
+    print("\n" + "=" * 78)
+    print("⑧ 断点率随输出位置怎么变(测「排版约定跑出窗口」这个猜想)")
+    print("=" * 78)
+    step_oi = a["out_idx"][los]
+    broke = brk_row >= 0
+    edges = [0, 32, 64, 128, 192, 256, 384, 512, 768, 1 << 30]
+    fmt_at_break = None
+    if args.tokenizer and dec_raw is not None:
+        kc8 = make_kind(dec_raw)
+        fmt_at_break = np.zeros(len(los), dtype=bool)
+        fmt_at_break[broke] = np.isin([kc8(x) for x in a["target_tok"][br]], FORMAT_KINDS)
+    hdr = f"{'输出位置':>14} {'步数':>10} {'断点率':>9} {'平均前缀':>9}"
+    if fmt_at_break is not None:
+        hdr += f" {'断点中排版类占比':>18}"
+    print(hdr)
+    for i in range(len(edges) - 1):
+        m = (step_oi >= edges[i]) & (step_oi < edges[i + 1])
+        if not m.sum():
+            continue
+        hi_lab = edges[i + 1] if edges[i + 1] < (1 << 30) else "inf"
+        line = (f"{f'{edges[i]}-{hi_lab}':>14} {int(m.sum()):>10,} "
+                f"{broke[m].mean() * 100:>8.2f}% {nacc[m].mean():>9.3f}")
+        if fmt_at_break is not None:
+            nb = int((m & broke).sum())
+            line += f" {(fmt_at_break[m & broke].mean() * 100 if nb else 0):>17.2f}%"
+        print(line)
+    print("   ★ 最后一列【单调上升】= 支持窗口猜想;基本持平 = 排版问题与位置无关,窗口不是主因。")
+
+    # ---------------------------------------------------------------- ⑨ 控制 token 异常
+    # 目标在流【中间】要 BOS 不正常。可能是请求边界泄漏(那说明 dump 还有一处没对齐,前面的
+    # 结论都要打折),也可能只是收尾处的正常现象。看它们离请求末尾多远就能分辨。
+    if args.tokenizer and dec_raw is not None:
+        print("\n" + "=" * 78)
+        print("⑨ 断点上的控制 token(EOS/BOS 之类)—— 真失效还是边界泄漏")
+        print("=" * 78)
+        kc9 = make_kind(dec_raw)
+        spec = np.array([kc9(x) == "特殊标记" for x in tt])
+        n_spec = int(spec.sum())
+        if not n_spec:
+            print("   没有。干净。")
+        else:
+            last_oi: dict[int, int] = {}
+            for r_, oi_ in zip(a["req"], a["out_idx"]):
+                r_ = int(r_)
+                if oi_ > last_oi.get(r_, -1):
+                    last_oi[r_] = int(oi_)
+            d2end = np.array([last_oi[int(a["req"][row])] - int(a["out_idx"][row])
+                              for row in br[spec]])
+            print(f"   {n_spec:,} 个断点的【目标】是控制 token,占断点 {n_spec / len(br) * 100:.2f}%")
+            print(f"   距本请求输出末尾的距离:中位数 {np.median(d2end):.0f}"
+                  f"   ≤5 的占 {(d2end <= 5).mean() * 100:.1f}%"
+                  f"   ≤20 的占 {(d2end <= 20).mean() * 100:.1f}%")
+            print("   ⟹ 绝大多数贴着末尾 = 收尾处的正常现象(草稿没押准何时停),可忽略;")
+            print("      散布在流中间 = 【请求边界泄漏】,dump 还有一处没对齐,前面的结论要打折。")
     return 0
 
 
