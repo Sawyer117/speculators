@@ -192,6 +192,37 @@ echo "== 4. vllm-ascend @ ${VA_COMMIT:0:12} — FROM SOURCE (compiles the V4/SAS
 # is really an interpreter problem. Every other pip call here already goes through python.
 ( cd "$VA_DIR" && rm -rf csrc/build && python -m pip install -e . --no-deps --no-build-isolation -v )
 
+# ★ 4b. 老 pin 必打的 OOM 补丁(上游 #15216,jianzs,已合入 main 于 2026-08-29)
+# ⚠ 我们的 pin 4ce367a7d 是 08-21,比这个修复早 8 天 —— **pin 一个 commit 等于同时拒绝了
+# 它之后的所有修复**。缺了它,`_MEGA_MOE_SUPPORTED` 分支建好 per-expert 的 clone 列表后
+# 不删原来的堆叠张量,同一份 MoE 权重在显存里存两遍,DSV4-Flash bf16 直接:
+#   routed_experts.py:95  layer.w2_weight_list = [weight.clone() for ...]
+#   torch.OutOfMemoryError: NPU out of memory (60.44 GiB already allocated, 36 MiB free)
+# ⚠ 这是显存改动不是数值改动(list 里是同一份数据的 clone),不影响 accept_len。
+# ⚠ 为什么要写进脚本:这个修复此前只活在「文档的雷 3 + 归档的 patch 文件 + dumper 分支」
+# 三个地方,而装机脚本自己不打 —— 照 SSOT 装完的人必 OOM,再去翻文档。实测踩过。
+# ⚠ 哨兵必须是 `_MEGA_MOE_SUPPORTED or self.dynamic_eplb`(补丁把两个分支合并后才有的条件)。
+# 别用 `del layer.w13_weight` —— 它在**打补丁前就存在**(旧的 `enable_fused_mc2 == 1 and
+# dynamic_eplb` 分支,4ce367a7d 的第 102 行),拿它当哨兵会在未打补丁的树上静默跳过。
+_PATCH="$REPO_ROOT/docs/deployment/patches/vllm-ascend-4ce367a7d-routed-experts-mega-moe-free.patch"
+_RE="$VA_DIR/vllm_ascend/ops/fused_moe/routed_experts.py"
+if grep -q "_MEGA_MOE_SUPPORTED or self.dynamic_eplb" "$_RE" 2>/dev/null; then
+  echo ">>> routed_experts OOM 补丁:已在(可能来自 dumper 分支或更新的 VA_COMMIT),跳过"
+elif [ -f "$_PATCH" ] && ( cd "$VA_DIR" && git apply --check "$_PATCH" 2>/dev/null ); then
+  ( cd "$VA_DIR" && git apply -v "$_PATCH" )
+  grep -q "_MEGA_MOE_SUPPORTED or self.dynamic_eplb" "$_RE" \
+    && echo ">>> routed_experts OOM 补丁:已打上(上游 #15216 backport)" \
+    || { echo "!! 补丁打了但校验没过 —— 停下来看 $_RE"; exit 1; }
+else
+  # 打不上通常意味着 VA_COMMIT 换了、这段代码已经变了。不静默继续:缺它会在
+  # 加载模型时才 OOM,那时已经等了半小时,而且报错指向显存不指向这里。
+  echo "!! routed_experts OOM 补丁打不上,且文件里没有 '_MEGA_MOE_SUPPORTED or self.dynamic_eplb'。"
+  echo "   VA_COMMIT=$VA_COMMIT 可能已自带该修复(>= 上游 2026-08-29),也可能这段代码变了。"
+  echo "   人工确认 $_RE 的 _MEGA_MOE_SUPPORTED 分支有没有 del 掉堆叠张量,再继续。"
+  echo "   跳过检查:SKIP_MEGAMOE_PATCH=1"
+  [ "${SKIP_MEGAMOE_PATCH:-0}" = "1" ] || exit 1
+fi
+
 echo "== 5. vllm-ascend runtime extras (--no-deps protects torch) =="
 python -m pip install numba einops pandas msgpack
 python -m pip install --no-deps torchvision==0.25.0 torchaudio==2.10.0 --extra-index-url "$HW_PYPI"
