@@ -101,7 +101,30 @@ def load(dirpath: str, tag: str) -> np.ndarray:
         off += n_ids
     a = np.concatenate(out)
     print(f">>> {tag}: {len(files)} 个流, {len(a):,} 行, {len(np.unique(a['req'])):,} 个请求")
-    return a
+
+    # top-k 侧流(可选)。⚠ 必须【按主流的文件顺序逐个配对】再拼接,不能各自 glob 再 concat:
+    # 两个前缀的排序未必给出同样的 pid 次序,错配就是一份行数对得上、内容全错的数据。
+    tk_parts, K = [], None
+    for f in files:
+        cand = glob.glob(os.path.join(os.path.dirname(f),
+                                      "topk*_" + os.path.basename(f)[len("verdict_"):]))
+        if len(cand) != 1:
+            return a, None
+        k = int(os.path.basename(cand[0]).split("_")[0][len("topk"):])
+        K = k if K is None else K
+        if k != K:
+            print(f"⚠️ top-k 的 K 不一致({K} vs {k}),跳过 top-k 分析")
+            return a, None
+        t = np.fromfile(cand[0], dtype=np.int32)
+        n_main = len(np.fromfile(f, dtype=_REC))
+        if t.size % k or t.size // k != n_main:
+            print(f"⚠️ {os.path.basename(cand[0])} 行数 {t.size // k:,} 与主流 {n_main:,} 不符,跳过 top-k")
+            return a, None
+        tk_parts.append(t.reshape(-1, k))
+    tk = np.concatenate(tk_parts) if tk_parts else None
+    if tk is not None:
+        print(f">>> top-k 侧流: K={K}, {len(tk):,} 行(与主流一一对应)")
+    return a, tk
 
 
 def steps(a: np.ndarray):
@@ -124,8 +147,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    a = load(args.dir, args.tag)
+    a, topk_arr = load(args.dir, args.tag)
     K = int(a["slot"].max()) + 1
+    order = np.lexsort((a["slot"], a["step"], a["req"]))
+    if topk_arr is not None:
+        topk_arr = topk_arr[order]          # ★ steps() 会重排 a,top-k 必须同序重排,否则逐行对应就断了
     a, los, his = steps(a)
 
     # --- 每个请求剔掉最后一个 block(块越界,见模块注释)---
@@ -382,6 +408,82 @@ def main() -> int:
                   f"   ≤20 的占 {(d2end <= 20).mean() * 100:.1f}%")
             print("   ⟹ 绝大多数贴着末尾 = 收尾处的正常现象(草稿没押准何时停),可忽略;")
             print("      散布在流中间 = 【请求边界泄漏】,dump 还有一处没对齐,前面的结论要打折。")
+
+    # ---------------------------------------------------------------- ⑩ oracle top-k 覆盖
+    # 「目标要的那个词,排在草稿的第几位?」——【单路径 dump 能回答的最有价值的一个问题】。
+    #
+    # ★ 它能做什么:把「草稿知道但排错序」和「草稿根本不知道」分开。前者是蒸馏/损失问题
+    #   (温度、double-norm 那条线),后者是容量/数据问题,下一步动作完全相反。
+    #
+    # ⚠ 它【不能】做什么:推不出 oracle 的 accept_len。oracle 换掉 slot s 的词之后,
+    #   slot s+1..K-1 是草稿基于自己那个【错词】草出来的,前缀变了就得重草 —— 单路径 dump
+    #   里没有那条分支。所以下面只给「每救回一个断点至少多接受 1 个 token」这个【下界】,
+    #   不给 oracle accept_len。这也正是树形草稿实测收益总低于覆盖率数字的原因。
+    #
+    # ⚠ 而且 oracle 不是免费的:从 top-k 接受意味着目标要验证 k 个候选,正确的指标是
+    #   「每个被验证 token 的接受长度」。否则 k=词表大小 就能"证明" accept_len=block_size。
+    if topk_arr is not None:
+        print("\n" + "=" * 78)
+        print("⑩ 目标要的词排在草稿 top-k 的第几位(只看断点)")
+        print("=" * 78)
+        KT = topk_arr.shape[1]
+        hit = topk_arr[br] == tt[:, None]                       # [n_break, K]
+        found = hit.any(axis=1)
+        rank = np.where(found, hit.argmax(axis=1), -1)    # 0-based;-1 = 不在 top-k 里
+
+        n0 = int((rank == 0).sum())
+        print(f"   自检:rank 0 的断点 {n0} 个 —— 必须是 0。"
+              f"{'✅' if n0 == 0 else '❌ 不为 0 说明 top-k 与主流错位,下面的数不能信'}")
+        print(f"   (断点处草稿的第 1 名【就是】它自己选的那个词,而那个词与目标不符才成为断点)\n")
+
+        print(f"{'k':>6} {'覆盖率(累计)':>16} {'救回断点数':>12} {'Δaccept_len 下界':>18}")
+        for k in (2, 4, 8, 16, 32, 64):
+            if k > KT:
+                break
+            c = int(((rank >= 1) & (rank < k)).sum())
+            print(f"{k:>6} {c/len(br)*100:>15.2f}% {c:>12,} {c/n_steps:>17.3f}")
+        out_k = int((rank < 0).sum())
+        print(f"{'>k':>6} {out_k/len(br)*100:>15.2f}% {out_k:>12,}"
+              f"{'  ← 草稿【不知道】,容量/数据问题':>18}")
+
+        print(f"\n{'排名区间':>12} {'断点数':>10} {'占断点':>9}   含义")
+        for lo_r, hi_r, lab in ((1, 2, "第 2 名"), (2, 5, "第 3-5 名"), (5, 10, "第 6-10 名"),
+                                (10, 32, "第 11-32 名"), (32, 64, "第 33-64 名")):
+            if lo_r >= KT:
+                break
+            c = int(((rank >= lo_r) & (rank < min(hi_r, KT))).sum())
+            note = "★ 知道,只是排错序 —— 蒸馏/损失能买到" if hi_r <= 5 else \
+                   ("知道得很模糊" if hi_r <= 32 else "几乎等于不知道")
+            print(f"{lab:>12} {c:>10,} {c/len(br)*100:>8.2f}%   {note}")
+        print(f"{'不在 top-k':>12} {out_k:>10,} {out_k/len(br)*100:>8.2f}%   草稿不知道")
+
+        # 按置信档拆 —— p>0.9 那一档才是高价值的,它的覆盖率决定训练方向
+        print(f"\n{'置信档':>22} {'断点数':>9} {'覆盖@8':>9} {'覆盖@64':>9} {'不在 top-k':>11}")
+        for lo_b, hi_b, name in BANDS:
+            m = (p1 > lo_b) & (p1 <= hi_b)
+            n = int(m.sum())
+            if not n:
+                continue
+            c8 = int(((rank >= 1) & (rank < min(8, KT)) & m).sum())
+            c64 = int(((rank >= 1) & m).sum())
+            miss = (rank < 0)[m].mean() * 100
+            print(f"{name:>22} {n:>9,} {c8/n*100:>8.2f}% {c64/n*100:>8.2f}% {miss:>10.2f}%")
+        print("   ★ p>0.9 这一档的覆盖@64 是关键:高 = 草稿知道答案只是排不上去(蒸馏);"
+              "低 = 真不知道(容量)。")
+
+        # 按目标 token 类别拆 —— 数字那一类尤其想知道
+        if args.tokenizer and dec_raw is not None:
+            kcat10 = make_kind(dec_raw)
+            ktt10 = np.array([kcat10(x) for x in tt])
+            print(f"\n{'目标要的类别':>14} {'断点数':>9} {'覆盖@8':>9} {'覆盖@64':>9}   ")
+            for c in sorted(set(ktt10.tolist())):
+                m = ktt10 == c
+                n = int(m.sum())
+                c8 = int(((rank >= 1) & (rank < min(8, KT)) & m).sum())
+                c64 = int(((rank >= 1) & m).sum())
+                print(f"{c:>14} {n:>9,} {c8/n*100:>8.2f}% {c64/n*100:>8.2f}%")
+            print("   ★ 数字那一行:覆盖高 = 草稿算得出、只是没押第一(可训);"
+                  "覆盖低 = 草稿做不了算术(要么加容量,要么别指望它)。")
     return 0
 
 
