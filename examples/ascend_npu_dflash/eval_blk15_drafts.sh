@@ -94,6 +94,14 @@ ENTRIES=(
   "ep1p0-blk15|dsv4_dspark_blk15_ep1p0_vllm-77w"
 )
 
+# ENTRIES_OVERRIDE = 空格分隔的 "label|dirname",整份替换上面的清单。
+# 上面那份是写死的 5 条;换一个 run(或者半 epoch 存点 ep2p5 这种)就对不上了,而对不上的
+# 表现是「MISSING draft dir — SKIPPED」,一批跑完什么都没量到。export_run_ckpts.py 导完会把
+# 可直接粘贴的这一串打出来,所以新导一批不必回来改这个文件。
+if [ -n "${ENTRIES_OVERRIDE:-}" ]; then
+  read -r -a ENTRIES <<< "$ENTRIES_OVERRIDE"
+fi
+
 say() { echo "$*" | tee -a "$MASTER"; }
 
 serve_up() { curl -sf --noproxy '*' "http://localhost:$PORT/v1/models" >/dev/null 2>&1; }
