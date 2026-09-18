@@ -51,6 +51,21 @@ BANDS = ((0.9, 1.01, "目标很确定 p>0.9"),
 # 各自频次都很低,逐个看永远发现不了模式;归到类别上一眼就出来。
 FORMAT_KINDS = ("标点/符号", "换行", "空格")   # 排版类:定界符、空行节奏、分词边界
 
+# 英文虚词/功能词。⑫ 用它把「英文词/词片」拆成承载意义的实词和不承载的虚词 —— 草稿把 the
+# 猜成 a,和把 32 算成 24,是完全不同的病,而 ⑤/⑦ 的字符形态分类看不出这个区别。
+# ⚠ 这是一份【人工清单】,边界必然粗糙(比如 "each"/"per" 在数学题里其实承载意义)。
+# 它只用于分诊、给人看,不参与任何数值结论。
+FUNC_WORDS = {
+    "the", "a", "an", "this", "that", "these", "those", "it", "its", "he", "she", "they", "we",
+    "you", "his", "her", "their", "our", "your", "i", "them", "him", "us", "me",
+    "is", "are", "was", "were", "be", "been", "being", "am", "s", "re", "ve", "ll", "d", "m", "t",
+    "has", "have", "had", "do", "does", "did", "will", "would", "can", "could", "should", "may",
+    "of", "to", "in", "on", "at", "for", "with", "by", "from", "as", "into", "over", "under",
+    "and", "or", "but", "so", "if", "then", "than", "because", "since", "while", "when", "where",
+    "which", "who", "what", "how", "not", "no", "there", "here", "now", "also", "thus", "hence",
+    "each", "per", "let", "us", "both", "all", "any", "some", "more", "most", "less", "such",
+}
+
 
 def make_kind(dec_raw):
     cache: dict[int, str] = {}
@@ -518,6 +533,85 @@ def main() -> int:
                 print(f"       目标 top1 p={float(a['target_top1_p'][int(row)]):.3f}"
                       f"   目标给草稿那词 p={float(a['target_p_draft'][int(row)]):.3f}")
         print("\n   ★ 同一组里几个例子的上文如果长得像 -> 是可命名的失效模式;各不相干 -> 只是高频词碰撞。")
+
+    # ---------------------------------------------------------------- ⑫ 语义严重度
+    # ⑤/⑦ 的类别是【字符形态】的,「英文词/词片」里混着 the/is/are 这种虚词。
+    # 这一段按【语义承载】重切:草稿猜错一个 the,和把 32 算成 24,是完全不同的病。
+    # ⚠ 但两者对吞吐的损失【完全相同】—— 断点就是断点。本段只回答"模型哪里真的不懂",
+    #   不用于决定优化优先级(那要看 ⑦ 的体量和 ⑩ 的排名)。
+    if args.tokenizer and dec_raw is not None:
+        print("\n" + "=" * 78)
+        print("⑫ 按【语义严重度】重切断点 —— 哪些是「意思都不对了」")
+        print("=" * 78)
+        kc12 = make_kind(dec_raw)
+
+        def word(tid):
+            return dec_raw(int(tid)).strip().lower().strip(".,:;!?'\"()[]{}")
+
+        def numval(tid):
+            w = dec_raw(int(tid)).strip().replace(",", "")
+            try:
+                return float(w)
+            except ValueError:
+                return None
+
+        def tier(di, ti):
+            kd_, kt_ = kc12(di), kc12(ti)
+            if kt_ == "特殊标记" or kd_ == "特殊标记":
+                return "T1 控制 token(终止/回合边界)"
+            if kt_ in FORMAT_KINDS and kd_ in FORMAT_KINDS:
+                return "T0 纯格式(两边都是标点/空白)"
+            nd, nt = numval(di), numval(ti)
+            if nd is not None and nt is not None:
+                return "T3a ★ 数值不同(算错/抄错)" if nd != nt else "T0 纯格式(两边都是标点/空白)"
+            wd, wt = word(di), word(ti)
+            d_fn, t_fn = wd in FUNC_WORDS, wt in FUNC_WORDS
+            d_ct = bool(wd) and not d_fn and kd_ in ("英文词/词片", "混合", "数字")
+            t_ct = bool(wt) and not t_fn and kt_ in ("英文词/词片", "混合", "数字")
+            if t_ct and d_ct:
+                return "T3b ★ 实词换实词(说成了别的意思)"
+            if t_ct or d_ct:
+                return "T3c ★ 实词 ↔ 虚词/格式(该说实义时没说,或反之)"
+            if d_fn and t_fn:
+                return "T2 虚词/语法(the/is/are 之类)"
+            return "T2 虚词/语法(the/is/are 之类)"
+
+        tiers = np.array([tier(d_, t_) for d_, t_ in zip(dt, tt)])
+        order12 = ["T3a ★ 数值不同(算错/抄错)", "T3b ★ 实词换实词(说成了别的意思)",
+                   "T3c ★ 实词 ↔ 虚词/格式(该说实义时没说,或反之)",
+                   "T2 虚词/语法(the/is/are 之类)", "T1 控制 token(终止/回合边界)",
+                   "T0 纯格式(两边都是标点/空白)"]
+        print(f"{'严重度':>34} {'断点数':>9} {'占断点':>8} {'其中 p>0.9':>11} {'该档高置信率':>13} {'Δ 下界':>8}")
+        sev_rows = 0
+        for name in order12:
+            m = tiers == name
+            n = int(m.sum())
+            if not n:
+                continue
+            hi = int(((p1 > 0.9) & m).sum())
+            if name.startswith(("T3",)):
+                sev_rows += hi
+            print(f"{name:>34} {n:>9,} {n/len(br)*100:>7.2f}% {hi:>11,} {hi/n*100:>12.1f}% {hi/n_steps:>+8.3f}")
+        other = int((~np.isin(tiers, order12)).sum())
+        if other:
+            print(f"{'(未归类)':>34} {other:>9,}")
+        print(f"\n   ★ T3 三档合计的高置信断点 = {sev_rows:,},Δaccept_len 下界 {sev_rows/n_steps:+.3f}")
+        print("   —— 这才是「主模型笃定、而草稿说成了别的意思」的那部分。")
+        print("   ⚠ T0/T2 对吞吐的损失与 T3 完全相同(断点就是断点),只是病因不同,别据此砍优化项。")
+
+        # 每个 T3 档给例子
+        if args.pair_samples:
+            rng12 = np.random.default_rng(args.seed)
+            for name in order12[:3]:
+                idx = np.flatnonzero((tiers == name) & (p1 > 0.9))
+                if not len(idx):
+                    continue
+                print(f"\n{'─' * 78}\n【{name}】 高置信档 {len(idx):,} 个,抽 {min(args.pair_samples, len(idx))} 个\n{'─' * 78}")
+                for j in rng12.choice(idx, size=min(args.pair_samples, len(idx)), replace=False):
+                    row = int(br[j])
+                    print(f"  上文 …{ctx_of(row)!r}")
+                    print(f"       草稿 -> {dec_raw(int(dt[j]))!r}      主模型 -> {dec_raw(int(tt[j]))!r}"
+                          f"   (主模型 top1 p={float(p1[j]):.3f})")
     return 0
 
 
