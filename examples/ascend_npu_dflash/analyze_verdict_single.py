@@ -81,6 +81,10 @@ def main() -> int:
     ap.add_argument("--tag", required=True)
     ap.add_argument("--tokenizer", help="目标模型目录;给了就把断点 token 解码成文本")
     ap.add_argument("--top", type=int, default=25, help="列出多少个最常见的断点 token")
+    ap.add_argument("--samples", type=int, default=0,
+                    help="每个置信档打印几个【带上下文的断点样例】(需要 --tokenizer)")
+    ap.add_argument("--ctx", type=int, default=30, help="样例里回看多少个 token 作为上文")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     a = load(args.dir, args.tag)
@@ -168,12 +172,15 @@ def main() -> int:
     pair = dt.astype(np.int64) * (1 << 21) + tt.astype(np.int64)
     uniq, cnt = np.unique(pair, return_counts=True)
     top = np.argsort(-cnt)[: args.top]
-    dec = None
+    dec = dec_raw = dec_raw_many = None
     if args.tokenizer:
         try:
             from transformers import AutoTokenizer  # noqa: PLC0415
             tk = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-            dec = lambda t: repr(tk.decode([int(t)]))  # noqa: E731
+            # 单 token 逐个 decode 会丢掉 SentencePiece 的前导空格语义,所以上文用整串 decode。
+            dec_raw = lambda t: tk.decode([int(t)])            # noqa: E731
+            dec_raw_many = lambda ts: tk.decode(list(ts))      # noqa: E731
+            dec = lambda t: repr(dec_raw(t))                   # noqa: E731
         except Exception as e:  # noqa: BLE001
             print(f"   (分词器加载失败,只给 id:{type(e).__name__}: {e})")
     if dec is None:
@@ -182,6 +189,94 @@ def main() -> int:
     for i in top:
         d, t = int(uniq[i] >> 21), int(uniq[i] & ((1 << 21) - 1))
         print(f"{cnt[i]:>8,} {cnt[i]/len(br)*100:>7.2f}%   {dec(d):<28} -> {dec(t)}")
+
+    # ---------------------------------------------------------------- ⑤ 字符类别
+    # token 对的频次表看得到「最常断在哪几个词」,看不到「断在哪【类】东西上」。长尾里同一类
+    # 的几百个不同 token 各自频次都很低,逐个看永远发现不了模式;归到类别上一眼就出来。
+    if args.tokenizer and dec_raw is not None:
+        print("\n" + "=" * 78)
+        print("⑤ 断点 token 属于哪一类(草稿给的 / 目标要的)")
+        print("=" * 78)
+
+        def kind(tid: int) -> str:
+            t = dec_raw(tid)
+            if t == "":
+                return "空/特殊"
+            core = t.strip()
+            if core == "":
+                return "换行" if "\n" in t else "空格"
+            if core.isdigit() or (core.lstrip("-").replace(".", "", 1).isdigit() and any(c.isdigit() for c in core)):
+                return "数字"
+            if all(not c.isalnum() for c in core):
+                return "标点/符号"
+            if any("\u4e00" <= c <= "\u9fff" for c in core):
+                return "中文"
+            if core.isalpha():
+                return "英文词/词片"
+            return "混合"
+
+        cache: dict[int, str] = {}
+
+        def kcached(tid):
+            if tid not in cache:
+                cache[tid] = kind(tid)
+            return cache[tid]
+
+        kd = [kcached(int(x)) for x in dt]
+        kt = [kcached(int(x)) for x in tt]
+        cats = sorted(set(kd) | set(kt))
+        print(f"{'类别':>12} {'草稿给的':>12} {'目标要的':>12}   说明")
+        note = {"数字": "算术/数值 —— 草稿没法凭语言模式猜出来的那类",
+                "英文词/词片": "实词,语义预测失手",
+                "标点/符号": "格式/断句",
+                "换行": "结构边界(步骤之间)",
+                "空格": "分词边界",
+                "中文": "中文实词", "混合": "", "空/特殊": "EOS 等"}
+        for c in cats:
+            a_ = sum(1 for x in kd if x == c)
+            b_ = sum(1 for x in kt if x == c)
+            print(f"{c:>12} {a_:>11,} {b_:>11,}   {note.get(c,'')}")
+        print("   ⟹ 两列差得多的类别 = 草稿【系统性地把 A 类词猜成 B 类词】,那是可命名的失效模式。")
+
+    # ---------------------------------------------------------------- ⑥ 带上下文的样例
+    if args.samples and args.tokenizer and dec_raw is not None:
+        print("\n" + "=" * 78)
+        print(f"⑥ 断点样例(每档 {args.samples} 个,上文 {args.ctx} 个 token)")
+        print("=" * 78)
+        # 重建每个请求实际发出的 token 序列。规则:该步接受的草稿 token,然后要么是断点处的
+        # target_tok,要么(全接受时)是 bonus_tok。★ 没有 bonus_tok 这一列,全接受的步会
+        # 静默少一个 token,上文就会错位 —— 这也是当初非加它不可的原因。
+        stream: dict[int, dict[int, int]] = {}
+        for lo, hi in zip(los, his):
+            r = int(a["req"][lo])
+            d = stream.setdefault(r, {})
+            acc = a["accepted"][lo:hi]
+            n = int(np.argmin(acc)) if not acc.all() else len(acc)
+            for j in range(n):
+                d[int(a["out_idx"][lo + j])] = int(a["draft_tok"][lo + j])
+            if n < len(acc):
+                d[int(a["out_idx"][lo + n])] = int(a["target_tok"][lo + n])
+            else:
+                d[int(a["out_idx"][lo + n - 1]) + 1] = int(a["bonus_tok"][lo])
+
+        rng = np.random.default_rng(args.seed)
+        for lo_b, hi_b, name in BANDS:
+            sel = br[(p1 > lo_b) & (p1 <= hi_b)]
+            if not len(sel):
+                continue
+            pick = rng.choice(sel, size=min(args.samples, len(sel)), replace=False)
+            print(f"\n{'─' * 78}\n【{name}】 共 {len(sel):,} 个断点,抽 {len(pick)} 个\n{'─' * 78}")
+            for row in pick:
+                r, oi = int(a["req"][row]), int(a["out_idx"][row])
+                d = stream.get(r, {})
+                ctx_ids = [d[k] for k in range(max(0, oi - args.ctx), oi) if k in d]
+                ctx = dec_raw_many(ctx_ids)
+                print(f"  req {r}  step {int(a['step'][row])}  slot {int(a['slot'][row])}  "
+                      f"out_idx {oi}   目标 top1 p={float(a['target_top1_p'][row]):.3f}  "
+                      f"目标给草稿那词 p={float(a['target_p_draft'][row]):.3f}")
+                print(f"    上文 …{ctx!r}")
+                print(f"    草稿 -> {dec_raw(int(a['draft_tok'][row]))!r}"
+                      f"      目标 -> {dec_raw(int(a['target_tok'][row]))!r}")
     return 0
 
 
