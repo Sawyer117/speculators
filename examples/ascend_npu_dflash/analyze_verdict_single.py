@@ -302,7 +302,9 @@ def main() -> int:
     # 断点处的 target_tok,要么(全接受时)是 bonus_tok。★ 没有 bonus_tok 这一列,全接受的
     # 步会静默少一个 token,上文就整体错位 —— 这也是当初非加它不可的原因。
     stream: dict[int, dict[int, int]] = {}
-    if (args.samples or args.pairs) and args.tokenizer and dec_raw is not None:
+    # ⚠ 只要给了分词器就建 —— ⑥⑪⑫ 都用它取上文。曾经只在 --samples/--pairs 时构建,
+    # 结果单独跑 ⑫ 时每条例子的上文都是空字符串,而且不报错。
+    if args.tokenizer and dec_raw is not None:
         for lo, hi in zip(los, his):
             r = int(a["req"][lo])
             d = stream.setdefault(r, {})
@@ -548,6 +550,14 @@ def main() -> int:
         def word(tid):
             return dec_raw(int(tid)).strip().lower().strip(".,:;!?'\"()[]{}")
 
+        def is_markup(tid):
+            """LaTeX 命令算【格式】,不算实词。
+
+            \\frac -> \\text 这种在字符形态上是「混合」,会被误判成「实词换实词」,但它是排版
+            选择不是语义分歧。⑤/⑦ 是字符形态分类,保持原样;只在语义分档里纠正。
+            """
+            return dec_raw(int(tid)).strip().startswith("\\")
+
         def numval(tid):
             w = dec_raw(int(tid)).strip().replace(",", "")
             try:
@@ -559,15 +569,17 @@ def main() -> int:
             kd_, kt_ = kc12(di), kc12(ti)
             if kt_ == "特殊标记" or kd_ == "特殊标记":
                 return "T1 控制 token(终止/回合边界)"
-            if kt_ in FORMAT_KINDS and kd_ in FORMAT_KINDS:
-                return "T0 纯格式(两边都是标点/空白)"
+            fmt_d = kd_ in FORMAT_KINDS or is_markup(di)
+            fmt_t = kt_ in FORMAT_KINDS or is_markup(ti)
+            if fmt_d and fmt_t:
+                return "T0 纯格式(两边都是标点/空白/LaTeX 命令)"
             nd, nt = numval(di), numval(ti)
             if nd is not None and nt is not None:
-                return "T3a ★ 数值不同(算错/抄错)" if nd != nt else "T0 纯格式(两边都是标点/空白)"
+                return "T3a ★ 数值不同(算错/抄错)" if nd != nt else "T0 纯格式(两边都是标点/空白/LaTeX 命令)"
             wd, wt = word(di), word(ti)
             d_fn, t_fn = wd in FUNC_WORDS, wt in FUNC_WORDS
-            d_ct = bool(wd) and not d_fn and kd_ in ("英文词/词片", "混合", "数字")
-            t_ct = bool(wt) and not t_fn and kt_ in ("英文词/词片", "混合", "数字")
+            d_ct = bool(wd) and not d_fn and not is_markup(di) and kd_ in ("英文词/词片", "混合", "数字")
+            t_ct = bool(wt) and not t_fn and not is_markup(ti) and kt_ in ("英文词/词片", "混合", "数字")
             if t_ct and d_ct:
                 return "T3b ★ 实词换实词(说成了别的意思)"
             if t_ct or d_ct:
@@ -580,7 +592,7 @@ def main() -> int:
         order12 = ["T3a ★ 数值不同(算错/抄错)", "T3b ★ 实词换实词(说成了别的意思)",
                    "T3c ★ 实词 ↔ 虚词/格式(该说实义时没说,或反之)",
                    "T2 虚词/语法(the/is/are 之类)", "T1 控制 token(终止/回合边界)",
-                   "T0 纯格式(两边都是标点/空白)"]
+                   "T0 纯格式(两边都是标点/空白/LaTeX 命令)"]
         print(f"{'严重度':>34} {'断点数':>9} {'占断点':>8} {'其中 p>0.9':>11} {'该档高置信率':>13} {'Δ 下界':>8}")
         sev_rows = 0
         for name in order12:
