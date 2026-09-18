@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare two drafts' per-slot accept/reject dumps: where does OURS lose that theirs wins?
 
-Input = the ``verdict_<tag>_*.npz`` shards written by vllm-ascend's ``DsparkVerdictDumper``
+Input = the ``verdict_<tag>_<pid>.bin`` streams written by vllm-ascend's ``DsparkVerdictDumper``
 (``DSPARK_VERDICT_DUMP=1``), one tag per draft, both from the SAME eval on the SAME stack.
 
 WHAT THIS ANSWERS THAT /metrics CANNOT. The serve's per-position accept rate says slot k
@@ -55,27 +55,37 @@ import numpy as np
 BANDS = ((0.9, 1.01, "目标很确定 >0.9"), (0.5, 0.9, "中间 0.5-0.9"), (-0.01, 0.5, "目标也不确定 <0.5"))
 
 
+# ⚠ 必须与 vllm_ascend/dspark_verdict_dumper.py 的 _REC 逐字段一致(名字、顺序、宽度)。
+# 这是定长二进制流,没有自描述头部 —— 对不上不会报错,只会读出一堆看似合理的垃圾。
+_REC = np.dtype([
+    ("step", "<i4"), ("req", "<i4"), ("out_idx", "<i4"),
+    ("draft_tok", "<i4"), ("target_tok", "<i4"), ("bonus_tok", "<i4"),
+    ("slot", "i1"), ("accepted", "?"),
+    ("target_top1_p", "<f2"), ("target_p_draft", "<f2"),
+])
+
+
 def load(dirpath: str, tag: str) -> dict[str, np.ndarray]:
-    files = sorted(glob.glob(os.path.join(dirpath, f"verdict_{tag}_*.npz")))
+    files = sorted(glob.glob(os.path.join(dirpath, f"verdict_{tag}_*.bin")))
     if not files:
-        raise SystemExit(f"!! 没找到 verdict_{tag}_*.npz in {dirpath}")
+        raise SystemExit(f"!! 没找到 verdict_{tag}_*.bin in {dirpath}\n"
+                         f"   (旧版写的是 .npz 分片 —— 那批 dump 的 out_idx 不可用,重采)")
     parts: dict[str, list] = {}
-    # Each writer process numbers its shards from 0, so `req` indices are per-PROCESS. Offset
-    # them per file group or two processes' request 0 would merge into one bogus stream.
-    off, pid_seen = 0, None
+    # `req` 是每个 writer 进程各自从 0 开始编号的行号,所以按文件累加偏移,否则两个进程的
+    # 请求 0 会合成一条不存在的流。偏移量取 reqs_*.txt 的行数 —— 用它而不是 req.max()+1,
+    # 因为最后登记的请求可能一行都还没轮到发 token。
+    off = 0
     for f in files:
-        z = np.load(f)
-        pid = os.path.basename(f).split("_")[-2]
-        if pid_seen is not None and pid != pid_seen:
-            off = int(max(parts["req"][-1])) + 1 if parts.get("req") else 0
-        pid_seen = pid
-        for k in z.files:
-            v = z[k]
-            if k == "req":
-                v = v.astype(np.int64) + off
+        a = np.fromfile(f, dtype=_REC)   # 末尾不足一条记录的残片会被自动丢弃
+        rq = f.replace("verdict_", "reqs_")[: -len(".bin")] + ".txt"
+        n_ids = sum(1 for _ in open(rq)) if os.path.exists(rq) else \
+            (int(a["req"].max()) + 1 if len(a) else 0)
+        for k in _REC.names:
+            v = a[k].astype(np.int64) + off if k == "req" else a[k]
             parts.setdefault(k, []).append(v)
+        off += n_ids
     d = {k: np.concatenate(v) for k, v in parts.items()}
-    print(f">>> {tag}: {len(files)} 个分片, {len(d['step']):,} 行, {len(np.unique(d['req'])):,} 个请求")
+    print(f">>> {tag}: {len(files)} 个流, {len(d['step']):,} 行, {len(np.unique(d['req'])):,} 个请求")
     return d
 
 
