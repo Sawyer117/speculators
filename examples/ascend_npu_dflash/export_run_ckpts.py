@@ -13,8 +13,13 @@ WHY
 它替你挡掉的四个坑
 ------------------
 1. **``--config-from`` 把 γ 抄错。** 转换器是整份拷贝 released 草稿的 config.json,而那份
-   写死 ``dspark_block_size=5``。block-16 训出来的草稿(γ=15)照抄就会带着 5 出厂。
-   本脚本改成 **released 打底 + 用 ckpt 自己的 config 覆盖**,并把每一处不同都打出来。
+   写死 ``dspark_block_size=5``;BLOCK=15 训出来的草稿照抄就带着 5 出厂。本脚本改成
+   **released 打底 + 用 ckpt 自己的 config 覆盖**,每一处不同都打出来。
+   ★ γ 到底是 ``block_size`` 还是 ``block_size−1``,**取决于 ``sample_from_anchor``**:
+   True(DSpark 默认,2026-07-17 恢复)时 BLOCK 个槽全是预测,γ = block_size;
+   False(DFlash,以及 DSpark 修好之前的绕法)时 slot 0 是给定的 anchor,γ = block_size−1。
+   写死任何一边都会让 serve 的 NUM_SPEC 差一个槽,而块注意力非因果 —— **不报错,只出错数**。
+   ckpt 里没这个字段就当场停,不猜(要么补,要么 ``--gamma`` 显式给)。
    (当前 pin ``4ce367a`` 上 ``dspark_block_size`` 只在 ``deepseek_v4/dspark.py:126``
    赋给一个没人再读的字段,实际 γ 由 ``NUM_SPEC`` 决定 —— 所以这条今天不致命,但
    出厂目录自己描述错了自己,下一个 pin 读它就是事故。``sliding_window`` 同理,而那条
@@ -39,6 +44,9 @@ USAGE
 
     # 只转某几个整数 ckpt 目录 / 换输出根 / 重转已存在的
     ... --only 4,3  |  --out-root /home/canada_group_folder/ckpt  |  --force
+
+    # 权重已经转好、只有 config.json 需要重写时(比如 γ 算错了):不重转权重
+    python examples/ascend_npu_dflash/export_run_ckpts.py --run 20260916_031128 --config-only
 
 纯 CPU(torch + safetensors),和训练/serve 抢不到资源,可以在 serve 起着的时候跑。
 """
@@ -225,8 +233,8 @@ def label_ckpts(run: Path) -> list[dict]:
     return out
 
 
-def _merge_config(released: dict, ck_flat: dict,
-                  n_layers: int | None) -> tuple[dict, list[str], list[str]]:
+def _merge_config(released: dict, ck_flat: dict, n_layers: int | None,
+                  gamma_override: int | None = None) -> tuple[dict, list[str], list[str]]:
     """released config 打底,用 ckpt 自己的值覆盖。返回 (config, 改动行, 警告行)。"""
     cfg = dict(released)
     changes: list[str] = []
@@ -238,26 +246,48 @@ def _merge_config(released: dict, ck_flat: dict,
                          f"{released.get(serve_key)!r}")
             continue
         val = ck_flat[src]
-        if xform == "gamma":
-            # ckpt 的 block_size 是【块宽】= anchor + γ 个 mask 槽;serve 的
-            # dspark_block_size 是 γ。差的那 1 就是 anchor(slot 0,训练时 loss 被 mask)。
-            val = int(val) - 1
+        if xform == "gamma" and gamma_override is not None:
+            val = gamma_override            # --gamma:人工拍板,不再看 sample_from_anchor
+        elif xform == "gamma":
+            # ★ γ = block_size 还是 block_size−1,取决于 sample_from_anchor,不能写死。
+            #   True (DSpark 默认,2026-07-17 恢复):BLOCK 个槽【全是】预测 —— slot 0 从
+            #       anchor 自己的 hidden 预测下一个 token。γ = block_size。
+            #   False (DFlash,以及 DSpark 修好之前的那个绕法):slot 0 是给定的 anchor,
+            #       loss 被 mask,只草 block_size−1 个。γ = block_size − 1。
+            # 猜错的代价是 serve 的 NUM_SPEC 差一:块注意力是非因果的,块宽和训练时不一致
+            # 【不报错,只出错数】。所以这个字段缺了就当场停,不许猜。
+            sfa = ck_flat.get("sample_from_anchor")
+            if sfa is None:
+                raise SystemExit(
+                    "!! ckpt 的 config 里没有 sample_from_anchor,推不出 γ。\n"
+                    "   γ = block_size(True,DSpark)还是 block_size−1(False,DFlash)差一个槽,\n"
+                    "   猜错了 serve 不报错只出错数 —— 这里不猜。确认后用 --gamma <N> 显式给。")
+            val = int(val) - (0 if sfa else 1)
         elif xform == "list":
             val = list(val)
         old = cfg.get(serve_key)
         cfg[serve_key] = val
         if old != val:
-            changes.append(f"{serve_key}: {old!r} → {val!r}   (取自 ckpt 的 {src}"
-                           f"{'−1=γ' if xform == 'gamma' else ''})")
-    if n_layers:
-        old = cfg.get("num_nextn_predict_layers")
-        cfg["num_nextn_predict_layers"] = n_layers
-        if old != n_layers:
-            changes.append(f"num_nextn_predict_layers: {old!r} → {n_layers}   "
-                           f"(数权重里的 layers.{{n}}.,不是查 config)")
-    else:
-        warns.append("权重里数不出 layers.{n}. —— num_nextn_predict_layers 沿用 released 的 "
-                     f"{cfg.get('num_nextn_predict_layers')!r}")
+            why = f"取自 ckpt 的 {src}"
+            if xform == "gamma" and gamma_override is not None:
+                why = "--gamma 人工指定"
+            elif xform == "gamma":
+                why = (f"取自 ckpt 的 {src}={ck_flat[src]},sample_from_anchor="
+                       f"{ck_flat.get('sample_from_anchor')!r} ⟹ γ="
+                       f"{'block_size' if ck_flat.get('sample_from_anchor') else 'block_size−1'}")
+            changes.append(f"{serve_key}: {old!r} → {val!r}   ({why})")
+    # ★ num_nextn_predict_layers 【故意不动】,原样沿用 released 的值。
+    # 它看着像"草稿几层",但 DSpark 的模型根本不读它:deepseek_v4/dspark.py:65
+    # `_get_dspark_num_mtp_layers` 读的是 n_mtp_layers / dspark_num_mtp_layers(默认 3)。
+    # 硬证据:released 草稿自己是 3 层(mtp.0/1/2 + mtp.2 上的 hc_head),而它的 config 里
+    # 这个字段写的是 1,并且在这套栈上跑到 accept_len 4.52 —— 1 是被实测背书过的值。
+    # 把一个模型不读的字段从"实测能跑的值"改成"看起来更对的值",全是风险没有收益:
+    # vLLM core 的 SpeculativeConfig 有一串按 model_type 分派、拿它推 n_predict 的分支
+    # (vllm/config/speculative.py),今天 dspark 不落在里面,但值一变就多一份赌注。
+    if n_layers and n_layers != cfg.get("num_nextn_predict_layers"):
+        warns.append(f"权重是 {n_layers} 层草稿,released config 里 num_nextn_predict_layers="
+                     f"{cfg.get('num_nextn_predict_layers')!r} —— 【保持不变,这是对的】,"
+                     f"DSpark 读的是 n_mtp_layers,不是它")
     # serve 走 EAGLE3 的 aux 通路读这个名字;为空会回落到 eagle3 默认的 4 层,
     # 和草稿 main_proj 要的 3H 对不上,第一次提议就崩。
     cfg["eagle_aux_hidden_state_layer_ids"] = list(cfg["dspark_target_layer_ids"])
@@ -278,6 +308,10 @@ def main() -> int:
     ap.add_argument("--only", help="只处理这些整数 ckpt 目录,逗号分隔(如 4,3)")
     ap.add_argument("--prefix", default="dsv4_dspark", help="输出目录名前缀")
     ap.add_argument("--suffix", default="vllm-77w", help="输出目录名后缀")
+    ap.add_argument("--gamma", type=int,
+                    help="显式指定 γ(每步草稿几个 token),覆盖从 block_size/sample_from_anchor 推的值")
+    ap.add_argument("--config-only", action="store_true",
+                    help="只重写【已存在】输出目录里的 config.json,权重一个字节不动")
     ap.add_argument("--go", action="store_true", help="真的转换(默认只打印计划)")
     ap.add_argument("--force", action="store_true", help="覆盖已存在的输出 / 不跳过刚写过的 ckpt")
     ap.add_argument("--fresh-sec", type=int, default=600,
@@ -345,7 +379,8 @@ def main() -> int:
         return 2
     ck_flat = _flatten(json.loads(ck_cfg_path.read_text()), {})
     cfg, changes, warns = _merge_config(released, ck_flat,
-                                        n_draft_layers(tensor_names(ck_cfg_path.parent)))
+                                        n_draft_layers(tensor_names(ck_cfg_path.parent)),
+                                        args.gamma)
     gamma = int(cfg["dspark_block_size"])
 
     print(f"\nckpt config  : {ck_cfg_path}")
@@ -359,6 +394,31 @@ def main() -> int:
         print("released config 与 ckpt 完全一致(没有需要覆盖的字段)")
     for w in warns:
         print(f"    ⚠ {w}")
+
+    # ── --config-only:权重不动,只把 config.json 重写一遍 ──────────────────────────
+    # 用处:γ 算错了/released config 换了,但 2378 个张量没变。重转一遍要几分钟 × 每个
+    # epoch,而且已经拷到别的机器上的那份还得重拷;只换 config.json 是秒级的。
+    if args.config_only:
+        n_ok = 0
+        print()
+        for e in entries:
+            dst = out_root / f"{args.prefix}_blk{gamma}_{e['label']}_{args.suffix}"
+            if not (dst / "model.safetensors").is_file():
+                print(f"    跳过 {dst.name}:里面没有 model.safetensors(还没转过)")
+                continue
+            (dst / "config.json").write_text(json.dumps(cfg, indent=2))
+            (dst / "config.json").chmod(0o644)
+            print(f"    ✓ {dst}/config.json")
+            n_ok += 1
+        print(f"\n>>> --config-only:重写 {n_ok} 份 config.json,权重一个字节没动。")
+        print("    serve-critical: " + "  ".join(
+            f"{k}={cfg.get(k)}" for k in ("dspark_block_size", "dspark_noise_token_id",
+                                          "dspark_target_layer_ids", "sliding_window",
+                                          "dspark_markov_rank", "num_nextn_predict_layers")))
+        _print_eval_hint(gamma, [f"{e['label']}-blk{gamma}|"
+                                 f"{args.prefix}_blk{gamma}_{e['label']}_{args.suffix}"
+                                 for e in entries if e["weights"]])
+        return 0
 
     # ── 逐个 ckpt 的计划 ────────────────────────────────────────────────────────────
     now = time.time()
