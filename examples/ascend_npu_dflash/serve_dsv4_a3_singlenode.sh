@@ -170,7 +170,31 @@ if [ "$HS_SIDECAR" = "1" ] && [ "$HS_DUMP" != "1" ]; then
   echo ">>> [HS_SIDECAR] ignored — needs HS_DUMP=1 (no producer = nothing to serve). Add HS_DUMP=1."
 fi
 
-pkill -9 -u "$USER" -f vllm 2>/dev/null; sleep 10
+# ⚠ `pkill -f` 区分大小写,而 vLLM 把子进程改名成 **VLLM::EngineCore / VLLM::Worker**(大写),
+# 只有 API server 是小写的 `vllm serve`。小写模式 = 杀掉 server、**留下 engine core 活着攥住
+# 每一字节 HBM**,下一次 serve 于是死在:
+#   ValueError: Free memory on device (5.61/61.27 GiB) on startup is less than desired
+#   GPU memory utilization (0.9, 55.14 GiB)
+# 这个坑 eval_all_drafts.sh 早就记过并用 `pkill -if "$PROCPAT"` 绕开了,而这里没有 —— 实测踩过。
+# 另外 `sleep 10` 是盲等:进程被 -9 之后 HBM 还要几秒才归还,残留多的时候不够。改成轮询到
+# 真的没了为止,再 settle。
+# ⚠ 模式里**绝不能**放 serve_dsv4_a3_singlenode —— 本脚本自己就叫这个名字,`pkill -f` 匹配
+# 的是完整命令行,加进去等于 kill -9 自己。eval_all_drafts.sh 能用那个模式,是因为它是外部
+# 驱动、不叫这个名。这里只打 HBM 的真正持有者。
+_PROCPAT="${PROCPAT:-vllm|EngineCore}"
+pkill -9 -i -u "$USER" -f "$_PROCPAT" 2>/dev/null || true
+for _i in $(seq 1 30); do
+  pgrep -u "$USER" -if "$_PROCPAT" >/dev/null 2>&1 || break
+  [ "$_i" = 1 ] && echo ">>> 等旧进程退出(HBM 归还)…"
+  sleep 2
+done
+if pgrep -u "$USER" -if "$_PROCPAT" >/dev/null 2>&1; then
+  echo "!! 60s 后仍有进程没死,它们攥着 HBM,这次起服务多半 OOM:"
+  pgrep -u "$USER" -aif "$_PROCPAT" | head -10 | sed 's/^/     /'
+  echo "   手动处理后重来(必要时 sudo -n pkill -9 -if '$_PROCPAT')。"   # 引号别丢,| 是管道
+  exit 1
+fi
+sleep 10   # 进程没了之后,驱动侧归还 HBM 还要几秒
 
 echo ">>> [A3 single-node] model=$MODEL  DP$DP / TP$TP / EP=$ENABLE_EP  eager=$EAGER  port=$API_PORT"
 echo ">>> draft=${DRAFT:-<none, plain serve>}  num_spec=$NUM_SPEC  STANDARD_DSA=${VLLM_ASCEND_DSPARK_USE_STANDARD_DSA:-<unset>}"
