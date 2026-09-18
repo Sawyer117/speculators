@@ -145,6 +145,9 @@ def main() -> int:
                     help="每个置信档打印几个【带上下文的断点样例】(需要 --tokenizer)")
     ap.add_argument("--ctx", type=int, default=30, help="样例里回看多少个 token 作为上文")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--pairs", type=int, default=0,
+                    help="按 (草稿给的 -> 目标要的) token 对分组,列出最高频的前 N 组")
+    ap.add_argument("--pair-samples", type=int, default=3, help="每组打印几个带上文的例子")
     args = ap.parse_args()
 
     a, topk_arr = load(args.dir, args.tag)
@@ -280,14 +283,11 @@ def main() -> int:
         print("   ⟹ 两列差得多的类别 = 草稿【系统性地把 A 类词猜成 B 类词】,那是可命名的失效模式。")
 
     # ---------------------------------------------------------------- ⑥ 带上下文的样例
-    if args.samples and args.tokenizer and dec_raw is not None:
-        print("\n" + "=" * 78)
-        print(f"⑥ 断点样例(每档 {args.samples} 个,上文 {args.ctx} 个 token)")
-        print("=" * 78)
-        # 重建每个请求实际发出的 token 序列。规则:该步接受的草稿 token,然后要么是断点处的
-        # target_tok,要么(全接受时)是 bonus_tok。★ 没有 bonus_tok 这一列,全接受的步会
-        # 静默少一个 token,上文就会错位 —— 这也是当初非加它不可的原因。
-        stream: dict[int, dict[int, int]] = {}
+    # 重建每个请求实际发出的 token 序列(⑥⑪ 共用)。规则:该步接受的草稿 token,然后要么是
+    # 断点处的 target_tok,要么(全接受时)是 bonus_tok。★ 没有 bonus_tok 这一列,全接受的
+    # 步会静默少一个 token,上文就整体错位 —— 这也是当初非加它不可的原因。
+    stream: dict[int, dict[int, int]] = {}
+    if (args.samples or args.pairs) and args.tokenizer and dec_raw is not None:
         for lo, hi in zip(los, his):
             r = int(a["req"][lo])
             d = stream.setdefault(r, {})
@@ -300,6 +300,15 @@ def main() -> int:
             else:
                 d[int(a["out_idx"][lo + n - 1]) + 1] = int(a["bonus_tok"][lo])
 
+    def ctx_of(row: int) -> str:
+        r, oi = int(a["req"][row]), int(a["out_idx"][row])
+        d = stream.get(r, {})
+        return dec_raw_many([d[k] for k in range(max(0, oi - args.ctx), oi) if k in d])
+
+    if args.samples and args.tokenizer and dec_raw is not None:
+        print("\n" + "=" * 78)
+        print(f"⑥ 断点样例(每档 {args.samples} 个,上文 {args.ctx} 个 token)")
+        print("=" * 78)
         rng = np.random.default_rng(args.seed)
         for lo_b, hi_b, name in BANDS:
             sel = br[(p1 > lo_b) & (p1 <= hi_b)]
@@ -309,9 +318,7 @@ def main() -> int:
             print(f"\n{'─' * 78}\n【{name}】 共 {len(sel):,} 个断点,抽 {len(pick)} 个\n{'─' * 78}")
             for row in pick:
                 r, oi = int(a["req"][row]), int(a["out_idx"][row])
-                d = stream.get(r, {})
-                ctx_ids = [d[k] for k in range(max(0, oi - args.ctx), oi) if k in d]
-                ctx = dec_raw_many(ctx_ids)
+                ctx = ctx_of(row)
                 print(f"  req {r}  step {int(a['step'][row])}  slot {int(a['slot'][row])}  "
                       f"out_idx {oi}   目标 top1 p={float(a['target_top1_p'][row]):.3f}  "
                       f"目标给草稿那词 p={float(a['target_p_draft'][row]):.3f}")
@@ -484,6 +491,33 @@ def main() -> int:
                 print(f"{c:>14} {n:>9,} {c8/n*100:>8.2f}% {c64/n*100:>8.2f}%")
             print("   ★ 数字那一行:覆盖高 = 草稿算得出、只是没押第一(可训);"
                   "覆盖低 = 草稿做不了算术(要么加容量,要么别指望它)。")
+
+    # ---------------------------------------------------------------- ⑪ 按 token 对分组的例子
+    # ④ 给的是「哪些 (A -> B) 最常断」的频次,但一行频次说不清【什么情况下】草稿爱选 A。
+    # 这一段把同一个 (A -> B) 的若干次断点摆在一起,连上文一起看 —— 这才是人能读懂、能据此
+    # 判断"这是不是一个真的失效模式"的形式。写简报、给别人看,用的是这一段。
+    if args.pairs and args.tokenizer and dec_raw is not None:
+        print("\n" + "=" * 78)
+        print(f"⑪ 最高频的 {args.pairs} 组 (草稿给的 -> 目标要的),每组 {args.pair_samples} 个带上文的例子")
+        print("=" * 78)
+        pair_key = dt.astype(np.int64) * (1 << 21) + tt.astype(np.int64)
+        uniq_p, cnt_p = np.unique(pair_key, return_counts=True)
+        rngp = np.random.default_rng(args.seed)
+        for i in np.argsort(-cnt_p)[: args.pairs]:
+            d_id, t_id = int(uniq_p[i] >> 21), int(uniq_p[i] & ((1 << 21) - 1))
+            rows_p = br[pair_key == uniq_p[i]]
+            # 同组内的置信分布 —— 决定这组值不值得追
+            pp = p1[pair_key == uniq_p[i]]
+            hi_share = float((pp > 0.9).mean()) * 100
+            print(f"\n{'─' * 78}")
+            print(f"【{cnt_p[i]:,} 次 · 占断点 {cnt_p[i]/len(br)*100:.2f}% · 其中目标 p>0.9 的占 {hi_share:.0f}%】"
+                  f"  草稿 {dec_raw(d_id)!r}  ->  目标 {dec_raw(t_id)!r}")
+            print("─" * 78)
+            for row in rngp.choice(rows_p, size=min(args.pair_samples, len(rows_p)), replace=False):
+                print(f"  上文 …{ctx_of(int(row))!r}")
+                print(f"       目标 top1 p={float(a['target_top1_p'][int(row)]):.3f}"
+                      f"   目标给草稿那词 p={float(a['target_p_draft'][int(row)]):.3f}")
+        print("\n   ★ 同一组里几个例子的上文如果长得像 -> 是可命名的失效模式;各不相干 -> 只是高频词碰撞。")
     return 0
 
 
