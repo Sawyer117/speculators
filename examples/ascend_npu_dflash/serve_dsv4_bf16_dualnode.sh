@@ -150,9 +150,20 @@ GPUUTIL_EFF="$GPUUTIL"; [ "$ROLE" = "worker" ] && GPUUTIL_EFF="${WORKER_GPUUTIL:
 # times out and tears the cluster down while the headless WORKER (no such timeout) keeps loading.
 # If the head dies at 0/46 but the worker survives → set PREFETCH=0 (incremental load: progress shows
 # immediately, engine stays responsive). LOAD_THREADS lowers the multithread fan-out on a slow mount.
-PREFETCH="${PREFETCH:-1}"; LOAD_THREADS="${LOAD_THREADS:-16}"
-LOAD_ARGS=(); [ "$PREFETCH" = "1" ] && LOAD_ARGS=(--safetensors-load-strategy prefetch)
-LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num_threads\":$LOAD_THREADS}")
+# ⚠ 默认从 1 改成 0 —— 见下面 LOAD_ARGS 处的说明:1 会让本脚本必然起不来。
+PREFETCH="${PREFETCH:-0}"; LOAD_THREADS="${LOAD_THREADS:-16}"
+# ⚠ 0.27.1 起 `--safetensors-load-strategy prefetch` 与 `enable_multithread_load` 互斥
+#   (0.23.0 上两者共存)。两个同时传下去,worker 起来时就抛:
+#     ValueError: enable_multithread_load does not support safetensors_load_strategy='prefetch'
+#   而原来的写法【默认就是同时传】—— 也就是说本脚本按默认值手动起必然失败。一直没暴露,
+#   只因为 eval_blk15_drafts.sh 显式传了 PREFETCH=0。所以默认改成 0(= 多线程加载,本项目
+#   所有跑成功的 serve 用的都是这一档);真要 prefetch 就自动把多线程关掉,而不是让 vLLM 抛。
+if [ "$PREFETCH" = "1" ]; then
+  LOAD_ARGS=(--safetensors-load-strategy prefetch)
+  echo ">>> PREFETCH=1:用 prefetch 策略,多线程加载自动关闭(0.27.1 上两者互斥)"
+else
+  LOAD_ARGS=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num_threads\":$LOAD_THREADS}")
+fi
 
 # ---- optional HIDDEN-STATE EXTRACTION (DSpark/DFlash training-data producer) ----
 # HS_EXTRACT=1 turns this serve into a HS producer: vLLM's `extract_hidden_states`

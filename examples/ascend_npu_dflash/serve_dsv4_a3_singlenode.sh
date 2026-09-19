@@ -58,7 +58,8 @@ EAGER="${EAGER:-0}"                # ★ DEFAULT = graph mode (ACLGraph FULL_DEC
                                    # Manual EAGER=1 → --enforce-eager (safest first bring-up / debug).
 QUANT="${QUANT:-}"                 # empty = bf16; QUANT=ascend + MODEL=<w8a8 ckpt> to serve w8a8
 ENABLE_EP="${ENABLE_EP:-1}"        # ★ ON by default on A3 (intra-node EP works). Set ENABLE_EP=0 to TP-shard.
-PREFETCH="${PREFETCH:-1}"; LOAD_THREADS="${LOAD_THREADS:-16}"
+# ⚠ 默认从 1 改成 0 —— 见下面 LOAD_ARGS 处的说明:1 会让本脚本必然起不来。
+PREFETCH="${PREFETCH:-0}"; LOAD_THREADS="${LOAD_THREADS:-16}"
 DRAFT="${DRAFT:-}"                 # set DRAFT=<dspark mtp dir> → spec-decode with a DSpark draft (else plain serve)
 NUM_SPEC="${NUM_SPEC:-5}"          # = dspark_block_size (released DSV4 draft = 5). draft shards under the engine's TP/EP.
 DSPARK_AUX_LAYERS="${DSPARK_AUX_LAYERS:-[40,41,42]}"  # target aux layers the draft's main_proj consumes (3 → 3*H),
@@ -122,8 +123,18 @@ if [ "$EAGER" = "1" ]; then EAGER_FLAG="--enforce-eager"
 else GRAPH_ARGS=(--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'); fi
 QUANT_ARGS=(); [ -n "$QUANT" ] && QUANT_ARGS=(--quantization "$QUANT")
 EP_ARGS=(); [ "$ENABLE_EP" = "1" ] && EP_ARGS=(--enable-expert-parallel)
-LOAD_ARGS=(); [ "$PREFETCH" = "1" ] && LOAD_ARGS=(--safetensors-load-strategy prefetch)
-LOAD_ARGS+=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num_threads\":$LOAD_THREADS}")
+# ⚠ 0.27.1 起 `--safetensors-load-strategy prefetch` 与 `enable_multithread_load` 互斥
+#   (0.23.0 上两者共存)。两个同时传下去,worker 起来时就抛:
+#     ValueError: enable_multithread_load does not support safetensors_load_strategy='prefetch'
+#   而原来的写法【默认就是同时传】—— 也就是说本脚本按默认值手动起必然失败。一直没暴露,
+#   只因为 eval_blk15_drafts.sh 显式传了 PREFETCH=0。所以默认改成 0(= 多线程加载,本项目
+#   所有跑成功的 serve 用的都是这一档);真要 prefetch 就自动把多线程关掉,而不是让 vLLM 抛。
+if [ "$PREFETCH" = "1" ]; then
+  LOAD_ARGS=(--safetensors-load-strategy prefetch)
+  echo ">>> PREFETCH=1:用 prefetch 策略,多线程加载自动关闭(0.27.1 上两者互斥)"
+else
+  LOAD_ARGS=(--model-loader-extra-config "{\"enable_multithread_load\":true,\"num_threads\":$LOAD_THREADS}")
+fi
 # DSpark spec-decode: point the draft at the converted mtp.* dir (method mtp). Draft shards under the
 # engine's TP/EP; num_speculative_tokens = dspark_block_size (5). Unset DRAFT → plain target serve.
 # ★ CRITICAL flag: STANDARD_DSA=1 routes the draft attention through the PA_ND (paged) op path. The
