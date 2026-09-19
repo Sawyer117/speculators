@@ -67,6 +67,12 @@ ARMS="${ARMS:-A B C}"
 #     不崩 = 阴性,【不可信】(可能只是这次没撞上)
 #   所以每个臂必须重复若干次,阴性才有意义。REPEAT=1 只够拿阳性结论。
 REPEAT="${REPEAT:-3}"
+# ★★ 固定开销每轮 ~19 分钟(清场 12.5 + 加载编译 2.3 + 等端口),而一轮 256 条只打 10 秒。
+#   靠反复重启来攒触发机会是把 99% 的时间花在开销上。BURSTS = 在【同一个服务实例】上
+#   连打几轮,一轮崩了就停。实测 A 臂单轮 256 条的复现率只有 ~20%,BURSTS=8(=2048 条)
+#   能把单次起服务的触发概率拉到 ~83%,而代价只是 +80 秒。
+BURSTS="${BURSTS:-8}"
+GRACE="${GRACE:-60}"                 # 先 SIGTERM 让 vllm 自己收尾,等这么久再 SIGKILL
 N="${N:-256}"
 CONC="${CONC:-64}"
 PORT="${PORT:-7000}"
@@ -157,6 +163,15 @@ PYEOF
 #   睡固定秒数不是清场,是许愿。
 cleanup_verified() {
   local tag="$1"
+  # ★ 先 SIGTERM。实测 SIGKILL 之后显存要 12 分 40 秒才被驱动收回(每轮都付),而 vllm
+  #   自己有 graceful shutdown(日志里的 `[shutdown] send sigterm to process ...`),
+  #   让它自己退能快得多。等 GRACE 秒还赖着再 -9 —— 最坏多花 60 秒,最好省 10 分钟。
+  if [ -n "$(_alive)" ]; then
+    pkill -TERM -i -u "$USER" -f "$KILLPAT" >/dev/null 2>&1
+    local g=0
+    while [ "$g" -lt "$GRACE" ] && [ -n "$(_alive)" ]; do sleep 2; g=$((g + 2)); done
+    [ -n "$(_alive)" ] && say "    SIGTERM 后 $(hms $g) 还没退干净,转 SIGKILL"
+  fi
   pkill -9 -i -u "$USER" -f "$KILLPAT" >/dev/null 2>&1
   local t=0 n
   while [ "$t" -lt "$KILL_WAIT" ]; do
@@ -261,7 +276,8 @@ echo "  臂         $ARMS"
 echo "  ARROW      ${ARROW:-<找不到,用 ARROW= 指定>}"
 echo "  serve      $SERVE_SH"
 echo "  HS_DIR     $DSPARK_HS_DIR"
-echo "  流量       每臂 $N 条 @ 并发 $CONC,Arrow 行 [$START_ROW, $((START_ROW+N)))"
+echo "  流量       每臂 $REPEAT 次起服务 × $BURSTS 连打 × $N 条 @ 并发 $CONC = $((REPEAT*BURSTS*N)) 条/臂"
+echo "             Arrow 行 [$START_ROW, $((START_ROW+N)))(每轮同一批,负载逐条相同)"
 echo "  DSA_OVERLAP=$DSA_OVERLAP  VLLM_DISABLE_COMPILE_CACHE=$VLLM_DISABLE_COMPILE_CACHE (都锁死,否则臂之间不可比)"
 echo "  plog       $LOGDIR"
 echo "  产物       $OUT"
@@ -348,6 +364,10 @@ run_arm() {
   fi
   say "服务 READY($(hms $((SECONDS-t0))))"
 
+  : > "$flog"
+  rm -rf "$OUT/dumps_$arm"
+  local errs=0 fired_tot=0 b e
+  for b in $(seq 1 "$BURSTS"); do
   # ★ id 段必须每次都新。2026-09-20 实测:id-base 写死 901000,第二轮 231 条请求报错,
   #   却照样打印 `collected 256/256` —— 收到的是上一轮留在 DSPARK_HS_DIR 里的旧文件。
   #   一个假的「全收齐」比没有数更糟。所以段号全局递增,并且开打前把这一段清空。
@@ -363,19 +383,20 @@ run_arm() {
   fi
   seq "$idbase" $((idbase + N - 1)) \
     | sed "s|^|$DSPARK_HS_DIR/hs_|; s|\$|.safetensors|" | xargs -r rm -f 2>/dev/null
-  rm -rf "$OUT/dumps_$arm"
 
-  say "打 $N 条 @ 并发 $CONC(max_tokens=$maxtok,id 段 $idbase+)→ $flog"
   local collect=()
   [ "$hsdump" = "1" ] || collect=(--no-collect)
   ENDPOINT="$ENDPOINT" ARROW="$ARROW" HS_DIR="$DSPARK_HS_DIR" \
     python "$SCRIPT_DIR/dsv4_fire_hs_dumps.py" \
       --out "$OUT/dumps_$arm" --n "$N" --concurrency "$CONC" \
       --id-base "$idbase" --start-row "$START_ROW" \
-      --max-tokens "$maxtok" "${collect[@]}" > "$flog" 2>&1
-  tail -3 "$flog"
-
-  local errs; errs=$(sed -n 's/.*errors=\([0-9]*\).*/\1/p' "$flog" | tail -1); errs="${errs:-?}"
+      --max-tokens "$maxtok" "${collect[@]}" >> "$flog" 2>&1
+  e=$(sed -n 's/.*errors=\([0-9]*\).*/\1/p' "$flog" | tail -1); e="${e:-0}"
+  errs=$((errs + e)); fired_tot=$((fired_tot + N))
+  say "    第 $b/$BURSTS 轮(id 段 $idbase+):$(tail -1 "$flog" | cut -c1-96)"
+  if ! serve_up; then say "    ★ 引擎在第 $b 轮死了 —— 停止连打"; break; fi
+  done
+  say "打完:累计 $fired_tot 条,errors=$errs"
 
   say "等 ${SETTLE}s 让 plog 落盘(507015 是异步故障,来得比请求晚)..."
   sleep "$SETTLE"
