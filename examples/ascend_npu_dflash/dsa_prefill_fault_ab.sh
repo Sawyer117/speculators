@@ -45,6 +45,7 @@
 # ----
 #   bash dsa_prefill_fault_ab.sh                       # 跑 A B C(默认)
 #   ARMS="A B" bash dsa_prefill_fault_ab.sh            # 只跑两臂
+#   HBM_WAIT=3600 bash dsa_prefill_fault_ab.sh         # 显存放得更慢就再加大(默认 1800s)
 #   ARMS="A B C D" N=256 CONC=64 bash dsa_prefill_fault_ab.sh
 #
 #   建议 nohup:每臂要等一次 543GB 权重加载,三臂大约 1.5–2 小时。
@@ -74,9 +75,11 @@ OUT="${OUT:-$HOME/dsa_fault_ab}"
 START_ROW="${START_ROW:-0}"          # 所有臂打同一批行 —— 负载必须逐条相同
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"   # 543GB 权重加载 + 禁用缓存后的一次真编译,给足
 SETTLE="${SETTLE:-25}"               # 打完到读 plog 之间的等待(plog 落盘 + 异步故障浮出来)
-KILL_WAIT="${KILL_WAIT:-60}"         # pkill 之后最多等多久确认进程真的没了
-PORT_WAIT="${PORT_WAIT:-90}"         # 进程没了但端口还没放开(TIME_WAIT)时再等多久
-HBM_WAIT="${HBM_WAIT:-180}"          # 等卡上显存回落多久(驱动侧释放不是瞬时的)
+# ★ 这三个等待宁可长,不可短 —— 等长了人可以 Ctrl-C / kill,等短了就要人整晚盯着
+#   手动重来。这台 A3 崩溃之后显存回落尤其慢(实测崩完瞬间还占着 61042/65536 MiB)。
+KILL_WAIT="${KILL_WAIT:-180}"        # pkill 之后最多等多久确认进程真的没了
+PORT_WAIT="${PORT_WAIT:-300}"        # 进程没了但端口还没放开(TIME_WAIT)时再等多久
+HBM_WAIT="${HBM_WAIT:-1800}"         # 等卡上显存回落多久。崩溃后驱动侧释放很慢,给足半小时
 HBM_FREE_MB="${HBM_FREE_MB:-4096}"   # 单 die 已用显存低于这个数才算「卡是空的」(空卡通常几百 MiB)
 SERVE_SH="${SERVE_SH:-$SCRIPT_DIR/serve_dsv4_a3_singlenode_specmethod.sh}"
 LOGDIR="${ASCEND_PROCESS_LOG_PATH:-$HOME/ascend/log}"
@@ -169,10 +172,11 @@ cleanup_verified() {
   fi
   # 端口:进程没了不代表端口放开了(TIME_WAIT / 别人占着)。等的时候要出声 ——
   # 静默地等一分钟,和卡死在用户眼里没有区别。
-  local pt=0
+  local pt=0 pb=0
   while ! _port_free && [ "$pt" -lt "$PORT_WAIT" ]; do
     [ "$pt" -eq 0 ] && say "    端口 $PORT 还被占着,等它放开(最多 $(hms "$PORT_WAIT"))..."
-    sleep 2; pt=$((pt + 2))
+    sleep 2; pt=$((pt + 2)); pb=$((pb + 2))
+    if [ "$pb" -ge 60 ]; then pb=0; say "    ... 端口还没放开($(hms $pt))"; fi
   done
   [ "$pt" -gt 0 ] && _port_free && say "    端口 $PORT 在 $(hms $pt) 后放开"
   if ! _port_free; then
@@ -191,13 +195,17 @@ cleanup_verified() {
   # ★ 显存:pkill 之后驱动侧释放要时间,进程没了不等于卡空了。等它回落,别一次性判死。
   local used; used=$(_npu_used_mb)
   if [ "$used" -ge 0 ] 2>/dev/null; then
-    local ht=0
+    local ht=0 hb=0
     while [ "$used" -gt "$HBM_FREE_MB" ] && [ "$ht" -lt "$HBM_WAIT" ]; do
       [ "$ht" -eq 0 ] && say "    卡上还占着 ${used} MiB,等显存回落(最多 $(hms "$HBM_WAIT"))..."
-      sleep 5; ht=$((ht + 5)); used=$(_npu_used_mb)
+      sleep 10; ht=$((ht + 10)); used=$(_npu_used_mb)
+      # 心跳:半小时的等待不出声和卡死没区别。每分钟一行,只说还没清完就够了。
+      hb=$((hb + 10))
+      if [ "$hb" -ge 60 ]; then hb=0; say "    ... 显存还没清空($(hms $ht))"; fi
     done
     if [ "$used" -gt "$HBM_FREE_MB" ]; then
       say "!! 清场未完成($tag):卡上仍有 ${used} MiB 被占(阈值 ${HBM_FREE_MB} MiB,等了 $(hms $ht))。"
+      say "   占用一直没往下走 = 有进程没杀掉;还在往下走 = 这台机器放得慢,加大 HBM_WAIT 重跑。"
       say "   带着这些残留起服务,会在 worker init 报"
       say "   'Free memory on device (...) is less than desired GPU memory utilization' —— 那不是配置问题。"
       npu-smi info 2>/dev/null | grep -iE 'vllm|python|process id' | head -20
