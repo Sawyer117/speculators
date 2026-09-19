@@ -144,16 +144,37 @@ run_arm() {
     MAXBATCHTOK="$mbt" DSA_OVERLAP="$DSA_OVERLAP" \
       nohup bash "$SERVE_SH" > "$slog" 2>&1 &
   fi
+  local spid=$!   # serve 脚本 exec 成 vllm,所以这个 PID 就是引擎:它没了 = 起失败
 
-  local t0=$SECONDS ready=0
+  # ★ 2026-09-19 教训:第一版只会干等 READY_TIMEOUT(40 分钟),服务 2 分钟就崩了却一行不吭,
+  #   用户盯着 tail -f 看一片空白。**起失败必须立刻报,并且把致命 traceback 打到主日志里** ——
+  #   要去翻另一个文件才知道出了什么事,等于没报。
+  local t0=$SECONDS ready=0 why=""
   while [ $((SECONDS - t0)) -lt "$READY_TIMEOUT" ]; do
     if serve_up; then ready=1; break; fi
+    # (a) 进程没了 = 引擎起失败。最可靠的判据,没有误报
+    if ! kill -0 "$spid" 2>/dev/null; then why="引擎进程已退出"; break; fi
+    # (b) 进程还在但日志里已经有致命行 —— 比等进程退出更快
+    if grep -qE 'Engine core initialization failed|EngineCore failed to start|^ *(ValueError|RuntimeError|AssertionError|ImportError|OSError):' "$slog" 2>/dev/null; then
+      why="日志出现致命错误"; break
+    fi
+    # (c) 心跳:别让 tail -f 看起来像卡死
+    if [ $(( (SECONDS - t0) % 60 )) -lt 10 ] && [ $((SECONDS - t0)) -ge 60 ]; then
+      say "    ... 等 READY $(hms $((SECONDS-t0)))  | $(tail -1 "$slog" 2>/dev/null | cut -c1-120)"
+    fi
     sleep 10
   done
   if [ "$ready" != "1" ]; then
-    say "!! 服务 $(hms $((SECONDS-t0))) 没起来 —— 这一臂作废(不是「不崩」!)"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$arm" "$desc" "起不来" "-" "-" "-" "$slog" >> "$RESULTS"
+    [ -n "$why" ] || why="等满 $(hms "$READY_TIMEOUT") 仍未就绪"
+    say "!! 臂 $arm 起不来($why,用时 $(hms $((SECONDS-t0))))—— 这一臂【作废】,不是「不崩」"
+    echo "---------------- $slog 的致命片段 ----------------"
+    grep -nE 'Error|Traceback|raise |Engine core' "$slog" 2>/dev/null | tail -25
+    echo "---------------- 末尾 15 行 ----------------"
+    tail -15 "$slog" 2>/dev/null
+    echo "------------------------------------------------"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$arm" "$desc" "起不来" "-" "-" "$why" "$slog" >> "$RESULTS"
     pkill -9 -i -u "$USER" -f 'vllm|EngineCore' >/dev/null 2>&1
+    ARM_FAILED_START=$((ARM_FAILED_START + 1))
     return
   fi
   say "服务 READY($(hms $((SECONDS-t0))))"
@@ -201,6 +222,10 @@ run_arm() {
 
 T_ALL=$SECONDS
 ARM_SEQ=0
+ARM_FAILED_START=0
+# 起不来通常是配置/构建问题,不是这一臂特有的 —— 后面的臂几乎必然同样起不来。默认第一次
+# 起失败就停,别让人回来发现空等了两小时。STOP_ON_START_FAIL=0 可以强行跑完全部臂。
+STOP_ON_START_FAIL="${STOP_ON_START_FAIL:-1}"
 for arm in $ARMS; do
   case "$arm" in
     A) run_arm A 1 1  8192 "复现对照(纯 prefill + dumper)" ;;
@@ -209,6 +234,13 @@ for arm in $ARMS; do
     D) run_arm D 1 1  2048 "单步 prefill token 砍到 1/4 —— 剂量关系" ;;
     *) echo "!! 未知的臂:$arm(只认 A B C D)" ;;
   esac
+  if [ "$ARM_FAILED_START" -gt 0 ] && [ "$STOP_ON_START_FAIL" = "1" ]; then
+    echo
+    say "!! 服务起不来,后面的臂大概率一样 —— 就地停,不空烧时间。"
+    say "   先按上面的 traceback 修好起服务这一步,再重跑整个脚本。"
+    say "   确实想跑完全部臂:STOP_ON_START_FAIL=0 bash ..."
+    break
+  fi
 done
 
 echo
