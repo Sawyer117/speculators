@@ -126,6 +126,9 @@ def main() -> int:
     #   (2) 用 loss_mask 只统计 **response** 段。「尾部 40%」只是近似,prompt 长的行会把
     #       response 段稀释掉,得出的高 mismatch 没有意义。response 段才是该 ~0% 的地方。
     ap.add_argument("--arrow", help="训练 Arrow 目录;给了就做 token_ids 对拍 + loss_mask 限定")
+    # 24 格全算在 CPU 上很慢([T,4096]@[4096,129280] × 24)。约定已经钉死之后
+    # (切片=末、过 norm=否、shift=1),只算那一格就够,快 24 倍。
+    ap.add_argument("--combo", help="只算一格,格式 '切片,norm(0/1),shift',例如 '-1,0,1'")
     ap.add_argument("--id-offset", type=int, default=0,
                     help="Arrow 行号 = 文件 id − 这个值。生产约定 id==row 所以是 0;"
                          "今晚那批 pilot 用了 --id-base 768 --start-row 0,所以填 768")
@@ -178,6 +181,11 @@ def main() -> int:
 
     # ── 穷举:切片 × {raw, normed} × shift ────────────────────────────────────
     combos = [(s, n, k) for s in range(L) for n in (False, True) for k in (1, 0, -1)]
+    if args.combo:
+        cs, cn, ck = (x.strip() for x in args.combo.split(","))
+        ci = int(cs) % L
+        combos = [(ci, bool(int(cn)), int(ck))]
+        print(f"只算一格:切片[{ci}] {'过' if int(cn) else '不过'} norm shift={int(ck)}\n")
     acc: dict[tuple, list] = {c: [[0, 0], [0, 0]] for c in combos}   # [全量, 尾部] 各 [bad, tot]
     hits: dict[tuple, float] = {}
 

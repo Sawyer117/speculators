@@ -53,6 +53,12 @@ def main() -> int:
     ap.add_argument("--id-base", type=int, default=960000,
                     help="★ 必须 > 数据集行数,否则会污染生产 HS 目录")
     ap.add_argument("--rows-full", type=int, default=772684)
+    # ★ 2026-09-20:同一条命令跑两遍,行[0] 从 32/32 变成 0/32(第一个 token 就不同)。
+    #   温度 0、并发 1、prefix cache 关着 —— 贪心解码本该是确定性的。所以在拿语料说事
+    #   之前,必须先测【服务自己可不可复现】:同一个 prompt 连打 R 次,互相比。
+    #   服务不可复现 ⟹ 任何「和历史语料对不上」的结论都不成立,病在栈里不在数据里。
+    ap.add_argument("--repeat", type=int, default=1,
+                    help=">1 时对同一个 prompt 重复生成,报告各次之间的一致性(确定性自检)")
     args = ap.parse_args()
 
     if not args.arrow:
@@ -84,6 +90,7 @@ def main() -> int:
 
     tot_match = tot_cmp = 0
     prefix_lens = []
+    det_runs: list[tuple] = []
     for i in range(args.n):
         row = ds[args.start_row + i]
         ids = list(row["input_ids"])
@@ -104,18 +111,34 @@ def main() -> int:
         if want < 2 or not prompt:
             print(f"  [{i}] 太短,跳过"); continue
 
-        r = cli.completions.create(
-            model=model, prompt=prompt, max_tokens=want, temperature=0,
-            extra_headers={"X-Request-Id": f"hs_{args.id_base + i}"},
-            extra_body={"return_token_ids": True}, timeout=600,
-        )
-        got = getattr(r.choices[0], "token_ids", None)
-        if got is None:
-            d = r.choices[0].model_dump()
-            got = d.get("token_ids")
-        if not got:
+        runs = []
+        for rep in range(max(1, args.repeat)):
+            r = cli.completions.create(
+                model=model, prompt=prompt, max_tokens=want, temperature=0,
+                extra_headers={"X-Request-Id": f"hs_{args.id_base + i * 16 + rep}"},
+                extra_body={"return_token_ids": True}, timeout=600,
+            )
+            g = getattr(r.choices[0], "token_ids", None)
+            if g is None:
+                g = r.choices[0].model_dump().get("token_ids")
+            if g:
+                runs.append([int(t) for t in g][:want])
+        if not runs:
             print(f"  [{i}] serve 没返回 token_ids,跳过"); continue
-        got = [int(t) for t in got][:want]
+        if len(runs) > 1:
+            # 各次之间的一致性 —— 这一项和语料无关,纯粹是服务自己稳不稳
+            base = runs[0]
+            agree = [sum(1 for a, b in zip(base, o) if a == b) / max(len(base), 1) for o in runs[1:]]
+            pref = []
+            for o in runs[1:]:
+                k2 = 0
+                while k2 < min(len(base), len(o)) and base[k2] == o[k2]:
+                    k2 += 1
+                pref.append(k2)
+            det_runs.append((min(agree), min(pref), want))
+            print(f"  [{i}] ★确定性:{len(runs)} 次生成互比 —— 最低逐 token 一致 "
+                  f"{100.0 * min(agree):.1f}%,最短完全一致前缀 {min(pref)}/{want}")
+        got = runs[0]
         tgt = [int(t) for t in resp[:want]]
 
         pref = 0
@@ -130,6 +153,22 @@ def main() -> int:
         if pref < 4:
             print(f"        语料: {tgt[:8]}")
             print(f"        模型: {got[:8]}   ← 第 {pref} 个 token 就分叉")
+
+    if det_runs:
+        worst = min(a for a, _, _ in det_runs)
+        allp = [p for _, p, _ in det_runs]
+        print("\n" + "=" * 70)
+        print(f"★ 服务确定性:最差一行的逐 token 一致 {100.0 * worst:.1f}%,"
+              f"完全一致前缀最短 {min(allp)}")
+        if worst > 0.999:
+            print("  ✅ 温度 0 下服务可复现 —— 和语料的差异才谈得上是语料的问题。")
+        else:
+            print("  ❌ **服务在温度 0 下不可复现。** 同一个 prompt 两次贪心出不同结果。")
+            print("     ⟹ 任何「HS/语料对不上」的结论都不成立 —— 病在栈里,不在数据里。")
+            print("     ⟹ 而且这意味着前向【本身】就在出错,只是大多数时候不崩。")
+            print("        和 SparseAttnSharedkv 那个间歇 aicore 越界很可能是同一个根因:")
+            print("        有时崩掉,有时只是悄悄算错。后者更可怕。")
+            print("     ⚠ 在这件事定性之前,这套栈产出的 HS 一概不可信,批量 dump 必须停。")
 
     print("\n" + "=" * 70)
     if not tot_cmp:
