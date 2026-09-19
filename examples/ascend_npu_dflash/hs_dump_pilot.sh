@@ -82,11 +82,28 @@ echo; echo ">>> [1/3] 打 $N 行 ..."
 T0=$SECONDS
 ENDPOINT="$ENDPOINT" ARROW="$ARROW" HS_DIR="$HS_DIR" \
   python "$SCRIPT_DIR/dsv4_fire_hs_dumps.py" \
-    --out "$OUT" --n "$N" --concurrency "$CONCURRENCY" --id-base "$ID_BASE" || exit 1
+    --out "$OUT" --n "$N" --concurrency "$CONCURRENCY" --id-base "$ID_BASE" \
+    2>&1 | tee "$OUT/.fire.log" || exit 1
 ELAPSED=$((SECONDS - T0))
 GOT=$(ls "$OUT"/hs_*.safetensors 2>/dev/null | wc -l)
 [ "$GOT" -gt 0 ] || { echo "!! 一个文件都没收到 —— serve 的 DSPARK_HS_DUMP 开了吗?"; exit 1; }
 
+# ★ 速率只有在【几乎没有错误】时才有意义。2026-09-19 实测教训:256 条里 236 条 500、
+#   serve 中途死掉,脚本照样打出「0.11 行/s → 全量 81.8 天」,而那量的是崩溃过程不是吞吐。
+#   一个看起来精确的错数,比没有数更糟 —— 它会被拿去做决策。
+ERRS=$(sed -n 's/.*errors=\([0-9]*\).*/\1/p' "$OUT/.fire.log" | tail -1)
+ERRS="${ERRS:-0}"
+if [ "$ERRS" -gt $((N / 20)) ] || [ "$GOT" -lt $((N / 2)) ]; then
+  echo
+  echo "################################################################################"
+  echo "!! 速率【不予报告】:$N 条里 $ERRS 条报错,只收到 $GOT 个文件。"
+  echo "   这种情况下计时量的是崩溃过程,不是吞吐。先修崩溃再谈速度。"
+  echo "   体积和压缩率不受影响(它们只看文件内容),下面照常给。"
+  echo "################################################################################"
+  SKIP_RATE=1
+fi
+
+if [ -z "${SKIP_RATE:-}" ]; then
 echo
 echo "================================================================================"
 printf ">>> 速度:%s 行 / %s 秒 = %s 行/s\n" "$GOT" "$ELAPSED" \
@@ -98,6 +115,7 @@ awk -v g="$GOT" -v e="$ELAPSED" -v R="$ROWS_FULL" 'BEGIN{
     printf "                         %7d 行 = %.1f 小时\n", n, n/r/3600;
 }'
 echo "================================================================================"
+fi
 
 # ── 2) 体积 ───────────────────────────────────────────────────────────────────
 echo; echo ">>> [2/3] 体积"
