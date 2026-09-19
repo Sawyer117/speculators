@@ -4,7 +4,7 @@ CONCURRENCY, then poll+collect the written ``hs_<idx>.safetensors`` into an out 
 
 This reproduces EXACTLY what the trainer's ``ArrowDataset._dump_generate_hs`` does
 (``data.py:382-389``): a prefill-only ``completions.create`` with the same token-id
-prompt (read straight from the training Arrow), ``max_tokens=1``,
+prompt (read straight from the training Arrow), ``max_tokens=1`` (``--max-tokens`` to vary),
 ``X-Request-Id=hs_<idx>``, ``return_token_ids=True``. The serve-side dumper writes
 ``hs_<idx>.safetensors`` to its ``DSPARK_HS_DIR``; nobody deletes it here (deletion is
 trainer-side), so on a shared-FS serve the file persists and we copy it out.
@@ -99,6 +99,13 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=600.0, help="per-request timeout (s)")
     ap.add_argument("--collect-timeout", type=float, default=90.0,
                     help="how long to wait for dumped files to appear before failing LOUD (s)")
+    # ★ 加这两个开关是为了做故障 A/B(dsa_prefill_fault_ab.sh),两个默认值都保持原行为不变。
+    ap.add_argument("--max-tokens", type=int, default=1,
+                    help="每条请求解码几个 token。默认 1 = 训练侧 _dump_generate_hs 的原样(纯 prefill)。"
+                         ">1 让调度器把 decode 步混进来,用来测「纯 prefill 是不是故障的必要条件」")
+    ap.add_argument("--no-collect", action="store_true",
+                    help="只打流量、不收 hs_*.safetensors。服务端没开 DSPARK_HS_DUMP 时必须带"
+                         "(否则会因为「一个文件都没找到」而 SystemExit)")
     args = ap.parse_args()
 
     for req in ("endpoint", "arrow", "hs_dir"):
@@ -121,7 +128,7 @@ def main() -> None:
         client.completions.create(
             model=model,
             prompt=_row_ids(ds, row, args.col),
-            max_tokens=1,
+            max_tokens=args.max_tokens,
             extra_headers={"X-Request-Id": f"hs_{args.id_base + i}"},
             extra_body={"return_token_ids": True},
             timeout=args.timeout,
@@ -139,6 +146,11 @@ def main() -> None:
                 if errs <= 3:
                     print(f"  fire error: {e}")
     fired_s = time.monotonic() - t0
+
+    if args.no_collect:
+        print(f"fired {args.n}@conc{args.concurrency} in {fired_s:.1f}s (errors={errs}); "
+              f"collected 0/{args.n} (--no-collect: 服务端没开 dumper,本来就不该有文件)")
+        return
 
     os.makedirs(args.out, exist_ok=True)
     names = [f"hs_{args.id_base + i}.safetensors" for i in range(args.n)]
