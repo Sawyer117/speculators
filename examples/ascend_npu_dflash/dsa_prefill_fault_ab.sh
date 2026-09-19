@@ -73,6 +73,14 @@ PORT="${PORT:-7000}"
 ENDPOINT="http://localhost:$PORT/v1"
 OUT="${OUT:-$HOME/dsa_fault_ab}"
 START_ROW="${START_ROW:-0}"          # 所有臂打同一批行 —— 负载必须逐条相同
+# ★★ HS 文件是按 Arrow【行号】命名的(hs_<行号>.safetensors),训练侧也按行号去找。
+#   所以 pilot 的 id 段必须落在数据集行数【之外】,否则:
+#     (1) 写出去的 hs_<n> 看着像第 n 行的 HS,其实是第 START_ROW+k 行的 —— 静默投毒;
+#     (2) 本脚本开打前会 rm 掉该段的旧文件,那就是在删真正的训练 HS。
+#   2026-09-20 实测:ID_BASE 忘了定义,$((ID_BASE+...)) 当 0 算,id 段落到 256/512 ——
+#   正好砸在真实行号范围里。下面加了硬闸,宁可退出也不让它再发生。
+ID_BASE="${ID_BASE:-900000}"         # 每次 fire 用 [ID_BASE + k*N, +N) 一段,k 全局递增
+ROWS_FULL="${ROWS_FULL:-772684}"     # 数据集行数;id 段必须整段在它之上
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"   # 543GB 权重加载 + 禁用缓存后的一次真编译,给足
 SETTLE="${SETTLE:-25}"               # 打完到读 plog 之间的等待(plog 落盘 + 异步故障浮出来)
 # ★ 这三个等待宁可长,不可短 —— 等长了人可以 Ctrl-C / kill,等短了就要人整晚盯着
@@ -345,6 +353,14 @@ run_arm() {
   #   一个假的「全收齐」比没有数更糟。所以段号全局递增,并且开打前把这一段清空。
   RUN_SEQ=$((RUN_SEQ + 1))
   local idbase=$((ID_BASE + RUN_SEQ * N))
+  # 硬闸:整段都必须在数据集行号之外,否则停机。这条不是洁癖 —— 越过去就是往生产 HS
+  # 目录里投毒(内容对不上行号),而且开打前那个 rm 会删掉真的训练 HS。
+  if [ "$idbase" -le "$ROWS_FULL" ]; then
+    say "!! id 段 [$idbase, $((idbase + N))) 落在数据集行号范围内(共 $ROWS_FULL 行)——"
+    say "   这会往 $DSPARK_HS_DIR 里写出【行号与内容对不上】的 HS,并且删掉同号的真文件。"
+    say "   停。把 ID_BASE 调到 > $ROWS_FULL(默认 900000)再跑。"
+    exit 3
+  fi
   seq "$idbase" $((idbase + N - 1)) \
     | sed "s|^|$DSPARK_HS_DIR/hs_|; s|\$|.safetensors|" | xargs -r rm -f 2>/dev/null
   rm -rf "$OUT/dumps_$arm"
