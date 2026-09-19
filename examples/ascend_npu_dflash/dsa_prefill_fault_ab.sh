@@ -60,6 +60,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"
 
 ARMS="${ARMS:-A B C}"
+# ★★ 2026-09-20 实测:同一个臂、同一套配置,一次 256 条全过(21.9s / 0 错),下一次
+#   231 错 + 12 次 SparseAttnSharedkv 故障。**这个故障是间歇的。** 于是:
+#     崩   = 阳性,可信(这个条件下确实能触发)
+#     不崩 = 阴性,【不可信】(可能只是这次没撞上)
+#   所以每个臂必须重复若干次,阴性才有意义。REPEAT=1 只够拿阳性结论。
+REPEAT="${REPEAT:-3}"
 N="${N:-256}"
 CONC="${CONC:-64}"
 PORT="${PORT:-7000}"
@@ -256,9 +262,6 @@ fi
 run_arm() {
   local arm="$1" hsdump="$2" maxtok="$3" mbt="$4" desc="$5"
   local slog="$OUT/serve_$arm.log" flog="$OUT/fire_$arm.log"
-  # 每臂独立 id 段,文件不串;900000 起 —— 落在数据集 772,684 行之外,训练进程不会当成自己的 HS 删掉
-  ARM_SEQ=$((ARM_SEQ + 1))
-  local idbase=$((900000 + 1000 * ARM_SEQ))
   local t_arm=$SECONDS
 
   echo
@@ -329,7 +332,16 @@ run_arm() {
   fi
   say "服务 READY($(hms $((SECONDS-t0))))"
 
-  say "打 $N 条 @ 并发 $CONC(max_tokens=$maxtok)→ $flog"
+  # ★ id 段必须每次都新。2026-09-20 实测:id-base 写死 901000,第二轮 231 条请求报错,
+  #   却照样打印 `collected 256/256` —— 收到的是上一轮留在 DSPARK_HS_DIR 里的旧文件。
+  #   一个假的「全收齐」比没有数更糟。所以段号全局递增,并且开打前把这一段清空。
+  RUN_SEQ=$((RUN_SEQ + 1))
+  local idbase=$((ID_BASE + RUN_SEQ * N))
+  seq "$idbase" $((idbase + N - 1)) \
+    | sed "s|^|$DSPARK_HS_DIR/hs_|; s|\$|.safetensors|" | xargs -r rm -f 2>/dev/null
+  rm -rf "$OUT/dumps_$arm"
+
+  say "打 $N 条 @ 并发 $CONC(max_tokens=$maxtok,id 段 $idbase+)→ $flog"
   local collect=()
   [ "$hsdump" = "1" ] || collect=(--no-collect)
   ENDPOINT="$ENDPOINT" ARROW="$ARROW" HS_DIR="$DSPARK_HS_DIR" \
@@ -371,19 +383,23 @@ run_arm() {
 }
 
 T_ALL=$SECONDS
-ARM_SEQ=0
+RUN_SEQ=0
 ARM_FAILED_START=0
 # 起不来通常是配置/构建问题,不是这一臂特有的 —— 后面的臂几乎必然同样起不来。默认第一次
 # 起失败就停,别让人回来发现空等了两小时。STOP_ON_START_FAIL=0 可以强行跑完全部臂。
 STOP_ON_START_FAIL="${STOP_ON_START_FAIL:-1}"
 for arm in $ARMS; do
-  case "$arm" in
-    A) run_arm A 1 1  8192 "复现对照(纯 prefill + dumper)" ;;
-    B) run_arm B 1 64 8192 "混入 decode —— 纯 prefill 是不是必要条件" ;;
-    C) run_arm C 0 1  8192 "去掉 dumper/aux —— aux 是不是必要条件" ;;
-    D) run_arm D 1 1  2048 "单步 prefill token 砍到 1/4 —— 剂量关系" ;;
-    *) echo "!! 未知的臂:$arm(只认 A B C D)" ;;
-  esac
+  for rep in $(seq 1 "$REPEAT"); do
+    [ "$REPEAT" -gt 1 ] && say "===== 臂 $arm 第 $rep/$REPEAT 次 ====="
+    case "$arm" in
+      A) run_arm A 1 1  8192 "复现对照(纯 prefill + dumper)" ;;
+      B) run_arm B 1 64 8192 "混入 decode —— 纯 prefill 是不是必要条件" ;;
+      C) run_arm C 0 1  8192 "去掉 dumper/aux —— aux 是不是必要条件" ;;
+      D) run_arm D 1 1  2048 "单步 prefill token 砍到 1/4 —— 剂量关系" ;;
+      *) echo "!! 未知的臂:$arm(只认 A B C D)"; break ;;
+    esac
+    [ "$ARM_FAILED_START" -gt 0 ] && break
+  done
   if [ "$ARM_FAILED_START" -gt 0 ] && [ "$STOP_ON_START_FAIL" = "1" ]; then
     echo
     say "!! 服务起不来,后面的臂大概率一样 —— 就地停,不空烧时间。"
@@ -400,7 +416,13 @@ echo "==========================================================================
 printf '%-4s %-38s %-6s %-8s %-8s %s\n' 臂 说明 引擎 fire错 算子故障 故障算子
 awk -F'\t' '{printf "%-4s %-38s %-6s %-8s %-8s %s\n", $1, $2, $3, $4, $5, $6}' "$RESULTS"
 echo
-echo "怎么读"
+echo "按臂汇总(崩 = 引擎死 或 算子故障>0):"
+awk -F'\t' '{n[$1]++; if ($3=="死" || ($5+0)>0) k[$1]++}
+  END{for (a in n) printf "  臂 %s: 崩 %d/%d 次\n", a, k[a]+0, n[a]}' "$RESULTS" | sort
+echo
+echo "怎么读   ★ 这个故障是【间歇】的(实测同配置一次 0 错、一次 231 错):"
+echo "         崩 = 阳性,可信。不崩 = 阴性,只在 $REPEAT 次全都不崩时才值得采信,"
+echo "         而且 $REPEAT 次也只是弱证据 —— 要硬结论就加大 REPEAT 或 N。"
 echo "  A 崩 + B 不崩          ⟹ 「整批纯 prefill」是必要条件。顺带解释了旧栈 rollout"
 echo "                            (prefill+decode)为什么没事。上游报告要写清这个触发形状。"
 echo "  A 崩 + C 也崩          ⟹ 与我们的 HS dumper 无关,纯上游问题,报告里不用提 dumper。"
