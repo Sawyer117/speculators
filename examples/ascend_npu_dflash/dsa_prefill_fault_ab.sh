@@ -70,6 +70,8 @@ READY_TIMEOUT="${READY_TIMEOUT:-3600}"   # 543GB 权重加载 + 禁用缓存后�
 SETTLE="${SETTLE:-25}"               # 打完到读 plog 之间的等待(plog 落盘 + 异步故障浮出来)
 KILL_WAIT="${KILL_WAIT:-60}"         # pkill 之后最多等多久确认进程真的没了
 PORT_WAIT="${PORT_WAIT:-90}"         # 进程没了但端口还没放开(TIME_WAIT)时再等多久
+HBM_WAIT="${HBM_WAIT:-180}"          # 等卡上显存回落多久(驱动侧释放不是瞬时的)
+HBM_FREE_MB="${HBM_FREE_MB:-4096}"   # 单 die 已用显存低于这个数才算「卡是空的」(空卡通常几百 MiB)
 SERVE_SH="${SERVE_SH:-$SCRIPT_DIR/serve_dsv4_a3_singlenode_specmethod.sh}"
 LOGDIR="${ASCEND_PROCESS_LOG_PATH:-$HOME/ascend/log}"
 DSPARK_HS_DIR="${DSPARK_HS_DIR:-/home/canada_group_folder/dataset/dsv4_hs_dump}"
@@ -105,6 +107,19 @@ KILLPAT="${KILLPAT:-vllm|EngineCore|APIServer|ApiServer|DPCoordinator|VLLMWorker
 
 # 还活着的目标进程(排除自己和自己的父 shell,否则 pgrep -f 会把本脚本也数进去)
 _alive() { pgrep -i -u "$USER" -f "$KILLPAT" 2>/dev/null | grep -vx "$$" | grep -vx "$PPID"; }
+
+# ★ 终极判据:卡上还剩多少显存被占。进程列表可能漏(名字对不上、D 状态卡在驱动里),
+#   **显存不会骗人**。2026-09-19 实测:pkill 之后 pgrep 干净,起服务却报
+#   `Free memory on device (22.42/61.27 GiB) ... less than desired (0.9, 55.14 GiB)`
+#   —— 38.85 GiB 还被残留的 VLLMWorker_DP(各 41056 MiB)攥着。
+#   npu-smi 的 HBM-Usage 列形如 `3536 / 65536`;只取分母 >= 30000 的那组(HBM,不是
+#   旁边那列小的 Memory(MB)),返回所有 die 里最大的已用值(MB)。
+_npu_used_mb() {
+  command -v npu-smi >/dev/null 2>&1 || { echo -1; return; }
+  npu-smi info 2>/dev/null \
+    | grep -oE '[0-9]+ */ *[0-9]{5,}' \
+    | awk -F'/' '{gsub(/ /,""); if ($2+0>=30000 && $1+0>mx) mx=$1+0} END{print mx+0}'
+}
 
 _port_free() {
   python - "$PORT" <<'PYEOF' 2>/dev/null
@@ -159,12 +174,24 @@ cleanup_verified() {
     find /dev/shm -maxdepth 1 -user "$USER" \
       \( -name 'psm_*' -o -name '*vllm*' -o -name 'torch_*' \) -delete 2>/dev/null
   fi
-  # NPU 上还有没有人占卡(best-effort,npu-smi 不在就跳过)
-  if command -v npu-smi >/dev/null 2>&1; then
-    local nn; nn=$(npu-smi info 2>/dev/null | grep -ci 'vllm' || true)
-    [ "${nn:-0}" -gt 0 ] && say "!! 注意:npu-smi 里还有 $nn 行 vllm 进程占着卡"
+  # ★ 显存:pkill 之后驱动侧释放要时间,进程没了不等于卡空了。等它回落,别一次性判死。
+  local used; used=$(_npu_used_mb)
+  if [ "$used" -ge 0 ] 2>/dev/null; then
+    local ht=0
+    while [ "$used" -gt "$HBM_FREE_MB" ] && [ "$ht" -lt "$HBM_WAIT" ]; do
+      [ "$ht" -eq 0 ] && say "    卡上还占着 ${used} MiB,等显存回落(最多 $(hms "$HBM_WAIT"))..."
+      sleep 5; ht=$((ht + 5)); used=$(_npu_used_mb)
+    done
+    if [ "$used" -gt "$HBM_FREE_MB" ]; then
+      say "!! 清场未完成($tag):卡上仍有 ${used} MiB 被占(阈值 ${HBM_FREE_MB} MiB,等了 $(hms $ht))。"
+      say "   带着这些残留起服务,会在 worker init 报"
+      say "   'Free memory on device (...) is less than desired GPU memory utilization' —— 那不是配置问题。"
+      npu-smi info 2>/dev/null | grep -iE 'vllm|python|process id' | head -20
+      return 1
+    fi
+    [ "$ht" -gt 0 ] && say "    显存在 $(hms $ht) 后回落到 ${used} MiB"
   fi
-  say "    清场已核实:无残留进程,端口 $PORT 可绑定"
+  say "    清场已核实:无残留进程,端口 $PORT 可绑定,卡上占用 ${used} MiB"
   return 0
 }
 
