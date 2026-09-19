@@ -193,6 +193,17 @@ HS_ARGS=()
 if [ "$HS_DUMP" = "1" ]; then
   [ -n "$DRAFT" ] && { echo "!! HS_DUMP=1 is mutually exclusive with DRAFT (the HS producer serves the target only)"; exit 2; }
   export DSPARK_HS_DUMP=1 DSPARK_HS_DIR
+  # ★★ 必须绕开 torch.compile / npugraph_ex 的编译缓存。
+  #   aux 通路改变的是【模型 forward 的返回签名】:开了 aux 返回 (hs, aux),没开返回一个裸
+  #   tensor。而 set_aux_hidden_state_layers() 是在 get_model() **之后**才调的
+  #   (model_runner_v1.py:3601 vs :3661),所以它进不了编译缓存的 key —— 缓存无从知道
+  #   这一份图带不带 aux。后果:同一台机器上 eval serve(无 aux)和 HS-dump serve(有 aux)
+  #   轮流跑,谁先编译谁把缓存占了,另一个直接命中错误的图。
+  #   2026-09-19 实测:日志里 `Directly load AOT compilation` + `torch.compile took 2.94 s`
+  #   (命中缓存的速度),16 个 worker 都打印了 aux 已开,profile_run 里却拿到裸 tensor,
+  #   `hidden_states, _ = outputs` → ValueError: too many values to unpack (expected 2)。
+  #   ⚠ 崩掉还算走运 —— 反过来(缓存里是带 aux 但【层号不同】的图)会静默 dump 错层。
+  export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
   mkdir -p "$DSPARK_HS_DIR" 2>/dev/null; chmod 0777 "$DSPARK_HS_DIR" 2>/dev/null || true
   HS_ARGS=(--hf-overrides "{\"dspark_target_layer_ids\":$DSPARK_AUX_LAYERS}")
   echo ">>> [HS_DUMP] Plan B producer → $DSPARK_HS_DIR (hs_<id>.safetensors); aux $DSPARK_AUX_LAYERS; NO draft"

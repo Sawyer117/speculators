@@ -66,7 +66,7 @@ PORT="${PORT:-7000}"
 ENDPOINT="http://localhost:$PORT/v1"
 OUT="${OUT:-$HOME/dsa_fault_ab}"
 START_ROW="${START_ROW:-0}"          # 所有臂打同一批行 —— 负载必须逐条相同
-READY_TIMEOUT="${READY_TIMEOUT:-2400}"   # 543GB 权重加载,给足
+READY_TIMEOUT="${READY_TIMEOUT:-3600}"   # 543GB 权重加载 + 禁用缓存后的一次真编译,给足
 SETTLE="${SETTLE:-25}"               # 打完到读 plog 之间的等待(plog 落盘 + 异步故障浮出来)
 KILL_WAIT="${KILL_WAIT:-60}"         # pkill 之后等 HBM 真正释放
 SERVE_SH="${SERVE_SH:-$SCRIPT_DIR/serve_dsv4_a3_singlenode_specmethod.sh}"
@@ -77,6 +77,12 @@ DSPARK_HS_DIR="${DSPARK_HS_DIR:-/home/canada_group_folder/dataset/dsv4_hs_dump}"
 #   关掉之后同一个错跑到 SparseAttnSharedkv —— 那是异步故障换了个暴露点,不是修好了。
 #   要对比 SparseAttnSharedkv 这个签名,三个臂就必须都在 0 上,否则臂之间不可比。
 DSA_OVERLAP="${DSA_OVERLAP:-0}"
+
+# ★ 全臂禁用编译缓存。A/B/D 臂带 aux、C 臂不带,而 aux 改的是模型返回签名,却【进不了
+#   编译缓存的 key】(set_aux_hidden_state_layers 在 get_model 之后才调)。留着缓存,
+#   先跑的臂会把图塞进缓存、后跑的臂直接命中错误的图 —— 臂之间互相污染,对照全废。
+#   代价是每个臂多一次真编译;换来的是每个臂跑的确实是它自己那张图。
+export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
 
 if [ -z "${ARROW:-}" ]; then
   for d in /home/canada_group_folder/dataset/arrow* \
@@ -101,7 +107,7 @@ echo "  ARROW      ${ARROW:-<找不到,用 ARROW= 指定>}"
 echo "  serve      $SERVE_SH"
 echo "  HS_DIR     $DSPARK_HS_DIR"
 echo "  流量       每臂 $N 条 @ 并发 $CONC,Arrow 行 [$START_ROW, $((START_ROW+N)))"
-echo "  DSA_OVERLAP=$DSA_OVERLAP (全程锁死,否则臂之间不可比)"
+echo "  DSA_OVERLAP=$DSA_OVERLAP  VLLM_DISABLE_COMPILE_CACHE=$VLLM_DISABLE_COMPILE_CACHE (都锁死,否则臂之间不可比)"
 echo "  plog       $LOGDIR"
 echo "  产物       $OUT"
 echo "================================================================================"
