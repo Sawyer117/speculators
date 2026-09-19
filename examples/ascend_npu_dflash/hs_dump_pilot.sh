@@ -31,6 +31,13 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# ⚠ 一旦 source 过 portproxy_remote.sh,http_proxy 就会把 localhost 也劫走。脚本自己的
+#   curl 带了 --noproxy '*' 所以探活能过,但 dsv4_fire_hs_dumps.py 用的是 openai 客户端,
+#   它认 http_proxy —— 于是请求被送到公司代理,回来一张 HTML 错误页,报
+#   openai.InternalServerError: <!doctype html>...HIS Proxy Notification...
+#   eval_blk15_drafts.sh 里一直有这行,这个脚本漏了。
+export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"
+
 PORT="${PORT:-7000}"
 ENDPOINT="${ENDPOINT:-http://localhost:$PORT/v1}"
 N="${N:-256}"
