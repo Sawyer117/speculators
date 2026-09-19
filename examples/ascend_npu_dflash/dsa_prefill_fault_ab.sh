@@ -68,7 +68,8 @@ OUT="${OUT:-$HOME/dsa_fault_ab}"
 START_ROW="${START_ROW:-0}"          # 所有臂打同一批行 —— 负载必须逐条相同
 READY_TIMEOUT="${READY_TIMEOUT:-3600}"   # 543GB 权重加载 + 禁用缓存后的一次真编译,给足
 SETTLE="${SETTLE:-25}"               # 打完到读 plog 之间的等待(plog 落盘 + 异步故障浮出来)
-KILL_WAIT="${KILL_WAIT:-60}"         # pkill 之后等 HBM 真正释放
+KILL_WAIT="${KILL_WAIT:-60}"         # pkill 之后最多等多久确认进程真的没了
+PORT_WAIT="${PORT_WAIT:-90}"         # 进程没了但端口还没放开(TIME_WAIT)时再等多久
 SERVE_SH="${SERVE_SH:-$SCRIPT_DIR/serve_dsv4_a3_singlenode_specmethod.sh}"
 LOGDIR="${ASCEND_PROCESS_LOG_PATH:-$HOME/ascend/log}"
 DSPARK_HS_DIR="${DSPARK_HS_DIR:-/home/canada_group_folder/dataset/dsv4_hs_dump}"
@@ -95,6 +96,88 @@ fi
 hms() { printf '%02d:%02d:%02d' $(($1/3600)) $((($1%3600)/60)) $(($1%60)); }
 say() { echo "[$(date '+%m-%d %H:%M:%S')] $*"; }
 serve_up() { curl -sf --noproxy '*' "$ENDPOINT/models" >/dev/null 2>&1; }
+
+# vLLM 给自己的进程改名:setproctitle(f"{VLLM_PROCESS_NAME_PREFIX}::{name}") ->
+# VLLM::APIServer_0 / VLLM::DPCoordinator / VLLM::EngineCore_DP0 / VLLM::Worker,
+# vllm-ascend 侧还有 VLLMWorker_DP / VLLM_DP_Coordinator。都带 VLLM,但别只赌这一点:
+# 多列几个名字,漏掉一个残留进程 = 下一次起服务在 gloo rendezvous 上莫名其妙地挂。
+KILLPAT="${KILLPAT:-vllm|EngineCore|APIServer|ApiServer|DPCoordinator|VLLMWorker|dspark_hs}"
+
+# 还活着的目标进程(排除自己和自己的父 shell,否则 pgrep -f 会把本脚本也数进去)
+_alive() { pgrep -i -u "$USER" -f "$KILLPAT" 2>/dev/null | grep -vx "$$" | grep -vx "$PPID"; }
+
+_port_free() {
+  python - "$PORT" <<'PYEOF' 2>/dev/null
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("0.0.0.0", int(sys.argv[1]))); sys.exit(0)
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PYEOF
+}
+
+# ★ 清场必须【可验证】。第一版是 pkill 之后 sleep 60 就当干净了 —— 2026-09-19 下一次起
+#   服务在 `torch.distributed.new_group(backend="gloo")` 上报
+#   `Failed to recv, got 0 bytes`(rendezvous 对端没了),典型的残留/端口没放开。
+#   睡固定秒数不是清场,是许愿。
+cleanup_verified() {
+  local tag="$1"
+  pkill -9 -i -u "$USER" -f "$KILLPAT" >/dev/null 2>&1
+  local t=0 n
+  while [ "$t" -lt "$KILL_WAIT" ]; do
+    n=$(_alive | wc -l)
+    [ "$n" -eq 0 ] && break
+    sleep 2; t=$((t + 2))
+  done
+  n=$(_alive | wc -l)
+  if [ "$n" -gt 0 ]; then
+    say "!! 清场未完成($tag):还有 $n 个进程没死。它们是:"
+    _alive | while read -r pid; do ps -o pid=,etime=,args= -p "$pid" 2>/dev/null | cut -c1-140; done
+    return 1
+  fi
+  # 端口:进程没了不代表端口放开了(TIME_WAIT / 别人占着)。等的时候要出声 ——
+  # 静默地等一分钟,和卡死在用户眼里没有区别。
+  local pt=0
+  while ! _port_free && [ "$pt" -lt "$PORT_WAIT" ]; do
+    [ "$pt" -eq 0 ] && say "    端口 $PORT 还被占着,等它放开(最多 $(hms "$PORT_WAIT"))..."
+    sleep 2; pt=$((pt + 2))
+  done
+  [ "$pt" -gt 0 ] && _port_free && say "    端口 $PORT 在 $(hms $pt) 后放开"
+  if ! _port_free; then
+    say "!! 清场未完成($tag):端口 $PORT 仍被占用($(hms $pt) 没放开)。"
+    command -v ss >/dev/null && ss -ltnp 2>/dev/null | grep ":$PORT " | head -3
+    return 1
+  fi
+  # 泄漏的 IPC:刚才那次崩溃日志里就有「7 leaked semaphore / 1 leaked shared_memory」
+  local shm; shm=$(find /dev/shm -maxdepth 1 -user "$USER" \
+                   \( -name 'psm_*' -o -name '*vllm*' -o -name 'torch_*' \) 2>/dev/null | wc -l)
+  if [ "$shm" -gt 0 ]; then
+    say "    清掉 $shm 个残留的 /dev/shm 对象(进程已全部确认退出,不会误删活着的)"
+    find /dev/shm -maxdepth 1 -user "$USER" \
+      \( -name 'psm_*' -o -name '*vllm*' -o -name 'torch_*' \) -delete 2>/dev/null
+  fi
+  # NPU 上还有没有人占卡(best-effort,npu-smi 不在就跳过)
+  if command -v npu-smi >/dev/null 2>&1; then
+    local nn; nn=$(npu-smi info 2>/dev/null | grep -ci 'vllm' || true)
+    [ "${nn:-0}" -gt 0 ] && say "!! 注意:npu-smi 里还有 $nn 行 vllm 进程占着卡"
+  fi
+  say "    清场已核实:无残留进程,端口 $PORT 可绑定"
+  return 0
+}
+
+# 单实例:两个 A/B 同时跑 = 互相 pkill 对方的服务,结果全是噪声。
+LOCK="${LOCK:-$HOME/.dsa_prefill_fault_ab.lock}"
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "!! 已经有一个实例在跑(PID $(cat "$LOCK"))。先 kill 它,或删掉 $LOCK。"
+  echo "   ⚠ 上一轮那个【旧版】脚本会在 READY_TIMEOUT 到点后 pkill 一切 —— 它还活着的时候"
+  echo "     再起新的,两边会互相踹。"
+  exit 2
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
 
 mkdir -p "$OUT"
 RESULTS="$OUT/results.tsv"
@@ -135,8 +218,12 @@ run_arm() {
   echo "################################################################################"
 
   say "清场 ..."
-  pkill -9 -i -u "$USER" -f 'vllm|EngineCore' >/dev/null 2>&1
-  sleep "$KILL_WAIT"
+  if ! cleanup_verified "臂 $arm 起跑前"; then
+    say "!! 起跑前清不干净,这一臂【作废】—— 带着残留起服务只会得到一堆看不懂的 gloo 报错。"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$arm" "$desc" "清场失败" "-" "-" "残留未清干净" "$slog" >> "$RESULTS"
+    ARM_FAILED_START=$((ARM_FAILED_START + 1))
+    return
+  fi
 
   # 故障判据的时间基准:只认这一刻【之后】写进 plog 的东西,不然会把上一个臂的账算过来
   local T0; T0=$(date +%s)
@@ -173,13 +260,20 @@ run_arm() {
   if [ "$ready" != "1" ]; then
     [ -n "$why" ] || why="等满 $(hms "$READY_TIMEOUT") 仍未就绪"
     say "!! 臂 $arm 起不来($why,用时 $(hms $((SECONDS-t0))))—— 这一臂【作废】,不是「不崩」"
-    echo "---------------- $slog 的致命片段 ----------------"
-    grep -nE 'Error|Traceback|raise |Engine core' "$slog" 2>/dev/null | tail -25
-    echo "---------------- 末尾 15 行 ----------------"
-    tail -15 "$slog" 2>/dev/null
+    # ★ 多进程崩溃是【级联】:一个 worker 先死,其余在 gloo rendezvous 上报
+    #   `Failed to recv, got 0 bytes` —— 那是后果不是原因。所以先给【最早】那段。
+    local first_err
+    first_err=$(grep -nE 'ERROR|Traceback \(most recent call last\)' "$slog" 2>/dev/null | head -1 | cut -d: -f1)
+    echo "---------------- ★ 最早的错误(首因,第 ${first_err:-?} 行起)----------------"
+    [ -n "$first_err" ] && sed -n "${first_err},$((first_err + 40))p" "$slog" | cut -c1-200
+    echo "---------------- 各类错误各取一条 ----------------"
+    grep -ohE '(ValueError|RuntimeError|AssertionError|ImportError|OSError|DistNetworkError|HCCL[A-Za-z]*Error|RuntimeError)[^\n]{0,140}' \
+      "$slog" 2>/dev/null | sed 's/  */ /g' | sort -u | head -8
+    echo "---------------- 末尾 12 行 ----------------"
+    tail -12 "$slog" 2>/dev/null | cut -c1-200
     echo "------------------------------------------------"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$arm" "$desc" "起不来" "-" "-" "$why" "$slog" >> "$RESULTS"
-    pkill -9 -i -u "$USER" -f 'vllm|EngineCore' >/dev/null 2>&1
+    cleanup_verified "臂 $arm 收尾" || true
     ARM_FAILED_START=$((ARM_FAILED_START + 1))
     return
   fi
@@ -222,7 +316,7 @@ run_arm() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$arm" "$desc" "$alive" "$errs" "$faults" "$kinds" "507015×$e507" >> "$RESULTS"
 
-  pkill -9 -i -u "$USER" -f 'vllm|EngineCore' >/dev/null 2>&1
+  cleanup_verified "臂 $arm 收尾" || true
   say "臂 $arm 用时 $(hms $((SECONDS-t_arm)))"
 }
 
