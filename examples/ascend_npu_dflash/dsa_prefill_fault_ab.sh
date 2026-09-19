@@ -199,33 +199,35 @@ cleanup_verified() {
     fi
     [ "$ht" -gt 0 ] && say "    显存在 $(hms $ht) 后回落到 ${used} MiB"
   fi
-  say "    清场已核实:无残留进程,端口 $PORT 可绑定,卡上占用 ${used} MiB"
+  if [ "$used" -ge 0 ] 2>/dev/null; then
+    say "    清场已核实:无残留进程,端口 $PORT 可绑定,卡上占用 ${used} MiB"
+  else
+    say "    清场已核实:无残留进程,端口 $PORT 可绑定(没有 npu-smi,跳过显存检查)"
+  fi
   return 0
 }
 
-# 单实例。★ 光靠锁文件不够 —— 2026-09-19 实测:23:21 起的那个【旧版本】脚本不写锁,
-#   用户又 rm 了锁文件,于是 23:45 的新实例和它同时在跑:旧实例把新实例起的服务当成
-#   自己的(都在 7000 端口),打完自己的 256 条又 pkill 掉它,两边的输出还写进同一个
-#   ~/dsa_ab.log 交叉在一起。结果全废。所以先按【进程名】找同名实例,这能抓到任何版本。
-_other_me() {
-  pgrep -f 'dsa_prefill_fault_ab\.sh' 2>/dev/null | grep -vx "$$" | grep -vx "$PPID"
-}
-_OTHER=$(_other_me)
-if [ -n "$_OTHER" ]; then
-  echo "!! 已经有别的 dsa_prefill_fault_ab.sh 在跑,PID:$(echo "$_OTHER" | tr '\n' ' ')"
-  echo "   两个实例会互相把对方的服务当成自己的、再互相 pkill,拿到的数全是噪声。"
-  echo "   先杀掉:pkill -9 -f dsa_prefill_fault_ab.sh   然后重跑本脚本。"
-  exit 2
-fi
+# 单实例 —— 用 flock,不用进程名。
+# ★ 试过按进程名 pgrep 自己,反复误报:`$(...)` 命令替换 fork 出的子 shell cmdline
+#   和本体一模一样(实测本体 2731224 / 子 shell 2731230),连启动它的那层
+#   `bash .../dsa_prefill_fault_ab.sh` 也会被数进来。想靠 PGID 或父子链把「自己人」
+#   摘出去,在嵌套/非交互 shell 下都不稳。flock 是内核级的文件锁,不看进程名、
+#   不看血缘,进程一退内核自动释放 —— 没有歧义,也不会留下要手工删的陈旧锁。
 LOCK="${LOCK:-$HOME/.dsa_prefill_fault_ab.lock}"
-if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
-  echo "!! 已经有一个实例在跑(PID $(cat "$LOCK"))。先 kill 它,或删掉 $LOCK。"
-  echo "   ⚠ 上一轮那个【旧版】脚本会在 READY_TIMEOUT 到点后 pkill 一切 —— 它还活着的时候"
-  echo "     再起新的,两边会互相踹。"
-  exit 2
+exec 9>"$LOCK" || { echo "!! 打不开锁文件 $LOCK"; exit 2; }
+if command -v flock >/dev/null 2>&1; then
+  if ! flock -n 9; then
+    echo "!! 已经有一个实例持有 $LOCK —— 两个 A/B 同时跑会互相把对方的服务当成自己的、"
+    echo "   再互相 pkill,拿到的数全是噪声。"
+    echo "   先杀掉:pkill -9 -f dsa_prefill_fault_ab.sh"
+    exit 2
+  fi
+else
+  echo ">>> 注意:没有 flock,跳过单实例保护。手工确认没有别的实例在跑。"
 fi
-echo $$ > "$LOCK"
-trap 'rm -f "$LOCK"' EXIT
+echo $$ >&9
+# ⚠ 上一轮那个【旧版本】脚本不持有这把锁(它根本没有锁),所以它拦不住。跑之前
+#   自己确认一眼:pgrep -af dsa_prefill_fault_ab.sh —— 只该看到你刚起的这一个。
 
 mkdir -p "$OUT"
 RESULTS="$OUT/results.tsv"
