@@ -68,23 +68,29 @@ def rms_norm(x, w, eps: float = 1e-6):
     return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)) * w.float()
 
 
-def mismatch(h, W, ids, shift: int, chunk: int) -> tuple[float, int]:
-    """argmax(h_i @ W.T) 与 ids[i+shift] 的不一致率。"""
-    import torch  # noqa: PLC0415
+def mismatch(h, W, ids, shift: int, chunk: int, topk: int = 0) -> tuple[float, int, float]:
+    """argmax(h_i @ W.T) 与 ids[i+shift] 的不一致率;topk>0 时另给 top-k 命中率。
 
+    ★ 为什么要 top-k:argmax 不中【不等于】值是垃圾。目标 token 稳定落在 top-10 里
+      = 方向对、只是数值有偏差(精度/非确定性);连 top-10 都进不去 = 真的不相干。
+      这两种要的下一步完全不同,而它们的 argmax mismatch 长得一模一样。
+    """
     T = h.shape[0]
     lo = max(0, -shift)
     hi = min(T, T - shift)
     if hi - lo <= 0:
-        return float("nan"), 0
-    bad = tot = 0
+        return float("nan"), 0, float("nan")
+    bad = tot = hit = 0
     for s in range(lo, hi, chunk):
         e = min(s + chunk, hi)
-        pred = (h[s:e].float() @ W.T).argmax(-1)
+        logits = h[s:e].float() @ W.T
         tgt = ids[s + shift: e + shift]
-        bad += int((pred != tgt).sum())
+        bad += int((logits.argmax(-1) != tgt).sum())
+        if topk:
+            tk = logits.topk(topk, dim=-1).indices
+            hit += int((tk == tgt.unsqueeze(-1)).any(-1).sum())
         tot += e - s
-    return 100.0 * bad / max(tot, 1), tot
+    return 100.0 * bad / max(tot, 1), tot, (100.0 * hit / max(tot, 1) if topk else float("nan"))
 
 
 def main() -> int:
@@ -96,6 +102,7 @@ def main() -> int:
     ap.add_argument("--max-pos", type=int, default=768, help="每个文件最多算几个位置")
     ap.add_argument("--tail-frac", type=float, default=0.4, help="尾部这一段近似 response 段")
     ap.add_argument("--chunk", type=int, default=128)
+    ap.add_argument("--topk", type=int, default=10, help="另报「目标 token 在 top-k 内」的比例")
     args = ap.parse_args()
 
     import torch  # noqa: PLC0415
@@ -109,6 +116,10 @@ def main() -> int:
 
     hk, W = _find_tensor(args.model_dir, _HEAD_KEYS, "lm_head")
     nk, NW = _find_tensor(args.model_dir, _NORM_KEYS, "final norm weight")
+    # ★ ckpt 权重是 bf16,而我们按 float32 算 —— 不统一会直接
+    #   `expected m1 and m2 to have the same dtype`。载入时 cast 一次,别在内层循环里转。
+    W = W.float()
+    NW = NW.float()
     print(f"lm_head='{hk}' {tuple(W.shape)}   final_norm='{nk}' {tuple(NW.shape)}")
     print(f"样本 {len(fs)} 个文件,每个最多 {args.max_pos} 个位置\n")
 
@@ -128,6 +139,7 @@ def main() -> int:
     # ── 穷举:切片 × {raw, normed} × shift ────────────────────────────────────
     combos = [(s, n, k) for s in range(L) for n in (False, True) for k in (1, 0, -1)]
     acc: dict[tuple, list] = {c: [[0, 0], [0, 0]] for c in combos}   # [全量, 尾部] 各 [bad, tot]
+    hits: dict[tuple, float] = {}
 
     for f in fs:
         d = load_file(f)
@@ -139,27 +151,30 @@ def main() -> int:
             h = hs[:, s, :]
             if n:
                 h = rms_norm(h, NW)
-            r_all, n_all = mismatch(h, W, ids, k, args.chunk)
-            r_tl, n_tl = mismatch(h[t0:], W, ids[t0:], k, args.chunk)
+            r_all, n_all, _ = mismatch(h, W, ids, k, args.chunk)
+            r_tl, n_tl, hit = mismatch(h[t0:], W, ids[t0:], k, args.chunk, topk=args.topk)
             if n_all:
                 acc[(s, n, k)][0][0] += r_all * n_all / 100.0
                 acc[(s, n, k)][0][1] += n_all
             if n_tl:
                 acc[(s, n, k)][1][0] += r_tl * n_tl / 100.0
                 acc[(s, n, k)][1][1] += n_tl
+                hits[(s, n, k)] = hits.get((s, n, k), 0.0) + hit * n_tl / 100.0
 
-    print(f"{'切片':<8}{'norm':<7}{'shift':<7}{'全量 mismatch':>14}{'尾部 mismatch':>14}")
-    print("-" * 52)
+    print(f"{'切片':<8}{'norm':<7}{'shift':<7}{'全量 mismatch':>14}{'尾部 mismatch':>14}"
+          f"{f'尾部 top{args.topk} 命中':>16}")
+    print("-" * 68)
     best = None
     for (s, n, k) in combos:
         (ba, ta), (bt, tt) = acc[(s, n, k)]
         ra = 100.0 * ba / max(ta, 1)
         rt = 100.0 * bt / max(tt, 1)
         tag = f"[{s}]" + ("=末" if s == L - 1 else "")
-        print(f"{tag:<8}{'是' if n else '否':<6}{k:>4}   {ra:>12.2f}% {rt:>13.2f}%")
+        hk_ = 100.0 * hits.get((s, n, k), 0.0) / max(tt, 1)
+        print(f"{tag:<8}{'是' if n else '否':<6}{k:>4}   {ra:>12.2f}% {rt:>13.2f}% {hk_:>14.2f}%")
         if best is None or rt < best[0]:
             best = (rt, s, n, k, ra)
-    print("-" * 52)
+    print("-" * 68)
     rt, s, n, k, ra = best
     print(f"\n最好的一格:切片[{s}] {'过 norm' if n else '不过 norm'} shift={k} "
           f"→ 尾部 {rt:.2f}%(全量 {ra:.2f}%)")
@@ -175,8 +190,12 @@ def main() -> int:
     elif rt < 20:
         print("⚠️ 最好的一格也有几个到十几个百分点 —— 像是【部分】损坏(过订阅/并发写坏),")
         print("   而不是读法问题。对比 conc=1 的 dump:run_hs_consistency_check.sh。")
+    elif max(hits.get(c, 0.0) / max(acc[c][1][1], 1) * 100.0 for c in combos) > 60:
+        print("⚠️ argmax 都不中,但目标 token 大比例落在 top-k 里 ⟹ 方向对、数值有偏差,")
+        print("   不是「捕获了完全不相干的东西」。优先怀疑:基准本身(rollout 不是这套栈/不是贪心)、")
+        print("   bf16 非确定性、或者 prompt 段占比过高。先用 Arrow 的 loss_mask 只统计 response 段。")
     else:
-        print("❌ 所有读法都很差 ⟹ 不是切片/norm/错位的问题,dump 出来的值本身就不对。")
+        print("❌ 所有读法都很差,连 top-k 都不中 ⟹ dump 出来的值本身就不对。")
         print("   下一步 MODE 2(独立 HF 前向)定位是捕获点错了还是数值被写坏:")
         print("   dsv4_hs_integrity_check.py --hf-model <dir>  (重,需要整模型)")
         print("   在那之前【绝对不要】开始批量 dump。")
