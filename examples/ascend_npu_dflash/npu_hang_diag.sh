@@ -81,7 +81,27 @@ if [ -d "$LOGDIR" ]; then
   echo "-- 最近 $SINCE 内改动过的日志文件(前 5)--"
   find "$LOGDIR" -name "*.log" -newermt "-$SINCE" 2>/dev/null | head -5
   echo
-  echo "-- 关键字命中统计 --"
+  # ★ 算子级故障必须单独看,而且要放在最前面。2026-09-19 的教训:一次 aicore 越界
+  #   (npu_sparse_attn_sharedkv)让 16 个 worker 全挂,而下面那组【只查链路层】的关键词
+  #   全是 0,于是本脚本给出「以上都干净 -> 回到软件侧」—— 真凶就在它刚列出来的同一批
+  #   文件里,只是没人 grep `fault kernel_name`。工具报「干净」比报不出来更误导。
+  echo "-- ★ 算子级故障(aicore / aivector)--"
+  _OPHIT=$(find "$LOGDIR" -name "*.log" -newermt "-$SINCE" 2>/dev/null \
+           | xargs grep -ohE "fault kernel_name=[^ ,]*" 2>/dev/null | sort | uniq -c | sort -rn)
+  if [ -n "$_OPHIT" ]; then
+    echo "$_OPHIT" | head -10
+    echo "  ↳ 这就是越界的算子。PTA 侧通常表现为 error code 507015 /"
+    echo "    acl::AclQueryEventRecordedStatus —— 那是【异步故障的延迟暴露】,"
+    echo "    报错位置不等于出事位置,以这里的 kernel_name 为准。"
+    find "$LOGDIR" -name "*.log" -newermt "-$SINCE" 2>/dev/null \
+      | xargs grep -ohE "there is an exception of [^,]*, core id is [0-9]*, error code = [0-9a-fx]*" 2>/dev/null \
+      | sort | uniq -c | sort -rn | head -5 | sed 's/^/    /'
+  else
+    echo "  (无 —— 最近 $SINCE 内没有 aicore 级故障)"
+  fi
+  echo
+
+  echo "-- 关键字命中统计(链路层)--"
   for kw in "error cqe" "Stuck Occurred" "EI0002" "EI0006" "link down" "retry"; do
     n=$(find "$LOGDIR" -name "*.log" -newermt "-$SINCE" 2>/dev/null \
         | xargs grep -ilF "$kw" 2>/dev/null | wc -l)
@@ -117,4 +137,5 @@ echo
 echo "读法:"
 echo "  error cqe 有命中          -> 卡间链路丢包,硬件/链路层,复位或报修"
 echo "  残留进程或卡上有进程       -> 先清干净再谈其他"
-echo "  以上都干净                -> 不是残留也不是链路,回到软件侧继续切"
+echo "  ★ 算子级故障有 kernel_name -> 就是它越界;链路层全 0 也不代表没事,两层是独立的
+  以上都干净                -> 不是残留、不是链路、也不是算子,才轮到回软件侧继续切"
