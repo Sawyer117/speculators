@@ -93,6 +93,23 @@ def mismatch(h, W, ids, shift: int, chunk: int, topk: int = 0) -> tuple[float, i
     return 100.0 * bad / max(tot, 1), tot, (100.0 * hit / max(tot, 1) if topk else float("nan"))
 
 
+def resp_mismatch(h, W, ids, shift: int, chunk: int, mask, ) -> tuple[float, int]:
+    """只在 mask 为真的【目标位置】上算 mismatch —— 即 ids[i+shift] 属于 response 段。"""
+    T = h.shape[0]
+    lo, hi = max(0, -shift), min(T, T - shift)
+    bad = tot = 0
+    for s in range(lo, hi, chunk):
+        e = min(s + chunk, hi)
+        m = mask[s + shift: e + shift]
+        if not bool(m.any()):
+            continue
+        logits = h[s:e][m].float() @ W.T
+        tgt = ids[s + shift: e + shift][m]
+        bad += int((logits.argmax(-1) != tgt).sum())
+        tot += int(m.sum())
+    return (100.0 * bad / max(tot, 1)), tot
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -103,10 +120,33 @@ def main() -> int:
     ap.add_argument("--tail-frac", type=float, default=0.4, help="尾部这一段近似 response 段")
     ap.add_argument("--chunk", type=int, default=128)
     ap.add_argument("--topk", type=int, default=10, help="另报「目标 token 在 top-k 内」的比例")
+    # ★ 决定性的两条:拿 Arrow 原始行来对。
+    #   (1) dump 里的 token_ids 和 Arrow 的 input_ids 逐个比 —— 不一致 = dumper 把 id 写错了
+    #       /错位了,那是 dumper 的 bug,和模型无关;
+    #   (2) 用 loss_mask 只统计 **response** 段。「尾部 40%」只是近似,prompt 长的行会把
+    #       response 段稀释掉,得出的高 mismatch 没有意义。response 段才是该 ~0% 的地方。
+    ap.add_argument("--arrow", help="训练 Arrow 目录;给了就做 token_ids 对拍 + loss_mask 限定")
+    ap.add_argument("--id-offset", type=int, default=0,
+                    help="Arrow 行号 = 文件 id − 这个值。生产约定 id==row 所以是 0;"
+                         "今晚那批 pilot 用了 --id-base 768 --start-row 0,所以填 768")
     args = ap.parse_args()
 
     import torch  # noqa: PLC0415
     from safetensors.torch import load_file  # noqa: PLC0415
+
+    ds = None
+    if args.arrow:
+        from datasets import load_from_disk  # noqa: PLC0415
+
+        ds = load_from_disk(args.arrow)
+        if hasattr(ds, "keys") and not hasattr(ds, "num_rows"):
+            ds = ds[next(iter(ds.keys()))]
+        try:
+            ds = ds.with_format(None)
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"Arrow: {args.arrow}  {len(ds)} 行  列={ds.column_names}  "
+              f"(行号 = 文件 id − {args.id_offset})")
 
     fs = sorted(glob.glob(f"{args.hs_dir}/hs_*.safetensors"))
     if not fs:
@@ -141,11 +181,31 @@ def main() -> int:
     acc: dict[tuple, list] = {c: [[0, 0], [0, 0]] for c in combos}   # [全量, 尾部] 各 [bad, tot]
     hits: dict[tuple, float] = {}
 
+    resp_acc: dict[tuple, list] = {c: [0.0, 0] for c in combos}
+    ids_checked = ids_equal = 0
+
     for f in fs:
         d = load_file(f)
         hs, ids = d["hidden_states"], d["token_ids"].long()
+        lm = None
+        if ds is not None:
+            row = int(os.path.basename(f)[3:].split(".")[0]) - args.id_offset
+            if 0 <= row < len(ds):
+                a_ids = torch.tensor(ds[row]["input_ids"], dtype=torch.long)
+                ids_checked += 1
+                n = min(len(a_ids), len(ids))
+                same = bool(len(a_ids) == len(ids)) and bool((a_ids == ids).all())
+                ids_equal += int(same)
+                if not same:
+                    diff = int((a_ids[:n] != ids[:n]).sum())
+                    print(f"  ⚠ {os.path.basename(f)} 的 token_ids 和 Arrow 行 {row} 不一致:"
+                          f"长度 {len(ids)} vs {len(a_ids)},前 {n} 位里 {diff} 处不同")
+                if "loss_mask" in ds.column_names:
+                    lm = torch.tensor(ds[row]["loss_mask"], dtype=torch.bool)
         T = min(hs.shape[0], args.max_pos)
         hs, ids = hs[:T], ids[:T]
+        if lm is not None:
+            lm = lm[:T]
         t0 = int(T * (1.0 - args.tail_frac))
         for (s, n, k) in combos:
             h = hs[:, s, :]
@@ -160,9 +220,15 @@ def main() -> int:
                 acc[(s, n, k)][1][0] += r_tl * n_tl / 100.0
                 acc[(s, n, k)][1][1] += n_tl
                 hits[(s, n, k)] = hits.get((s, n, k), 0.0) + hit * n_tl / 100.0
+            # response 段(loss_mask==1):这才是「该 ~0%」的地方
+            if lm is not None and bool(lm.any()):
+                pred_ok = resp_mismatch(h, W, ids, k, args.chunk, lm)
+                if pred_ok[1]:
+                    resp_acc[(s, n, k)][0] += pred_ok[0] * pred_ok[1] / 100.0
+                    resp_acc[(s, n, k)][1] += pred_ok[1]
 
     print(f"{'切片':<8}{'norm':<7}{'shift':<7}{'全量 mismatch':>14}{'尾部 mismatch':>14}"
-          f"{f'尾部 top{args.topk} 命中':>16}")
+          f"{f'尾部 top{args.topk} 命中':>16}{'response 段':>14}")
     print("-" * 68)
     best = None
     for (s, n, k) in combos:
@@ -171,10 +237,33 @@ def main() -> int:
         rt = 100.0 * bt / max(tt, 1)
         tag = f"[{s}]" + ("=末" if s == L - 1 else "")
         hk_ = 100.0 * hits.get((s, n, k), 0.0) / max(tt, 1)
-        print(f"{tag:<8}{'是' if n else '否':<6}{k:>4}   {ra:>12.2f}% {rt:>13.2f}% {hk_:>14.2f}%")
+        rr = resp_acc[(s, n, k)]
+        rs = (f"{100.0 * rr[0] / rr[1]:>12.2f}%" if rr[1] else f"{'—':>13}")
+        print(f"{tag:<8}{'是' if n else '否':<6}{k:>4}   {ra:>12.2f}% {rt:>13.2f}% {hk_:>14.2f}% {rs}")
         if best is None or rt < best[0]:
             best = (rt, s, n, k, ra)
     print("-" * 68)
+    if ids_checked:
+        print(f"\n★ token_ids 对拍:{ids_equal}/{ids_checked} 个文件与 Arrow 完全一致"
+              + ("  → dumper 的 id 没写错,错位/串行都排除" if ids_equal == ids_checked
+                 else "  → ⚠ dumper 把 token_ids 写错了,这是 dumper 的 bug,先修它"))
+        rbest = min(((resp_acc[c][0] / resp_acc[c][1] * 100.0, c)
+                     for c in combos if resp_acc[c][1]), default=None)
+        if rbest:
+            rv, (cs, cn, ck) = rbest
+            print(f"★ response 段(loss_mask==1)最好的一格:切片[{cs}] "
+                  f"{'过' if cn else '不过'} norm shift={ck} → {rv:.2f}%")
+            if rv < 5:
+                print("  ✅ response 段几乎全中 ⟹ **dump 是好的**,之前的 79.9% 是因为把 prompt 段"
+                      "(用户给的 token,本来就预测不了)算进去了。可以放行批量 dump。")
+            elif rv < 30:
+                print("  ⚠ response 段也有明显偏差 —— 可能这批语料不是本模型贪心生成的。"
+                      "先确认 Arrow 的来源(rollout 回流 vs 原始 SFT 语料)。")
+            else:
+                print("  ❌ response 段也很差 ⟹ 要么语料不是本模型生成的,要么 dump 真有问题。"
+                      "下一步:自产自验 —— 用这台 serve 贪心生成一段,再把 prompt+生成 回灌做"
+                      "prefill dump,那段的 mismatch 必须 ~0%。")
+
     rt, s, n, k, ra = best
     print(f"\n最好的一格:切片[{s}] {'过 norm' if n else '不过 norm'} shift={k} "
           f"→ 尾部 {rt:.2f}%(全量 {ra:.2f}%)")
