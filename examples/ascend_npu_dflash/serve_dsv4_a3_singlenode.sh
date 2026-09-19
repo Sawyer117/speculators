@@ -210,6 +210,21 @@ sleep 10   # 进程没了之后,驱动侧归还 HBM 还要几秒
 echo ">>> [A3 single-node] model=$MODEL  DP$DP / TP$TP / EP=$ENABLE_EP  eager=$EAGER  port=$API_PORT"
 echo ">>> draft=${DRAFT:-<none, plain serve>}  num_spec=$NUM_SPEC  STANDARD_DSA=${VLLM_ASCEND_DSPARK_USE_STANDARD_DSA:-<unset>}"
 echo ">>> full engine log = THIS stdout (you launched under nohup → ~/dsv4_a3.log). No poll to Ctrl+C."
+# DSA_OVERLAP=0 -> 关掉 multistream_dsv4_dsa_overlap(ascend_config.py 里默认 True)。
+# 为什么给这个开关:4ce367a 上做 target-only 的 aux 捕获(HS_DUMP=1,无草稿)时,worker 在
+#   attention/dsa_v1.py:1356 _mla_prolog_multistream -> cv_wkv.matmul 里抛 aicore 异常
+#   (507015 / EE9999 rtEventQueryStatus, reason=aicore exception),且只炸 DP1 不炸 DP0。
+# dsa_v1.py:1517 的分支是 `if self.multistream_dsv4_dsa_overlap:` —— 置 0 就整个绕开那段。
+# ⚠ 这是【绕过】不是【修复】:同一个开关在老 pin 386530d12 上也默认 True,而那套
+#   (老 pin + HS dumper)在 A3 双机上长期跑通过,所以真正的回归在 386530d12→4ce367a 之间
+#   的别处。绕过只是为了先把 HS 产出来,回归要单独查/上报。
+DSA_OVERLAP="${DSA_OVERLAP:-1}"
+ACFG='{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}'
+if [ "$DSA_OVERLAP" = "0" ]; then
+  ACFG='{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true,"multistream_dsv4_dsa_overlap":false}'
+  echo ">>> DSA_OVERLAP=0:关闭 multistream_dsv4_dsa_overlap(绕开 _mla_prolog_multistream)"
+fi
+
 exec vllm serve "$MODEL" --served-model-name dsv4 --port "$API_PORT" \
   --data-parallel-size "$DP" --data-parallel-size-local "$DP" \
   --tensor-parallel-size "$TP" "${EP_ARGS[@]}" "${QUANT_ARGS[@]}" \
@@ -217,6 +232,6 @@ exec vllm serve "$MODEL" --served-model-name dsv4 --port "$API_PORT" \
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --block-size 128 \
   --max-num-batched-tokens "$MAXBATCHTOK" \
   --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching --async-scheduling \
-  --additional-config '{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}' \
+  --additional-config "$ACFG" \
   "${LOAD_ARGS[@]}" "${SPEC_ARGS[@]}" "${HS_ARGS[@]}" \
   $EAGER_FLAG "${GRAPH_ARGS[@]}"
