@@ -147,11 +147,19 @@ cleanup_verified() {
     [ "$n" -eq 0 ] && break
     sleep 2; t=$((t + 2))
   done
-  n=$(_alive | wc -l)
-  if [ "$n" -gt 0 ]; then
-    say "!! 清场未完成($tag):还有 $n 个进程没死。它们是:"
-    _alive | while read -r pid; do ps -o pid=,etime=,args= -p "$pid" 2>/dev/null | cut -c1-140; done
-    return 1
+  # 宽限一次再判:上面那轮和这一行之间进程可能刚好退出,直接判失败会误杀一整臂。
+  if [ "$(_alive | wc -l)" -gt 0 ]; then sleep 3; fi
+  local left; left=$(_alive)
+  if [ -n "$left" ]; then
+    local shown; shown=$(echo "$left" | while read -r pid; do
+      ps -o pid=,etime=,args= -p "$pid" 2>/dev/null | cut -c1-140; done)
+    if [ -z "$shown" ]; then
+      say "    (pgrep 数到残留但 ps 已查不到 —— 它们在这几秒里退干净了,继续)"
+    else
+      say "!! 清场未完成($tag):还有进程没死:"
+      echo "$shown"
+      return 1
+    fi
   fi
   # 端口:进程没了不代表端口放开了(TIME_WAIT / 别人占着)。等的时候要出声 ——
   # 静默地等一分钟,和卡死在用户眼里没有区别。
@@ -195,7 +203,20 @@ cleanup_verified() {
   return 0
 }
 
-# 单实例:两个 A/B 同时跑 = 互相 pkill 对方的服务,结果全是噪声。
+# 单实例。★ 光靠锁文件不够 —— 2026-09-19 实测:23:21 起的那个【旧版本】脚本不写锁,
+#   用户又 rm 了锁文件,于是 23:45 的新实例和它同时在跑:旧实例把新实例起的服务当成
+#   自己的(都在 7000 端口),打完自己的 256 条又 pkill 掉它,两边的输出还写进同一个
+#   ~/dsa_ab.log 交叉在一起。结果全废。所以先按【进程名】找同名实例,这能抓到任何版本。
+_other_me() {
+  pgrep -f 'dsa_prefill_fault_ab\.sh' 2>/dev/null | grep -vx "$$" | grep -vx "$PPID"
+}
+_OTHER=$(_other_me)
+if [ -n "$_OTHER" ]; then
+  echo "!! 已经有别的 dsa_prefill_fault_ab.sh 在跑,PID:$(echo "$_OTHER" | tr '\n' ' ')"
+  echo "   两个实例会互相把对方的服务当成自己的、再互相 pkill,拿到的数全是噪声。"
+  echo "   先杀掉:pkill -9 -f dsa_prefill_fault_ab.sh   然后重跑本脚本。"
+  exit 2
+fi
 LOCK="${LOCK:-$HOME/.dsa_prefill_fault_ab.lock}"
 if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
   echo "!! 已经有一个实例在跑(PID $(cat "$LOCK"))。先 kill 它,或删掉 $LOCK。"
