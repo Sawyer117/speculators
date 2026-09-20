@@ -148,6 +148,18 @@ say "3/4 source CANN(经安全外壳):$CANN_ENV"
 # shellcheck disable=SC1090
 source "$SAFE_CANN" || exit 1
 
+# ★ hs_connectors:speculators 的 pyproject 里明确依赖它(`hs-connectors`,uv workspace
+#   成员),但 SSOT 用 `--no-deps` 装 speculators,所以它从来不会被带上 —— 于是第 7 步
+#   verify 里 `import speculators` 直接炸:
+#     ImportError: cannot import name 'FileTransfer' from 'hs_connectors' (unknown location)
+#   "unknown location" 是因为仓库根目录下正好有个同名目录,Python 把它当成命名空间包,
+#   而真正的模块在 hs_connectors/src/hs_connectors。必须 editable 装上。
+#   在调 SSOT【之前】装,这样它第 7 步的 verify 能过。
+if [ -f "$REPO_ROOT/hs_connectors/pyproject.toml" ]; then
+  say "预装 hs_connectors(speculators 的 workspace 依赖,SSOT 的 --no-deps 不会带)"
+  python -m pip install --no-deps -e "$REPO_ROOT/hs_connectors" || exit 1
+fi
+
 say "4/4 调 SSOT 安装脚本(编译算子,几十分钟到几小时;全程输出到 $ROOT/install.log)"
 mkdir -p "$ROOT"
 ROOT="$ROOT" VLLM_DIR="$VLLM_DIR" VA_DIR="$VA_DIR" VA_BRANCH="$OLD_SHA" \
