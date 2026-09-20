@@ -57,6 +57,10 @@ def main() -> int:
     #   温度 0、并发 1、prefix cache 关着 —— 贪心解码本该是确定性的。所以在拿语料说事
     #   之前,必须先测【服务自己可不可复现】:同一个 prompt 连打 R 次,互相比。
     #   服务不可复现 ⟹ 任何「和历史语料对不上」的结论都不成立,病在栈里不在数据里。
+    # 确定性会不会随上下文变长而变差?loss_mask 切出来的 prompt 只有几十到几百 token,
+    # 测不到长上下文。给一个强制长度,直接拿 ids[:L] 当 prompt。
+    ap.add_argument("--prompt-len", type=int, default=0,
+                    help=">0 时忽略 loss_mask,直接用 ids[:L] 当 prompt(测长上下文的确定性)")
     ap.add_argument("--repeat", type=int, default=1,
                     help=">1 时对同一个 prompt 重复生成,报告各次之间的一致性(确定性自检)")
     args = ap.parse_args()
@@ -94,7 +98,10 @@ def main() -> int:
     for i in range(args.n):
         row = ds[args.start_row + i]
         ids = list(row["input_ids"])
-        if has_mask:
+        if args.prompt_len > 0:
+            k = min(args.prompt_len, len(ids) - args.gen - 1)
+            frac = -1.0                      # 强制切,loss_mask 占比无意义
+        elif has_mask:
             m = list(row["loss_mask"])
             ones = [j for j, v in enumerate(m) if v]
             if not ones:
@@ -104,6 +111,8 @@ def main() -> int:
         else:
             k = len(ids) // 2
             frac = 0.5
+        if k < 8:
+            print(f"  [{i}] prompt 太短,跳过"); continue
         prompt, resp = ids[:k], ids[k:]
         if len(prompt) > args.max_prompt:
             prompt = prompt[-args.max_prompt:]
@@ -138,6 +147,8 @@ def main() -> int:
             det_runs.append((min(agree), min(pref), want))
             print(f"  [{i}] ★确定性:{len(runs)} 次生成互比 —— 最低逐 token 一致 "
                   f"{100.0 * min(agree):.1f}%,最短完全一致前缀 {min(pref)}/{want}")
+        if args.prompt_len > 0:
+            continue          # 强制切点下「和语料比」无意义,这一模式只测确定性
         got = runs[0]
         tgt = [int(t) for t in resp[:want]]
 
@@ -169,6 +180,9 @@ def main() -> int:
             print("        和 SparseAttnSharedkv 那个间歇 aicore 越界很可能是同一个根因:")
             print("        有时崩掉,有时只是悄悄算错。后者更可怕。")
             print("     ⚠ 在这件事定性之前,这套栈产出的 HS 一概不可信,批量 dump 必须停。")
+
+    if args.prompt_len > 0:
+        return 0              # 只测确定性,下面的语料对比不适用
 
     print("\n" + "=" * 70)
     if not tot_cmp:
