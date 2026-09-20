@@ -173,12 +173,23 @@ if [ "$rc" != "0" ]; then
 fi
 
 # ── 事后:哪些 flag 老 vLLM 不认 ─────────────────────────────────────────────
+# ★ 这里必须先确认 --help 真的跑出来了。第一版写成 `H=$(vllm serve --help 2>/dev/null)`,
+#   命令失败时 H 为空,于是每个 flag 都 grep 不中 → 全部报「不认」。实测 8 个全 ❌,
+#   其中 --enable-expert-parallel 在 0.23.0 上明明存在。**「没测到」不能报成「不支持」**
+#   —— 一个看起来确定的错答案比没有答案更糟。
 say "检查我们 serve 脚本用的 flag 在 vLLM $VLLM_TAG 上认不认:"
-H=$(vllm serve --help 2>/dev/null)
-for f in --async-scheduling --tokenizer-mode --enable-expert-parallel --data-parallel-size-local \
-         --no-enable-prefix-caching --additional-config --compilation-config --model-loader-extra-config; do
-  echo "$H" | grep -q -- "$f" && echo "    ✅ $f" || echo "    ❌ $f  ← 老 vLLM 不认,起服务时要去掉"
-done
+H=$(vllm serve --help 2>&1)
+nflag=$(echo "$H" | grep -c -- '--' 2>/dev/null)
+if [ "${nflag:-0}" -lt 10 ]; then
+  say "    ⚠ 判不了:\`vllm serve --help\` 只给出 ${nflag:-0} 行带 flag 的输出,多半是它自己就没跑起来。"
+  say "      前 15 行原样如下 —— 先解决这个,再谈 flag:"
+  echo "$H" | head -15 | sed 's/^/        /'
+else
+  for f in --async-scheduling --tokenizer-mode --enable-expert-parallel --data-parallel-size-local \
+           --no-enable-prefix-caching --additional-config --compilation-config --model-loader-extra-config; do
+    echo "$H" | grep -q -- "$f" && echo "    ✅ $f" || echo "    ❌ $f  ← 老 vLLM 不认,起服务时要去掉"
+  done
+fi
 
 echo
 echo "================================================================================"
