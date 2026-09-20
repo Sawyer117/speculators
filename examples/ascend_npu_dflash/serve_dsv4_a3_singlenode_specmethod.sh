@@ -267,6 +267,20 @@ echo ">>> full engine log = THIS stdout (you launched under nohup → ~/dsv4_a3.
 #   (老 pin + HS dumper)在 A3 双机上长期跑通过,所以真正的回归在 386530d12→4ce367a 之间
 #   的别处。绕过只是为了先把 HS 产出来,回归要单独查/上报。
 DSA_OVERLAP="${DSA_OVERLAP:-1}"
+
+# ★ ASYNC_SCHED —— 2026-09-20 查「温度 0 不可复现」时加的开关。
+#   --async-scheduling 让调度跑在设备执行前面,而 dsa_v1.py 在这个 pin 上把 SAS 的
+#   每核任务分配写进一个**常驻共享 buffer**(self.sas_metadata_buffer,__init__ 里分配
+#   一次、每步覆写后原样交给 kernel)。下一步的 host 侧写入若赶在上一步 kernel 读完之前,
+#   拿到的就是别的批次的任务切分 —— 症状正好是「同输入不同输出,且上下文越长越明显」。
+#   另:华为官方 DeepSeek-V4-Flash 文档里【六个配方一个都没用】--async-scheduling。
+#   ASYNC_SCHED=0 关掉它,是这个假设一次就能证伪的实验。
+ASYNC_SCHED="${ASYNC_SCHED:-1}"
+ASYNC_ARGS=(--async-scheduling)
+if [ "$ASYNC_SCHED" = "0" ]; then
+  ASYNC_ARGS=()
+  echo ">>> ASYNC_SCHED=0:不传 --async-scheduling(官方配方也不带)"
+fi
 ACFG='{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}'
 if [ "$DSA_OVERLAP" = "0" ]; then
   ACFG='{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true,"multistream_dsv4_dsa_overlap":false}'
@@ -279,7 +293,7 @@ exec vllm serve "$MODEL" --served-model-name dsv4 --port "$API_PORT" \
   --tokenizer-mode deepseek_v4 \
   --max-model-len "$MAXLEN" --max-num-seqs "$MAXSEQS" --block-size 128 \
   --max-num-batched-tokens "$MAXBATCHTOK" \
-  --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching --async-scheduling \
+  --gpu-memory-utilization "$GPUUTIL" --no-enable-prefix-caching "${ASYNC_ARGS[@]}" \
   --additional-config "$ACFG" \
   "${LOAD_ARGS[@]}" "${SPEC_ARGS[@]}" "${HS_ARGS[@]}" \
   $EAGER_FLAG "${GRAPH_ARGS[@]}"
