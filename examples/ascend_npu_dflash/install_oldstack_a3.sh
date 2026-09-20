@@ -127,6 +127,13 @@ fi
 say "    $(git -C "$VA_DIR" log --oneline -1)"
 
 # ── 3+4. 交给 SSOT ───────────────────────────────────────────────────────────
+# ★ CANN 的 nnal/atb/set_env.sh 第 43 行判 `$ZSH_VERSION`,而 SSOT 安装脚本带 `set -u`
+#   —— 未定义变量直接让它在第 0 步就退出(实测 rc=1)。SSOT 默认的 CANN_ENV 只 source
+#   toolkit、不 source atb,所以它自己从来没撞上;我们传的 920env_npu.sh 三个都 source。
+#   把 ZSH_VERSION 显式设成空串:`[ -n "" ]` 为假 → 走 bash 分支,行为不变,且不用改
+#   那份已在产的 SSOT 脚本。(我们自己的 serve 脚本顶上早就写了这个坑,只是没串起来。)
+export ZSH_VERSION=""
+
 say "3/4 source CANN:$CANN_ENV"
 # shellcheck disable=SC1090
 source "$CANN_ENV"
@@ -134,11 +141,13 @@ source "$CANN_ENV"
 say "4/4 调 SSOT 安装脚本(编译算子,几十分钟到几小时;全程输出到 $ROOT/install.log)"
 mkdir -p "$ROOT"
 ROOT="$ROOT" VLLM_DIR="$VLLM_DIR" VA_DIR="$VA_DIR" VA_BRANCH="$OLD_SHA" \
-  CANN_ENV="$CANN_ENV" \
+  CANN_ENV="$CANN_ENV" ZSH_VERSION="" \
   bash "$SCRIPT_DIR/install_npu_env_dspark.sh" 2>&1 | tee "$ROOT/install.log"
 rc=${PIPESTATUS[0]}
 if [ "$rc" != "0" ]; then
-  say "!! 安装失败(rc=$rc)。最后 30 行:"; tail -30 "$ROOT/install.log"; exit "$rc"
+  say "!! 安装失败(rc=$rc)。最后 30 行:"; tail -30 "$ROOT/install.log"
+  say "   重跑是安全的:conda 环境和已 clone 的代码都会跳过,只重做失败那步之后的部分。"
+  exit "$rc"
 fi
 
 # ── 事后:哪些 flag 老 vLLM 不认 ─────────────────────────────────────────────
