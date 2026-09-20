@@ -95,7 +95,7 @@ echo
 echo "将要执行:"
 echo "  1. conda create -n $ENV_NAME python=$PY_VER"
 echo "  2. git clone $FORK → $VA_DIR ; git checkout $OLD_SHA"
-echo "  3. source $CANN_ENV"
+echo "  3. source $CANN_ENV(经 set +u 安全外壳 —— CANN 的 set_env 不兼容 set -u)"
 echo "  4. ROOT=$ROOT VLLM_DIR=$VLLM_DIR VA_DIR=$VA_DIR CANN_ENV=$CANN_ENV \\"
 echo "       bash $SCRIPT_DIR/install_npu_env_dspark.sh"
 echo "     (它自己 clone vLLM $VLLM_TAG,并从源码编译 V4/SAS 的 CANN 算子 —— 这步最久)"
@@ -127,21 +127,31 @@ fi
 say "    $(git -C "$VA_DIR" log --oneline -1)"
 
 # ── 3+4. 交给 SSOT ───────────────────────────────────────────────────────────
-# ★ CANN 的 nnal/atb/set_env.sh 第 43 行判 `$ZSH_VERSION`,而 SSOT 安装脚本带 `set -u`
-#   —— 未定义变量直接让它在第 0 步就退出(实测 rc=1)。SSOT 默认的 CANN_ENV 只 source
-#   toolkit、不 source atb,所以它自己从来没撞上;我们传的 920env_npu.sh 三个都 source。
-#   把 ZSH_VERSION 显式设成空串:`[ -n "" ]` 为假 → 走 bash 分支,行为不变,且不用改
-#   那份已在产的 SSOT 脚本。(我们自己的 serve 脚本顶上早就写了这个坑,只是没串起来。)
-export ZSH_VERSION=""
-
-say "3/4 source CANN:$CANN_ENV"
-# shellcheck disable=SC1090
+# ★ CANN 的 set_env.sh 根本不是为 `set -u` 写的,而 SSOT 安装脚本是 `set -euo pipefail`。
+#   实测连撞两个:nnal/atb/set_env.sh 第 43 行的 `$ZSH_VERSION`、第 15 行的 `$1`。
+#   逐个补变量是打地鼠 —— 正确做法是把整段 source 包在 `set +u` 里。
+#   做法:生成一个"安全外壳",它保存当前的 -u 状态、关掉、source 真正的 CANN env、再还原。
+#   `set` 在被 source 的文件里生效于调用方 shell,所以这样包得住。
+#   这样不用改那份已在产的 SSOT 脚本,也不用预测 CANN 还会引用哪些未定义变量。
+SAFE_CANN="$ROOT/cann_env_safe.sh"
+mkdir -p "$ROOT" || exit 1
+cat > "$SAFE_CANN" <<SAFEEOF
+# 自动生成 —— 把 $CANN_ENV 包在 set +u 里(CANN 的 set_env 引用 \$ZSH_VERSION / \$1 等未定义变量)
+__u_was_set=0
+case "\$-" in *u*) __u_was_set=1 ;; esac
+set +u
 source "$CANN_ENV"
+[ "\$__u_was_set" = 1 ] && set -u
+unset __u_was_set
+SAFEEOF
+say "3/4 source CANN(经安全外壳):$CANN_ENV"
+# shellcheck disable=SC1090
+source "$SAFE_CANN" || exit 1
 
 say "4/4 调 SSOT 安装脚本(编译算子,几十分钟到几小时;全程输出到 $ROOT/install.log)"
 mkdir -p "$ROOT"
 ROOT="$ROOT" VLLM_DIR="$VLLM_DIR" VA_DIR="$VA_DIR" VA_BRANCH="$OLD_SHA" \
-  CANN_ENV="$CANN_ENV" ZSH_VERSION="" \
+  CANN_ENV="$SAFE_CANN" \
   bash "$SCRIPT_DIR/install_npu_env_dspark.sh" 2>&1 | tee "$ROOT/install.log"
 rc=${PIPESTATUS[0]}
 if [ "$rc" != "0" ]; then
