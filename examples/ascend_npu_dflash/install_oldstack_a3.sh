@@ -65,8 +65,15 @@ say() { echo "[$(date '+%m-%d %H:%M:%S')] $*"; }
 
 echo "================================================================================"
 echo "  A3 老栈安装(只为测温度 0 的可复现性)"
-echo "  vllm-ascend   $OLD_SHA   (2026-07-14,gsm8k 96.59% 那套)"
-echo "  vLLM          $VLLM_TAG      (Dockerfile ARG VLLM_TAG 认定)"
+# 横幅跟着参数走 —— 这个脚本本来是为老栈写的,但 OLD_SHA/VLLM_TAG/CANN_ENV 全可覆盖,
+# 拿它装主线 pin 配别的 CANN 完全成立。写死「老栈」会让人以为装错了。
+case "$OLD_SHA" in
+  386530d12*) _WHAT="老栈(2026-07-14,gsm8k 96.59% 那套)" ;;
+  4ce367a*)   _WHAT="主线评测栈(ledger 里 mainline-a3 的 pin)" ;;
+  *)          _WHAT="自定 pin" ;;
+esac
+echo "  vllm-ascend   $OLD_SHA   $_WHAT"
+echo "  vLLM          $VLLM_TAG      (Dockerfile ARG VLLM_TAG 认定;换 pin 必须跟着换)"
 echo "  CANN          $CANN_ENV"
 echo "  新环境        conda env '$ENV_NAME'  (python $PY_VER)"
 echo "  新目录        $ROOT"
@@ -193,7 +200,7 @@ fi
 
 echo
 echo "================================================================================"
-echo "  装好了。老栈 = vllm-ascend $OLD_SHA + vLLM $VLLM_TAG + CANN 9.2"
+echo "  装好了 = vllm-ascend $OLD_SHA + vLLM $VLLM_TAG + $CANN_ENV"
 echo "================================================================================"
 cat <<EOF
 起服务(注意:老 pin **没有** HS dumper,所以别带 HS_DUMP —— 这也正好是 dumper 的对照):
