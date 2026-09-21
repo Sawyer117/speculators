@@ -1,0 +1,215 @@
+# A3 186:温度 0 下服务自己和自己对不上 —— 调查归档(2026-09-19 → 09-22)
+
+> **一句话**:这台机在上下文 ≥512 时,**同一个 prompt、温度 0、并发 1、prefix cache 关着,
+> 连打三次会得到三个不同的输出**。不是崩溃,是**静默算错**。在定性之前,这台机产出的 HS
+> 一概不可信,批量 HS 生产必须停。
+
+本文归档整条调查链:每一步在问什么、量到了什么、排除了什么,以及**我在中途说过头、
+后来被自己的数据推翻的那些结论**。后者和结论同样重要 —— 它们是这条线上最容易重犯的错。
+
+机器:A3 单机 16 逻辑卡,DP2×TP8/EP16,DeepSeek-V4-Flash bf16。
+
+---
+
+## 0. 起因
+
+把 HS dump 出来的 hidden 过 `lm_head` 取 argmax,和 Arrow 语料里的 token 比,
+在 **response 段(`loss_mask==1`)mismatch 高达 64%**。
+
+最初的假设:dumper 写错了层,或者对齐差一位。
+
+---
+
+## 1. 先洗清 dumper:自洽 oracle
+
+不和历史语料比 —— 历史语料是另一套栈、另一个时间产的,拿它当基准等于一次测两件事。
+改成只用**服务当场产出的东西**做自洽检验(`examples/ascend_npu_dflash/hs_self_oracle.py`):
+
+| 段 | 检验 | 结果 |
+|---|---|---|
+| A 恒等式 | 温度 0 时 `serve 吐的 token == argmax(lm_head(它那步的 final hidden))` —— serve 本来就是这么算的 | **4/4 完全一致**,256~2048 每个长度都过 |
+| B 回灌 | 让 serve 贪心生成 16 个 token,把 `prompt+生成` 整条回灌做 prefill dump,检查那 16 个位置 | **64 个位置 mismatch 0.00%** |
+
+顺带用 `hs_value_probe.py` 穷举 slice × {raw,normed} × shift{−1,0,1},定死了读法约定:
+
+* dump 形状 `[seq, 3 aux + 1, H]`;
+* **`[:, -1]` 是 final 且已经 post-norm** —— 它的 RMS 0.3446 ≈ `norm.weight` 的 RMS 0.3090,
+  再过一次 norm 反而更差;
+* `argmax(h_i)` 对齐 `token_ids[i+1]`(shift=1 远好于 0/−1);
+* `token_ids` 与 Arrow 的 `input_ids` 逐个一致。
+
+⟹ **dumper 的管路是对的。**
+
+> ⚠ 当时我写成了「证明 dump 的**值**是对的」。**这句过头了** —— 恒等式两边都来自同一次前向,
+> 两边可以一起错。它证明的是**管路**(层号、切片、对齐、落盘),不是数值绝对正确。
+
+---
+
+## 2. 那就怀疑语料
+
+思路很干净:把 prompt 喂回去让模型贪心续写,和语料里的 response 直接比
+(`corpus_provenance_check.py`)。不涉及 HS、不涉及 lm_head、不依赖任何中间约定 ——
+只问「模型会不会这么说」。
+
+**然后就撞上了这件事:同一条命令跑两遍,第 0 行从 32/32 变成 0/32。**
+
+温度 0、并发 1、`--no-enable-prefix-caching`。贪心解码本该是确定性的。
+
+---
+
+## 3. 先量服务自己稳不稳
+
+给脚本加了两个开关:`--repeat`(同一个 prompt 连打 N 次互比)和 `--prompt-len`
+(忽略 `loss_mask`、直接拿 `ids[:L]` 当 prompt,才测得到长上下文)。
+
+同时**换掉指标**。贪心是混沌的:第一个 token 一分叉,后面全不同,所以
+「逐 token 一致率」会把「早分叉一次」和「处处不同」混为一谈 ——
+该看的是**完全一致前缀**(第一次分叉在哪)。
+
+同一 prompt 连打 3 次,互比最短完全一致前缀 / 32:
+
+| prompt-len | 256 | 512 | 1024 | 2048 |
+|---|---|---|---|---|
+| 新栈 `4ce367a` + vLLM 0.27.1 | **32/32** | 2/32 | **0/32** | **0/32** |
+| 老栈 `386530d` + vLLM 0.23.0 | 19/32 | 12/32 | 8/32 | 6/32 |
+
+**≥512 就静默算错。** 新栈是断崖,老栈是平滑退化 —— 但**两条都不确定**。
+
+阈值和 **`index_topk = 512` 重合**:≤512 时稀疏选择是平凡的(全选),>512 才真正开始选。
+而间歇崩溃的算子正是 `SparseAttnSharedkv`。**崩和静默算错很可能是同一个根因的两面。**
+
+复现:
+
+```bash
+ENDPOINT=http://localhost:7000/v1 ARROW=<arrow_0730_77w_dedup> \
+python examples/ascend_npu_dflash/corpus_provenance_check.py \
+  --n 3 --gen 32 --repeat 3 --prompt-len 2048 --id-base 980000
+```
+
+> `--id-base` 必须 > 数据集行数(772,684),否则 HS 会写进生产目录。脚本有硬 guard。
+
+---
+
+## 4. 并行的一条线:`SparseAttnSharedkv` 间歇崩
+
+`dsa_prefill_fault_ab.sh` 四臂 A/B。两个关键结果:
+
+* **arm C(`HS_DUMP=0`)照样崩**,16 次 `SparseAttnSharedkv` ⟹ **和我们的 dumper 无关**。
+* **它是间歇的**。同一个臂、同一套配置、都禁了编译缓存:
+
+  | | 用时 | errors | 算子故障 | 引擎 |
+  |---|---|---|---|---|
+  | 第一次 | 21.9 s | 0 | 0 | 活 |
+  | 第二次 | 83.9 s | 231 | 12×SparseAttnSharedkv | 死 |
+
+  ⟹ **判读规则:崩 = 阳性,可信;不崩 = 阴性,不可信。** 阴性只在重复多次全不崩时
+  才算弱证据。脚本因此有 `REPEAT`(默认 3)和「臂 X:崩 k/n 次」汇总。
+
+另外查清一件独立的事(`aux` 与编译缓存):`set_aux_hidden_state_layers()` 在 `get_model()`
+**之后**才调(`model_runner_v1.py:3601` → `:3661`),所以 aux 配置**进不了 torch.compile
+的缓存 key**;而 aux 改的是 forward 的**返回签名**(开了返回 `(hs, aux)`,没开返回裸 tensor)。
+⟹ eval serve(无 aux)和 HS-dump serve(有 aux)在同一台机上轮流跑,谁先编译谁占住缓存,
+另一个直接命中错误的图。崩掉算走运(`ValueError: too many values to unpack`);
+反过来命中「带 aux 但层号不同」的图会**静默 dump 错层**,几 TB 条件输入全错且零报错。
+已修:`HS_DUMP=1` 时强制 `VLLM_DISABLE_COMPILE_CACHE=1`。
+
+---
+
+## 5. 站得住的结论
+
+1. **HS dumper 的管路是对的**,别再怀疑它。
+2. **算子故障与 dumper 无关**,且是间歇的(~18%)。
+3. **服务在上下文 ≥512、温度 0 下不可复现** —— 静默算错,不只是崩。
+4. 那个 64% **不是「语料有问题」的证据** —— 量到的就是这个不确定性。
+5. **在定性之前,这台机产的 HS 一概不可信,批量 HS 生产必须停。**
+
+---
+
+## 6. 中途说过头、被自己的数据推翻的
+
+记在这里是因为这几条都不是笔误,是**方法上的同一类错**:拿单次结果下结论、
+拿另一套栈的数当基准、把「机制对」说成「数值对」。
+
+| 说过的 | 被什么推翻 |
+|---|---|
+| 「根因是编译缓存污染」 | 基于 n=1 的一次「不崩」。下一次同配置 231 错 |
+| 「语料不是本模型贪心输出」 | 我自己后来量到 99.6% 一致 |
+| 「并发是变量」 | conc1(88.97%)比 conc64(84.75%)**还差** |
+| 「self-oracle 证明 dump 的值是对的」 | 应为「证明**管路**是对的」 |
+| 「新栈老栈都不确定 ⟹ 不是栈的问题」 | 见下节 —— 两条臂共用 CANN 9.2.0-beta1 |
+
+---
+
+## 7. ★ 没有排除掉的变量(2026-09-22 修正)
+
+第 3 节那张表我一度读成「**新栈老栈都不确定 ⟹ 不是栈的问题**」。
+**这句超出了实验能支持的范围。**
+
+那次老栈是按「老栈就用 CANN 9.2 + 老 VLLM」装的(`install_oldstack_a3.sh` 的注释写着
+「只留 vllm-ascend + vLLM 一个变量」——当时是对的做法)。于是:
+
+* 被排除的是 **pin**(`386530d12` vs `4ce367a`)和 **vLLM 版本**(0.23.0 vs 0.27.1);
+* **CANN 9.2.0-beta1 一次都没被排除** —— 它是唯一贯穿两条臂的软件变量;
+* 而产出 77w 那批 HS 的**真老栈是 CANN 9.0.0**
+  (`ascend-npu-dsv4-rollout-data.md:23-24`),我们从没在上面测过。
+
+**还有一条推论值得单独记**:`sas_metadata_buffer`(这个 pin 的 `dsa_v1.py` 把 SAS 每核
+任务分配写进一个常驻共享 buffer,`__init__` 分配一次、每步覆写)一度是头号嫌疑。
+但旧 pin `386530d12` **没有这个共享**(它把刚算出的张量直接传下去),**却同样不确定**
+—— 所以它**解释不了老栈那一半**。这把嫌疑从「新 pin 特有的东西」推向「两条臂共有的东西」:
+
+| 嫌疑 | 状态 | 怎么证伪 | 成本 |
+|---|---|---|---|
+| **别的机器也这样?**(硬件 / 驱动 / 这台 186) | **没测过** | 换一台机跑同一条 `--repeat 3 --prompt-len 2048` | **几分钟,不用重编** |
+| **CANN 9.2.0-beta1** | 没测过 | 装 CANN 9.0.0(或 9.1.0)+ 同 pin | 几小时,要重编算子 |
+| `--async-scheduling` | 没测过 | `ASYNC_SCHED=0`,一次重启 | 一次重启 |
+| DP2 跨 replica 的 MoE all-to-all(并发 1 时另一个 replica 在跑 dummy batch,形状每步不同) | 没测过 | `DP=1 TP=16` | 一次重启 |
+
+后三项 `determinism_sweep.sh` 三臂(`base` / `noasync` / `dp1`)已经写好,**但一次都没跑过**。
+
+**下一步应当先做最便宜的那一条:换一台机跑同一个测试。** 它一刀把「硬件/这台机」和
+「软件栈」切开,几分钟出结果,而重装 CANN 要几小时。
+
+```bash
+# 在另一台机上(A2 115/116,或第二台 A3,或 w8a8 那台)
+ENDPOINT=http://<那台>:7000/v1 ARROW=<同一份 arrow> \
+python examples/ascend_npu_dflash/corpus_provenance_check.py \
+  --n 3 --gen 32 --repeat 3 --prompt-len 2048 --id-base 980000
+```
+
+读法:
+
+* 另一台机 **32/32** ⟹ 问题在 **186 这台**(硬件/驱动),换机器即可,不用动栈;
+* 另一台机**也不确定**且 CANN 也是 9.2 ⟹ 嫌疑锁定 **CANN 9.2.0-beta1**,值得重装 9.0.0/9.1.0;
+* 另一台机 CANN 不同却也不确定 ⟹ 是更普遍的东西(`--async-scheduling` / DP / 算子本身),
+  回到 `determinism_sweep.sh` 三臂。
+
+---
+
+## 8. 与「跨栈不可比」不是一回事
+
+容易混,分清:
+
+| | 现象 | 性质 |
+|---|---|---|
+| **跨栈系统性偏移** | 同一份 released draft,老栈 gsm8k 4.665 / 主线 4.523(−3%),五个数据集五个位置上**都是平移** | 已知、可量、**可比较**(每行自带同栈横杆) |
+| **本文这件事** | **同一套栈、同一个 prompt、同一次服务**,连打三次三个结果 | 自身不自洽,**任何单次读数都失去意义** |
+
+所以「切回一致的栈就没事了」这个说法要拆开看:**如果**根因是 CANN 9.2.0-beta1,
+那么回到 9.0.0 确实会没事 —— 那套栈当年在这台机上跑出过 gsm8k 96.59%。
+但这是**一个还没验证的假设**,不是已知结论;而且它解释不了「为什么老栈在 CANN 9.2 上
+在 256 长度反而比新栈更差(19/32 vs 32/32)」。先做第 7 节那个几分钟的换机测试。
+
+---
+
+## 附:相关文件
+
+| 文件 | 作用 |
+|---|---|
+| `examples/ascend_npu_dflash/hs_self_oracle.py` | 自洽 oracle(A 段恒等式 / B 段回灌) |
+| `examples/ascend_npu_dflash/hs_value_probe.py` | 穷举 slice×norm×shift,定读法约定 |
+| `examples/ascend_npu_dflash/corpus_provenance_check.py` | 语料溯源 + **确定性自检**(`--repeat` / `--prompt-len`) |
+| `examples/ascend_npu_dflash/dsa_prefill_fault_ab.sh` | 算子故障四臂 A/B,带 `REPEAT` |
+| `examples/ascend_npu_dflash/determinism_sweep.sh` | 三臂确定性扫描 —— **写好了,没跑过** |
+| `examples/ascend_npu_dflash/npu_cleanup_lib.sh` | 已核实清场(进程 + 显存双门) |
+| `examples/ascend_npu_dflash/install_oldstack_a3.sh` | 老栈安装;`CANN_ENV` / `ENV_NAME` / `ROOT` 可覆盖 |

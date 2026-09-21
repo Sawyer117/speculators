@@ -12,6 +12,11 @@
 > | 栈 | vLLM 0.23.0 + 我们 fork 的 `dspark-dsv4` | **vLLM 0.27.1 + vllm-ascend 上游 main** |
 > | CANN | 9.0.0(训练栈)/ 9.1.0.0627(A2 主线栈) | **9.2.0-beta1** ⚠️ 无人验过 |
 >
+> **★ 2026-09-22:上面那个「无人验过」后来出事了。** 这台机在上下文 ≥512 时温度 0 不可复现
+> —— 同一个 prompt 连打三次三个输出,**静默算错而不是崩**。调查全过程、已排除与未排除的
+> 变量见 [`ascend-npu-dsv4-a3-186-nondeterminism.md`](ascend-npu-dsv4-a3-186-nondeterminism.md)。
+> CANN 9.2.0-beta1 是目前**唯一没被排除**的软件变量。在定性前,这台机产的 HS 不可信。
+>
 > 相邻文档:A2 w8a8 主线栈的建栈过程 = [`ascend-npu-dsv4-improvement-experiments.md`](./ascend-npu-dsv4-improvement-experiments.md) §18
 > (**那份是历史记录,不要改写**);A3 bf16 在**老栈**上的性能数 =
 > [`ascend-npu-dsv4-a3-singlenode-benchmark.md`](./ascend-npu-dsv4-a3-singlenode-benchmark.md)。
