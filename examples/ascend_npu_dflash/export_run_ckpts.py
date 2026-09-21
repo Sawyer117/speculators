@@ -516,7 +516,10 @@ def main() -> int:
     for lbl, stage in bad:
         print(f"    ✗ {lbl:<8} 卡在 {stage}")
     print("=" * 96)
-    _print_eval_hint(gamma, [f"{lbl}-blk{gamma}|{d.name}" for lbl, d in ok])
+    # ★ 这里也必须走 eval_label():转换成功后的这一串是真正会被复制粘贴去跑 eval 的,
+    #   而标签就是 eval 日志名和 article 仓 run_id 的来源。少了 tag,bal 线的结果会顶着
+    #   基线线的 run_id 落盘 —— 和目录撞名是同一个病,只是换了个地方犯。
+    _print_eval_hint(gamma, [f"{eval_label(lbl, gamma, args.tag)}|{d.name}" for lbl, d in ok])
     return 1 if bad else 0
 
 
