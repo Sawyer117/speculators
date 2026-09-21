@@ -39,6 +39,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
+import time
 
 
 def main() -> int:
@@ -63,6 +65,15 @@ def main() -> int:
                     help=">0 时忽略 loss_mask,直接用 ids[:L] 当 prompt(测长上下文的确定性)")
     ap.add_argument("--repeat", type=int, default=1,
                     help=">1 时对同一个 prompt 重复生成,报告各次之间的一致性(确定性自检)")
+    # ★ 2026-09-22:`dp1` 臂(DP=1 TP=16)起不来 —— 维度被 16 整除后成了 0,而
+    #   `DP=1 TP=8` 会把 EP 从 16 降到 8、每卡专家显存翻倍装不下。⟹ bf16 在这台机上的
+    #   并行布局钉死在 DP2×TP8,「去掉 DP」这个实验做不了。换个问法问同一件事:
+    #   **一个温度 0 的请求,输出会不会随另一个 replica 在干什么而变?**
+    #   会变 = 跨请求/跨 DP 污染,那本身就是正确性 bug,与机制无关。
+    ap.add_argument("--bg", type=int, default=0, metavar="N",
+                    help="量确定性时在后台持续打 N 路【无关】请求(填满另一个 DP replica)。"
+                         "跑两遍 --bg 0 和 --bg 4 对比:一致性变了 ⟹ 输出被并发请求污染")
+    ap.add_argument("--bg-len", type=int, default=512, help="背景请求的 prompt 长度")
     args = ap.parse_args()
 
     if not args.arrow:
@@ -86,11 +97,33 @@ def main() -> int:
 
     cli = openai.OpenAI(base_url=args.endpoint, api_key="EMPTY", max_retries=0)
     model = cli.models.list().data[0].id
+
+    # 背景负载:内容和被测 prompt 完全无关,只为了让另一个 replica 有真活干
+    # (并发 1 时它跑的是 dummy batch,形状每步不同 → 跨 DP 的 MoE all-to-all payload 每步不同)。
+    bg_stop = threading.Event()
+    bg_threads: list[threading.Thread] = []
+
+    def _bg_worker(seed: int) -> None:
+        c = openai.OpenAI(base_url=args.endpoint, api_key="EMPTY", max_retries=0)
+        toks = [(seed * 7919 + i * 31) % 100000 + 1000 for i in range(args.bg_len)]
+        while not bg_stop.is_set():
+            try:
+                c.completions.create(model=model, prompt=toks, max_tokens=24,
+                                     temperature=0, timeout=120)
+            except Exception:  # noqa: BLE001,S110
+                pass
     print(f"serve={model}   arrow={args.arrow}  {len(ds)} 行\n")
 
     has_mask = "loss_mask" in ds.column_names
     if not has_mask:
         print("⚠ 这份 Arrow 没有 loss_mask 列,只能按「后半段」切 prompt/response。")
+
+    if args.bg > 0:
+        for k in range(args.bg):
+            t = threading.Thread(target=_bg_worker, args=(k + 1,), daemon=True)
+            t.start(); bg_threads.append(t)
+        time.sleep(5)          # 让背景负载先稳住,再开始量
+        print(f"★ 背景负载:{args.bg} 路无关请求持续打着(prompt {args.bg_len} token)\n")
 
     tot_match = tot_cmp = 0
     prefix_lens = []
@@ -180,6 +213,8 @@ def main() -> int:
             print("        和 SparseAttnSharedkv 那个间歇 aicore 越界很可能是同一个根因:")
             print("        有时崩掉,有时只是悄悄算错。后者更可怕。")
             print("     ⚠ 在这件事定性之前,这套栈产出的 HS 一概不可信,批量 dump 必须停。")
+
+    bg_stop.set()
 
     if args.prompt_len > 0:
         return 0              # 只测确定性,下面的语料对比不适用
