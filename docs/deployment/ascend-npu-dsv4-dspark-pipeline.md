@@ -123,6 +123,14 @@ Expected trajectory (so you can tell early whether your run is on track):
   vLLM-Ascend/MindSpeed/torchtitan-npu). A from-scratch RoPE-fixed run — same recipe as the degenerate
   `ep0p5-bal1e3`, **ONLY variable = RoPE** — now climbs **monotonically**:
 
+  > ⚠️ **口径:这是各 checkpoint 当时边跑边记的历史读数,不是同一批测出来的。**
+  > 对照/引用请用 [`…-eval-results.md` 的「all 17 drafts + the released bar, one sample set」
+  > 那张表](./ascend-npu-dsv4-dspark-eval-results.md#accept-length--all-17-drafts--the-released-bar-one-sample-set)
+  > —— 那份是 17 个草稿**同一个采样集重测一遍**,有逐数据集拆分,而且标了
+  > 2026-08-13 的采样集切换。两份对同一个 ckpt 会差 0.01~0.04(例:ep5 gsm8k
+  > 本表 4.849 / 那份 4.845),**那是两次独立测量的噪声,不是谁抄错**。
+  > 跨草稿、跨栈的横向比较**只能用那一份**。
+
   | epoch | 0.5 | 1.0 | 1.5 | 2.0 | 2.5 | 3.0 | 3.5 | 4.0 | 4.5 | **5.0** |
   |---|---|---|---|---|---|---|---|---|---|---|
   | mean accept_len | 3.84 | 4.06 | 4.18 | 4.25 | 4.29 | 4.35 | 4.36 | 4.39 | 4.41 | **4.40** |

@@ -284,6 +284,13 @@ rows below remain valid *among themselves* (old 1309/490/154/247/70 set); do not
 
 ### Accept length — all 17 drafts + the released bar, one sample set
 
+> ★ **这张表是横向比较的权威口径** —— 17 个草稿同一个采样集重测,逐数据集拆分,
+> 采样集见本文档开头的 MEASURED-SET CUTOVER 说明。
+> `…-dspark-pipeline.md` 的「Status at a glance」里另有一张 block5 线的表,那是**当时
+> 边跑边记的历史读数**,同一个 ckpt 会差 0.01~0.04(ep5 gsm8k 4.849 vs 本表 4.845)——
+> 两次独立测量,不是抄错。**引用请用本表。**
+
+
 | draft | gsm8k | math500 | humaneval | mbpp | mt-bench | **mean** | %bar | non-chat | %bar |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | **released draft** *(bar)* | 4.665 | 4.639 | 4.939 | 4.526 | **3.347** | **4.4232** | 100.00% | 4.6922 | 100.00% |
