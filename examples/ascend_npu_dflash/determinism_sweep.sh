@@ -83,6 +83,30 @@ echo "  ★ 指标 = 完全一致前缀(贪心混沌,逐 token 一致率是误�
 echo "================================================================================"
 [ -n "$ARROW" ] && [ -f "$ARROW/dataset_info.json" ] || { echo "!! Arrow 不可用"; exit 2; }
 
+# 服务起不来时把【有用的】那几行捞出来。
+# ★ 2026-09-22:第一版是「从第一个 ERROR 往下打 26 行 | cut -c1-180」。两处都错:
+#   1. Python 的异常在 traceback 的【末尾】,不在开头 —— 26 行经常正好停在它前面,
+#      于是日志里全是栈帧、没有原因。dp1 臂就是这么报的,什么都没说明。
+#   2. vLLM 每行带 `(Worker_TP13_EP13 pid=…) ERROR 09-22 03:20:33 [multiproc_executor.py:912] `
+#      的前缀,占掉 ~100 列,`cut -c1-180` 之后只剩 80 列内容,路径都是断的。
+#   现在:剥掉前缀,开头给 12 行上下文,再单独把末尾的异常行捞出来。
+dump_first_error() {
+  local slog="$1" fl
+  fl=$(grep -naE 'ERROR|Traceback' "$slog" 2>/dev/null | head -1 | cut -d: -f1)
+  if [ -z "$fl" ]; then
+    say "    日志里没有 ERROR/Traceback —— 打末尾 25 行:"
+    tail -25 "$slog" | cut -c1-220
+    return
+  fi
+  say "    最早的错误(第 $fl 行起,已剥掉 worker 行前缀):"
+  sed -n "${fl},$((fl + 11))p" "$slog" | sed -E 's/^\([^)]*\) *//; s/^(ERROR|WARNING|INFO) [0-9:. -]+\[[^]]*\] *//' | cut -c1-220
+  say "    ★ 异常行(traceback 的末尾才是原因):"
+  grep -aE '^\S*(Error|Exception)\b|Error:|Exception:|out of memory|OOM|CANN|EZ[0-9]|aclnn' "$slog" \
+    | sed -E 's/^\([^)]*\) *//; s/^(ERROR|WARNING|INFO) [0-9:. -]+\[[^]]*\] *//' \
+    | grep -avE '^(File |Traceback|  )' | tail -6 | cut -c1-260
+  say "    全量日志:$slog"
+}
+
 RUN=0
 run_arm() {
   local arm="$1"; shift
@@ -101,15 +125,16 @@ run_arm() {
   while [ $((SECONDS - t0)) -lt "$READY_TIMEOUT" ]; do
     serve_up && break
     if ! pgrep -i -u "$USER" -f 'vllm|EngineCore' >/dev/null 2>&1 && [ $((SECONDS-t0)) -gt 120 ]; then
-      say "!! 服务进程没了。最早的错误:"
-      local fl; fl=$(grep -nE 'ERROR|Traceback' "$slog" | head -1 | cut -d: -f1)
-      [ -n "$fl" ] && sed -n "${fl},$((fl+25))p" "$slog" | cut -c1-180
+      say "!! 服务进程没了。"
+      dump_first_error "$slog"
       printf '%s\t起不来\t-\n' "$arm" >> "$RES"; cleanup_verified "收尾" >/dev/null 2>&1; return
     fi
     [ $(( (SECONDS-t0) % 120 )) -lt 10 ] && [ $((SECONDS-t0)) -ge 120 ] && say "    ... 等 READY $(hms $((SECONDS-t0)))"
     sleep 10
   done
-  serve_up || { say "!! 等满仍未 READY"; printf '%s\t起不来\t-\n' "$arm" >> "$RES"; cleanup_verified "收尾" >/dev/null 2>&1; return; }
+  serve_up || { say "!! 等满 $READY_TIMEOUT s 仍未 READY"; dump_first_error "$slog"
+                printf '%s\t起不来\t-\n' "$arm" >> "$RES"
+                cleanup_verified "收尾" >/dev/null 2>&1; return; }
   say "服务 READY($(hms $((SECONDS-t0))))"
 
   local row="$arm"
