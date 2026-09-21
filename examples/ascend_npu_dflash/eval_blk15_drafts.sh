@@ -39,6 +39,9 @@
 #   ONLY=<egrep pattern>   only entries whose label matches (e.g. ONLY='ep1p0|ep2p0|ep3p0')
 #   SKIP_DONE=1            skip entries whose log already ended with FINAL SUMMARY
 #   SERVE_TIMEOUT=1800  SETTLE=45  OUTDIR=~/eval_blk15_<TS>
+#   HBM_WAIT=1800  HBM_FREE_MB=4096  PROC_WAIT=300
+#     ★ 进程退干净 ≠ 显存回收完。崩溃退出后驱动实测要 ~12 分 40 秒,
+#       而旧版只等 180 s 就起下一个 serve —— 2026-09-19 的 ep3 因此连挂七次。
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -152,18 +155,44 @@ npu_procs_held() {
 # before that makes it OOM at weight load, which this driver would then log as "serve did not
 # come up" -- i.e. a silently missing data point. pkill above already confirmed OUR processes
 # are gone; this additionally catches a device pinned by somebody else's job.
+# ★ 2026-09-22:这个函数原来只等【进程】退干净,等满 180 s 就走。这不够 —— 显存是
+#   驱动在最后一个进程退出【之后】才回收的,而崩溃退出那条路上实测要 **~12 分 40 秒**。
+#   进程表早就空了,`npu_procs_held` 返回"没人占",于是 sleep 20 就起下一个 serve,撞上
+#   `ValueError: Free memory on device (6.08/61.27 GiB) on startup is less than desired`。
+#   2026-09-19 的 ep3 就是这么连挂七次、最后一个数据点彻底丢掉的。
+#   所以进程门之后必须再加一道【显存门】:轮询 npu-smi,等 used 落回空闲基线才放行。
+HBM_WAIT="${HBM_WAIT:-1800}"        # 显存回落的最长等待(实测崩溃后 ~760 s)
+HBM_FREE_MB="${HBM_FREE_MB:-4096}"  # used 低于它就算空闲(A3 单卡 61.27 GiB)
+PROC_WAIT="${PROC_WAIT:-300}"       # 等进程放开设备的最长时间
+
 wait_npu_free() {
   local waited=0 rc mb
-  while [ "$waited" -lt 180 ]; do
+  while [ "$waited" -lt "$PROC_WAIT" ]; do
     npu_procs_held; rc=$?
     [ "$rc" = 2 ] && { sleep "$SETTLE"; return 0; }       # can't tell → fixed settle
     [ "$rc" = 1 ] && break                                # nothing holding a device
     [ "$waited" = 60 ] && say "    waiting for an NPU still held by another process ..."
     sleep 10; waited=$((waited + 10))
   done
-  sleep 20
-  if mb=$(npu_used_mb); then say "    NPU clear after ${waited}s (max ${mb} MB still mapped)"
-  else                       say "    NPU clear after ${waited}s"; fi
+
+  # 显存门。拿不到 npu-smi 读数就退回固定 settle(和以前一样,不比以前差)。
+  if ! mb=$(npu_used_mb); then
+    sleep 20; say "    NPU clear after ${waited}s (npu-smi 读不到,按固定 settle 放行)"
+    return 0
+  fi
+  local hb=0
+  while [ "$mb" -gt "$HBM_FREE_MB" ] && [ "$hb" -lt "$HBM_WAIT" ]; do
+    [ $((hb % 60)) = 0 ] && say "    等驱动回收显存 ... ${mb} MB 仍映射着(已等 ${hb}s / 上限 ${HBM_WAIT}s)"
+    sleep 20; hb=$((hb + 20))
+    mb=$(npu_used_mb) || { say "    npu-smi 读不到了,放行"; return 0; }
+  done
+  if [ "$mb" -gt "$HBM_FREE_MB" ]; then
+    # 不静默放行 —— 下一个 serve 多半会 OOM,说清楚为什么,别让人对着"没起来"猜。
+    say "    ⚠ 等满 ${HBM_WAIT}s 显存仍有 ${mb} MB 映射着(阈值 ${HBM_FREE_MB} MB)。"
+    say "      下一个 serve 很可能 OOM 在权重加载。是不是有别人的任务占着这台机?"
+  else
+    say "    NPU clear:进程 ${waited}s + 显存回收 ${hb}s(max ${mb} MB 仍映射)"
+  fi
   return 0
 }
 
