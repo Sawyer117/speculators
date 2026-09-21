@@ -177,6 +177,24 @@ def find_ckpt_root(explicit: str | None) -> Path | None:
     return None
 
 
+def out_name(prefix: str, gamma: int, label: str, tag: str, suffix: str) -> str:
+    """出厂目录名。
+
+    ★ 2026-09-22:没有 tag 的时候,名字里只编了 epoch,没编是哪条 run —— 于是
+    `ckpt_faithful_ep_20260908_025936`(blk15 基线)和 `ckpt_faithful_ep_20260916_031128`
+    (fp32 bias + 均衡)的同一个 epoch 会解析到**同一个目录**。轻则 `--force` 把上一条线
+    的出厂权重覆盖掉(每个 39 GB,而基线那条是已发表的 5 点曲线),重则不加 --force 时
+    被判成「已存在 —— 跳过」,然后拿上一条线的权重当这一条的数去测,而且不会有任何报错。
+    """
+    t = f"{tag}_" if tag else ""
+    return f"{prefix}_blk{gamma}_{label}_{t}{suffix}"
+
+
+def eval_label(label: str, gamma: int, tag: str) -> str:
+    """eval 侧的标签。和 article 仓 experiments/data 里的 run_id 对齐(如 ep3p0-blk15-bal)。"""
+    return f"{label}-blk{gamma}" + (f"-{tag}" if tag else "")
+
+
 def label_ckpts(run: Path) -> list[dict]:
     """列出 run 下的整数 ckpt 目录,给每个标上"训了多少 epoch"。
 
@@ -308,6 +326,9 @@ def main() -> int:
     ap.add_argument("--only", help="只处理这些整数 ckpt 目录,逗号分隔(如 4,3)")
     ap.add_argument("--prefix", default="dsv4_dspark", help="输出目录名前缀")
     ap.add_argument("--suffix", default="vllm-77w", help="输出目录名后缀")
+    ap.add_argument("--tag", default="",
+                    help="★ 这条线的标签(如 bal / g5wsd)。出厂目录名和 eval 标签都会带上它。\n"
+                         "不给 = 和历史命名一致,但那样【两条 run 的同一个 epoch 会撞名】")
     ap.add_argument("--gamma", type=int,
                     help="显式指定 γ(每步草稿几个 token),覆盖从 block_size/sample_from_anchor 推的值")
     ap.add_argument("--config-only", action="store_true",
@@ -402,7 +423,7 @@ def main() -> int:
         n_ok = 0
         print()
         for e in entries:
-            dst = out_root / f"{args.prefix}_blk{gamma}_{e['label']}_{args.suffix}"
+            dst = out_root / out_name(args.prefix, gamma, e["label"], args.tag, args.suffix)
             if not (dst / "model.safetensors").is_file():
                 print(f"    跳过 {dst.name}:里面没有 model.safetensors(还没转过)")
                 continue
@@ -415,8 +436,8 @@ def main() -> int:
             f"{k}={cfg.get(k)}" for k in ("dspark_block_size", "dspark_noise_token_id",
                                           "dspark_target_layer_ids", "sliding_window",
                                           "dspark_markov_rank", "num_nextn_predict_layers")))
-        _print_eval_hint(gamma, [f"{e['label']}-blk{gamma}|"
-                                 f"{args.prefix}_blk{gamma}_{e['label']}_{args.suffix}"
+        _print_eval_hint(gamma, [f"{eval_label(e['label'], gamma, args.tag)}|"
+                                 f"{out_name(args.prefix, gamma, e['label'], args.tag, args.suffix)}"
                                  for e in entries if e["weights"]])
         return 0
 
@@ -426,7 +447,7 @@ def main() -> int:
     print(f"\n{'ckpt':>5}  {'训练量':>7}  {'global_step':>11}  {'来源':<22}  输出")
     print("-" * 96)
     for e in entries:
-        name = f"{args.prefix}_blk{gamma}_{e['label']}_{args.suffix}"
+        name = out_name(args.prefix, gamma, e["label"], args.tag, args.suffix)
         dst = out_root / name
         note = ""
         skip = False
@@ -452,9 +473,10 @@ def main() -> int:
     if not args.go or not plan:
         # 干跑时把【全部】ckpt 都列进 eval 清单(包括本次跳过的:多半是上一轮已经转好的),
         # 这样这条命令直接可用,不用再手补。
-        shown = plan or [(e, out_root / f"{args.prefix}_blk{gamma}_{e['label']}_{args.suffix}")
+        shown = plan or [(e, out_root / out_name(args.prefix, gamma, e["label"], args.tag, args.suffix))
                          for e in entries if e["weights"]]
-        _print_eval_hint(gamma, [f"{e['label']}-blk{gamma}|{d.name}" for e, d in shown])
+        _print_eval_hint(gamma, [f"{eval_label(e['label'], gamma, args.tag)}|{d.name}"
+                                 for e, d in shown])
         return 0
 
     # ── 真的转 ─────────────────────────────────────────────────────────────────────
