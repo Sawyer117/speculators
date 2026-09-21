@@ -91,7 +91,12 @@ run_arm() {
   if ! cleanup_verified "臂 $arm 起跑前"; then
     say "!! 清不干净,这一臂作废"; printf '%s\t清场失败\t-\n' "$arm" >> "$RES"; return
   fi
-  ( export "$@"; DSA_OVERLAP="$DSA_OVERLAP" nohup bash "$SERVE_SH" > "$slog" 2>&1 & )
+  # ⚠ `export "$@"` 在【没有参数】时(base 臂就是)不是空操作 —— 它是「打印所有导出变量」。
+  #   2026-09-22 实测:整个环境被 dump 进了 ~/det_sweep.log,其中包括
+  #   `HTTPS_PROXY=http://<user>:<pass>@...` —— 代理密码明文落盘。必须先判非空。
+  #   (`redact_log.py` 现在也会擦这类凭据,但别指望脱敏兜底,先别写出去。)
+  ( [ $# -gt 0 ] && export "$@"
+    DSA_OVERLAP="$DSA_OVERLAP" nohup bash "$SERVE_SH" > "$slog" 2>&1 & )
   local t0=$SECONDS
   while [ $((SECONDS - t0)) -lt "$READY_TIMEOUT" ]; do
     serve_up && break
