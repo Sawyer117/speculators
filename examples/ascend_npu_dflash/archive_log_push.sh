@@ -86,18 +86,26 @@ cmd_pack() {
   e="$(ext)"
   mkdir -p "$dest"
 
-  local raw_sha raw_size
-  raw_sha="$(sha256sum "$log" | cut -d' ' -f1)"
-  raw_size="$(stat -c%s "$log")"
+  # ★ 打包一个【还在被追加写】的日志时,绝不能分两趟读。
+  #   原来是先 `sha256sum $log`(558 MB 要几秒)、再让 python 重读一遍切片 —— 两趟之间
+  #   训练又写进去好几步(每 3.2 s 约 26 行),于是分片包含的内容比被哈希的那段多,
+  #   verify 必然失败。2026-09-22 实测:325 片全部推完,最后 sha 对不上,而分片本身是好的。
+  #   修法:先 stat 取一个快照大小当硬边界,然后**在切片的同一趟里**对真正写进分片的
+  #   字节算 sha —— 哈希的和打包的按定义就是同一批。
+  local raw_sha raw_size snap
+  snap="$(stat -c%s "$log")"
 
   echo "== 切片 + 压缩 ($COMPRESS, 每片约 $RAW_TARGET 未压缩字节, 只在记录边界落刀)"
-  rm -f "$dest"/part.*
+  rm -f "$dest"/part.* "$dest/.packed"   # 陈旧的 .packed 会让下面读到上一次的 sha
   COMPRESS="$COMPRESS" RAW_TARGET="$RAW_TARGET" PART_BYTES="$PART_BYTES" \
-    python3 - "$log" "$dest" "$e" <<'PYSPLIT'
-import gzip, lzma, os, re, sys
+    python3 - "$log" "$dest" "$e" "$snap" "$dest/.packed" <<'PYSPLIT'
+import gzip, hashlib, lzma, os, re, sys
 log, dest, e = sys.argv[1], sys.argv[2], sys.argv[3]
+snap, sidecar = int(sys.argv[4]), sys.argv[5]                # 快照边界:只打包这么多字节,不追着长大的文件跑
 target = int(os.environ["RAW_TARGET"])
 limit = int(os.environ["PART_BYTES"])
+h = hashlib.sha256()                   # ★ 只对真正写进分片的字节算,和打包同一趟
+consumed = 0
 comp = (lambda b: lzma.compress(b, preset=9)) if os.environ["COMPRESS"] == "xz" \
     else (lambda b: gzip.compress(b, 9))
 START = re.compile(rb"^\[")            # [HH:MM:SS] ... or [MOE-LOAD Lx] ...
@@ -114,16 +122,29 @@ def flush():
 
 with open(log, "rb") as fh:
     for line in fh:
+        # 跨过快照边界的那一行整行不要 —— 保证切口落在行边界上,而且哈希与分片一致。
+        if consumed + len(line) > snap:
+            break
         # Cut only once we are over target AND standing at a record start, so a part
         # never begins mid-record.
         if size >= target and START.match(line):
             flush()
         buf.append(line); size += len(line)
+        h.update(line); consumed += len(line)
 flush()
 print(f"   {idx} 片 · 合计 {total:,} 字节 · 最大一片 {worst:,}", end=" ")
 print("(在上限内)" if worst <= limit else f"(★超过 {limit:,},调小 RAW_TARGET 重跑)")
+open(sidecar, "w").write(f"{h.hexdigest()} {consumed}\n")
 sys.exit(0 if worst <= limit else 3)
 PYSPLIT
+  # 切片脚本把「真正打进分片的」sha 和字节数写在 $dest/.packed 里(边信道,不和进度
+  # 输出抢 stdout,nohup 下也不依赖 tty)。
+  [ -f "$dest/.packed" ] || die "拿不到打包后的 sha —— 切片脚本没写 .packed"
+  raw_sha="$(awk '{print $1}' "$dest/.packed")"
+  raw_size="$(awk '{print $2}' "$dest/.packed")"
+  [ -n "$raw_sha" ] && [ -n "$raw_size" ] || die ".packed 内容不对:$(cat "$dest/.packed")"
+  rm -f "$dest/.packed"                  # 边信道用完即弃,别留在仓库工作区里
+  [ "$raw_size" = "$snap" ] || echo "   (快照 $snap B,按行边界收敛到 $raw_size B —— 末尾半行已舍去)"
 
   local n; n="$(find "$dest" -name "part.*.$e" | wc -l)"
   cat > "$dest/MANIFEST.txt" <<EOF
@@ -194,8 +215,13 @@ cmd_push() {
   echo; echo "== 全部推送完成"
 }
 
+# verify <dest_dir> [原始日志]
+# 给了原始日志、而 sha 又对不上时,会再判一次「重组结果是不是原始日志的前缀」——
+# 对一条【还在跑】的 run,这才是真正要问的问题:数据完好但源文件之后又长了(正常),
+# 还是分片本身坏了(严重)。旧版本的 pack 有过一个两趟读的竞态会造成前者。
 cmd_verify() {
-  local dest="${1:?usage: verify <dest_dir>}"
+  local dest="${1:?usage: verify <dest_dir> [原始日志]}"
+  local src="${2:-}"
   local mfp; mfp="$(mf "$dest")"
   [ -f "$mfp" ] || die "no MANIFEST.txt in $dest"
   local name want got tool e
@@ -209,7 +235,24 @@ cmd_verify() {
   cat $(find "$dest" -name "part.*.$e" | sort) > "$tmp/$name.$e"
   "$tool" -d "$tmp/$name.$e"
   got="$(sha256sum "$tmp/$name" | cut -d' ' -f1)"
-  [ "$got" = "$want" ] || die "校验失败: want $want got $got"
+  if [ "$got" != "$want" ]; then
+    echo "!! sha 对不上: want $want" >&2
+    echo "               got  $got" >&2
+    if [ -n "$src" ] && [ -f "$src" ]; then
+      local n; n="$(stat -c%s "$tmp/$name")"
+      if [ "$(stat -c%s "$src")" -ge "$n" ] && cmp -s -n "$n" "$tmp/$name" "$src"; then
+        echo "   但重组结果是 $src 的【前缀】($n B,源文件现在 $(stat -c%s "$src") B)。" >&2
+        echo "   ⟹ 分片数据是好的,只是 MANIFEST 的 sha 算早了 / 源文件之后又长了。" >&2
+        echo "   重跑 pack 即可让 MANIFEST 自洽(旧分片字节相同,push 会自动跳过)。" >&2
+        return 4
+      fi
+      echo "   而且它【不是】$src 的前缀 —— 分片真的坏了,别信这份归档。" >&2
+    else
+      echo "   传第二个参数(原始日志路径)可以再判一次它是不是前缀:" >&2
+      echo "     bash $0 verify $dest <原始日志>" >&2
+    fi
+    return 1
+  fi
   echo "== 校验通过: $name 与原始逐字节相同 ($(awk '$1=="parts"{print $2}' "$mfp") 片)"
 }
 

@@ -89,7 +89,15 @@ say "开始推送(一片一次请求;中断后重跑本脚本会从断点继续)
 
 # ── 5. 校验:重组后和源文件比 sha256 ────────────────────────────────────────
 say "校验(重组 → sha256 对拍)"
-( cd "$ART" && bash "$SCRIPT_DIR/archive_log_push.sh" verify "$DEST" ) || die "校验不通过 —— 别信这份归档"
+# 把源日志也传进去:sha 对不上时 verify 会再判一次「重组结果是不是源日志的前缀」。
+# 退出码 4 = 数据完好、只是 MANIFEST 的 sha 算早了(旧版 pack 有过这个两趟读的竞态);
+# 对一条还在跑的 run 这不是损坏,重跑本脚本就会让 MANIFEST 自洽。
+( cd "$ART" && bash "$SCRIPT_DIR/archive_log_push.sh" verify "$DEST" "$SRC" )
+case $? in
+  0) ;;
+  4) say "⚠ 归档数据完好,但 MANIFEST 的 sha 是旧版 pack 算早的 —— 重跑本脚本即可自洽" ;;
+  *) die "校验不通过 —— 别信这份归档" ;;
+esac
 
 echo
 echo "================================================================================"
