@@ -2112,7 +2112,21 @@ def main() -> None:
         if ov > 0.3 * tot:
             notes.append(f"recompile spikes eat {100*ov/tot:.0f}% of wall-clock — fixing them (fixed-shape "
                          f"MoE padding) would ~{tot/(tot-ov):.1f}× throughput.")
-    if al and last_al < RELEASED_ACCEPT_LEN["avg"]:
+    # ★ 只有 γ=5 的 run 才能和这根横杆比。RELEASED_ACCEPT_LEN 是 released 草稿在
+    #   **ns=5** 下的读数;released 是个 block5 草稿。拿它去评判 γ=15 的 run 是【假对比】
+    #   —— 块更长本来就机械地允许更长的 accept_len(同一条规矩写在 article 仓的
+    #   figures/README.md §gen_eval_by_epoch,以及 …-dspark-eval-results.md 的权威口径段)。
+    #   2026-09-21 实测:这条提示在一条 γ=15 的 run 上打出「4.38 < 4.42 还在训」,
+    #   而那两个数根本不是同一个量。γ 从 pos 键数推断(pos0..posK ⟹ γ=K+1)。
+    _gamma = len(pos_keys) if pos_keys else None
+    if al and _gamma is not None and _gamma != 5:
+        notes.append(
+            f"accept_len {last_al:.2f} 是 SOFT 训练侧读数,且本 run γ={_gamma} —— "
+            f"**不要**和 released 的 {RELEASED_ACCEPT_LEN['avg']} 比,那是 block5@ns5 的数,"
+            "块长不同,同轴比较无意义。跨草稿只能比 tok/s 或 pos0 条件接受率,"
+            "绝对水平必须用同 γ 同栈的真实评测。"
+        )
+    elif al and last_al < RELEASED_ACCEPT_LEN["avg"]:
         notes.append(
             f"accept_len {last_al:.2f} (SOFT) < the {RELEASED_ACCEPT_LEN['avg']} same-serve released "
             "bar — still training; note the serve-side number is measured differently, so compare "
