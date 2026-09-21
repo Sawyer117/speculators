@@ -1,5 +1,6 @@
 import functools
 import json
+import re
 import logging
 import shutil
 from abc import abstractmethod
@@ -267,6 +268,42 @@ def convert_float_dtype(sd: pytree.PyTree, dtype: torch.dtype) -> pytree.PyTree:
     return pytree.tree_map(convert_fn, sd)
 
 
+# ★ 存盘时必须保持 fp32 的键。
+#
+# WHY. DeepSeek noaux_tc 的负载均衡 bias 在 bf16 下会掉进 -0.5 的舍入吸收态 —— 均衡挂着
+# 但 ~500 步就死了(`6b946c2b` 因此把这个 buffer 钉成 fp32,并用 `_apply` 钩住
+# `model.to(bf16)`,训练时确实是 fp32)。**但存盘这一步把它又降回 bf16 了** ——
+# `convert_float_dtype` 对每个浮点张量一视同仁。后果是训练用 fp32 bias、服务用 bf16
+# 舍入过的值,又一处 train↔serve 不一致(这个项目已经栽过 RoPE、非因果、
+# sample_from_anchor 三次,每次都是"数值上应该不要紧"然后不是)。
+#
+# 官方发布的草稿这个张量存的就是 float32;而且我们比官方更依赖它 —— 官方 L0 的有效
+# bias std 只有 0.09、L1/L2 全零,我们是 std 0.35~0.73、有专家被压到 -7。
+# bf16 在 |x|=2 处 ulp 0.0156、|x|=7 处 0.0625,而 router 打分量级 ~1,
+# topk(scores+bias) 里排在第 8/9 名附近的专家会因此翻转。
+#
+# ⚠ 这【救不回已有的 checkpoint】:精度在存盘那一刻就没了,重新转换也拿不回来。
+KEEP_FP32_KEYS = (r"(^|\.)(gate|router)\.bias$",)
+
+
+def convert_float_dtype_keeping(
+    sd: dict, dtype: torch.dtype, keep: tuple[str, ...] = KEEP_FP32_KEYS
+) -> dict:
+    """像 convert_float_dtype,但按【键名】豁免一批张量,让它们保持原精度。"""
+    pat = re.compile("|".join(keep)) if keep else None
+    out = {}
+    for k, v in sd.items():
+        if (
+            isinstance(v, torch.Tensor)
+            and v.is_floating_point()
+            and not (pat and isinstance(k, str) and pat.search(k))
+        ):
+            out[k] = v.to(dtype)
+        else:
+            out[k] = v
+    return out
+
+
 def load_safetensors_state_dict(path: Path, device: str) -> dict[str, torch.Tensor]:
     full_state_dict = {}
     with safe_open(path, framework="pt", device=device) as f:
@@ -320,7 +357,9 @@ class SingleGPUCheckpointer(BaseCheckpointer):
             device,
         )
         full_state_dict = state_dict_from_checkpoint(model, full_state_dict)
-        full_state_dict = convert_float_dtype(
+        # 加载侧也要豁免:model.dtype 是 bf16,不豁免的话续训/热启动会把盘上的 fp32
+        # bias 又降回去,存盘那边的修复等于白做(而模型里那个 buffer 本来就是 fp32)。
+        full_state_dict = convert_float_dtype_keeping(
             full_state_dict, float_dtype or model.dtype
         )
         # Note: `strict=False` because we don't load the verifier weights
@@ -358,7 +397,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         raw_model: PreTrainedModel = (
             model.module if isinstance(model, DistributedDataParallel) else model
         )  # type: ignore[assignment]
-        model_state_dict = convert_float_dtype(raw_model.state_dict(), float_dtype)
+        model_state_dict = convert_float_dtype_keeping(raw_model.state_dict(), float_dtype)
         raw_model.save_pretrained(self.path / str(epoch), state_dict=model_state_dict)
         patch_config_dtype(self.path / str(epoch) / "config.json", float_dtype)
 
@@ -380,7 +419,9 @@ class DistributedCheckpointer(BaseCheckpointer):
             self.model_path(self.previous_epoch), "cpu"
         )
         full_state_dict = state_dict_from_checkpoint(model, full_state_dict)
-        full_state_dict = convert_float_dtype(
+        # 加载侧也要豁免:model.dtype 是 bf16,不豁免的话续训/热启动会把盘上的 fp32
+        # bias 又降回去,存盘那边的修复等于白做(而模型里那个 buffer 本来就是 fp32)。
+        full_state_dict = convert_float_dtype_keeping(
             full_state_dict, float_dtype or model.dtype
         )
 
@@ -436,7 +477,7 @@ class DistributedCheckpointer(BaseCheckpointer):
         model_state_dict = get_model_state_dict(
             model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
         )
-        model_state_dict = convert_float_dtype(model_state_dict, float_dtype)
+        model_state_dict = convert_float_dtype_keeping(model_state_dict, float_dtype)
 
         optimizer_state_dict = get_optimizer_state_dict(
             model,
