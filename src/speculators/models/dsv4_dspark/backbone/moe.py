@@ -52,8 +52,18 @@ class Router(nn.Module):
             "bias", torch.zeros(cfg.n_routed_experts, dtype=torch.float32), persistent=True
         )
         self.n_routed_experts = cfg.n_routed_experts
-        # DSPARK_LOG_EXPERT_LOAD=1 -> stash per-expert selection counts each fwd (diagnostic; core.py).
+        # DSPARK_LOG_EXPERT_LOAD=1 -> stash per-expert selection counts (diagnostic; core.py).
+        # ★ 2026-09-23:这不是免费的。实测 `DSPARK_LOG_EXPERT_LOAD=1` 让前向从 686 ms 变成
+        #   1,010 ms(1.47×),单步 3,370 → 3,640(+8%),10 个 epoch 多花约 19 小时 ——
+        #   反向/优化器/取 HS 三项分毫不动,多出来的全在前向。数据量本身微不足道
+        #   (~24k 个元素填 256 个桶),所以开销来自 `torch.bincount` 在这个后端上的
+        #   同步/回退路径,不是算力。
+        #   而这个诊断要的是【轨迹】,不是每一步。DSPARK_LOG_EXPERT_LOAD_EVERY 采样即可:
+        #   每 50 步一次把成本除以 50,轨迹的分辨率仍远超需要(一个 epoch ~24,896 步 -> ~500 点)。
+        #   ⚠️ 均衡【开着】时不受影响:那条路径每步都必须要这个计数,采样只作用在纯诊断上。
         self._log_load = os.environ.get("DSPARK_LOG_EXPERT_LOAD") == "1"
+        self._log_every = max(1, int(os.environ.get("DSPARK_LOG_EXPERT_LOAD_EVERY", "50")))
+        self._log_n = 0
         # DSPARK_MOE_BALANCE=1 -> the noaux_tc bias update (update_load_balance_bias, called per step from
         # _backbone_forward): b_i += rate * sign(avg_load - load_i). OFF by default = the historical frozen
         # bias (zero balancing) that let the router COLLAPSE to a few experts. rate via DSPARK_MOE_BALANCE_RATE.
@@ -119,9 +129,16 @@ class Router(nn.Module):
         if self.score_func != "softmax":
             weights = weights / weights.sum(dim=-1, keepdim=True)
         weights = weights * self.route_scale
-        if self._log_load or (self._balance and self.training):
+        _want_balance = self._balance and self.training
+        _want_log = False
+        if self._log_load:
+            self._log_n += 1
+            _want_log = (self._log_n % self._log_every) == 0
+        if _want_log or _want_balance:
             _cnt = torch.bincount(indices.reshape(-1), minlength=self.n_routed_experts).detach().float()
-            if self._log_load:            # this rank's per-expert selection histogram (diagnostic)
+            if _want_log:                 # this rank's per-expert selection histogram (diagnostic)
+                # 只在采样步刷新;core.py 读到的是【最近一次】的直方图(最多滞后
+                # DSPARK_LOG_EXPERT_LOAD_EVERY 步)。不清空,所以打印端永远拿得到值。
                 self._sel_counts = _cnt
             if self._balance and self.training:  # stash for the per-step bias update (SET, so a recompute
                 self._step_load = _cnt           # forward just re-sets the same value -> no double count)
