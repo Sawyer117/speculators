@@ -93,6 +93,10 @@ echo "  温度 0 确定性扫描   臂: $ARMS   长度: $LENS"
 echo "  ARROW      ${ARROW:-<找不到>}"
 echo "  serve      $SERVE_SH   (CONDA_ENV=${CONDA_ENV:-<脚本默认>})"
 echo "  探针解释器 $PROBE_PY"
+# 两份日志被并排粘进聊天时,OUT 目录名往往丢了。把决定 MoE 走哪条路的开关直接写进
+# 表头 —— 「这个数是哪个配置跑出来的」在这个项目里已经错过不止一次。
+echo "  FUSED_MC2  ${VLLM_ASCEND_ENABLE_FUSED_MC2:-<未设,serve 脚本默认 1 = MegaMoe 开>}"
+echo "  DSA_OVERLAP $DSA_OVERLAP"
 echo "  每点       $NROWS 行 × $REPEAT 次重复,各生成 $GEN 个 token"
 echo "  ★ 指标 = 完全一致前缀(贪心混沌,逐 token 一致率是误导性指标)"
 echo "================================================================================"
