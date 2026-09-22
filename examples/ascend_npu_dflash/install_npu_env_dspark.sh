@@ -24,7 +24,10 @@
 # USAGE:   bash examples/ascend_npu_dflash/install_npu_env_dspark.sh
 # OVERRIDES (env):
 #   ROOT=<dir>       code root holding installation/ + speculators/ (default: repo's ../..)
-#   VLLM_DIR         existing vLLM checkout to build editable (default $ROOT/installation/vllm-v0.23.0)
+#   VLLM_TAG         vLLM tag to clone/verify (default v0.23.0). ★ MUST match what the
+#                    vllm-ascend pin's Dockerfile ARG VLLM_TAG says — a mismatched pair
+#                    builds and installs fine and then dies in `vllm serve --help`.
+#   VLLM_DIR         existing vLLM checkout to build editable (default $ROOT/installation/vllm-$VLLM_TAG)
 #   VA_DIR           existing vllm-ascend checkout   (default $ROOT/installation/vllm-ascend-v4)
 #   VA_BRANCH        vllm-ascend branch if cloning fresh (default dspark-dsv4)
 #   NUMPY_VER        default 2.3.5 (verified); set 1.26.4 for the conservative pin
@@ -34,7 +37,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"                 # the speculators checkout
 ROOT="${ROOT:-$(cd "$REPO_ROOT/.." && pwd)}"                 # code root (installation/ + speculators/)
-VLLM_DIR="${VLLM_DIR:-$ROOT/installation/vllm-v0.23.0}"
+VLLM_TAG="${VLLM_TAG:-v0.23.0}"
+VLLM_DIR="${VLLM_DIR:-$ROOT/installation/vllm-$VLLM_TAG}"
 VA_DIR="${VA_DIR:-$ROOT/installation/vllm-ascend-v4}"
 VA_BRANCH="${VA_BRANCH:-dspark-dsv4}"
 NUMPY_VER="${NUMPY_VER:-2.3.5}"
@@ -75,8 +79,24 @@ fi
 for t in gcc g++ make patch; do command -v "$t" >/dev/null || { echo "!! missing host tool: $t"; exit 1; }; done
 echo "toolchain OK: gcc=$(command -v gcc) | patch=$(command -v patch) | lld=$(command -v lld 2>/dev/null || echo 'from CANN')"
 
-echo "== 3. vLLM v0.23.0 (empty build, editable) =="
-[ -d "$VLLM_DIR/.git" ] || git clone --depth 1 --branch v0.23.0 https://github.com/vllm-project/vllm "$VLLM_DIR"
+echo "== 3. vLLM $VLLM_TAG (empty build, editable) =="
+if [ -d "$VLLM_DIR/.git" ]; then
+  # ★ 2026-09-23:目录存在就跳过 clone,于是【目录名和里面的版本可以不一致】。
+  #   实际踩到:install_oldstack_a3.sh 传了 VLLM_DIR=.../vllm-v0.27.1 却没传 VLLM_TAG,
+  #   这里把写死的 v0.23.0 克隆了进去 —— 装完是 vLLM 0.23.0 配 vllm-ascend 44bbd5ea3
+  #   (它要 0.27.1),`vllm serve --help` 崩在 CLI 解析上。目录名在说谎,而且没人会怀疑它。
+  _have="$(git -C "$VLLM_DIR" describe --tags --exact-match 2>/dev/null \
+            || git -C "$VLLM_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  if [ "$_have" != "$VLLM_TAG" ]; then
+    echo "!! $VLLM_DIR 里是 vLLM '$_have',但本次要的是 '$VLLM_TAG'。" >&2
+    echo "   目录名不代表内容。修法(会重新 clone + 重编):" >&2
+    echo "     rm -rf '$VLLM_DIR'  然后带 VLLM_TAG=$VLLM_TAG 重跑" >&2
+    exit 2
+  fi
+  echo "   复用已有 checkout:$VLLM_DIR ($_have)"
+else
+  git clone --depth 1 --branch "$VLLM_TAG" https://github.com/vllm-project/vllm "$VLLM_DIR"
+fi
 ( cd "$VLLM_DIR" && TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_TARGET_DEVICE=empty \
     python -m pip install -e . --no-build-isolation -v )
 
@@ -107,6 +127,6 @@ print("OK: DSpark/DSV4 stack imports cleanly")
 PY
 
 echo "==================================================================="
-echo " DONE. Expect: numpy $NUMPY_VER | torch 2.10.0 | vllm 0.23.0 | vllm-ascend from $VA_DIR"
+echo " DONE. Expect: numpy $NUMPY_VER | torch 2.10.0 | vllm ${VLLM_TAG#v} | vllm-ascend from $VA_DIR"
 echo " NOTE: serve/eval also needs the CANN 9.0.0 nnal/atb set_env sourced in a clean shell."
 echo "==================================================================="

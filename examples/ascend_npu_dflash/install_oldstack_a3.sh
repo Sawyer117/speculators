@@ -105,7 +105,7 @@ echo "将要执行:"
 echo "  1. conda create -n $ENV_NAME python=$PY_VER"
 echo "  2. git clone $FORK → $VA_DIR ; git checkout $OLD_SHA"
 echo "  3. source $CANN_ENV(经 set +u 安全外壳 —— CANN 的 set_env 不兼容 set -u)"
-echo "  4. ROOT=$ROOT VLLM_DIR=$VLLM_DIR VA_DIR=$VA_DIR CANN_ENV=$CANN_ENV \\"
+echo "  4. ROOT=$ROOT VLLM_TAG=$VLLM_TAG VLLM_DIR=$VLLM_DIR VA_DIR=$VA_DIR CANN_ENV=$CANN_ENV \\"
 echo "       bash $SCRIPT_DIR/install_npu_env_dspark.sh"
 echo "     (它自己 clone vLLM $VLLM_TAG,并从源码编译 V4/SAS 的 CANN 算子 —— 这步最久)"
 echo
@@ -171,7 +171,7 @@ fi
 
 say "4/4 调 SSOT 安装脚本(编译算子,几十分钟到几小时;全程输出到 $ROOT/install.log)"
 mkdir -p "$ROOT"
-ROOT="$ROOT" VLLM_DIR="$VLLM_DIR" VA_DIR="$VA_DIR" VA_BRANCH="$OLD_SHA" \
+ROOT="$ROOT" VLLM_TAG="$VLLM_TAG" VLLM_DIR="$VLLM_DIR" VA_DIR="$VA_DIR" VA_BRANCH="$OLD_SHA" \
   CANN_ENV="$SAFE_CANN" \
   bash "$SCRIPT_DIR/install_npu_env_dspark.sh" 2>&1 | tee "$ROOT/install.log"
 rc=${PIPESTATUS[0]}
