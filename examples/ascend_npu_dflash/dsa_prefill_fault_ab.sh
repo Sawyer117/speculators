@@ -145,8 +145,13 @@ _npu_used_mb() {
     | awk -F'/' '{gsub(/ /,""); if ($2+0>=30000 && $1+0>mx) mx=$1+0} END{print mx+0}'
 }
 
+# ★ 2026-09-23:原来写死 `python`,未激活 conda 的 shell 上 command-not-found 被
+#   2>/dev/null 吞掉、返回 127,空闲端口被判成永久占用。与 npu_cleanup_lib.sh 同步。
+_AB_PYBIN="${_AB_PYBIN:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
+
 _port_free() {
-  python - "$PORT" <<'PYEOF' 2>/dev/null
+  [ -n "$_AB_PYBIN" ] || { ! ss -ltn 2>/dev/null | grep -qE "[:.]${PORT}[[:space:]]"; return $?; }
+  "$_AB_PYBIN" - "$PORT" <<'PYEOF' 2>/dev/null
 import socket, sys
 s = socket.socket()
 try:

@@ -46,8 +46,17 @@ _npu_used_mb() {
     | awk -F'/' '{gsub(/ /,""); if ($2+0>=30000 && $1+0>mx) mx=$1+0} END{print mx+0}'
 }
 
+# ★ 2026-09-23:这里原来写死 `python`。未激活 conda 的 shell(以及很多发行版)只有
+#   `python3`,于是 `python: command not found` 被 `2>/dev/null` 吞掉、bash 返回 127,
+#   _port_free 永远为假 —— **空闲的端口被判成永久占用**。实测:一台完全空闲的 A3 上
+#   determinism_sweep 等满 300 秒报「清场失败」,而 ss 里一个监听都没有,整臂作废。
+#   现在:python3 优先,退回 python,再退回 ss/netstat;一个都没有就说清楚并放行。
+_CL_PYBIN="${_CL_PYBIN:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
+
 _port_free() {
-  python - "${PORT:-7000}" <<'PYEOF' 2>/dev/null
+  local port="${PORT:-7000}"
+  if [ -n "$_CL_PYBIN" ]; then
+    "$_CL_PYBIN" - "$port" <<'PYEOF' 2>/dev/null
 import socket, sys
 s = socket.socket()
 try:
@@ -57,6 +66,18 @@ except OSError:
 finally:
     s.close()
 PYEOF
+    return $?
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    ! ss -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    ! netstat -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"
+    return $?
+  fi
+  _cl_say "    !! 没有 python3/python/ss/netstat,端口 $port 无法验证 —— 当作空闲放行"
+  return 0
 }
 
 # 返回 0 = 确认干净;返回 1 = 清不干净(调用方必须当失败处理,别硬起服务)
@@ -93,7 +114,16 @@ cleanup_verified() {
   done
   if ! _port_free; then
     _cl_say "!! 清场未完成($tag):端口 $port 仍被占用($(_cl_hms $pt) 没放开)。"
-    command -v ss >/dev/null && ss -ltnp 2>/dev/null | grep ":$port " | head -3
+    # 「判定占用」和「真的有人在监听」是两回事。没监听却判占用 = 检查器坏了,
+    # 而不是端口被占 —— 把这句话直接写进日志,别让下一个人再花半小时去找幽灵进程。
+    local _lsn=""
+    command -v ss >/dev/null 2>&1 && _lsn="$(ss -ltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -3)"
+    if [ -n "$_lsn" ]; then
+      echo "$_lsn"
+    else
+      _cl_say "   ⚠ 但没有任何进程在监听 $port —— 不是端口被占,是这个检查本身坏了。"
+      _cl_say "     端口检查用的解释器:${_CL_PYBIN:-<python3/python 都没找到>}"
+    fi
     return 1
   fi
 

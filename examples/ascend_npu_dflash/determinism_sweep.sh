@@ -59,6 +59,18 @@ OUT="${OUT:-$HOME/det_sweep}"
 ID_BASE="${ID_BASE:-980000}"
 DSA_OVERLAP="${DSA_OVERLAP:-0}"
 
+# ★ 2026-09-23:探针原来是裸 `python`。它得跑在【装了 datasets/pyarrow/requests 的那个
+#   env】里,而不是系统 python:从未激活 conda 的 shell 里启动时,`python` 根本不存在
+#   (这台机只有 /usr/bin/python3),或者存在但缺依赖 —— 两种都是整臂作废。
+PROBE_PY="${PROBE_PY:-}"
+if [ -z "$PROBE_PY" ]; then
+  if [ -n "${CONDA_ENV:-}" ] && command -v conda >/dev/null 2>&1; then
+    PROBE_PY="conda run --no-capture-output -n ${CONDA_ENV} python"
+  else
+    PROBE_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || echo python)"
+  fi
+fi
+
 if [ -z "${ARROW:-}" ]; then
   for d in /home/canada_group_folder/dataset/arrow* \
            /share/canada_group_folder/dataset/*/arrow* \
@@ -80,6 +92,7 @@ echo "==========================================================================
 echo "  温度 0 确定性扫描   臂: $ARMS   长度: $LENS"
 echo "  ARROW      ${ARROW:-<找不到>}"
 echo "  serve      $SERVE_SH   (CONDA_ENV=${CONDA_ENV:-<脚本默认>})"
+echo "  探针解释器 $PROBE_PY"
 echo "  每点       $NROWS 行 × $REPEAT 次重复,各生成 $GEN 个 token"
 echo "  ★ 指标 = 完全一致前缀(贪心混沌,逐 token 一致率是误导性指标)"
 echo "================================================================================"
@@ -144,7 +157,7 @@ run_arm() {
     RUN=$((RUN + 1))
     local o
     o=$(ENDPOINT="$ENDPOINT" ARROW="$ARROW" \
-        python "$SCRIPT_DIR/corpus_provenance_check.py" \
+        $PROBE_PY "$SCRIPT_DIR/corpus_provenance_check.py" \
           --n "$NROWS" --gen "$GEN" --repeat "$REPEAT" --prompt-len "$L" \
           --id-base $((ID_BASE + RUN * 1000)) 2>&1)
     # 取「完全一致前缀最短」——贪心下这才是有意义的指标
