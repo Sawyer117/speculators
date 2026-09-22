@@ -532,6 +532,16 @@ PROV="$RUN/${TAG}_${TS}.provenance.txt"
   if [ -n "$GIT_DIRTY" ]; then
     echo "dirty=YES  -- the commit above does NOT fully describe this run:"
     echo "$GIT_DIRTY" | sed 's/^/  /'
+    # ★ 2026-09-23:光记「哪些文件脏了」不够 —— 24 条历史 run 里 12 条改过训练路径
+    #   (src/speculators/** 或本脚本),那些 run 【无法从它们自己的 commit 复现】。
+    #   代码其实没丢,是后来提交了而 provenance 指着提交之前的 SHA;但事后没人对得上。
+    #   所以把 tracked 改动的 diff 一起落盘,脏 run 也能精确复原:
+    #       git -C <repo> checkout <commit> && git apply <这个 .diff>
+    #   只存 tracked 的改动:未跟踪的 kernel_meta/ nohup.out output/ 是构建产物,不该进来。
+    echo "diff=${PROV%.provenance.txt}.diff  (tracked changes only; git apply 可还原)"
+    git -C "$REPO_ROOT" diff HEAD > "${PROV%.provenance.txt}.diff" 2>/dev/null \
+      && echo "diff_bytes=$(stat -c%s "${PROV%.provenance.txt}.diff" 2>/dev/null || echo ?)" \
+      || echo "diff=FAILED -- 这条 run 无法精确复现"
   else
     echo "dirty=no"
   fi
