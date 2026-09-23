@@ -281,11 +281,26 @@ if [ "$ASYNC_SCHED" = "0" ]; then
   ASYNC_ARGS=()
   echo ">>> ASYNC_SCHED=0:不传 --async-scheduling(官方配方也不带)"
 fi
-ACFG='{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true}'
+# ★ 2026-09-23:`multistream_overlap_shared_expert:true` 在这份配方里【从来没生效过】。
+#   ascend_config.py:174 —— `if enable_fused_mc2 == 1 and multistream_overlap_shared_expert:
+#   multistream_overlap_shared_expert = False` —— 两者互斥,fused_mc2 赢。而我们默认
+#   VLLM_ASCEND_ENABLE_FUSED_MC2=1,所以它每次都被强制关掉。
+#   后果:设 VLLM_ASCEND_ENABLE_FUSED_MC2=0 并不是「关掉 MegaMoe」这一个动作,而是
+#   **关掉一个、同时唤醒一条我们从未跑过的 multistream overlap 路径**。2026-09-23 实测
+#   两次都在 profile_run 里挂掉(9.1 vector core timeout / 9.2 fftsplus aivector error),
+#   而我据此得出的「MC2 在这台机上是坏的」是错的 —— 那两次走的根本不是 MC2:
+#   `_select_a3_moe_comm_method` 的 fused 分支在任何 num_tokens 判断【之前】就 return,
+#   关掉之后 8192 > mc2_tokens_capacity(每 rank 上限从 4096 掉到 512)⟹ 落到 ALLTOALL。
+#   所以默认让它跟着 FUSED_MC2 走:已验证配方里它是 OFF,关 MegaMoe 时也保持 OFF,
+#   这样才是单变量。要显式开就 MSOSE=true。
+MSOSE="${MSOSE:-$([ "${VLLM_ASCEND_ENABLE_FUSED_MC2:-1}" = "1" ] && echo true || echo false)}"
+ACFG="{\"enable_cpu_binding\":true,\"multistream_overlap_shared_expert\":$MSOSE"
 if [ "$DSA_OVERLAP" = "0" ]; then
-  ACFG='{"enable_cpu_binding":true,"multistream_overlap_shared_expert":true,"multistream_dsv4_dsa_overlap":false}'
+  ACFG="$ACFG,\"multistream_dsv4_dsa_overlap\":false"
   echo ">>> DSA_OVERLAP=0:关闭 multistream_dsv4_dsa_overlap(绕开 _mla_prolog_multistream)"
 fi
+ACFG="$ACFG}"
+echo ">>> additional-config = $ACFG"
 
 exec vllm serve "$MODEL" --served-model-name dsv4 --port "$API_PORT" \
   --data-parallel-size "$DP" --data-parallel-size-local "$DP" \
