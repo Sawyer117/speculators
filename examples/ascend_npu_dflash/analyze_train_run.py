@@ -1263,7 +1263,10 @@ def _print_vs_baseline(recs, ckpt_steps, base_recs, base_ckpt, cur_label, base_l
     """A compact headline delta table: CURRENT vs BASELINE (the plots carry the full comparison)."""
     hc = _headline(recs, ckpt_steps, spike_k)
     hb = _headline(base_recs, base_ckpt, spike_k)
-    bl, cl = (base_label or "baseline")[:13], (cur_label or "current")[:13]
+    bl, cl = (base_label or "baseline"), (cur_label or "current")
+    # Run names share their head (faithful_ep_2026…), so cutting both from the left printed two
+    # identical column headers. The tail is the timestamp, which is what tells them apart.
+    bl, cl = (bl[-13:], cl[-13:]) if bl[:13] == cl[:13] else (bl[:13], cl[:13])
     print("\n-- VS BASELINE (headline; the full report below is CURRENT only) " + "-" * 13)
     print(f"  steps: {bl}={hb['span'][0]}..{hb['span'][1]}   {cl}={hc['span'][0]}..{hc['span'][1]}")
     print(f"  {'metric':16} {bl:>13} {cl:>13} {'Δ (cur−base)':>16}")
