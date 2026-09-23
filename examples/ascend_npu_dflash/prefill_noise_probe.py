@@ -382,11 +382,23 @@ def main() -> int:
         print()
         fr = flip_n / flip_d
         mm = 1.0 - (corp_resp_n / corp_resp_d if corp_resp_d else (corp_n / max(corp_d, 1)))
+        # 笃定档(margin > 2 nat)的翻转率 —— 这一档是否翻转决定整组数能不能用。
+        conf_n, conf_d = bucket_flip[-1]
+        conf = (conf_n / conf_d) if conf_d else 0.0
         print("★ 判读")
-        print(f"     本底翻转率 {100 * fr:.2f}%   vs   语料 mismatch {100 * mm:.2f}%")
-        if mm <= max(0.02, 3 * fr):
-            print("     ⟹ mismatch 和本底同量级 —— 语料没问题,历史上那个 64% 是引擎本底。")
-        elif fr < 0.05 and mm > 0.30:
+        print(f"     本底翻转率 {100 * fr:.2f}%   vs   语料 mismatch {100 * mm:.2f}%"
+              f"   笃定档(margin>2)翻转 {100 * conf:.2f}%")
+        # ★ 2026-09-23:第一版直接拿 fr 和 mm 比「同量级」就宣布语料清白。那是错的:
+        #   fr 很大时,语料对比的参照物本身是垃圾,这个比较没有意义。实测 bg=0 那组
+        #   fr=78.8% 而笃定档翻转 61.8% —— margin>2 nat 的位置末位抖动【翻不动】,
+        #   所以那组数测的不是噪声,是别的东西。先拒绝下结论,别急着给语料判无罪。
+        if conf > 0.05 or fr > 0.25:
+            print("     ⟹ ★ 这组数【不能用来判语料】。margin>2 nat 的位置本不该翻,"
+                  f"而这里翻了 {100 * conf:.2f}%;")
+            print("        整体翻转率也高到让「对比语料」失去参照。这说明要么长 prefill")
+            print("        这条路在算错,要么这个测量在这个长度上无效 —— 两者都得先查清。")
+            print("        先看短序列那几行:它们干净 ⟹ 问题随长度出现,不是全局的。")
+        elif mm <= max(0.02, 3 * fr):
             print("     ⟹ ★★ 本底很干净而 mismatch 很大:**那批 response 不是这个目标模型")
             print("        会产生的**。所有 DSpark 训练都跑在这份 Arrow 上,这件事的影响")
             print("        远大于任何算子/栈的问题。先停批量 HS 生产,查语料来源。")
