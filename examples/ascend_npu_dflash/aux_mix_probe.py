@@ -214,15 +214,23 @@ def main() -> int:
     print()
     if len(rows) > 1:
         base = rows[0]
-        bt = sum(base[5]) or 1.0
+        # ★ 2026-09-23:第一版这张差值表用的是权重范数,而上面表头报的是【贡献占比】。
+        #   两个口径混在一起看会得出相反的结论 —— 有 --hs 时一律用贡献。
+        use_c = base[7] is not None and all(r[7] is not None for r in rows[1:])
+        bvec = base[7] if use_c else base[5]
+        bt = sum(bvec) or 1.0
         print("=" * 96)
-        print(f"  相对 {base[0]} 的占比差(正 = 我们更看重这一层)")
+        print(f"  相对 {base[0]} 的{'贡献' if use_c else '权重范数'}占比差(正 = 我们更看重这一层)")
+        if not use_c:
+            print("  ⚠ 没有 --hs,这里比的是权重范数,不是贡献。深层激活 RMS 更大 ⟹ 权重偏小,")
+            print("    只看范数会系统性低估深层。")
         print("=" * 96)
-        print("   " + " " * 22 + "".join(f"{('L' + labels[b]):>14}" for b in range(base[4])))
-        for nm, _k, _s, _h, nb, fro, _m, _c in rows[1:]:
-            t = sum(fro) or 1.0
-            print(f"   {nm[:20]:<22}" + "".join(
-                f"{100 * fro[b] / t - 100 * base[5][b] / bt:>+13.2f}pt" for b in range(nb)))
+        print("   " + " " * 30 + "".join(f"{('L' + labels[b]):>14}" for b in range(base[4])))
+        for nm, _k, _s, _h, nb, fro, _m, contrib in rows[1:]:
+            vec = contrib if use_c else fro
+            t = sum(vec) or 1.0
+            print(f"   {nm[:28]:<30}" + "".join(
+                f"{100 * vec[b] / t - 100 * bvec[b] / bt:>+13.2f}pt" for b in range(nb)))
     print()
     print("读法 —— 这个表能说和不能说的:")
     print("  能说:released 和我们的加权方式差多少。差很多 = 我们学到的是另一种组合方式。")
