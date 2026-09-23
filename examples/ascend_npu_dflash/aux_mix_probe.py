@@ -79,11 +79,25 @@ def _reader():
 
 
 def load_main_proj(d: str):
-    """返回 (name, W float32 [out, 3*H], 来源文件)。fp8 块量化会按 scale 反量化。"""
+    """返回 (name, W float32 [out, 3*H], 来源文件)。fp8 块量化会按 scale 反量化。
+
+    找不到时会说清楚是【目录里没有权重文件】还是【有文件但没有形状对的键】,并把看到的
+    候选键打出来 —— 第一版只说「找不到」,而实际原因是目录名打错了,查了半天。
+    """
     import numpy as np  # noqa: PLC0415
     fw, safe_open, _get = _reader()
 
-    for f in _find_files(d):
+    files = _find_files(d)
+    if not os.path.isdir(d):
+        print(f"!! {d}: 目录不存在")
+        return None, None, None
+    if not files:
+        print(f"!! {d}: 目录里没有 .safetensors —— 里面有:"
+              f"{sorted(os.listdir(d))[:8]}")
+        return None, None, None
+    seen: list[str] = []
+
+    for f in files:
         try:
             with safe_open(f, framework=fw) as fh:
                 keys = list(fh.keys())
@@ -92,9 +106,16 @@ def load_main_proj(d: str):
                 for k in cands:
                     sl = fh.get_slice(k)
                     shp = list(sl.get_shape())
-                    if len(shp) != 2 or shp[1] != 3 * shp[0]:
-                        continue                      # 不是 [H, 3H] 的那一个
+                    seen.append(f"{k}{shp}")
+                    if len(shp) != 2:
+                        continue
+                    # [H, 3H] 是常规存法;有的导出会转置成 [3H, H],两种都收。
+                    transposed = shp[0] == 3 * shp[1]
+                    if not (shp[1] == 3 * shp[0] or transposed):
+                        continue
                     w = _get(fh, k).astype(np.float32)
+                    if transposed:
+                        w = w.T.copy()
                     skey = k[: -len("weight")] + "scale"
                     if skey in keys:                  # fp8 块量化
                         s = _get(fh, skey).astype(np.float32)
@@ -109,6 +130,10 @@ def load_main_proj(d: str):
         except Exception as e:  # noqa: BLE001
             print(f"    (跳过 {os.path.basename(f)}: {type(e).__name__}: "
                   f"{' '.join(str(e).split())[:110]})", file=sys.stderr)
+    if seen:
+        print(f"!! {d}: 有 main_proj/fc 键但形状都不是 [H, 3H]:{seen[:6]}")
+    else:
+        print(f"!! {d}: {len(files)} 个 safetensors 里一个 main_proj/fc 权重都没有")
     return None, None, None
 
 
@@ -151,7 +176,6 @@ def main() -> int:
     for d in args.ckpt:
         name, w, src = load_main_proj(d)
         if w is None:
-            print(f"!! {d}: 找不到 [H, 3H] 的 main_proj/fc 权重 —— 跳过")
             continue
         h = w.shape[0]
         nb = w.shape[1] // h
