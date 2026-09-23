@@ -57,6 +57,10 @@ PY_VER="${PY_VER:-3.11}"
 CANN_ENV="${CANN_ENV:-/home/a00652497/920env_npu.sh}"
 FORK="${FORK:-https://github.com/Sawyer117/vllm-ascend.git}"
 PROD_ENVS="${PROD_ENVS:-dspark-dsv4-serving dsv4-eval-main}"
+# 透传给 SSOT。SKIP_SPECULATORS=1 装出一个【只有推理栈】的环境 —— 做对照时想排除
+# 「我们自己的包在里面动了手脚」这一条嫌疑,就用它。
+SKIP_SPECULATORS="${SKIP_SPECULATORS:-0}"
+TRANSFORMERS_VER="${TRANSFORMERS_VER:-}"
 NEED_GB="${NEED_GB:-60}"
 GO="${GO:-0}"
 
@@ -164,7 +168,9 @@ source "$SAFE_CANN" || exit 1
 #   "unknown location" 是因为仓库根目录下正好有个同名目录,Python 把它当成命名空间包,
 #   而真正的模块在 hs_connectors/src/hs_connectors。必须 editable 装上。
 #   在调 SSOT【之前】装,这样它第 7 步的 verify 能过。
-if [ -f "$REPO_ROOT/hs_connectors/pyproject.toml" ]; then
+if [ "$SKIP_SPECULATORS" = "1" ]; then
+  say "SKIP_SPECULATORS=1 —— 跳过 hs_connectors(它只是 speculators 的 workspace 依赖)"
+elif [ -f "$REPO_ROOT/hs_connectors/pyproject.toml" ]; then
   say "预装 hs_connectors(speculators 的 workspace 依赖,SSOT 的 --no-deps 不会带)"
   python -m pip install --no-deps -e "$REPO_ROOT/hs_connectors" || exit 1
 fi
@@ -172,7 +178,7 @@ fi
 say "4/4 调 SSOT 安装脚本(编译算子,几十分钟到几小时;全程输出到 $ROOT/install.log)"
 mkdir -p "$ROOT"
 ROOT="$ROOT" VLLM_TAG="$VLLM_TAG" VLLM_DIR="$VLLM_DIR" VA_DIR="$VA_DIR" VA_BRANCH="$OLD_SHA" \
-  CANN_ENV="$SAFE_CANN" \
+  CANN_ENV="$SAFE_CANN" SKIP_SPECULATORS="$SKIP_SPECULATORS" TRANSFORMERS_VER="$TRANSFORMERS_VER" \
   bash "$SCRIPT_DIR/install_npu_env_dspark.sh" 2>&1 | tee "$ROOT/install.log"
 rc=${PIPESTATUS[0]}
 if [ "$rc" != "0" ]; then
@@ -189,6 +195,17 @@ fi
 say "检查我们 serve 脚本用的 flag 在 vLLM $VLLM_TAG 上认不认:"
 H=$(vllm serve --help 2>&1)
 nflag=$(echo "$H" | grep -c -- '--' 2>/dev/null)
+# ★ vLLM 0.27+ 的 help 是分页的:裸 `--help` 只给分组摘要,全部 flag 要 `--help=all`。
+#   2026-09-23 实测 0.27.1 裸 --help 只有 6 行带 flag,被这里报成「多半没跑起来」,
+#   而它其实好好的 —— 白查了一轮。所以少了就换 --help=all 再问一次。
+if [ "${nflag:-0}" -lt 10 ]; then
+  H2=$(vllm serve --help=all 2>&1)
+  n2=$(echo "$H2" | grep -c -- '--' 2>/dev/null)
+  if [ "${n2:-0}" -gt "${nflag:-0}" ]; then
+    say "    (裸 --help 只有 ${nflag:-0} 行 —— 0.27+ 的 help 分页,改用 --help=all,得到 $n2 行)"
+    H="$H2"; nflag="$n2"
+  fi
+fi
 if [ "${nflag:-0}" -lt 10 ]; then
   say "    ⚠ 判不了:\`vllm serve --help\` 只给出 ${nflag:-0} 行带 flag 的输出,多半是它自己就没跑起来。"
   say "      前 15 行原样如下 —— 先解决这个,再谈 flag:"

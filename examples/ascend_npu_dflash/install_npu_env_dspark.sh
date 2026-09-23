@@ -43,6 +43,16 @@ VA_DIR="${VA_DIR:-$ROOT/installation/vllm-ascend-v4}"
 VA_BRANCH="${VA_BRANCH:-dspark-dsv4}"
 NUMPY_VER="${NUMPY_VER:-2.3.5}"
 CANN_ENV="${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
+# SKIP_SPECULATORS=1 —— 不把 speculators 装进这个 env。serve 用不到它:它的 pyproject
+#   只注册了 console_scripts,没有 vllm.general_plugins / vllm.platform_plugins,所以
+#   vLLM 起服务时根本不会 import 它。要一个「只有推理栈」的干净对照环境时用这个。
+#   探针要的 datasets/pyarrow/requests 照装。
+SKIP_SPECULATORS="${SKIP_SPECULATORS:-0}"
+# TRANSFORMERS_VER=<ver> —— 钉死 transformers;不设 = 沿用原行为(让 pip 自己解)。
+#   2026-09-23 实测不钉的后果:新装的 env 拿到 PyPI 当天的 5.17.0,而 vllm-ascend 的
+#   requirements 写的是 5.14.1、speculators 要求 <5.15.0 —— 两边都被违反,安装却照样
+#   「成功」。第 7b 步现在会把这类违反单独打一遍。
+TRANSFORMERS_VER="${TRANSFORMERS_VER:-}"
 HW_PYPI="https://mirrors.huaweicloud.com/repository/pypi/simple"
 HW_ASCEND="https://mirrors.huaweicloud.com/ascend/repos/pypi"
 IDX=(--extra-index-url "$HW_PYPI" --extra-index-url "$HW_ASCEND")
@@ -111,20 +121,41 @@ python -m pip install --no-deps torchvision==0.25.0 torchaudio==2.10.0 --extra-i
 python -m pip install triton-ascend==3.2.1 "${IDX[@]}"
 
 echo "== 6. speculators (--no-deps) + train/rollout deps =="
-python -m pip install --no-deps -e "$ROOT/speculators" 2>/dev/null || python -m pip install --no-deps -e "$REPO_ROOT"
+if [ "$SKIP_SPECULATORS" = "1" ]; then
+  echo "   SKIP_SPECULATORS=1 —— 跳过 speculators,只装探针/评测要的依赖"
+else
+  python -m pip install --no-deps -e "$ROOT/speculators" 2>/dev/null || python -m pip install --no-deps -e "$REPO_ROOT"
+fi
 python -m pip install datasets loguru typer pydantic-settings tensorboard aiohttp
+if [ -n "$TRANSFORMERS_VER" ]; then
+  echo "   钉 transformers==$TRANSFORMERS_VER"
+  python -m pip install "transformers==$TRANSFORMERS_VER"
+fi
 
 echo "== 7. FORCE numpy $NUMPY_VER (LAST pip op — triton-ascend<2 downgraded it) + verify =="
 python -m pip install --no-deps "numpy==$NUMPY_VER"
-NUMPY_VER="$NUMPY_VER" python - <<'PY'
-import os, numpy, torch, torch_npu, torchgen.model, vllm, vllm_ascend, speculators
+NUMPY_VER="$NUMPY_VER" SKIP_SPECULATORS="$SKIP_SPECULATORS" python - <<'PY'
+import os, numpy, torch, torch_npu, torchgen.model, vllm, vllm_ascend
 want = os.environ["NUMPY_VER"]
 print("numpy      ", numpy.__version__, "(want", want + ")", "OK" if numpy.__version__ == want else "!! MISMATCH")
 print("torch      ", torch.__version__, "| vllm", vllm.__version__)
 print("vllm_ascend", vllm_ascend.__file__)   # must be under your code root, not someone else's
-print("speculators", speculators.__file__)
+if os.environ.get("SKIP_SPECULATORS") == "1":
+    print("speculators <not installed — SKIP_SPECULATORS=1>")
+else:
+    import speculators
+    print("speculators", speculators.__file__)
+import transformers, tokenizers
+print("transformers", transformers.__version__, "| tokenizers", tokenizers.__version__)
 print("OK: DSpark/DSV4 stack imports cleanly")
 PY
+
+# ★ 「装完了」不等于「版本对」。pip 解不开依赖时只打一段 ERROR 然后继续,整个安装照样
+#   以 0 退出,而那段 ERROR 早被后面几千行 pip 输出冲走。2026-09-23 实测:一个全新 env
+#   里 transformers / torch-npu / triton-ascend / fastapi 四条 pin 同时被违反,所有步骤
+#   都「成功」。所以最后单独再打一遍。
+echo "== 7b. 依赖一致性(pip check)—— 不致命,但每一条都要看过 =="
+python -m pip check || echo "   ↑ 每一条都是【已装版本 ≠ 某个包声明的 pin】。serve 起不来先查这里。"
 
 echo "==================================================================="
 echo " DONE. Expect: numpy $NUMPY_VER | torch 2.10.0 | vllm ${VLLM_TAG#v} | vllm-ascend from $VA_DIR"
