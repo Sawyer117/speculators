@@ -160,7 +160,11 @@ run_arm() {
   for L in $LENS; do
     RUN=$((RUN + 1))
     local o
-    o=$(ENDPOINT="$ENDPOINT" ARROW="$ARROW" \
+    # ★ TORCH_DEVICE_BACKEND_AUTOLOAD=0 —— 探针是个 HTTP 客户端 + tokenizer,不需要 NPU。
+    #   不关的话 `import torch` 会自动去加载 torch_npu,而这个进程里没 source CANN,直接
+    #   `Failed to load the backend extension: torch_npu`,四个长度全部取不到数(2026-09-23 实测)。
+    #   而且就算能加载也不该加载:探针占卡会和正在测的 serve 抢资源。
+    o=$(ENDPOINT="$ENDPOINT" ARROW="$ARROW" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
         $PROBE_PY "$SCRIPT_DIR/corpus_provenance_check.py" \
           --n "$NROWS" --gen "$GEN" --repeat "$REPEAT" --prompt-len "$L" \
           --id-base $((ID_BASE + RUN * 1000)) 2>&1)
