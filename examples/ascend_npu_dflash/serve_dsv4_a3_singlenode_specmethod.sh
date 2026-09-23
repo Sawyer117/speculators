@@ -141,7 +141,15 @@ export USE_MULTI_BLOCK_POOL=1 USE_MULTI_GROUPS_KV_CACHE=1 VLLM_ASCEND_BALANCE_SC
 # ★ A3-SPECIFIC (from the official vllm-ascend DeepSeek-V4-Flash A3 recipe) — the A3 enable flag
 # and the fused-MC2 MoE dispatch/combine fast path. WITHOUT these the A3 EP path is wrong or slow.
 export ASCEND_A3_ENABLE="${ASCEND_A3_ENABLE:-1}"
-export VLLM_ASCEND_ENABLE_FUSED_MC2="${VLLM_ASCEND_ENABLE_FUSED_MC2:-1}"
+# ★ 2026-09-23:它也得跟着 ENABLE_EP。`FUSED_MC2=1` 不只是选一条 dispatch 路径 ——
+#   routed_experts.py:101 会把 MoE 权重从堆叠的 [E,K,N] 张量拆成 per-expert 的 Python
+#   列表,并把原张量 `del` 掉(只有 mega_moe 那个算子吃列表)。而 EP 关掉后
+#   select_moe_comm_method 第一个分支就返回 ALLGATHER,它的 unquant_apply_mlp 要的是
+#   三维张量,于是 `weight=[w1]` 变成 list-of-list:
+#     RuntimeError: Overloaded torch operator invoked from Python failed to match any schema
+#   报错里还会把 256 个专家权重整个打印出来,刷屏几万行,看不出和这个开关有任何关系。
+#   A2 双机(本来就 EP-off 跑生产)从不设这个变量,默认 0 —— 所以那边没事。
+export VLLM_ASCEND_ENABLE_FUSED_MC2="${VLLM_ASCEND_ENABLE_FUSED_MC2:-$([ "$ENABLE_EP" != "1" ] && echo 0 || echo 1)}"
 # FlashComm v1 (sequence-parallel comm) is a throughput win for PLAIN serve / HS-dump. BUT under graph
 # mode it forces cudagraph batch sizes to a multiple of TP, which CONFLICTS with spec-decode's required
 # multiple of (num_speculative_tokens+1) → "Can't determine cudagraph shapes ... disable sequence
