@@ -146,8 +146,14 @@ export VLLM_ASCEND_ENABLE_FUSED_MC2="${VLLM_ASCEND_ENABLE_FUSED_MC2:-1}"
 # mode it forces cudagraph batch sizes to a multiple of TP, which CONFLICTS with spec-decode's required
 # multiple of (num_speculative_tokens+1) → "Can't determine cudagraph shapes ... disable sequence
 # parallelism" crash. So AUTO-DEFAULT it OFF when a DRAFT (spec-decode) is set, ON otherwise. Explicit
-# VLLM_ASCEND_ENABLE_FLASHCOMM1=... still overrides. (EP is ON here, so FlashComm1 is otherwise allowed.)
-export VLLM_ASCEND_ENABLE_FLASHCOMM1="${VLLM_ASCEND_ENABLE_FLASHCOMM1:-$([ -n "$DRAFT" ] && echo 0 || echo 1)}"
+# VLLM_ASCEND_ENABLE_FLASHCOMM1=... still overrides.
+# ★ 2026-09-23:第二个条件是 ENABLE_EP。FlashComm v1 **硬要求 EP 开着** —— `ENABLE_EP=0`
+#   时 vLLM 在配置校验阶段就 assert:
+#     "Flash Comm v1 requires enable_expert_parallel=True for MoE models"
+#   服务连起都起不来,而报错在 pydantic 的 ValidationError 里,和 FlashComm 毫无字面关联。
+#   这和 multistream_overlap_shared_expert 是同一类坑:一个开关暗中耦合着另一个,
+#   而耦合只在其中一边被改动时才暴露。所以 EP 关掉时它跟着关。
+export VLLM_ASCEND_ENABLE_FLASHCOMM1="${VLLM_ASCEND_ENABLE_FLASHCOMM1:-$([ -n "$DRAFT" ] || [ "$ENABLE_EP" != "1" ] && echo 0 || echo 1)}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 # ★ engine-ready timeout: the API frontend waits VLLM_ENGINE_READY_TIMEOUT_S for the engine cores.
 # Loading the 543 GB bf16 model + KV alloc + warmup takes ~11-12 min (> the 600s default), so a fresh
