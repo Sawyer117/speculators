@@ -43,6 +43,7 @@ import argparse
 import glob
 import json
 import os
+import re
 
 import torch
 from safetensors import safe_open
@@ -164,6 +165,8 @@ def main() -> None:
     ap.add_argument("--inspect", action="store_true", help="just print the dump format of the first file")
     ap.add_argument("--hf-model", help="MODE 2: HF model dir for an independent forward (heavy)")
     ap.add_argument("--hf-max-len", type=int, default=2048, help="truncate seq for the HF forward")
+    ap.add_argument("--arrow", help="the Arrow the dump was made from: adds a RESPONSE-only rate "
+                    "(loss_mask==1), the number that matters. hs_<row> must be that Arrow's row")
     args = ap.parse_args()
 
     files = args.hs_files or sorted(glob.glob(os.path.join(args.hs_dir or ".", "hs_*.safetensors")))
@@ -204,6 +207,14 @@ def main() -> None:
             print(f"  (HF .to({device}) failed: {e}; using whatever device_map loaded)")
 
     agg_mism, agg_n = 0, 0
+    # 整体 mismatch 被 prompt 段灌水:prompt 是用户写的,模型本来就猜不中。只有 response
+    # (loss_mask==1,模型自己贪心生成的那段)该接近 0 —— 这才是判 dump 干不干净的数。
+    ds = None
+    if args.arrow:
+        from datasets import load_from_disk  # noqa: PLC0415
+        ds = load_from_disk(args.arrow)
+        ds = (ds if hasattr(ds, "num_rows") else ds[next(iter(ds))]).with_format(None)
+    agg_r_mism, agg_r_n, agg_p_mism, agg_p_n = 0, 0, 0, 0
     agg_hf_dumped, agg_hf_roll, agg_n_hf = 0, 0, 0
     per_file_deciles = []
     for path in files:
@@ -216,6 +227,20 @@ def main() -> None:
         per_file_deciles.append(decile_rates(next_token_mismatch(pred, tok, 0)[0]))
 
         line = f"  {os.path.basename(path):28s} T={len(tok):5d}  self-consistency mismatch={mism.float().mean():.3%} (n={n})"
+        if ds is not None:
+            m = re.search(r"hs_(\d+)\.safetensors$", os.path.basename(path))
+            row = int(m.group(1)) if m else -1
+            if not 0 <= row < len(ds):
+                line += "  | ⚠ 行号不在 --arrow 里"
+            elif list(ds[row]["input_ids"][: len(tok)]) != tok.tolist():
+                line += "  | ⚠ token_ids 和 --arrow 这一行对不上(换错 Arrow 了?)"
+            else:
+                lm = torch.tensor(ds[row]["loss_mask"][: len(tok)], dtype=torch.bool)[1:]
+                wrong = pred[:-1] != tok[1:]
+                r_n, r_m = int(lm.sum()), int((wrong & lm).sum())
+                p_n, p_m = int((~lm).sum()), int((wrong & ~lm).sum())
+                agg_r_mism += r_m; agg_r_n += r_n; agg_p_mism += p_m; agg_p_n += p_n
+                line += f"  | response {r_m / max(r_n, 1):.3%} (n={r_n})  prompt {p_m / max(p_n, 1):.1%}"
         if hf_model is not None:
             ids = tok[: args.hf_max_len].unsqueeze(0).to(next(hf_model.parameters()).device)
             with torch.no_grad():
@@ -240,6 +265,11 @@ def main() -> None:
             means.append(sum(vals) / len(vals) if vals else float("nan"))
         print("  mismatch by positional decile (0%=start/prompt .. 100%=end/response):")
         print("   " + "  ".join(f"{m:.2%}" for m in means))
+    if agg_r_n:
+        print(f"★ RESPONSE-only (loss_mask==1) mismatch: {agg_r_mism / agg_r_n:.3%}  over {agg_r_n} positions"
+              f"   (prompt 段 {agg_p_mism / max(agg_p_n, 1):.2%} over {agg_p_n} —— 用户写的,本来就猜不中)")
+        print("  读法:干净的 dump 在 response 段是个位数以内(干净配置下 prefill 探针测过 0.6–3.3%);")
+        print("        两位数 = 值不对,停产。")
     if agg_n_hf:
         print(f"[MODE 2] AGGREGATE HF-vs-rollout={agg_hf_roll / agg_n_hf:.3%}  "
               f"HF-vs-DUMPED={agg_hf_dumped / agg_n_hf:.3%}")
