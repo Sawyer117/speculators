@@ -11,6 +11,10 @@ WHY
 原行号写进新目录里的 `orig_rows.txt`(一行一个),不加成 Arrow 的列:训练侧对多出来的
 列怎么处理没验证过,不冒这个险。`SUBSET.txt` 记来源、种子、行数和体积估算。
 
+★ 可复现靠的是那份行号列表,不是种子:numpy 不保证 Generator.choice 跨版本抽出同一批。
+所以 SUBSET.txt 里记了 orig_rows.txt 的 sha256、源 Arrow 的指纹和 numpy 版本;要原样重建,
+用 `--from-rows <orig_rows.txt>`,不依赖任何随机数。
+
 写完会重新读回来,抽几行和原 Arrow 逐 token 比对,对不上直接报错。
 
 USAGE
@@ -18,6 +22,7 @@ USAGE
     python hs_subset_arrow.py --arrow <src> --out <dst> --fraction 0.5
     python hs_subset_arrow.py --arrow <src> --out <dst> --rows 300000 --seed 1
     python hs_subset_arrow.py --arrow <src> --out <dst> --budget-tb 6 --ratio 1.40
+    python hs_subset_arrow.py --arrow <src> --out <dst> --from-rows <旧目录>/orig_rows.txt   # 原样重建
 
 纯 CPU,不碰 NPU。
 """
@@ -25,6 +30,8 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import sys
@@ -57,6 +64,7 @@ def main() -> int:
     g.add_argument("--fraction", type=float, help="抽多大比例,如 0.5")
     g.add_argument("--rows", type=int, help="抽多少行")
     g.add_argument("--budget-tb", type=float, help="按盘预算反推行数(TB,十进制)")
+    g.add_argument("--from-rows", help="按一份已有的 orig_rows.txt 原样重建(不抽样)")
     ap.add_argument("--ratio", type=float, default=1.0,
                     help=f"--budget-tb 用的压缩比。1.0 = 原样 bf16;实测无损上限 {MEASURED_RATIO}")
     ap.add_argument("--seed", type=int, default=0)
@@ -77,7 +85,11 @@ def main() -> int:
     mean_len = float(np.mean(_lengths(ds, probe)))
     row_bytes = mean_len * BYTES_PER_TOKEN
 
-    if args.fraction is not None:
+    if args.from_rows is not None:
+        with open(args.from_rows) as fh:
+            given = [int(x) for x in fh.read().split()]
+        n = len(given)
+    elif args.fraction is not None:
         n = int(round(n_total * args.fraction))
     elif args.rows is not None:
         n = args.rows
@@ -87,12 +99,20 @@ def main() -> int:
         print(f"!! 行数 {n} 不在 (0, {n_total}] 里")
         return 2
 
-    # 抽行用独立的 rng(种子相同),这样 --sample-len 改了也不影响抽到哪些行。
-    idx = np.sort(np.random.default_rng(args.seed).choice(n_total, n, replace=False))
+    if args.from_rows is not None:
+        idx = np.asarray(given, dtype=np.int64)
+        if np.any(idx < 0) or np.any(idx >= n_total) or np.any(np.diff(idx) <= 0):
+            print(f"!! {args.from_rows} 里的行号要严格递增、且落在 [0, {n_total}) 里")
+            return 2
+    else:
+        # 抽行用独立的 rng(种子相同),这样 --sample-len 改了也不影响抽到哪些行。
+        idx = np.sort(np.random.default_rng(args.seed).choice(n_total, n, replace=False))
     sub = ds.select(idx.tolist())
     sub.save_to_disk(args.out)
+    rows_txt = "\n".join(str(int(i)) for i in idx) + "\n"
     with open(os.path.join(args.out, "orig_rows.txt"), "w") as fh:
-        fh.write("\n".join(str(int(i)) for i in idx) + "\n")
+        fh.write(rows_txt)
+    rows_sha = hashlib.sha256(rows_txt.encode()).hexdigest()
 
     # ── 读回校验:行数 + 抽几行逐 token 比 ────────────────────────────────────
     back = _load(args.out)
@@ -111,9 +131,20 @@ def main() -> int:
         np.random.default_rng(args.seed + 2).choice(n, min(args.sample_len, n), replace=False)))))
     raw_tb = n * sub_len * BYTES_PER_TOKEN / 1e12
     free_tb = shutil.disk_usage(args.out).free / 1e12
+    try:
+        with open(os.path.join(args.arrow, "state.json")) as fh:
+            src_fp = json.load(fh).get("_fingerprint", "?")
+    except (OSError, ValueError):
+        src_fp = "?"
+    import datasets  # noqa: PLC0415
+    how = (f"--from-rows {os.path.abspath(args.from_rows)}" if args.from_rows is not None
+           else f"seed {args.seed}  (numpy {np.__version__} default_rng.choice,无放回,排序)")
     lines = [
         f"source      {os.path.abspath(args.arrow)}",
-        f"rows        {n:,} / {n_total:,} ({100 * n / n_total:.1f}%)   seed {args.seed}",
+        f"source_fp   {src_fp}   ({n_total:,} 行;datasets {datasets.__version__})",
+        f"rows        {n:,} / {n_total:,} ({100 * n / n_total:.1f}%)",
+        f"selection   {how}",
+        f"rows_sha256 {rows_sha}   (orig_rows.txt —— 可复现以它为准)",
         f"mean_len    {sub_len:.1f} token   (源 Arrow 抽样 {mean_len:.1f})",
         f"hs_raw      {raw_tb:.2f} TB  (bf16 原样,{BYTES_PER_TOKEN:,} B/token)",
         f"hs_packed   {raw_tb / MEASURED_RATIO:.2f} TB  (无损字节拆分,实测 {MEASURED_RATIO}×)",
