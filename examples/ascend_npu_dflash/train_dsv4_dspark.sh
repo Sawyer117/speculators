@@ -172,7 +172,7 @@ _KNOWN=" RUN VERIFIER DATA HS_DIR ENDPOINT LR EPOCHS MAX_ANCHORS SEQLEN MASK_TOK
  SCHED_TYPE WARMUP_RATIO DECAY_RATIO MIN_LR_RATIO SCHED_TOTAL COSINE_CYCLES FROM_PRETRAINED LOSS_FN TEACHER_DNORM
  KD_TEMP NOISE_STD RECOMPUTE COMPILE NO_VAL INIT_MOE INIT_ATTN INIT_HC INIT_NORM
  INIT_LAYER INIT_MOE_NO_ROUTER CKPT_FREQ NPROC SAVE_PATH CANN_ENV TRAIN_PY MODE
- BF16_EXPERTS PYTORCH_NPU_ALLOC_CONF HCCL_TIMEOUT "
+ BF16_EXPERTS PYTORCH_NPU_ALLOC_CONF HCCL_TIMEOUT HS_ON_MISSING "
 _unknown=""
 for _e in $(env | sed -n 's/^\(DSPARK_[A-Z_]*\)=.*/\1/p'); do
   case "$_e" in
@@ -215,6 +215,15 @@ COMPILE="${COMPILE:-0}"                # ★ SEED TECH: torch.compile'd experts 
 # reads are cheap). Override with NUM_WORKERS=.
 if [ -n "${HS_FETCH_BASE:-}" ]; then NUM_WORKERS="${NUM_WORKERS:-4}"; else NUM_WORKERS="${NUM_WORKERS:-12}"; fi
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+# HS 从哪来。generate(默认,和以前完全一样)= serve 现场 prefill、用完即删的在线模式。
+# raise = HS 已经预存在 HS_DIR(hs_dump_daemon.sh 产的),缺一个文件就报错停训,不去找 serve。
+# ★ 预存模式下本脚本【绝不删】HS_DIR 里的任何文件 —— 在线模式开跑前那行清场 rm 会把整个
+#   预存目录(一半语料 ≈ 9.5 TB,dump 一次 9 小时)一次删光。
+HS_ON_MISSING="${HS_ON_MISSING:-generate}"
+case "$HS_ON_MISSING" in
+  generate|raise) ;;
+  *) echo "!! HS_ON_MISSING=$HS_ON_MISSING 只能是 generate(在线)或 raise(预存)" >&2; exit 2 ;;
+esac
 NOVAL="${NO_VAL:-1}"                    # ★ WELDED DEFAULT=1 (2026-07-30): cancel the per-epoch validation pass.
                                        # Val does SERIAL online HS generation for the 10% held-out split
                                        # (num_workers=0) which dominates the epoch AND wastes 10% of the data;
@@ -384,7 +393,23 @@ else
   echo "WARN: CANN env not found at $CANN_ENV — pass CANN_ENV=/path/to/900env_npu.sh"
 fi
 mkdir -p "$RUN" 2>/dev/null || { echo "!! cannot create RUN=$RUN (different box user?) — override e.g. RUN=\$HOME/dspark_austin/run"; exit 1; }
-rm -f "$HS_DIR"/hs_*.safetensors*                     # stale dumps collide with data row idx
+if [ "$HS_ON_MISSING" = "generate" ]; then
+  # 在线模式:清掉上一轮残留的 dump(文件名 = 行号,残留会被当成命中缓存)。
+  # 滚动缓冲区里同时只有几十到几百个文件;多到上千,说明 HS_DIR 指错到了预存目录 —— 不删,停。
+  # `|| true` 不能省:本脚本 set -eo pipefail,head 提前关管道会让 find 吃 SIGPIPE(141),
+  #   整条管道判失败,脚本就在【该打印拒绝原因的那一刻】一声不响地退出。
+  _n_hs=$( { find "$HS_DIR" -maxdepth 1 -name 'hs_*.safetensors*' 2>/dev/null || true; } | head -n 5001 | wc -l)
+  if [ "$_n_hs" -gt 5000 ]; then
+    echo "!! HS_DIR=$HS_DIR 里有 >5000 个 HS 文件 —— 这不是在线滚动缓冲区,像是预存目录。" >&2
+    echo "   在线模式开跑前会清空 HS_DIR,所以这里拒绝继续。要用预存 HS:HS_ON_MISSING=raise" >&2
+    exit 2
+  fi
+  rm -f "$HS_DIR"/hs_*.safetensors*                     # stale dumps collide with data row idx
+else
+  _n_hs=$( { find "$HS_DIR" -maxdepth 1 -name 'hs_*.safetensors' 2>/dev/null || true; } | wc -l)
+  echo ">>> HS_ON_MISSING=$HS_ON_MISSING:用预存 HS,$HS_DIR 里 $_n_hs 个文件(不删、不找 serve)"
+  [ "$_n_hs" -gt 0 ] || { echo "!! $HS_DIR 里一个 HS 文件都没有" >&2; exit 2; }
+fi
 # proxy-bypass hosts DERIVED from the endpoint (+ optional remote HS sidecar) so this works on
 # BOTH A2 (endpoint 115/116, shared FS) and A3 (endpoint 182 + HS_FETCH_BASE 182, no shared FS).
 # The old hardcoded 115/116 list silently sent A3's 182 traffic through the MITM proxy → HS fetch hung.
@@ -392,7 +417,7 @@ _ep_host="$(printf '%s' "$ENDPOINT"        | sed -E 's#^https?://([^:/]+).*#\1#'
 _fb_host="$(printf '%s' "${HS_FETCH_BASE:-}" | sed -E 's#^https?://([^:/]+).*#\1#')"
 export no_proxy="127.0.0.1,localhost,${_ep_host}${_fb_host:+,$_fb_host}"
 export NO_PROXY="$no_proxy"
-if ! curl -sf --noproxy '*' "$ENDPOINT/models" >/dev/null 2>&1; then
+if [ "$HS_ON_MISSING" = "generate" ] && ! curl -sf --noproxy '*' "$ENDPOINT/models" >/dev/null 2>&1; then
   echo "WARN: serve not reachable at $ENDPOINT — start 115/116 first (or set ENDPOINT=)."
 fi
 
@@ -555,7 +580,7 @@ PROV="$RUN/${TAG}_${TS}.provenance.txt"
             INITLAYER INITNOROUTER FROM_PRETRAINED LAYERS EXPERTS CKPT_FREQ \
             DSPARK_MOE_BALANCE DSPARK_MOE_BALANCE_RATE DSPARK_MOE_BALANCE_TARGET \
             DSPARK_LOG_EXPERT_LOAD DSPARK_LOG_EXPERT_LOAD_EVERY \
-            DSPARK_TRACE DSPARK_TRACE_SYNC DSPARK_EP_CHECK BF16_EXPERTS; do
+            DSPARK_TRACE DSPARK_TRACE_SYNC DSPARK_EP_CHECK BF16_EXPERTS HS_ON_MISSING; do
     eval "_val=\${$_v-}"
     # ⚠️ 打印【输入旗标名】,不是内部变量名。这个文件是给人照着重放的,而脚本内部
     #    把 DSPARK_EP 读进 EP、INIT_LAYER 读进 INITLAYER……直接打内部名会诱导出
@@ -632,7 +657,7 @@ nohup env \
     --scheduler-type "$SCHED_TYPE" --scheduler-warmup-ratio "$WARMUP_RATIO" \
     --scheduler-decay-ratio "$DECAY_RATIO" --scheduler-min-lr-ratio "$MIN_LR_RATIO" \
     --optimizer "$OPTIM" --lr "$LR" --epochs "$EPOCHS" $EXTRA \
-    --on-missing generate --on-generate delete \
+    --on-missing "$HS_ON_MISSING" --on-generate delete \
     --num-workers "$NUM_WORKERS" --prefetch-factor "$PREFETCH_FACTOR" \
     --hidden-states-path "$HS_DIR" --vllm-endpoint "$ENDPOINT" \
     --verifier-name-or-path "$VERIFIER" --data-path "$DATA" \
