@@ -41,6 +41,7 @@ CANN_ENV="${CANN_ENV:-/home/a00652497/920env_npu.sh}"
 PROXY_SH="${PROXY_SH:-/home/a00652497/portproxy_remote.sh}"
 PROTECTED="${PROTECTED:-base dsv4-oldstack dspark-dsv4-serving dsv4-eval-main dsv4-main-cann91}"
 
+TORCH_CPU_INDEX="${TORCH_CPU_INDEX:-https://download.pytorch.org/whl/cpu}"
 HW_PYPI="https://mirrors.huaweicloud.com/repository/pypi/simple"
 HW_ASCEND="https://mirrors.huaweicloud.com/ascend/repos/pypi"
 IDX=(--extra-index-url "$HW_PYPI" --extra-index-url "$HW_ASCEND")
@@ -88,7 +89,23 @@ say "   python = $(command -v python)"
 # ── 2. torch + torch_npu(pip 一律用 python -m pip,别让 PATH 上另一个 pip 装到别处)──
 say "2. torch $TORCH_VER + torch_npu $TORCH_NPU_VER + numpy $NUMPY_VER"
 python -m pip install -q -U pip setuptools wheel
-python -m pip install "${IDX[@]}" "torch==$TORCH_VER" "torch-npu==$TORCH_NPU_VER" pyyaml
+# ★ torch 必须是【不带 CUDA】的版本。aarch64 上 PyPI 的 torch 包(2.12.0 是 426 MB)带 CUDA,和 torch_npu
+#   装在一起导入就报 `Two accelerators cannot be used at the same time in PyTorch: npu and cuda`。
+#   109 装的是 2.12.0+cpu —— 来自 PyTorch 的 CPU 源,这里照做;连不上才退回 PyPI,并由下面那道检查兜底。
+if ! python -m pip install "torch==$TORCH_VER" --index-url "$TORCH_CPU_INDEX"; then
+  say "   ⚠ CPU 源($TORCH_CPU_INDEX)装不上,退回 PyPI —— 下一步会查它带不带 CUDA"
+  python -m pip install "${IDX[@]}" "torch==$TORCH_VER"
+fi
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c "
+import sys, torch
+print(f'   torch {torch.__version__}   torch.version.cuda = {torch.version.cuda}')
+sys.exit(0 if torch.version.cuda is None else 1)" || {
+  say "!! 装上的 torch 带 CUDA —— 会和 torch_npu 冲突(Two accelerators cannot be used at the same time)。"
+  say "   先卸掉:python -m pip uninstall -y torch;确认能连上 $TORCH_CPU_INDEX 后重跑本脚本。"
+  exit 1; }
+# torch_npu 按已装的 torch 钉住,防止它的依赖解析把 torch 换掉
+python -m pip install "${IDX[@]}" "torch-npu==$TORCH_NPU_VER" pyyaml \
+  -c <(python -m pip freeze | grep -iE '^torch==')
 python -m pip install "numpy==$NUMPY_VER"
 
 # ── 3. 训练依赖 ──────────────────────────────────────────────────────────────
