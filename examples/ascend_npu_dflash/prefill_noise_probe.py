@@ -198,6 +198,13 @@ def main() -> int:
     ap.add_argument("--bg-len", type=int, default=512)
     ap.add_argument("--csv", default="", help="逐位置明细写到这个 CSV(可选)")
     ap.add_argument("--label", default="", help="打在表头,便于多轮对照")
+    ap.add_argument("--min-len", type=int, default=0,
+                    help="只用长度 ≥ 这个值的行,从 --start-row 往后找够 --n 行(默认不筛)")
+    ap.add_argument("--gate-max-conf", type=float, default=None, metavar="PCT",
+                    help="质量闸:笃定档(margin>2 nat)翻转率超过 PCT%% 就以退出码 3 结束。"
+                         "不给就只报告、不判。HS dump 看门狗用它决定能不能继续产")
+    ap.add_argument("--gate-min-positions", type=int, default=200,
+                    help="笃定档可比位置少于这个数 = 样本不够,闸判不了,退出码 2")
     args = ap.parse_args()
 
     if not args.arrow:
@@ -275,11 +282,22 @@ def main() -> int:
         csv_f.write("row,pos,supervised,top1_run0,flipped,margin,max_abs_dlogprob,corpus_match\n")
 
     t0 = time.time()
-    for i in range(args.n):
+    # 不给 --min-len:和以前一样,就测 [start_row, start_row+n) 这 n 行,太短的跳过。
+    # 给了 --min-len:从 start_row 往后找,凑够 n 行长度 ≥ min-len 的为止 —— 这个 bug 随
+    # 一次 forward 的 token 数加速,短行根本碰不到,闸要用长行才有意义。
+    scanned = 0
+    for i in range(len(ds) - args.start_row):
+        if args.min_len:
+            if rows_used >= args.n or scanned >= 200 * args.n:
+                break
+        elif i >= args.n:
+            break
+        scanned += 1
         row = ds[args.start_row + i]
         ids = [int(t) for t in row["input_ids"]][:args.seq_len]
-        if len(ids) < 32:
-            print(f"  [{i}] 太短({len(ids)}),跳过")
+        if len(ids) < max(32, args.min_len):
+            if not args.min_len:
+                print(f"  [{i}] 太短({len(ids)}),跳过")
             continue
         mask = [int(v) for v in row["loss_mask"]][:len(ids)] if has_mask else [0] * len(ids)
 
@@ -416,6 +434,21 @@ def main() -> int:
     print("  两者 A 差不多  ⟹ 输出不受同批其他请求影响,批次组成不是机制。")
     print("  --bg 4 明显更差 ⟹ **输出取决于同一批里还有谁** —— 那是正确性 bug,而且能同时")
     print("                     解释「上下文越长越差」和「隔天数字不一样」。")
+    if args.gate_max_conf is not None:
+        # 闸只看笃定档:平局位置的翻转在任何干净配置下都有 ~2–3%,而且无害;
+        # margin>2 nat 的位置翻了,才是算出了实质不同的分布。
+        conf_n, conf_d = bucket_flip[-1]
+        conf_pct = 100.0 * conf_n / conf_d if conf_d else float("nan")
+        print()
+        if conf_d < args.gate_min_positions:
+            print(f"GATE INCONCLUSIVE  笃定档可比位置只有 {conf_d} 个(要 ≥{args.gate_min_positions})"
+                  " —— 加大 --n 或 --seq-len")
+            return 2
+        verdict = "PASS" if conf_pct <= args.gate_max_conf else "FAIL"
+        print(f"GATE {verdict}  笃定档翻转 {conf_n}/{conf_d} = {conf_pct:.2f}%"
+              f"  (上限 {args.gate_max_conf:g}%)  整体翻转 {100.0 * flip_n / flip_d:.2f}%")
+        if verdict == "FAIL":
+            return 3
     return 0
 
 
