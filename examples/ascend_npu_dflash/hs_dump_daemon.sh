@@ -16,6 +16,8 @@
 # 和 pilot 那种「用 900000+ 偏移避开真实行号」正好相反。
 #
 # 只写不删。任何删除动作都不在这个脚本里 —— 删 HS 是训练侧 rolling delete 的事。
+# 唯一的例外是质量闸自己的垃圾:dump 服务给【每个】请求都写文件,闸的请求没有 hs_<行号>
+# 标签,落成 hs_cmpl-*.safetensors(训练永远不读)。每次闸跑完清掉这一种,别的一概不碰。
 #
 # 用法
 # ----
@@ -178,6 +180,8 @@ gate() {
     --label "hs_dump_daemon $tag" > "$GATE_LOG.cur" 2>&1
   rc=$?
   cat "$GATE_LOG.cur" >> "$GATE_LOG"
+  local junk; junk=$(find "$DSPARK_HS_DIR" -maxdepth 1 -name 'hs_cmpl-*' -print -delete 2>/dev/null | wc -l)
+  [ "$junk" -gt 0 ] && echo "   (清掉闸请求留下的 $junk 个 hs_cmpl-* 文件)" >> "$GATE_LOG"
   local line; line=$(grep -E '^GATE ' "$GATE_LOG.cur" | tail -1)
   say "质量闸 [$tag]:${line:-没出判决(rc=$rc),见 $GATE_LOG}"
   return $rc
