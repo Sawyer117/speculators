@@ -137,6 +137,11 @@ say "   约束文件 $CONSTRAINTS:"; sed 's/^/     /' "$CONSTRAINTS"
 python -m pip install "${IDX[@]}" -c "$CONSTRAINTS" click huggingface-hub "loguru>=0.7.2,<=0.7.3" \
   "openai>=2.0.0" protobuf psutil "pydantic>=2.0.0" "pydantic-settings>=2.0.0" rich \
   "tqdm>=4.66.3,<=4.70.0" "typer>=0.12.0" tensorboard aiohttp packaging
+# CANN 自带的算子编译器(te / opc-tool / superkernel,source CANN 后在 PYTHONPATH 上)运行时 import 这些。
+#   torch_npu 训练中遇到要现场编译的算子(仓库里的 kernel_meta/ 就是它留下的)会调到它们,缺了就是
+#   跑到一半 `No module named 'decorator'`。推理栈的 SSOT(install_npu_env_dspark.sh 第 1 步)同一张表。
+python -m pip install "${IDX[@]}" -c "$CONSTRAINTS" decorator "scipy>=1.7.3" ml-dtypes attrs psutil \
+  pyyaml matplotlib openpyxl tornado
 if ! python -m pip install --no-deps "${IDX[@]}" "torchvision==$TV_VER" "torchaudio==$TA_VER" 2>/dev/null; then
   say "   ⚠ torchvision $TV_VER / torchaudio $TA_VER 装不上 —— 训练不 import 它们,只会让 pip check 抱怨,忽略"
 fi
