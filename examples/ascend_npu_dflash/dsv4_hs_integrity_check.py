@@ -152,6 +152,28 @@ def logits_argmax(hidden: torch.Tensor, W: torch.Tensor, device: str, chunk: int
     return torch.cat(preds)
 
 
+def argmax_and_gap(hidden: torch.Tensor, W: torch.Tensor, gt_next: torch.Tensor,
+                   device: str, chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Like logits_argmax, plus gap[i] = logit[top1] − logit[gt_next[i]] (0 where they agree).
+
+    Logit differences are log-prob differences, so gap is in nats: how far the corpus token
+    lost by. A near-tie (gap < ~0.5) flips on any numeric perturbation — batch composition,
+    reduction order, another stack — and the model had no real preference there. A gap > 2
+    means this forward computed a clearly different distribution, which is a bug."""
+    H = hidden.shape[1]
+    Wf = W.float().to(device)
+    Wt = Wf.t() if Wf.shape[1] == H else Wf
+    preds, gaps = [], []
+    n = min(hidden.shape[0], gt_next.shape[0])
+    for s in range(0, n, chunk):
+        lg = hidden[s:min(s + chunk, n)].float().to(device) @ Wt          # [c, vocab]
+        top_v, top_i = lg.max(-1)
+        g = gt_next[s:min(s + chunk, n)].to(device)
+        gaps.append((top_v - lg.gather(1, g.unsqueeze(1)).squeeze(1)).to("cpu"))
+        preds.append(top_i.to("cpu"))
+    return torch.cat(preds), torch.cat(gaps)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hs-dir", help="dir of hs_*.safetensors")
@@ -215,6 +237,7 @@ def main() -> None:
         ds = load_from_disk(args.arrow)
         ds = (ds if hasattr(ds, "num_rows") else ds[next(iter(ds))]).with_format(None)
     agg_r_mism, agg_r_n, agg_p_mism, agg_p_n = 0, 0, 0, 0
+    resp_wrong_gaps: list[float] = []
     agg_hf_dumped, agg_hf_roll, agg_n_hf = 0, 0, 0
     per_file_deciles = []
     for path in files:
@@ -236,7 +259,9 @@ def main() -> None:
                 line += "  | ⚠ token_ids 和 --arrow 这一行对不上(换错 Arrow 了?)"
             else:
                 lm = torch.tensor(ds[row]["loss_mask"][: len(tok)], dtype=torch.bool)[1:]
+                _, gap = argmax_and_gap(final[:-1], W, tok[1:], device, args.chunk)
                 wrong = pred[:-1] != tok[1:]
+                resp_wrong_gaps.extend(gap[wrong & lm].tolist())
                 r_n, r_m = int(lm.sum()), int((wrong & lm).sum())
                 p_n, p_m = int((~lm).sum()), int((wrong & ~lm).sum())
                 agg_r_mism += r_m; agg_r_n += r_n; agg_p_mism += p_m; agg_p_n += p_n
@@ -270,6 +295,18 @@ def main() -> None:
               f"   (prompt 段 {agg_p_mism / max(agg_p_n, 1):.2%} over {agg_p_n} —— 用户写的,本来就猜不中)")
         print("  读法:干净的 dump 在 response 段是个位数以内(干净配置下 prefill 探针测过 0.6–3.3%);")
         print("        两位数 = 值不对,停产。")
+        if resp_wrong_gaps:
+            g = resp_wrong_gaps
+            buckets = [(0, 0.1, "≤0.1   近乎平局"), (0.1, 0.5, "0.1–0.5"), (0.5, 2.0, "0.5–2"),
+                       (2.0, float("inf"), ">2     笃定处算错")]
+            print(f"★ response 段那 {len(g)} 个不一致,语料 token 输给 top1 多少(nat):")
+            for lo, hi, name in buckets:
+                k = sum(1 for x in g if lo <= x < hi)
+                print(f"     {name:<16} {k:>6}  ({k / len(g):6.1%})")
+            big = sum(1 for x in g if x >= 2.0)
+            print(f"  ⟹ 占全部 response 位置:>2 nat 的 {big / agg_r_n:.3%}。"
+                  "几乎全在 ≤0.5 = 平局翻转,和 dump 无关(同一台服务自己都复现不了这些位置);"
+                  "\n     >2 nat 有可观比例 = 这批 HS 在高置信位置算出了不同的分布,停产查。")
     if agg_n_hf:
         print(f"[MODE 2] AGGREGATE HF-vs-rollout={agg_hf_roll / agg_n_hf:.3%}  "
               f"HF-vs-DUMPED={agg_hf_dumped / agg_n_hf:.3%}")
