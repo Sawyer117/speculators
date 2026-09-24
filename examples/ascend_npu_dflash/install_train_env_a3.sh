@@ -92,7 +92,11 @@ python -m pip install -q -U pip setuptools wheel
 # ★ torch 必须是【不带 CUDA】的版本。aarch64 上 PyPI 的 torch 包(2.12.0 是 426 MB)带 CUDA,和 torch_npu
 #   装在一起导入就报 `Two accelerators cannot be used at the same time in PyTorch: npu and cuda`。
 #   109 装的是 2.12.0+cpu —— 来自 PyTorch 的 CPU 源,这里照做;连不上才退回 PyPI,并由下面那道检查兜底。
-if ! python -m pip install "torch==$TORCH_VER" --index-url "$TORCH_CPU_INDEX"; then
+#   公司代理对 download.pytorch.org 做 SSL 拦截(自签证书,pip 报 CERTIFICATE_VERIFY_FAILED);PyPI 和华为
+#   镜像不受影响。所以只对 PyTorch 的两个下载域名跳过证书校验,其余源照常校验。
+TORCH_TRUST=(--trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org)
+if ! python -m pip install "torch==$TORCH_VER" --index-url "$TORCH_CPU_INDEX" "${TORCH_TRUST[@]}" \
+       --retries 2 --timeout 60; then
   say "   ⚠ CPU 源($TORCH_CPU_INDEX)装不上,退回 PyPI —— 下一步会查它带不带 CUDA"
   python -m pip install "${IDX[@]}" "torch==$TORCH_VER"
 fi
