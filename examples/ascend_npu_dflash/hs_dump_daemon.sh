@@ -190,6 +190,7 @@ gate() {
 # ── 主循环 ────────────────────────────────────────────────────────────────────
 T0=$SECONDS
 ADDED=0 CRASHES=0 START_FAILS=0 SERVE_GEN=0 CHUNKS_SINCE_GATE=0
+FIRE_SEC=0   # 只累计真在 dump 的时间。起服务、过闸不算 —— 算进去的话开头几块的 ETA 会虚高 10 倍以上
 row=$ROW_START
 serve_pid=""
 
@@ -252,6 +253,7 @@ while [ "$row" -lt "$ROW_END" ]; do
   end=$((row + CHUNK)); [ "$end" -gt "$ROW_END" ] && end="$ROW_END"
   n=$((end - row))
   # ★ id == row(训练侧按行号找文件);--no-collect 不再复制一份(否则占盘翻倍)
+  t_chunk=$SECONDS
   ENDPOINT="$ENDPOINT" ARROW="$ARROW" HS_DIR="$DSPARK_HS_DIR" \
     python "$SCRIPT_DIR/dsv4_fire_hs_dumps.py" \
       --out /dev/null --n "$n" --concurrency "$CONC" \
@@ -265,10 +267,12 @@ while [ "$row" -lt "$ROW_END" ]; do
   done
   ADDED=$((ADDED + got))
 
-  el=$((SECONDS - T0)); rate=$(awk -v a="$ADDED" -v e="$el" 'BEGIN{printf "%.2f", a/(e>0?e:1)}')
+  dt=$((SECONDS - t_chunk)); FIRE_SEC=$((FIRE_SEC + dt))
+  rate=$(awk -v a="$ADDED" -v e="$FIRE_SEC" 'BEGIN{printf "%.2f", a/(e>0?e:1)}')
+  crate=$(awk -v g="$got" -v d="$dt" 'BEGIN{printf "%.1f", g/(d>0?d:1)}')
   left=$((ROW_END - row - got))
   eta=$(awk -v l="$left" -v r="$rate" 'BEGIN{printf "%.1f", (r>0? l/r/3600 : -1)}')
-  say "行 [$row,$end) → 落盘 $got/$n  errors=$errs | 累计 +$ADDED  $rate 行/s  剩 $left 行 ≈ ${eta}h  崩 $CRASHES 次  盘剩 ${fg}GB"
+  say "行 [$row,$end) → 落盘 $got/$n  errors=$errs  本块 ${dt}s ${crate} 行/s | 累计 +$ADDED  均 $rate 行/s  剩 $left 行 ≈ ${eta}h  崩 $CRASHES 次  盘剩 ${fg}GB"
 
   if ! serve_up; then
     CRASHES=$((CRASHES + 1))
