@@ -120,13 +120,17 @@ free_gb() { df -BG --output=avail "$DSPARK_HS_DIR" 2>/dev/null | tail -1 | tr -d
 
 # ── 已完成的行:扫一次目录,拿到 hs_<n>.safetensors 里的 n ────────────────────
 # 77W 个文件时这一步要几秒,所以只在启动和每次重启后扫,块内不扫。
+# ⚠ 必须在当前 shell 里调(`scan_done`),不能 `$(scan_done)`:命令替换跑在子 shell 里,DONE 填完
+#   就随子 shell 一起丢了,父进程的 DONE 永远是空的 —— 2026-09-25 全量 dump 因此把 pilot 已经落盘的
+#   2,048 行又打了一遍;中途 kill 再起的话会从 ROW_START 全部重打。计数放在 DONE_CNT 里。
 declare -A DONE
+DONE_CNT=0
 scan_done() {
   DONE=()
-  local n cnt=0
-  while read -r n; do DONE["$n"]=1; cnt=$((cnt + 1)); done < <(
+  DONE_CNT=0
+  local n
+  while read -r n; do DONE["$n"]=1; DONE_CNT=$((DONE_CNT + 1)); done < <(
     ls "$DSPARK_HS_DIR" 2>/dev/null | sed -n 's/^hs_\([0-9]\+\)\.safetensors$/\1/p')
-  echo "$cnt"
 }
 
 chunk_done() {   # $1=起始行 —— 整块都在盘上才算做完
@@ -135,7 +139,7 @@ chunk_done() {   # $1=起始行 —— 整块都在盘上才算做完
   return 0
 }
 
-DONE_CNT=$(scan_done)
+scan_done
 say "盘上已有 $DONE_CNT 个 HS 文件,剩余空间 $(free_gb) GB"
 
 # ── 目录里已有的文件真是这个 Arrow 的吗?抽 3 个比 token_ids ─────────────────────
@@ -247,7 +251,7 @@ while [ "$row" -lt "$ROW_END" ]; do
       break
     fi
     CHUNKS_SINCE_GATE=0
-    DONE_CNT=$(scan_done)          # 重启后重扫一次,崩溃那批可能写了一半
+    scan_done                      # 重启后重扫一次,崩溃那批可能写了一半
   fi
 
   end=$((row + CHUNK)); [ "$end" -gt "$ROW_END" ] && end="$ROW_END"
@@ -298,7 +302,7 @@ done
 
 say "================================================================================"
 say "结束:本次新增 $ADDED 行,崩溃 $CRASHES 次,起服务 $SERVE_GEN 次,用时 $(hms $((SECONDS - T0)))"
-say "盘上现有 $(scan_done) 个 HS 文件,剩余 $(free_gb) GB"
+scan_done; say "盘上现有 $DONE_CNT 个 HS 文件,剩余 $(free_gb) GB"
 say "serve 全量日志(含每次崩溃现场):$LOG"
 cleanup_verified "收尾" >/dev/null 2>&1
 say "机器已清场。"
