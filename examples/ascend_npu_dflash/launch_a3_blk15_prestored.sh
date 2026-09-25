@@ -64,9 +64,15 @@ print(f'    torch {torch.__version__}  torch_npu {torch_npu.__version__}  transf
 " ) || { say "!! 训练栈导入失败(先 conda activate 训练环境)"; exit 2; }
 
 # ── 检查 2:dump 服务已经退了 —— 它还占着 16 张卡就别起 ─────────────────────────
-if pgrep -u "$USER" -f 'vllm|EngineCore|hs_dump_daemon' >/dev/null 2>&1; then
-  say "!! 还有 vllm / hs_dump_daemon 进程在跑 —— dump 没结束,或者没清场。先停它。"
-  pgrep -u "$USER" -af 'vllm|EngineCore|hs_dump_daemon' | head -5
+# 僵尸(<defunct>)不算:评测停 serve 后常留几个 [VLLM::Worker] <defunct>,不占卡、也杀不掉,
+# 算进来的话流水线最后一步会永远起不来(eval_blk15_drafts.sh 的 procs_alive 同一个道理)。
+_live=""
+for _p in $(pgrep -u "$USER" -if 'vllm|EngineCore|hs_dump_daemon' 2>/dev/null); do
+  case "$(ps -o stat= -p "$_p" 2>/dev/null | tr -d ' ')" in ''|Z*) ;; *) _live="$_live $_p" ;; esac
+done
+if [ -n "$_live" ]; then
+  say "!! 还有 vllm / hs_dump_daemon 进程在跑 —— dump/评测没结束,或者没清场。先停它。"
+  ps -o pid=,stat=,args= -p ${_live// /,} 2>/dev/null | cut -c1-160 | head -5
   exit 2
 fi
 
