@@ -72,9 +72,15 @@ if [ "$HS_ON_MISSING" = "raise" ]; then
 from datasets import load_from_disk; d = load_from_disk('$DATA')
 print(d.num_rows if hasattr(d, 'num_rows') else d[next(iter(d))].num_rows)" 2>/dev/null)
   [ -n "$rows" ] || { say "!! 读不出 $DATA 的行数"; exit 2; }
-  say "数 HS 文件($HS_DIR,几十万个文件要十几秒)..."
-  have=$( { find "$HS_DIR" -maxdepth 1 -name 'hs_*.safetensors' 2>/dev/null || true; } | wc -l)
-  say "HS 文件 $have / Arrow 行数 $rows"
+  if [ -n "${HS_COUNT_SKIP:-}" ]; then
+    have="$rows"; say "HS_COUNT_SKIP=1:跳过计数(信 hs_dump_daemon 结尾那行「盘上现有 N 个 HS 文件」)"
+  else
+    # 用 `ls -f`(不排序、不 stat),和 hs_dump_daemon 同一个数法:NFS 上几十万个文件,find 可能慢得多。
+    say "数 HS 文件($HS_DIR,NFS 上几十万个文件,冷缓存可能要一两分钟;HS_COUNT_SKIP=1 可跳过)..."
+    _t0=$SECONDS
+    have=$( { ls -f "$HS_DIR" 2>/dev/null || true; } | grep -c '^hs_[0-9]*\.safetensors$' || true)
+    say "HS 文件 $have / Arrow 行数 $rows   (数了 $((SECONDS - _t0))s)"
+  fi
   if [ "$have" -lt "$rows" ]; then
     if [ "${ALLOW_PARTIAL:-0}" = "1" ]; then
       say "⚠ 缺 $((rows - have)) 个,ALLOW_PARTIAL=1 放行 —— 碰到缺的那一行训练会报错停下。"
