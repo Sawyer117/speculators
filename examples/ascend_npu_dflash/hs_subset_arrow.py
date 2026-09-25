@@ -17,12 +17,19 @@ WHY
 
 写完会重新读回来,抽几行和原 Arrow 逐 token 比对,对不上直接报错。
 
+★ 保留源 Arrow 的格式(2026-09-25 踩过):训练 Arrow 在预处理时 `set_format(type="torch")` 并随数据
+持久化,训练侧 data.py 依赖它 —— `self.data[i]["input_ids"]` 是 tensor。第一版在去掉格式的视图上
+抽样保存,新 Arrow 成了 python 格式,训练在 `torch.equal(token_ids, input_ids)` 上报
+`must be Tensor, not list`。现在在原始格式上 select 并核对;已经抽坏的用 --repair-format 修
+(只改 state.json 的四个格式字段,不动数据)。
+
 USAGE
 -----
     python hs_subset_arrow.py --arrow <src> --out <dst> --fraction 0.5
     python hs_subset_arrow.py --arrow <src> --out <dst> --rows 300000 --seed 1
     python hs_subset_arrow.py --arrow <src> --out <dst> --budget-tb 6 --ratio 1.40
     python hs_subset_arrow.py --arrow <src> --out <dst> --from-rows <旧目录>/orig_rows.txt   # 原样重建
+    python hs_subset_arrow.py --arrow <src> --out <dst> --repair-format   # 把源的格式补进已有子集
 
 纯 CPU,不碰 NPU。
 """
@@ -41,13 +48,47 @@ BYTES_PER_TOKEN = 4 * 4096 * 2      # 3 aux + 1 final,bf16
 MEASURED_RATIO = 1.40               # 真 HS 文件实测:字节拆分 + gzip -6(尾数那一字节压不动)
 
 
-def _load(path: str):
+_FORMAT_KEYS = ("_format_type", "_format_columns", "_format_kwargs", "_output_all_columns")
+
+
+def _load_raw(path: str):
+    """原样加载,保留持久化的格式(训练 Arrow 是 torch 格式)。抽样/保存用它。"""
     from datasets import load_from_disk  # noqa: PLC0415 — box dep
 
     ds = load_from_disk(path)
     if hasattr(ds, "keys") and not hasattr(ds, "num_rows"):
         ds = ds[next(iter(ds.keys()))]
-    return ds.with_format(None)
+    return ds
+
+
+def _load(path: str):
+    """去掉格式的读视图:取出来是 python list,读长度/比 token 用。"""
+    return _load_raw(path).with_format(None)
+
+
+def _state_format(path: str) -> dict:
+    with open(os.path.join(path, "state.json")) as fh:
+        st = json.load(fh)
+    return {k: st.get(k) for k in _FORMAT_KEYS}
+
+
+def _repair_format(src: str, dst: str) -> int:
+    """把 src 的格式字段写进 dst 的 state.json —— 只改元数据,数据一个字节不动。"""
+    want, have = _state_format(src), _state_format(dst)
+    if want == have:
+        print(f"  格式已一致:{want}")
+        return 0
+    p = os.path.join(dst, "state.json")
+    with open(p) as fh:
+        st = json.load(fh)
+    shutil.copy2(p, p + ".bak")
+    st.update(want)
+    with open(p, "w") as fh:
+        json.dump(st, fh, indent=2)
+    got = _load_raw(dst)
+    print(f"  {dst}/state.json:{have} → {want}(原件备份 state.json.bak)")
+    print(f"  读回:input_ids 是 {type(got[0]['input_ids']).__name__}")
+    return 0 if _state_format(dst) == want else 1
 
 
 def _lengths(ds, idx) -> list[int]:
@@ -65,12 +106,19 @@ def main() -> int:
     g.add_argument("--rows", type=int, help="抽多少行")
     g.add_argument("--budget-tb", type=float, help="按盘预算反推行数(TB,十进制)")
     g.add_argument("--from-rows", help="按一份已有的 orig_rows.txt 原样重建(不抽样)")
+    g.add_argument("--repair-format", action="store_true",
+                   help="不抽样:把 --arrow 的持久化格式补进已存在的 --out(只改 state.json)")
     ap.add_argument("--ratio", type=float, default=1.0,
                     help=f"--budget-tb 用的压缩比。1.0 = 原样 bf16;实测无损上限 {MEASURED_RATIO}")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--sample-len", type=int, default=5000, help="估平均长度时抽多少行")
     args = ap.parse_args()
 
+    if args.repair_format:
+        if not os.path.exists(os.path.join(args.out, "state.json")):
+            print(f"!! {args.out} 不是 save_to_disk 的目录(没有 state.json)")
+            return 2
+        return _repair_format(args.arrow, args.out)
     if os.path.exists(args.out):
         print(f"!! {args.out} 已存在。换个目录,或确认不要了再删 —— 不覆盖。")
         return 2
@@ -78,7 +126,8 @@ def main() -> int:
     import numpy as np  # noqa: PLC0415
 
     t0 = time.time()
-    ds = _load(args.arrow)
+    raw = _load_raw(args.arrow)          # 带格式:抽样、保存都用它,格式才会原样带过去
+    ds = raw.with_format(None)           # 读视图
     n_total = len(ds)
     rng = np.random.default_rng(args.seed)
     probe = np.sort(rng.choice(n_total, min(args.sample_len, n_total), replace=False))
@@ -107,14 +156,17 @@ def main() -> int:
     else:
         # 抽行用独立的 rng(种子相同),这样 --sample-len 改了也不影响抽到哪些行。
         idx = np.sort(np.random.default_rng(args.seed).choice(n_total, n, replace=False))
-    sub = ds.select(idx.tolist())
+    sub = raw.select(idx.tolist())
     sub.save_to_disk(args.out)
     rows_txt = "\n".join(str(int(i)) for i in idx) + "\n"
     with open(os.path.join(args.out, "orig_rows.txt"), "w") as fh:
         fh.write(rows_txt)
     rows_sha = hashlib.sha256(rows_txt.encode()).hexdigest()
 
-    # ── 读回校验:行数 + 抽几行逐 token 比 ────────────────────────────────────
+    # ── 读回校验:格式 + 行数 + 抽几行逐 token 比 ─────────────────────────────
+    if _state_format(args.out) != _state_format(args.arrow):
+        print(f"!! 格式没带过去:源 {_state_format(args.arrow)},新 {_state_format(args.out)}")
+        return 1
     back = _load(args.out)
     if len(back) != n:
         print(f"!! 读回来 {len(back)} 行,应为 {n}")
@@ -142,6 +194,7 @@ def main() -> int:
     lines = [
         f"source      {os.path.abspath(args.arrow)}",
         f"source_fp   {src_fp}   ({n_total:,} 行;datasets {datasets.__version__})",
+        f"format      {_state_format(args.out)['_format_type']}(与源一致)",
         f"rows        {n:,} / {n_total:,} ({100 * n / n_total:.1f}%)",
         f"selection   {how}",
         f"rows_sha256 {rows_sha}   (orig_rows.txt —— 可复现以它为准)",

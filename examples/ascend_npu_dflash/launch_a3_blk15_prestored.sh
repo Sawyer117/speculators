@@ -68,10 +68,19 @@ fi
 
 # ── 检查 3:HS 齐不齐 —— 预存模式下缺一个文件就会在训练中途报错停掉 ───────────
 if [ "$HS_ON_MISSING" = "raise" ]; then
-  rows=$(TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c "
+  # 顺带核格式:训练侧 data.py 要 torch 格式(input_ids 取出来是 tensor)。python 格式的 Arrow 会在
+  # 16 个 rank 加载完模型、第一个 batch 才报 `must be Tensor, not list` —— 在这里几秒就挡掉。
+  read=$(TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c "
 from datasets import load_from_disk; d = load_from_disk('$DATA')
-print(d.num_rows if hasattr(d, 'num_rows') else d[next(iter(d))].num_rows)" 2>/dev/null)
+d = d if hasattr(d, 'num_rows') else d[next(iter(d))]
+print(d.num_rows, d.format['type'])" 2>/dev/null)
+  rows=${read%% *}; fmt=${read##* }
   [ -n "$rows" ] || { say "!! 读不出 $DATA 的行数"; exit 2; }
+  if [ "$fmt" != "torch" ]; then
+    say "!! $DATA 的格式是 '$fmt',训练要 torch。修(只改 state.json,不动数据):"
+    say "   python $SCRIPT_DIR/hs_subset_arrow.py --arrow <源 Arrow> --out $DATA --repair-format"
+    exit 2
+  fi
   if [ -n "${HS_COUNT_SKIP:-}" ]; then
     have="$rows"; say "HS_COUNT_SKIP=1:跳过计数(信 hs_dump_daemon 结尾那行「盘上现有 N 个 HS 文件」)"
   else
