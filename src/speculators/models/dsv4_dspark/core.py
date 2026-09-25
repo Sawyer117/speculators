@@ -142,6 +142,35 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         # run by slowing the step to the serve's HS-production rate). See _backbone_forward.
         self.grad_checkpoint = bool(int(os.environ.get("DSPARK_RECOMPUTE", "0")))
 
+        # DSPARK_BLOCK_INPUT: what fills the draft block's slots 1..B-1 during TRAINING.
+        #   mask (default, also when unset) -- the mask token, as served. No-op: the forward
+        #        is exactly the pre-existing one.
+        #   true -- the TRUE tokens x[p+1..p+B-1]. A MEASUREMENT arm, not a servable model:
+        #        slot k then conditions on the real in-block prefix, so its greedy
+        #        hard_accept_len is the ceiling any in-block token injection could reach.
+        #        Slot k's own target sits in slot k+1's input, so block attention MUST be
+        #        causal -- a non-causal block would read the answer. Refused below.
+        self.block_input = os.environ.get("DSPARK_BLOCK_INPUT", "mask").strip().lower() or "mask"
+        if self.block_input not in ("mask", "true"):
+            raise ValueError(f"DSPARK_BLOCK_INPUT must be 'mask' or 'true', got {self.block_input!r}")
+        if self.block_input == "true" and not config.sample_from_anchor:
+            raise ValueError(
+                "DSPARK_BLOCK_INPUT=true assumes sample_from_anchor=True (slot k predicts x[p+k+1]); "
+                "with False slot k predicts x[p+k], i.e. its own input token."
+            )
+        if self.block_input == "true" and (self.sliding_window_non_causal or self.uses_full_attn):
+            raise ValueError(
+                "DSPARK_BLOCK_INPUT=true feeds each slot the token its predecessor must predict; "
+                "it needs CAUSAL block attention on every layer (NONCAUSAL=0 and no full-attention "
+                "layers, whose block mask is always non-causal). Refusing to train on leaked targets."
+            )
+        if self.block_input == "true":
+            import torch.distributed as _dist  # noqa: PLC0415
+
+            if not _dist.is_initialized() or _dist.get_rank() == 0:
+                print("[E1] DSPARK_BLOCK_INPUT=true: draft block slots read the TRUE tokens "
+                      "(causal block attention). Measurement arm, not a servable draft.", flush=True)
+
         # The released DSV4 layout has no slot for a bias on the confidence head, and
         # upstream's ConfidenceHead always builds one. Replace the projection rather than
         # changing how that head is built for every other DSpark draft.
@@ -610,6 +639,13 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             (1, mask_tokens_size), self.mask_token_id, dtype=torch.long, device=device
         )
         mask_token_ids[:, :: self.block_size] = input_ids[:, anchor_positions]
+        if self.block_input == "true":
+            # E1 measurement arm (see __init__): slot k <- x[p+k]; slot 0 is the anchor either way.
+            from speculators.models.dflash.utils import get_base_indices_for_anchored_blocks
+
+            mask_token_ids = input_ids[
+                :, get_base_indices_for_anchored_blocks(anchor_positions, self.block_size)
+            ].clone()
         noise_embedding = _prof(
             "OUT.embed", lambda: self.embed_tokens(mask_token_ids)
         )  # [1, TB, H]
