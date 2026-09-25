@@ -355,7 +355,7 @@ if [ "$BF16EXPERTS" = "auto" ]; then
 fi
 if [ "$BF16EXPERTS" = "1" ]; then
   EXTRA="$EXTRA --bf16-experts"
-  echo ">>> AMP: option B (experts stay bf16, no fp32 master) — memory path for faithful+EP=0"
+  echo ">>> AMP: option B (experts stay bf16, no fp32 master; BF16_EXPERTS=1 or auto with EP=0) — the memory path"
 else
   echo ">>> AMP: option A (experts get fp32 master, upstream #711) — fits under EP=1"
 fi

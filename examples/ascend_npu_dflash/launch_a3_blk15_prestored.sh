@@ -12,8 +12,12 @@
 #   LR            2e-4                     2.8e-4                    √2 批量缩放(之前 A3 线同法定 3e-4)
 #   步数/epoch    24,896                   ~6,200                    数据 ½ × 批量 2×
 #   HS            在线生成、用完即删       预存,缺文件直接报错      HS_ON_MISSING=raise
+#   专家精度      bf16(option B)          fp32 主权重(option A)    EP16 下每卡 16 个专家 × 4 B = EP8 的
+#                                                                     32 × 2 B,显存不变;更新在 fp32 里累加
 #
-# 其余(BLOCK/γ/锚点/Muon/噪声/非因果/warm-start/bf16 专家/不开均衡)与基线一致。
+# 其余(BLOCK/γ/锚点/Muon/噪声/非因果/warm-start/不开均衡)与基线一致。
+# option A 和 Muon 不冲突:Muon 在 bf16 里做 Newton-Schulz,更新按参数自己的 dtype 加回去
+# (muon_distributed.py `p_local.add_(update.to(p_local.dtype))`),fp32 主权重只会让累加更准。
 #
 # 用法
 #   bash launch_a3_blk15_prestored.sh                  # 正式跑
@@ -39,7 +43,7 @@ export MASK_TOKEN="${MASK_TOKEN:-128799}"
 export OPTIM="${OPTIM:-muon}" MUON_ADJUST="${MUON_ADJUST:-match_rms_adamw}" MUON_HYBRID="${MUON_HYBRID:-0}"
 export NONCAUSAL="${NONCAUSAL:-1}" SWA_WINDOW="${SWA_WINDOW:-128}" NOISE_STD="${NOISE_STD:-0.05}" KD_TEMP="${KD_TEMP:-1.0}"
 export RECOMPUTE="${RECOMPUTE:-1}" COMPILE="${COMPILE:-0}" NO_VAL="${NO_VAL:-1}" CKPT_FREQ="${CKPT_FREQ:-0.5}"
-export INIT_LAYER="${INIT_LAYER:-1}" INIT_MOE_NO_ROUTER="${INIT_MOE_NO_ROUTER:-1}" BF16_EXPERTS="${BF16_EXPERTS:-1}"
+export INIT_LAYER="${INIT_LAYER:-1}" INIT_MOE_NO_ROUTER="${INIT_MOE_NO_ROUTER:-1}" BF16_EXPERTS="${BF16_EXPERTS:-0}"
 export DSPARK_MOE_BALANCE="${DSPARK_MOE_BALANCE:-0}"
 export DSPARK_LOG_EXPERT_LOAD="${DSPARK_LOG_EXPERT_LOAD:-1}" DSPARK_LOG_EXPERT_LOAD_EVERY="${DSPARK_LOG_EXPERT_LOAD_EVERY:-50}"
 
