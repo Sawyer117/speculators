@@ -25,6 +25,7 @@
 #   EXTRA_ENTRIES / EXTRA_CKPT_ROOT / EXTRA_DATASET=gsm8k(可选:顺带评测已在本机上的其它草稿,
 #       格式同 ENTRIES_OVERRIDE,例如 'ep1p0-blk15-nobal|<目录名> ...')
 #   PROBES="A1 A2"  STOP_AT_STEP=6100
+#   START_AT=probes  跳过等待/停训练/导出/评测,直接从探针开始(前面几步已经做完、只需重跑探针时用)
 #   THEN_BASELINE=0  BASELINE_REPO=  NEXT_LR=3e-4 NEXT_BAL=1 NEXT_BAL_RATE=2e-3 NEXT_EPOCHS=10 NEXT_ANCHORS=192
 #   TRAIN_ENV=dspark-dsv4-train  SERVE_ENV=dspark-dsv4-serving  CANN_ENV=/home/a00652497/920env_npu.sh
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,6 +60,7 @@ TOKENIZER="${TOKENIZER:-/home/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
 HBM_FREE_MB="${HBM_FREE_MB:-4096}"
 HBM_WAIT="${HBM_WAIT:-1800}"
 DRY_RUN="${DRY_RUN:-0}"
+START_AT="${START_AT:-wait}"
 
 SAVE="$RUN_DIR/ckpt_faithful_ep_$RUN_TS"
 TLOG="$RUN_DIR/faithful_ep_$RUN_TS.log"
@@ -142,7 +144,15 @@ if [ "$THEN_BASELINE" = 1 ]; then
     || { say "!! THEN_BASELINE=1 需要 BASELINE_REPO=<基线分支的检出>(现在是 '${BASELINE_REPO}')"; bad=1; }
 fi
 for p in $PROBES; do case "$p" in A1|A2) ;; *) say "!! PROBES 只认 A1 A2,收到 '$p'"; bad=1 ;; esac; done
+case "$START_AT" in wait|probes) ;; *) say "!! START_AT 只认 wait 或 probes,收到 '$START_AT'"; bad=1 ;; esac
 [ "$bad" = 0 ] || { say "预检没过,什么都没动。"; exit 2; }
+if [ "$START_AT" = probes ]; then
+  if pgrep -f "$TRAIN_PAT" >/dev/null; then
+    say "!! START_AT=probes,但还有训练进程在跑 —— 先确认它该不该停,再起探针。"; exit 2
+  fi
+  say "START_AT=probes:跳过 1–3 步(等待、停训练、导出、评测),直接起探针 [$PROBES]"
+  if [ "$DRY_RUN" = 1 ]; then say "DRY_RUN=1:预检完成,到此为止。"; exit 0; fi
+else
 
 if [ -L "$MARK" ]; then
   say "注意:$MARK 已经存在 —— 会立刻进入停训练那一步"
@@ -212,6 +222,8 @@ fi
 if [ -n "$EXTRA_ENTRIES" ]; then
   run_eval extra "$EXTRA_CKPT_ROOT" "$EXTRA_ENTRIES" "$EXTRA_DATASET"
 fi
+
+fi   # START_AT != probes
 
 # ── 4. 探针 ─────────────────────────────────────────────────────────────────
 for ARM in $PROBES; do
