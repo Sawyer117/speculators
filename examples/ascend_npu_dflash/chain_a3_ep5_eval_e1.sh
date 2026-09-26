@@ -88,9 +88,21 @@ npu_used_mb() {
     | awk -F'/' '{ u=$1+0; t=$2+0; if (t > 1000 && u > m) m = u } END { if (m == "") exit 1; print m+0 }'
 }
 
+# 活着的(非僵尸)匹配进程是否存在。被杀掉的 vLLM worker 若没被父进程 wait(),会以
+# `[VLLM::Worker] <defunct>` 留在进程表里:不占卡、不占显存,但 pgrep 照样数它 ——
+# 于是每次都要白等满 10 分钟的上限(评测 → 探针之间实测就是这样)。
+alive() {   # $1 = pgrep -f 的模式,$2 = 额外的 pgrep 选项(如 -i)
+  local p st
+  for p in $(pgrep $2 -f "$1" 2>/dev/null); do
+    st=$(ps -o stat= -p "$p" 2>/dev/null | tr -d ' ')
+    case "$st" in ''|Z*) ;; *) return 0 ;; esac
+  done
+  return 1
+}
+
 wait_hbm_free() {
   local waited=0 mb
-  while pgrep -f "$TRAIN_PAT" >/dev/null || pgrep -if 'vllm|EngineCore' >/dev/null; do
+  while alive "$TRAIN_PAT" || alive 'vllm|EngineCore' -i; do
     sleep 10; waited=$((waited + 10))
     [ "$waited" -ge 600 ] && { say "⚠ 等进程退出等了 10 分钟还没退完,继续等显存"; break; }
   done
