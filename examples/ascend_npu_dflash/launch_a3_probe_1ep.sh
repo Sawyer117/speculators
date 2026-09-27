@@ -9,6 +9,7 @@
 #   E10   Markov 头换成 rnn(MARKOV_HEAD_TYPE=rnn:块内递推一个状态,而不是只看前一个 token)
 #   E11a  每层(除最后一层)后加一个低秩预测头 + 辅助损失(DSPARK_INTER_HEADS=aux)
 #   E11b  E11a + 把各层头的猜测经零初始化门控注入下一层(DSPARK_INTER_HEADS=inject)
+#   G5    只改损失的逐位置衰减 DECAY_GAMMA=15 → 5(研究笔记第 16 节:前几个位置的退化是否来自损失权重)
 #   E11 的结构与开关见 src/speculators/models/dsv4_dspark/inter_heads.py 与 core.py。
 #
 # 配对:REF=pilot(默认)逐项照抄试点 faithful_ep_20260925_143507(LR 2.8e-4、EPOCHS=10 的调度、
@@ -17,10 +18,10 @@
 #   REF=bal 照抄均衡基线 faithful_ep_20260927_145217(LR 3e-4、DSPARK_MOE_BALANCE=1、
 #   rate 1e-3、不设目标 entropy)。
 #   ⚠ E10 的 rnn 头用 PyTorch 默认初始化,建模型时多消耗全局随机数,之后的锚点与噪声不再与
-#     A0 逐步对齐,只能按窗口均值比。E11 的头用私有生成器,不影响对齐。
+#     A0 逐步对齐,只能按窗口均值比。E11 的头用私有生成器、G5 不改模型,都不影响对齐。
 #
 # 用法(在【实验分支的检出】里,训练环境已 activate;整条挂 nohup,日志落盘):
-#   ARMS="E11a E11b E10" nohup bash examples/ascend_npu_dflash/launch_a3_probe_1ep.sh \
+#   ARMS="E11a E11b E10 G5" nohup bash examples/ascend_npu_dflash/launch_a3_probe_1ep.sh \
 #     > ~/probe_queue_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 #
 # 队列:各臂依次跑。每个臂开跑前等机器空出来 —— 没有活着的训练 / vLLM / 流水线
@@ -48,12 +49,13 @@ arm_env() {   # 一个臂相对参照 run 唯一改动的环境变量
     E10)  echo "MARKOV_HEAD_TYPE=rnn" ;;
     E11a) echo "DSPARK_INTER_HEADS=aux" ;;
     E11b) echo "DSPARK_INTER_HEADS=inject" ;;
+    G5)   echo "DECAY_GAMMA=5" ;;
     *)    return 1 ;;
   esac
 }
-[ -n "$ARMS" ] || { say "!! 要指定 ARMS,如 ARMS=\"E11a E11b E10\""; exit 2; }
+[ -n "$ARMS" ] || { say "!! 要指定 ARMS,如 ARMS=\"E11a E11b E10 G5\""; exit 2; }
 for _a in $ARMS; do
-  arm_env "$_a" >/dev/null || { say "!! 不认识的臂 $_a(可选 E10 | E11a | E11b)"; exit 2; }
+  arm_env "$_a" >/dev/null || { say "!! 不认识的臂 $_a(可选 E10 | E11a | E11b | G5)"; exit 2; }
 done
 case "$REF" in pilot|bal) ;; *) say "!! REF 只能是 pilot 或 bal"; exit 2 ;; esac
 
@@ -83,7 +85,7 @@ fi
 # ── 配方:参照 run 逐项照抄,只改臂自己的那一个变量 ─────────────────────────────
 # 这几个若从 shell 里带进来会悄悄改掉配方(续跑、限步、热启动、换头),一律清掉。
 for _v in MAX_STEPS SAVE_PATH FROM_PRETRAINED MARKOV_HEAD_TYPE DSPARK_INTER_HEADS \
-          DSPARK_BLOCK_INPUT DSPARK_MOE_BALANCE_TARGET; do
+          DSPARK_BLOCK_INPUT DSPARK_MOE_BALANCE_TARGET DECAY_GAMMA; do
   if [ -n "${!_v:-}" ]; then say "注意:清掉 shell 里带进来的 $_v=${!_v}"; fi
   unset "$_v"
 done
