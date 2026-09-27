@@ -42,13 +42,24 @@ esac
 # 从另一个工作树起训练,不改 PYTHONPATH 的话 import 到的是基线的代码 ——
 # DSPARK_BLOCK_INPUT 会被【静默忽略】,A2 实际跑成 A1。所以先顶到最前面,再核一遍。
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+# 与 launch_a3_blk15_prestored.sh 相同的运行时环境,但要在 import 检查【之前】就位:
+# miniforge 环境自带的 libstdc++ 必须排在系统那份前面(torch_npu 要 CXXABI_1.3.15),
+# 只 conda activate 不够 —— 交互 shell 里直接跑本脚本时,import 会因此失败。
+CANN_ENV="${CANN_ENV:-/home/a00652497/920env_npu.sh}"
+# shellcheck source=/dev/null
+[ -f "$CANN_ENV" ] && source "$CANN_ENV"
+[ -n "${CONDA_PREFIX:-}" ] && export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+_imp_err=$(mktemp)
 got=$(cd "$HOME" && TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c \
-  "import speculators, os; print(os.path.realpath(speculators.__file__))" 2>/dev/null)
+  "import speculators, os; print(os.path.realpath(speculators.__file__))" 2>"$_imp_err")
 case "$got" in
   "$(realpath "$REPO_ROOT")"/src/*) say "speculators 来自本检出:$got" ;;
   *) say "!! import 到的 speculators 不在本检出里:${got:-<导入失败>}"
-     say "   期望在 $(realpath "$REPO_ROOT")/src/ 下。先 conda activate 训练环境。"; exit 2 ;;
+     say "   python=$(command -v python)  CONDA_PREFIX=${CONDA_PREFIX:-<未激活>}"
+     [ -s "$_imp_err" ] && { say "   报错末尾:"; tail -8 "$_imp_err" | sed 's/^/     /'; }
+     rm -f "$_imp_err"; exit 2 ;;
 esac
+rm -f "$_imp_err"
 if ! grep -q 'DSPARK_BLOCK_INPUT' "$REPO_ROOT/src/speculators/models/dsv4_dspark/core.py"; then
   say "!! 本检出的 core.py 里没有 DSPARK_BLOCK_INPUT —— 不在实验分支上?"; exit 2
 fi
