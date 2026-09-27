@@ -19,6 +19,7 @@ stack (expand once, collapse with the HyperHead at the end).
 from __future__ import annotations
 
 import os
+from functools import partial
 from typing import ClassVar, Literal
 
 import torch
@@ -28,6 +29,7 @@ from speculators import SpeculatorModelConfig
 from speculators.model import SpeculatorModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.core import DSparkDraftModel
+from speculators.models.dspark.metrics import _masked_decayed_mean
 
 # Absolute (not relative) imports: transformers' custom_object_save parses the
 # config module's RELATIVE imports to bundle them for trust_remote_code, and
@@ -38,6 +40,13 @@ from speculators.models.dsv4_dspark.backbone.block import MhcDecoderBlock, _prof
 from speculators.models.dsv4_dspark.backbone.hyper import HyperHead
 from speculators.models.dsv4_dspark.backbone.rotary import precompute_freqs_cis
 from speculators.models.dsv4_dspark.config import DSparkDraftConfig
+from speculators.models.dsv4_dspark.inter_heads import (
+    IntermediateHead,
+    chunked_argmax,
+    chunked_ce,
+    shift_within_blocks,
+)
+from speculators.models.metrics import dflash_loss_decay, dpace_loss_decay
 
 __all__ = ["DSV4DSparkConfig", "DSV4DSparkDraftModel"]
 
@@ -170,6 +179,47 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             if not _dist.is_initialized() or _dist.get_rank() == 0:
                 print("[E1] DSPARK_BLOCK_INPUT=true: draft block slots read the TRUE tokens "
                       "(causal block attention). Measurement arm, not a servable draft.", flush=True)
+
+        # DSPARK_INTER_HEADS (E11): a low-rank head after every draft layer but the last.
+        #   unset / "" / off -- nothing is built; the forward is exactly the pre-existing one.
+        #   aux    -- heads + an auxiliary loss: each predicts its slot's target token (E11a).
+        #   inject -- also embed each head's argmax for slot k-1 and add it, through a
+        #             zero-initialized gate, to slot k's input to the next layer (E11b).
+        # See inter_heads.py. DSPARK_INTER_AUX_WEIGHT (0.2) scales the auxiliary loss,
+        # DSPARK_INTER_RANK (256) is the head rank.
+        mode = os.environ.get("DSPARK_INTER_HEADS", "").strip().lower()
+        mode = "" if mode == "off" else mode
+        if mode not in ("", "aux", "inject"):
+            raise ValueError(f"DSPARK_INTER_HEADS must be off, aux or inject, got {mode!r}")
+        self.inter_mode = mode
+        self.inter_heads: nn.ModuleList | None = None
+        self.inter_gates: nn.ParameterList | None = None
+        self._inter_state: dict | None = None
+        if mode:
+            vocab = self.lm_head.weight.shape[0]
+            if mode == "inject" and vocab != self.embed_tokens.weight.shape[0]:
+                raise NotImplementedError(
+                    "DSPARK_INTER_HEADS=inject embeds the head's argmax, so the draft vocab must "
+                    f"be the full vocab (lm_head {vocab} vs embed {self.embed_tokens.weight.shape[0]})."
+                )
+            # Empty counts as unset: the training launcher passes these through as "".
+            rank = int(os.environ.get("DSPARK_INTER_RANK") or "256")
+            self.inter_aux_weight = float(os.environ.get("DSPARK_INTER_AUX_WEIGHT") or "0.2")
+            n = bb.n_draft_layers - 1
+            self.inter_heads = nn.ModuleList(
+                IntermediateHead(bb.hidden_size, rank, vocab, bb.rms_norm_eps, i) for i in range(n)
+            )
+            if mode == "inject":
+                self.inter_gates = nn.ParameterList(
+                    nn.Parameter(torch.zeros(bb.hidden_size)) for _ in range(n)
+                )
+            import torch.distributed as _dist  # noqa: PLC0415
+
+            if not _dist.is_initialized() or _dist.get_rank() == 0:
+                print(f"[E11] DSPARK_INTER_HEADS={mode}: {n} low-rank heads (rank {rank}), "
+                      f"aux weight {self.inter_aux_weight}"
+                      + ("; committed-token injection, zero-init gates" if mode == "inject" else ""),
+                      flush=True)
 
         # The released DSV4 layout has no slot for a bias on the confidence head, and
         # upstream's ConfidenceHead always builds one. Replace the projection rather than
@@ -604,6 +654,68 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             self._rebuild_freqs(int(positions.max()) + 1)
         return self.freqs_cis.to(positions.device)[positions]
 
+    def _inter_step(self, layer_idx: int, streams: torch.Tensor) -> torch.Tensor:
+        """E11: run the head after layer ``layer_idx``; with ``inject``, feed its guess forward."""
+        if layer_idx == 0:
+            self._inter_state = {"z": [], "g": []}
+        head = self.inter_heads[layer_idx]
+        z = head(streams)  # [T, r]
+        g = chunked_argmax(z.detach(), head.codebook.detach())  # [T], the committed guesses
+        self._inter_state["z"].append(z)
+        self._inter_state["g"].append(g)
+        if self.inter_gates is None:
+            return streams
+        shifted, valid = shift_within_blocks(g, self.block_size)
+        with torch.no_grad():
+            emb = self.embed_tokens(shifted) * valid.unsqueeze(-1).to(streams.dtype)  # [T, H]
+        inj = emb.to(streams.dtype) * self.inter_gates[layer_idx].to(streams.dtype)
+        return streams + inj.view(1, -1, 1, inj.shape[-1])
+
+    def forward(self, *args, **kwargs):
+        """The DSpark forward, plus the E11 auxiliary loss and metrics when the heads are on."""
+        self._inter_state = None
+        out = super().forward(*args, **kwargs)
+        st, self._inter_state = self._inter_state, None
+        if self.inter_heads is None or st is None or "ce" not in st:
+            return out
+        _, loss, metrics = out
+        # Weighted exactly like the main loss: same mask, same per-position decay, same
+        # (optionally global) normalization.
+        labels, mask = st["labels"], st["mask"]
+        bs = self.block_size
+        pos_idx = (torch.arange(labels.shape[0], device=labels.device) % bs).unsqueeze(0)
+        if kwargs.get("per_position_loss_weight", "fixed-exp-decay") == "dpace":
+            decay_fn = partial(dpace_loss_decay, loss_mask=mask, block_size=bs,
+                               dpace_alpha=kwargs.get("dpace_alpha", 0.5))
+        else:
+            decay_fn = partial(dflash_loss_decay, gamma=kwargs.get("gamma", 4.0),
+                               sample_from_anchor=self.config.sample_from_anchor)
+        aux = loss.new_zeros(())
+        mf = mask[0].float()
+        for i, (ce, g) in enumerate(zip(st["ce"], st["g"], strict=True)):
+            term = _masked_decayed_mean(ce.unsqueeze(0), mask, pos_idx, decay_fn)
+            aux = aux + term
+            hit = (g == labels).float() * mf
+            name = f"inter{i + 1}"  # the head after draft layer i + 1 (1-based)
+            metrics[f"{name}_ce_sum"] = term.detach().clone()
+            metrics[f"{name}_ce_total"] = torch.ones((), device=labels.device)
+            metrics[f"{name}_acc_sum"] = hit.sum()
+            metrics[f"{name}_acc_total"] = mf.sum().clamp_min(1.0)
+            hb, mb = hit.view(-1, bs), mf.view(-1, bs)
+            for k in range(bs):
+                metrics[f"{name}_position_{k}_acc_sum"] = hb[:, k].sum()
+                metrics[f"{name}_position_{k}_acc_total"] = mb[:, k].sum().clamp_min(1.0)
+            # This head's own greedy accept length, counted like the main hard_accept_len.
+            hs = slice(None) if self.config.sample_from_anchor else slice(1, None)
+            valid = (mb[:, hs].sum(-1) > 0).float()
+            hard = hb[:, hs].cumprod(-1).sum(-1) + 1.0
+            metrics[f"{name}_hard_accept_len_sum"] = (hard * valid).sum()
+            metrics[f"{name}_hard_accept_len_total"] = valid.sum().clamp_min(1.0)
+        loss = loss + self.inter_aux_weight * aux
+        metrics["inter_aux_loss_sum"] = aux.detach().clone()
+        metrics["inter_aux_loss_total"] = torch.ones((), device=labels.device)
+        return None, loss, metrics
+
     def _backbone_forward(  # noqa: C901
         self,
         hidden_states: torch.Tensor,
@@ -762,6 +874,8 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 streams = checkpoint(layer, *layer_args, use_reentrant=False)
             else:
                 streams = layer(*layer_args)
+            if self.inter_heads is not None and layer_idx < len(self.inter_heads):
+                streams = self._inter_step(layer_idx, streams)
             if _sat:
                 _rec["layers"].append(streams.detach().float().cpu())
 
@@ -841,6 +955,15 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             # False: slot 0 is the given anchor (not predicted) -> mask its loss. True
             # (DSpark): slot 0 IS a trained prediction (from the anchor's hidden) -> keep.
             aligned_loss_mask[:, :: self.block_size] = 0
+
+        if self.inter_heads is not None:
+            # E11: per-slot CE of each intermediate head against the teacher's argmax.
+            with torch.no_grad():
+                labels = targets[0].argmax(-1)
+            st = self._inter_state
+            st["labels"], st["mask"] = labels, aligned_loss_mask
+            st["ce"] = [chunked_ce(z, head.codebook, labels)
+                        for z, head in zip(st["z"], self.inter_heads, strict=True)]
 
         # DSPARK_DIAGNOSE=1: one-shot dump of the per-slot TARGET alignment — is
         # argmax(targets[slot k]) the TRUE next token input_ids[anchor+k+1]? Decides
