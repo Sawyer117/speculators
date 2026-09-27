@@ -24,7 +24,7 @@
 #   EVAL_DATASET_EP5=all  EVAL_DATASET_REST=all(ep1–ep4;想省约两小时就设 gsm8k)
 #   EXTRA_ENTRIES / EXTRA_CKPT_ROOT / EXTRA_DATASET=gsm8k(可选:顺带评测已在本机上的其它草稿,
 #       格式同 ENTRIES_OVERRIDE,例如 'ep1p0-blk15-nobal|<目录名> ...')
-#   PROBES="A1 A2"  STOP_AT_STEP=6100
+#   PROBES="A1 A2"  STOP_AT_STEP=6100   (PROBES=none:不跑探针,只做 ep5 → 停 → 导出 → 评测)
 #   START_AT=probes  跳过等待/停训练/导出/评测,直接从探针开始(前面几步已经做完、只需重跑探针时用)
 #   THEN_BASELINE=0  BASELINE_REPO=  NEXT_LR=3e-4 NEXT_BAL=1 NEXT_BAL_RATE=2e-3 NEXT_EPOCHS=10 NEXT_ANCHORS=192
 #   TRAIN_ENV=dspark-dsv4-train  SERVE_ENV=dspark-dsv4-serving  CANN_ENV=/home/a00652497/920env_npu.sh
@@ -45,6 +45,7 @@ EXTRA_ENTRIES="${EXTRA_ENTRIES:-}"
 EXTRA_CKPT_ROOT="${EXTRA_CKPT_ROOT:-/home/canada_group_folder/ckpt}"
 EXTRA_DATASET="${EXTRA_DATASET:-gsm8k}"
 PROBES="${PROBES:-A1 A2}"
+[ "$PROBES" = none ] && PROBES=""   # 空串会被上一行当成「没给」,所以用 none 表示不跑
 STOP_AT_STEP="${STOP_AT_STEP:-6100}"
 THEN_BASELINE="${THEN_BASELINE:-0}"
 BASELINE_REPO="${BASELINE_REPO:-}"
@@ -131,14 +132,18 @@ echo "  A3 流水线(实验分支):ep5 → 停 → 导出 ep1–ep5 → 评测 �
 echo "  训练 run   $RUN_TS   ($SAVE)"
 echo "  导出       ONLY=$ONLY  tag=$TAG"
 echo "  评测       ep5: $EVAL_DATASET_EP5   ep1–ep4: $EVAL_DATASET_REST   extra: ${EXTRA_ENTRIES:-无}"
-echo "  探针       $PROBES  各停在 global_step ≥ $STOP_AT_STEP"
+echo "  探针       ${PROBES:-不跑}${PROBES:+  各停在 global_step ≥ $STOP_AT_STEP}"
 echo "  之后       THEN_BASELINE=$THEN_BASELINE ${BASELINE_REPO:+(从 $BASELINE_REPO)}"
 echo "  输出       $OUT"
 hr
 
 # ── 0. 预检 ─────────────────────────────────────────────────────────────────
 bad=0
-[ -d "$SAVE" ] || { say "!! 找不到 $SAVE"; bad=1; }
+# 刚起的 run 在第一次存档(0.5 epoch)之前还没有存档目录 —— 只要训练在跑就放行。
+if [ ! -d "$SAVE" ]; then
+  if pgrep -f "$TRAIN_PAT" >/dev/null && [ -f "$TLOG" ]; then say "注意:$SAVE 还不存在(第一次存档前),训练在跑,放行"
+  else say "!! 找不到 $SAVE"; bad=1; fi
+fi
 [ -f "$TLOG" ] || { say "!! 找不到训练日志 $TLOG"; bad=1; }
 [ -f "$CANN_ENV" ] || { say "!! 找不到 CANN_ENV=$CANN_ENV"; bad=1; }
 [ -d "$TOKENIZER" ] || { say "!! 找不到 TOKENIZER=$TOKENIZER"; bad=1; }
