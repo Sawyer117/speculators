@@ -33,7 +33,16 @@
     "block_size": 7,
     "num_anchors": 8,
     "attention_backend": "eager",
-    "teacher_contract": "Frozen local DSV4 vocabulary tables in an HF metadata container; native RMSNorm applied to cached final hidden states. Not identical teacher logits to the original DSV4 benchmark."
+    "teacher_contract": "Frozen local DSV4 vocabulary tables in an HF metadata container; native RMSNorm applied to cached final hidden states. Not identical teacher logits to the original DSV4 benchmark.",
+    "draft_moe": {
+      "num_experts": 64,
+      "experts_per_token": 4,
+      "expert_intermediate_size": 1024,
+      "num_shared_experts": 1,
+      "score_function": "softmax",
+      "normalize_topk": true,
+      "routed_scaling_factor": 1.0
+    }
   },
   "scope": "Functional training/save/resume validation on repeated real-HS samples; not a quality, acceptance-length, throughput or customer-checkpoint result.",
   "logged_metrics": {
