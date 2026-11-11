@@ -2,12 +2,29 @@
 
 This change replaces only the DSpark draft's dense FFN with routed/shared SwiGLU experts. Attention, RoPE, target-HS conditioning, Markov/confidence heads, loss alignment and the offline evaluation interface remain the existing DSpark code. It does not import the DSV4 attention or mHC architecture.
 
-The default remains dense. For a three-layer experiment, add these options to the existing training command:
+## Try with your existing training command
+
+From a clean checkout of the customer repository, fetch this PR:
+
+```bash
+git fetch https://github.com/shangxt10/speculators.git pull/2/head:review/dspark-moe
+git switch review/dspark-moe
+```
+
+Use your existing DSpark training environment and native `scripts/train.py` command. If the package was installed editable from this checkout, switching branches updates the imported code; otherwise reinstall from this checkout using your usual installation procedure. Keep your model/data/HS paths, attention settings and distributed launcher.
+
+The following is an **argument fragment**, not a standalone shell command. For a fresh three-layer experiment, add or replace these options in your existing command:
 
 ```bash
 --speculator-type dspark --num-layers 3 \
 --draft-moe '{"num_experts":64,"experts_per_token":4,"expert_intermediate_size":1024,"num_shared_experts":1,"score_function":"softmax","normalize_topk":true,"routed_scaling_factor":1.0}'
 ```
+
+Use a new, unused `--save-path` and a separate `--log-dir` for this experiment: the trainer automatically resumes checkpoints in its save directory. Replace an existing `--num-layers 5` with `--num-layers 3`, rather than leaving both. If your decoder comes from `--draft-config`, set `num_hidden_layers` to 3 in that decoder config and omit `--num-layers`; those options are mutually exclusive.
+
+This fragment uses fresh model initialization. If your command uses `--from-pretrained`, do not append `--draft-moe` to it: the saved model config defines its FFN, and the CLI rejects a conflicting override. When loading an already initialized MoE checkpoint, use `--from-pretrained` alone for its architecture. Resume training with the same save directory and original training/scheduler recipe to retain optimizer and global-step state; `--from-pretrained` by itself only loads model initialization.
+
+For a quick initialization check, add `--dry-run` with a separate unused `--save-path`. This saves the initialized model and exits; it does not test backward or optimizer restoration. The 50+50 native training validation below covers those paths. The first-run config should contain `draft_moe`, with `transformer_layer_config.num_hidden_layers` equal to 3.
 
 The example mirrors the public Xing4 expert dimensions, not a verified private customer checkpoint. Adjust the expert budget explicitly before comparing a three-layer MoE to a five-layer dense draft. For width H and expert width I, the active FFN parameters per layer are `H*E + 3*H*I*(K+S)`, including the router, K selected routed experts and S shared experts. This is not a latency estimate.
 
