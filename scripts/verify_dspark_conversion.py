@@ -136,7 +136,7 @@ def main() -> None:
             covered.add(skey)
     # confidence_head.proj.bias: LEGACY checkpoints only. ConfidenceHead is now bias-free
     # (the released mtp.* layout has no such key); kept so pre-fix checkpoints still verify.
-    droppable = [k for k in src if not k.startswith(("verifier_", "freqs")) and k not in covered
+    droppable = [k for k in src if not k.startswith(("verifier_", "freqs", "inter_heads.")) and k not in covered
                  and not re.fullmatch(r"(confidence_head\.proj\.bias)", k)]
     if droppable:
         print(f"!! {len(droppable)} input tensors NOT represented in the output (silently dropped?): {droppable[:12]}")

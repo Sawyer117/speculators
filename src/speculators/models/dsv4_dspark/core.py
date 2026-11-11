@@ -19,6 +19,7 @@ stack (expand once, collapse with the HyperHead at the end).
 from __future__ import annotations
 
 import os
+from functools import partial
 from typing import ClassVar, Literal
 
 import torch
@@ -28,6 +29,14 @@ from speculators import SpeculatorModelConfig
 from speculators.model import SpeculatorModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.core import DSparkDraftModel
+from speculators.models.dspark.metrics import _masked_decayed_mean
+from speculators.models.dsv4_dspark.inter_heads import (
+    IntermediateHead,
+    chunked_ce,
+    settings_from_env,
+    weight_at,
+)
+from speculators.models.metrics import dflash_loss_decay
 
 # Absolute (not relative) imports: transformers' custom_object_save parses the
 # config module's RELATIVE imports to bundle them for trust_remote_code, and
@@ -77,6 +86,8 @@ class DSV4DSparkConfig(DSparkSpeculatorConfig):
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+    # Training-only heads are removed by the standard serving export.
+    intermediate_supervision: dict | None = None
 
     def backbone_config(self) -> DSparkDraftConfig:
         """Build the plain backbone dataclass our modules consume."""
@@ -141,6 +152,19 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         # Swap the decoder stack for our DSV4-native blocks + the mHC head.
         self.layers = nn.ModuleList(MhcDecoderBlock(bb) for _ in range(bb.n_draft_layers))
         self.hc_head = HyperHead(bb)
+        self.inter_settings = settings_from_env(config.intermediate_supervision)
+        config.intermediate_supervision = self.inter_settings
+        self.inter_heads = None
+        self._inter_state = None
+        self._train_step = 0
+        if self.inter_settings is not None:
+            self.inter_heads = nn.ModuleList(
+                IntermediateHead(
+                    bb.hidden_size, self.inter_settings["rank"],
+                    self.lm_head.weight.shape[0], bb.rms_norm_eps, i,
+                )
+                for i in range(bb.n_draft_layers - 1)
+            )
 
         # Our interleaved DSV4 RoPE cache, indexed by absolute position (YaRN off on the sliding
         # path -> original_seq_len=0). Stored as a REAL [seqlen, rope//2, 2] tensor (view_as_real
@@ -513,6 +537,45 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             self._rebuild_freqs(int(positions.max()) + 1)
         return self.freqs_cis.to(positions.device)[positions]
 
+    def set_train_step(self, step):
+        """Called by the trainer with its resumable optimizer-step counter."""
+        self._train_step = int(step)
+
+    def forward(self, *args, **kwargs):
+        if self.inter_heads is None or not self.training:
+            return super().forward(*args, **kwargs)
+        if kwargs.get("per_position_loss_weight", "fixed-exp-decay") != "fixed-exp-decay":
+            raise ValueError("Layerwise supervision currently supports fixed-exp-decay")
+        self._inter_state = {"codes": []}
+        try:
+            predictions, main_loss, metrics = super().forward(*args, **kwargs)
+            state = self._inter_state
+        finally:
+            self._inter_state = None
+        labels, mask = state["labels"], state["mask"]
+        positions = (
+            torch.arange(labels.numel(), device=labels.device) % self.block_size
+        )[None]
+        decay = partial(
+            dflash_loss_decay, gamma=kwargs.get("gamma", 4.0),
+            sample_from_anchor=self.config.sample_from_anchor,
+        )
+        auxiliary = main_loss.new_zeros(())
+        for index, (head, code) in enumerate(
+            zip(self.inter_heads, state["codes"], strict=True), 1
+        ):
+            ce = chunked_ce(code, head.codebook, labels)
+            term = _masked_decayed_mean(ce[None], mask, positions, decay)
+            auxiliary = auxiliary + term
+            metrics[f"inter{index}_ce_sum"] = term.detach().clone()
+            metrics[f"inter{index}_ce_total"] = term.new_ones(())
+        weight = weight_at(self.inter_settings, self._train_step)
+        metrics["inter_aux_loss_sum"] = auxiliary.detach().clone()
+        metrics["inter_aux_loss_total"] = auxiliary.new_ones(())
+        metrics["inter_aux_weight_sum"] = auxiliary.new_tensor(weight)
+        metrics["inter_aux_weight_total"] = auxiliary.new_ones(())
+        return predictions, main_loss + weight * auxiliary, metrics
+
     def _backbone_forward(  # noqa: C901
         self,
         hidden_states: torch.Tensor,
@@ -635,6 +698,8 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 streams = checkpoint(layer, *layer_args, use_reentrant=False)
             else:
                 streams = layer(*layer_args)
+            if self._inter_state is not None and layer_idx < len(self.inter_heads):
+                self._inter_state["codes"].append(self.inter_heads[layer_idx](streams))
             if _sat:
                 _rec["layers"].append(streams.detach().float().cpu())
 
@@ -737,6 +802,9 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                     aligned = [tgt_v[k] == true_next[k] for k in range(bs)]
                     print(f"a={a} tok[a]={int(input_ids[0, a])} | true_next(a+1..a+{bs})={true_next} "
                           f"| target_argmax(->verif)={tgt_v} | aligned={aligned}", flush=True)
+        if self._inter_state is not None:
+            self._inter_state["labels"] = targets[0].detach().argmax(-1)
+            self._inter_state["mask"] = aligned_loss_mask
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
 
     @staticmethod

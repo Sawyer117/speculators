@@ -10,6 +10,10 @@
 
 </div>
 
+**This experimental branch:** [DSV4 layerwise supervision](docs/developer/dsv4-layerwise-supervision.md)
+adds training-only low-rank heads and a two-stage auxiliary-loss schedule.
+The heads are bypassed in evaluation and removed at serving export.
+
 ## Overview
 
 Speculators is a library for training speculative decoding draft models that deploy directly to LLM inference engines like vLLM. Speculative decoding is a lossless technique that speeds up LLM inference by using a smaller, faster draft model (i.e. "the speculator") to propose tokens, which are then verified by the larger base model, reducing latency without compromising output quality. The speculator intelligently drafts multiple tokens ahead of time, and the base model verifies them in a single forward pass. This approach boosts performance without sacrificing output quality, as every accepted token is guaranteed to match what the main model would have generated on its own.

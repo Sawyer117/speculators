@@ -67,7 +67,7 @@ import shutil
 import sys
 from pathlib import Path
 
-_SKIP = ("verifier_lm_head", "verifier_norm")
+_SKIP = ("verifier_lm_head", "verifier_norm", "inter_heads.")
 
 
 def _map(key: str, last: int):

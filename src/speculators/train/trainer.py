@@ -552,6 +552,13 @@ class Trainer:
                 fetch_all = [round(float(t[0].item()), 1) for t in _out]
                 tokens_all = [int(t[1].item()) for t in _out]
             # --------------------------------------------------------------------------------------
+            step_model = (
+                self.model.module
+                if isinstance(self.model, DistributedDataParallel)
+                else self.model
+            )
+            if hasattr(step_model, "set_train_step"):
+                step_model.set_train_step(self.global_step)
             _draft_tokens, loss, metrics = self.model(
                 **gpu_batch, **(self.config.train_call_kwargs or {})
             )

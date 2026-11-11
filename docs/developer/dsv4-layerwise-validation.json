@@ -1,0 +1,17 @@
+{
+  "checked_utc": "2026-11-11T01:22:36.100242+00:00",
+  "public_base": "13ae97a030c5bb80d8f778e2ea998dd7194ee0ee",
+  "torch": "2.13.0+cu130",
+  "device": "CPU",
+  "tests_passed": 6,
+  "test_file": "tests/unit/models/test_dsv4_layerwise_supervision.py",
+  "coverage": [
+    "FP32/BF16 chunked cross entropy and gradients",
+    "initialization does not advance global RNG",
+    "total loss decomposition and original metrics",
+    "eval bypasses intermediate heads",
+    "two-stage weight boundary and settings restoration",
+    "serving export preserves base tensors and removes auxiliary heads"
+  ],
+  "scope": "Minimal public port; no new NPU/GPU training or throughput measurement."
+}
