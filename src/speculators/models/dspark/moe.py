@@ -47,6 +47,8 @@ class PackedExperts(nn.Module):
         output = torch.zeros_like(x)
         for expert in range(self.gate_up_proj.shape[0]):
             tokens, slots = torch.where(indices == expert)
+            if tokens.numel() == 0:
+                continue
             selected = x[tokens]
             gate, up = functional.linear(selected, self.gate_up_proj[expert]).chunk(
                 2, dim=-1
@@ -84,6 +86,8 @@ class DSparkMoE(nn.Module):
     def forward(self, hidden_states):
         shape = hidden_states.shape
         x = hidden_states.reshape(-1, shape[-1])
+        if x.shape[0] == 0:
+            return hidden_states
         scores = functional.linear(x.float(), self.gate.weight.float())
         if self.config.score_function == "softmax":
             scores = scores.softmax(dim=-1)

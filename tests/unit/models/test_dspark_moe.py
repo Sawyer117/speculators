@@ -134,3 +134,22 @@ def test_default_dense_unchanged():
 def test_invalid_topk_rejected():
     with pytest.raises(ValueError, match="experts_per_token"):
         DraftMoEConfig(num_experts=2, experts_per_token=3)
+
+
+def test_unselected_experts_and_empty_input():
+    layer = DSparkMoE(
+        8,
+        DraftMoEConfig(
+            num_experts=8,
+            experts_per_token=2,
+            expert_intermediate_size=4,
+            num_shared_experts=0,
+        ),
+    )
+    value = layer(torch.randn(1, 8, requires_grad=True))
+    value.sum().backward()
+    grad = layer.experts.gate_up_proj.grad.flatten(1).abs().sum(1)
+    assert (grad > 0).sum() == 2
+    empty = torch.empty(0, 8, requires_grad=True)
+    layer(empty).sum().backward()
+    assert empty.grad.shape == empty.shape
