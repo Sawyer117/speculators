@@ -2,13 +2,36 @@
 
 This change adds independent low-rank prediction heads after every draft layer except the last. Each head predicts the **same aligned teacher argmax** as the final head, using the same anchor validity, loss mask and exponential position decay. The auxiliary losses are summed and multiplied by the configured weight. The existing final-head loss and metrics retain their meaning.
 
-The feature is disabled by default. Add this option to an existing DSpark training command (two or more layers):
+## Try with your existing training command
+
+From a clean checkout of the customer repository, fetch this PR:
+
+```bash
+git fetch https://github.com/shangxt10/speculators.git pull/3/head:review/dspark-layerwise
+git switch review/dspark-layerwise
+```
+
+Use your existing DSpark training environment and native `scripts/train.py` command. If the package was installed editable from this checkout, switching branches updates the imported code; otherwise reinstall from this checkout using your usual installation procedure. Keep your model/data/HS paths, layer count, attention settings and distributed launcher. At least two draft layers are required.
+
+The following is an **argument fragment**, not a standalone shell command. For a first functional run with a constant auxiliary weight, add or replace:
+
+```bash
+--speculator-type dspark \
+--per-position-loss-weight fixed-exp-decay \
+--intermediate-supervision '{"rank":256,"weight":0.2,"logit_chunk_size":512}'
+```
+
+The feature is disabled by default. To use a two-stage auxiliary-weight schedule instead, replace the last option with:
 
 ```bash
 --intermediate-supervision '{"rank":256,"weight":0.2,"decay_steps":6118,"weight_end":0.08,"logit_chunk_size":512}'
 ```
 
 Choose `decay_steps` for your dataset and batch size; 6118 is an example, not a universal epoch length. The trainer uses its checkpointed global optimizer step, so resuming does not restart the schedule. Omitting `decay_steps` gives a constant weight. This implementation supports `fixed-exp-decay`, not DPACE.
+
+Use a new, unused `--save-path` and a separate `--log-dir` for this experiment: the trainer automatically resumes checkpoints in its save directory. This fragment uses fresh model initialization. If your command uses `--from-pretrained`, do not append `--intermediate-supervision` to it: the CLI uses the checkpoint's saved recipe and rejects a conflicting override. When loading an already initialized supervised draft, use its saved recipe. Resume training with the same save directory and original training/scheduler recipe to retain optimizer and global-step state; `--from-pretrained` by itself only loads model initialization.
+
+For a quick initialization check, add `--dry-run` with a separate unused `--save-path`. This saves the initialized model and exits; it does not test backward or optimizer restoration. During actual training, look for `inter1_ce` through `inter(N-1)_ce`, `inter_aux_loss` and `inter_aux_weight`; a five-layer draft has four intermediate heads.
 
 Heads use RMSNorm, a width-to-rank projection and an independent vocabulary codebook. Vocabulary logits are computed in chunks and recomputed in backward. They do not inject tokens into the next layer and do not alter inference logits. `interN_ce`, `inter_aux_loss` and `inter_aux_weight` are logged separately.
 
