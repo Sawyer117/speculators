@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import logging
 import random
 import warnings
@@ -825,6 +826,16 @@ def validate_draft_init_args(
         )
 
 
+def validate_draft_moe_args(parser, args):
+    if args.draft_moe is not None and (
+        args.speculator_type != "dspark" or args.from_pretrained
+    ):
+        parser.error(
+            "--draft-moe requires a new DSpark model; "
+            "--from-pretrained uses its saved FFN architecture."
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--verifier-name-or-path", type=str, required=True)
@@ -1053,6 +1064,12 @@ def parse_args():
     parser.add_argument("--d2t-path", type=str, default=None)
     parser.add_argument("--t2d-path", type=str, default=None)
     parser.add_argument("--mask-token-id", type=int, default=None)
+    parser.add_argument(
+        "--draft-moe",
+        type=json.loads,
+        default=None,
+        help="DSpark routed/shared FFN configuration as a JSON object; default dense.",
+    )
     parser.add_argument("--ttt-steps", type=int, default=3)
     parser.add_argument(
         "--num-speculative-steps",
@@ -1360,6 +1377,7 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    validate_draft_moe_args(parser, args)
 
     if args.vllm_endpoint is None:
         args.vllm_endpoint = ["http://localhost:8000/v1"]
