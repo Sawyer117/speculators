@@ -10,9 +10,14 @@
 
 </div>
 
-**This experimental branch:** [DSV4 layerwise supervision](docs/developer/dsv4-layerwise-supervision.md)
-adds training-only low-rank heads and a two-stage auxiliary-loss schedule.
-The heads are bypassed in evaluation and removed at serving export.
+**Here for DSV4 layerwise supervision? [Start with the method and code-reading guide](https://github.com/Sawyer117/speculators/blob/feat/dsv4-layerwise-supervision/docs/developer/dsv4-layerwise-supervision.md).**
+This experimental branch adds training-only low-rank heads and a two-stage
+auxiliary-loss schedule. The heads are bypassed in evaluation and removed at
+serving export. The guide provides the diagram, reading order, pinned checkout,
+training switches and test command. The implementation is frozen at
+[`8d07ab951646b23ccaf7a0fe9bb6e9ca4373caf1`](https://github.com/Sawyer117/speculators/commit/8d07ab951646b23ccaf7a0fe9bb6e9ca4373caf1).
+Use that checkout for this feature; the generic upstream/PyPI instructions below
+do not select this experimental branch.
 
 ## Overview
 

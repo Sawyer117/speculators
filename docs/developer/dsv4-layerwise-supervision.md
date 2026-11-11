@@ -6,6 +6,47 @@ recipe, not a release of a complete experiment environment or trained weights.
 It builds on the existing public `feat/dsv4-dspark` commit
 `13ae97a030c5bb80d8f778e2ea998dd7194ee0ee`; that branch is left unchanged.
 
+## Start here: links, version and reading order
+
+Share this guide as the entry point; readers do not need to search for the
+repository or guess which branch contains the feature:
+
+- **Guide:** https://github.com/Sawyer117/speculators/blob/feat/dsv4-layerwise-supervision/docs/developer/dsv4-layerwise-supervision.md
+- **Branch:** https://github.com/Sawyer117/speculators/tree/feat/dsv4-layerwise-supervision
+- **Fixed implementation and its diff:** https://github.com/Sawyer117/speculators/commit/8d07ab951646b23ccaf7a0fe9bb6e9ca4373caf1
+
+The branch can receive documentation updates. The full implementation commit
+ID is `8d07ab951646b23ccaf7a0fe9bb6e9ca4373caf1`; use it when citing or reproducing
+this code. Its diff against the existing public DSV4 base contains the feature
+and its tests, so there is no need to read the entire repository first.
+
+Read the diagram and loss below, then follow this order:
+
+| Step | Source | What to check |
+| --- | --- | --- |
+| 1 | [inter_heads.py](../../src/speculators/models/dsv4_dspark/inter_heads.py) | `IntermediateHead`, chunked CE, and the two-stage weight schedule. |
+| 2 | [core.py](../../src/speculators/models/dsv4_dspark/core.py) | Search `inter_heads` and `_inter_state`: capture intermediate states, reuse the main labels/mask, add the weighted loss, and bypass the heads in eval. |
+| 3 | [trainer.py](../../src/speculators/train/trainer.py) | Search `set_train_step`: supply the resumed optimizer step to the schedule. |
+| 4 | [conversion](../../scripts/convert_dspark_to_vllm.py) and [verification](../../scripts/verify_dspark_conversion.py) | Search `inter_heads.`: remove training-only tensors and verify the export exclusions. |
+| 5 | [focused tests](../../tests/unit/models/test_dsv4_layerwise_supervision.py) | Read executable checks for loss/gradients, RNG, eval bypass, schedule and export. |
+
+To obtain exactly the reviewed implementation:
+
+```bash
+git clone --single-branch --branch feat/dsv4-layerwise-supervision \
+  https://github.com/Sawyer117/speculators.git speculators-layerwise
+cd speculators-layerwise
+git checkout --detach 8d07ab951646b23ccaf7a0fe9bb6e9ca4373caf1
+git rev-parse HEAD
+```
+
+This obtains the source only. To train, first have a working DSV4 DSpark baseline
+environment, target weights and aligned hidden-state data, then enable the
+switches below in that same training command. The inherited Ascend launcher is
+[train_dsv4_dspark.sh](../../examples/ascend_npu_dflash/train_dsv4_dspark.sh);
+its machine-specific defaults must be replaced with your own paths and runtime
+settings. The focused CPU tests do not require the full target-model weights.
+
 ## Method
 
 For a three-layer draft:
